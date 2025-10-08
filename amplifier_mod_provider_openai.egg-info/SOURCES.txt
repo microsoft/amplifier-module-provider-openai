@@ -1,9 +1,0 @@
-LICENSE
-pyproject.toml
-amplifier_mod_provider_openai/__init__.py
-amplifier_mod_provider_openai.egg-info/PKG-INFO
-amplifier_mod_provider_openai.egg-info/SOURCES.txt
-amplifier_mod_provider_openai.egg-info/dependency_links.txt
-amplifier_mod_provider_openai.egg-info/entry_points.txt
-amplifier_mod_provider_openai.egg-info/requires.txt
-amplifier_mod_provider_openai.egg-info/top_level.txt
