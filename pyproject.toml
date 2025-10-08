@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amplifier-module-provider-openai"
+version = "1.0.0"
+description = "OpenAI provider module for Amplifier"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "amplifier-core>=1.0.0",
+    "openai>=1.0.0",
+]
+
+[project.entry-points."amplifier.modules"]
+provider-openai = "amplifier_mod_provider_openai:mount"

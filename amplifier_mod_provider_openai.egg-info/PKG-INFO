@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: amplifier-mod-provider-openai
+Version: 1.0.0
+Summary: OpenAI provider module for Amplifier
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: amplifier-core>=1.0.0
+Requires-Dist: openai>=1.0.0
+Dynamic: license-file

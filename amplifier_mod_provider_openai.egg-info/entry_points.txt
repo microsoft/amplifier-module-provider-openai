@@ -1,0 +1,2 @@
+[amplifier.modules]
+provider-openai = amplifier_mod_provider_openai:mount
