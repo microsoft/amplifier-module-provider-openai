@@ -1,13 +1,11 @@
 """
 OpenAI provider module for Amplifier.
-Integrates with OpenAI's GPT models.
+Integrates with OpenAI's Responses API.
 """
 
-import json
 import logging
 import os
 from typing import Any
-from typing import Optional
 
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderResponse
@@ -18,22 +16,11 @@ logger = logging.getLogger(__name__)
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
-    """
-    Mount the OpenAI provider.
-
-    Args:
-        coordinator: Module coordinator
-        config: Provider configuration including API key
-
-    Returns:
-        Optional cleanup function
-    """
+    """Mount the OpenAI provider."""
     config = config or {}
 
     # Get API key from config or environment
-    api_key = config.get("api_key")
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = config.get("api_key") or os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
         logger.warning("No API key found for OpenAI provider")
@@ -41,7 +28,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     provider = OpenAIProvider(api_key, config)
     await coordinator.mount("providers", provider, name="openai")
-    logger.info("Mounted OpenAIProvider")
+    logger.info("Mounted OpenAIProvider (Responses API)")
 
     # Return cleanup function
     async def cleanup():
@@ -52,139 +39,201 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
 
 class OpenAIProvider:
-    """OpenAI API integration."""
+    """OpenAI Responses API integration."""
 
     name = "openai"
 
     def __init__(self, api_key: str, config: dict[str, Any] | None = None):
-        """
-        Initialize OpenAI provider.
-
-        Args:
-            api_key: OpenAI API key
-            config: Additional configuration
-        """
+        """Initialize OpenAI provider with Responses API client."""
         self.client = AsyncOpenAI(api_key=api_key)
         self.config = config or {}
-        self.default_model = self.config.get("default_model", "gpt-4-turbo-preview")
+
+        # Configuration with sensible defaults
+        self.default_model = self.config.get("default_model", "gpt-5-codex")
         self.max_tokens = self.config.get("max_tokens", 4096)
-        self.temperature = self.config.get("temperature", 0.7)
+        self.temperature = self.config.get("temperature", None)  # None = not sent (some models don't support it)
+        self.reasoning = self.config.get("reasoning", None)  # None = not sent (minimal|low|medium|high)
+        self.enable_state = self.config.get("enable_state", False)
 
     async def complete(self, messages: list[dict[str, Any]], **kwargs) -> ProviderResponse:
-        """
-        Generate completion from messages.
+        """Generate completion using Responses API."""
 
-        Args:
-            messages: Conversation history
-            **kwargs: Additional parameters
+        # 1. Extract system instructions and convert messages to input
+        instructions, remaining_messages = self._extract_system_instructions(messages)
+        input_text = self._convert_messages_to_input(remaining_messages)
 
-        Returns:
-            Provider response
-        """
-        # Convert messages to OpenAI format
-        openai_messages = self._convert_messages(messages)
-
-        # Prepare request parameters
+        # 2. Prepare request parameters
         params = {
             "model": kwargs.get("model", self.default_model),
-            "messages": openai_messages,
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
-            "temperature": kwargs.get("temperature", self.temperature),
+            "input": input_text,
         }
 
-        # Add tools if provided
-        if "tools" in kwargs:
-            params["tools"] = self._convert_tools(kwargs["tools"])
-            params["tool_choice"] = "auto"
+        # Add instructions if present
+        if instructions:
+            params["instructions"] = instructions
 
-        # Add response format if needed
-        if kwargs.get("json_mode"):
-            params["response_format"] = {"type": "json_object"}
+        # Add max output tokens
+        if max_tokens := kwargs.get("max_tokens", self.max_tokens):
+            params["max_output_tokens"] = max_tokens
+
+        # Add temperature
+        if temperature := kwargs.get("temperature", self.temperature):
+            params["temperature"] = temperature
+
+        # Add reasoning control
+        if reasoning := kwargs.get("reasoning", self.reasoning):
+            params["reasoning"] = {"effort": reasoning}
+
+        # Add tools if provided
+        if "tools" in kwargs and kwargs["tools"]:
+            params["tools"] = self._convert_tools(kwargs["tools"])
+
+        # Add JSON schema if requested
+        if json_schema := kwargs.get("json_schema"):
+            params["text"] = {"format": {"type": "json_schema", "json_schema": json_schema}}
+
+        # Handle stateful conversations if enabled
+        if self.enable_state:
+            params["store"] = True
+            if previous_id := kwargs.get("previous_response_id"):
+                params["previous_response_id"] = previous_id
 
         try:
-            response = await self.client.chat.completions.create(**params)
+            # 3. Call Responses API
+            response = await self.client.responses.create(**params)
 
-            # Get the first choice
-            choice = response.choices[0]
-            message = choice.message
+            # 4. Parse response output
+            content, tool_calls = self._parse_response_output(response.output)
 
-            # Extract content and tool calls
-            content = message.content or ""
-            tool_calls = []
-
-            if message.tool_calls:
-                for tc in message.tool_calls:
-                    tool_calls.append(
-                        ToolCall(tool=tc.function.name, arguments=json.loads(tc.function.arguments), id=tc.id)
-                    )
-
+            # 5. Return standardized response
             return ProviderResponse(
                 content=content,
                 raw=response,
                 usage={
-                    "input": response.usage.prompt_tokens,
-                    "output": response.usage.completion_tokens,
-                    "total": response.usage.total_tokens,
-                }
-                if response.usage
-                else {},
+                    "input": getattr(response.usage, "prompt_tokens", 0) if hasattr(response, "usage") else 0,
+                    "output": getattr(response.usage, "completion_tokens", 0) if hasattr(response, "usage") else 0,
+                    "total": getattr(response.usage, "total_tokens", 0) if hasattr(response, "usage") else 0,
+                },
                 tool_calls=tool_calls if tool_calls else None,
             )
 
         except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
+            logger.error(f"OpenAI Responses API error: {e}")
             raise
 
     def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
-        """
-        Parse tool calls from provider response.
-
-        Args:
-            response: Provider response
-
-        Returns:
-            List of tool calls
-        """
+        """Parse tool calls from provider response."""
         return response.tool_calls or []
 
-    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Convert messages to OpenAI format."""
-        openai_messages = []
+    def _extract_system_instructions(self, messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
+        """Extract system messages as instructions."""
+        system_messages = [m for m in messages if m.get("role") == "system"]
+        other_messages = [m for m in messages if m.get("role") != "system"]
+
+        instructions = None
+        if system_messages:
+            instructions = "\n\n".join([m.get("content", "") for m in system_messages])
+
+        return instructions, other_messages
+
+    def _convert_messages_to_input(self, messages: list[dict[str, Any]]) -> str:
+        """Convert message array to single input string."""
+        formatted = []
 
         for msg in messages:
-            role = msg.get("role")
+            role = msg.get("role", "").upper()
             content = msg.get("content", "")
 
-            # Map roles
-            if role == "tool":
-                # Tool results in OpenAI format
-                openai_messages.append(
-                    {"role": "tool", "tool_call_id": msg.get("tool_call_id", "unknown"), "content": content}
-                )
+            # Handle tool messages
+            if role == "TOOL":
+                # Include tool results in the input
+                tool_id = msg.get("tool_call_id", "unknown")
+                formatted.append(f"TOOL RESULT [{tool_id}]: {content}")
+            elif role == "ASSISTANT" and msg.get("tool_calls"):
+                # Include assistant's tool calls
+                tool_call_desc = ", ".join([tc.get("tool", "") for tc in msg["tool_calls"]])
+                if content:
+                    formatted.append(f"{role}: {content} [Called tools: {tool_call_desc}]")
+                else:
+                    formatted.append(f"{role}: [Called tools: {tool_call_desc}]")
             else:
-                # Regular messages (system, user, assistant)
-                openai_messages.append({"role": role, "content": content})
+                # Regular messages
+                formatted.append(f"{role}: {content}")
 
-        return openai_messages
+        return "\n\n".join(formatted)
+
+    def _parse_response_output(self, output: list[Any]) -> tuple[str, list[ToolCall]]:
+        """Parse output blocks into content and tool calls.
+
+        Note: output can be either SDK objects or dictionaries depending on the response.
+        """
+        content_parts = []
+        tool_calls = []
+
+        for block in output:
+            # Handle both SDK objects and dictionaries
+            if hasattr(block, "type"):
+                # SDK object (like ResponseReasoningItem, ResponseMessageItem, etc.)
+                block_type = block.type
+
+                if block_type == "message":
+                    # Extract text from message content
+                    block_content = getattr(block, "content", [])
+                    if isinstance(block_content, list):
+                        for content_item in block_content:
+                            if hasattr(content_item, "type") and content_item.type == "output_text":
+                                content_parts.append(getattr(content_item, "text", ""))
+                            elif hasattr(content_item, "get") and content_item.get("type") == "output_text":
+                                content_parts.append(content_item.get("text", ""))
+                    elif isinstance(block_content, str):
+                        content_parts.append(block_content)
+
+                elif block_type == "reasoning":
+                    # Skip reasoning blocks - they're internal thinking, not output
+                    pass
+
+                elif block_type == "tool_call":
+                    # Native tool call from Responses API
+                    tool_calls.append(
+                        ToolCall(
+                            tool=getattr(block, "name", ""),
+                            arguments=getattr(block, "input", {}),
+                            id=getattr(block, "id", ""),
+                        )
+                    )
+            else:
+                # Dictionary format
+                block_type = block.get("type")
+
+                if block_type == "message":
+                    # Extract text from message content
+                    block_content = block.get("content", [])
+                    if isinstance(block_content, list):
+                        for content_item in block_content:
+                            if content_item.get("type") == "output_text":
+                                content_parts.append(content_item.get("text", ""))
+                    elif isinstance(block_content, str):
+                        content_parts.append(block_content)
+
+                elif block_type == "tool_call":
+                    # Native tool call from Responses API
+                    tool_calls.append(
+                        ToolCall(tool=block.get("name", ""), arguments=block.get("input", {}), id=block.get("id", ""))
+                    )
+
+        content = "\n\n".join(content_parts) if content_parts else ""
+        return content, tool_calls
 
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
-        """Convert tools to OpenAI format."""
-        openai_tools = []
+        """Convert tools to Responses API format."""
+        responses_tools = []
 
         for tool in tools:
-            openai_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},  # Would need tool schema here
-                            "required": [],
-                        },
-                    },
-                }
+            # Get schema from tool if available
+            input_schema = getattr(tool, "input_schema", {"type": "object", "properties": {}, "required": []})
+
+            responses_tools.append(
+                {"type": "function", "name": tool.name, "description": tool.description, "parameters": input_schema}
             )
 
-        return openai_tools
+        return responses_tools

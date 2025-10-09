@@ -1,10 +1,10 @@
 # Amplifier OpenAI Provider Module
 
-GPT model integration for Amplifier via OpenAI API.
+GPT model integration for Amplifier via OpenAI's Responses API.
 
 ## Purpose
 
-Provides access to OpenAI's GPT models (GPT-4, GPT-3.5, etc.) as an LLM provider for Amplifier.
+Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplifier using the Responses API for enhanced capabilities.
 
 ## Contract
 
@@ -14,9 +14,11 @@ Provides access to OpenAI's GPT models (GPT-4, GPT-3.5, etc.) as an LLM provider
 
 ## Supported Models
 
-- `gpt-4-turbo` - Latest GPT-4 Turbo
-- `gpt-4` - GPT-4
-- `gpt-3.5-turbo` - GPT-3.5 Turbo
+- `gpt-5-codex` - GPT-5 optimized for code (default)
+- `gpt-5` - Latest GPT-5 model
+- `gpt-5-mini` - Smaller, faster GPT-5
+- `gpt-4.1` - GPT-4.1 series
+- `gpt-4o` - GPT-4 optimized
 
 ## Configuration
 
@@ -25,9 +27,11 @@ Provides access to OpenAI's GPT models (GPT-4, GPT-3.5, etc.) as an LLM provider
 module = "provider-openai"
 name = "openai"
 config = {
-    model = "gpt-4-turbo",
+    default_model = "gpt-5-codex",
     max_tokens = 4096,
-    temperature = 0.7
+    temperature = 0.7,
+    reasoning = "low",
+    enable_state = false
 }
 ```
 
@@ -43,16 +47,19 @@ export OPENAI_API_KEY="your-api-key-here"
 # In amplifier configuration
 [provider]
 name = "openai"
-model = "gpt-4-turbo"
+model = "gpt-5-codex"
 ```
 
 ## Features
 
-- Streaming support
-- Function calling (tool use)
-- Vision capabilities (on supported models)
-- JSON mode
-- Token counting and management
+### Responses API Capabilities
+
+- **Reasoning Control** - Adjust reasoning effort (minimal, low, medium, high)
+- **Stateful Conversations** - Optional conversation persistence
+- **Native Tools** - Built-in web search, image generation, code interpreter
+- **Structured Output** - JSON schema-based output formatting
+- **Function Calling** - Custom tool use support
+- **Token Counting** - Usage tracking and management
 
 ## Dependencies
 
