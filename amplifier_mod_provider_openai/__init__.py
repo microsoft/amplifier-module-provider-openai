@@ -10,6 +10,9 @@ from typing import Any
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderResponse
 from amplifier_core import ToolCall
+from amplifier_core.content_models import TextContent
+from amplifier_core.content_models import ThinkingContent
+from amplifier_core.content_models import ToolCallContent
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
@@ -103,7 +106,7 @@ class OpenAIProvider:
             response = await self.client.responses.create(**params)
 
             # 4. Parse response output
-            content, tool_calls = self._parse_response_output(response.output)
+            content, tool_calls, content_blocks = self._parse_response_output(response.output)
 
             # 5. Return standardized response
             return ProviderResponse(
@@ -115,6 +118,7 @@ class OpenAIProvider:
                     "total": getattr(response.usage, "total_tokens", 0) if hasattr(response, "usage") else 0,
                 },
                 tool_calls=tool_calls if tool_calls else None,
+                content_blocks=content_blocks if content_blocks else None,
             )
 
         except Exception as e:
@@ -162,13 +166,14 @@ class OpenAIProvider:
 
         return "\n\n".join(formatted)
 
-    def _parse_response_output(self, output: list[Any]) -> tuple[str, list[ToolCall]]:
-        """Parse output blocks into content and tool calls.
+    def _parse_response_output(self, output: list[Any]) -> tuple[str, list[ToolCall], list[Any]]:
+        """Parse output blocks into content, tool calls, and content_blocks.
 
         Note: output can be either SDK objects or dictionaries depending on the response.
         """
         content_parts = []
         tool_calls = []
+        content_blocks = []
 
         for block in output:
             # Handle both SDK objects and dictionaries
@@ -182,15 +187,22 @@ class OpenAIProvider:
                     if isinstance(block_content, list):
                         for content_item in block_content:
                             if hasattr(content_item, "type") and content_item.type == "output_text":
-                                content_parts.append(getattr(content_item, "text", ""))
+                                text = getattr(content_item, "text", "")
+                                content_parts.append(text)
+                                content_blocks.append(TextContent(text=text, raw=content_item))
                             elif hasattr(content_item, "get") and content_item.get("type") == "output_text":
-                                content_parts.append(content_item.get("text", ""))
+                                text = content_item.get("text", "")
+                                content_parts.append(text)
+                                content_blocks.append(TextContent(text=text, raw=content_item))
                     elif isinstance(block_content, str):
                         content_parts.append(block_content)
+                        content_blocks.append(TextContent(text=block_content, raw=block))
 
                 elif block_type == "reasoning":
-                    # Skip reasoning blocks - they're internal thinking, not output
-                    pass
+                    # Extract reasoning as ThinkingContent
+                    reasoning_text = getattr(block, "text", "")
+                    if reasoning_text:
+                        content_blocks.append(ThinkingContent(text=reasoning_text, raw=block))
 
                 elif block_type == "tool_call":
                     # Native tool call from Responses API
@@ -199,6 +211,14 @@ class OpenAIProvider:
                             tool=getattr(block, "name", ""),
                             arguments=getattr(block, "input", {}),
                             id=getattr(block, "id", ""),
+                        )
+                    )
+                    content_blocks.append(
+                        ToolCallContent(
+                            id=getattr(block, "id", ""),
+                            name=getattr(block, "name", ""),
+                            arguments=getattr(block, "input", {}),
+                            raw=block,
                         )
                     )
             else:
@@ -211,18 +231,35 @@ class OpenAIProvider:
                     if isinstance(block_content, list):
                         for content_item in block_content:
                             if content_item.get("type") == "output_text":
-                                content_parts.append(content_item.get("text", ""))
+                                text = content_item.get("text", "")
+                                content_parts.append(text)
+                                content_blocks.append(TextContent(text=text, raw=content_item))
                     elif isinstance(block_content, str):
                         content_parts.append(block_content)
+                        content_blocks.append(TextContent(text=block_content, raw=block))
+
+                elif block_type == "reasoning":
+                    # Extract reasoning as ThinkingContent
+                    reasoning_text = block.get("text", "")
+                    if reasoning_text:
+                        content_blocks.append(ThinkingContent(text=reasoning_text, raw=block))
 
                 elif block_type == "tool_call":
                     # Native tool call from Responses API
                     tool_calls.append(
                         ToolCall(tool=block.get("name", ""), arguments=block.get("input", {}), id=block.get("id", ""))
                     )
+                    content_blocks.append(
+                        ToolCallContent(
+                            id=block.get("id", ""),
+                            name=block.get("name", ""),
+                            arguments=block.get("input", {}),
+                            raw=block,
+                        )
+                    )
 
         content = "\n\n".join(content_parts) if content_parts else ""
-        return content, tool_calls
+        return content, tool_calls, content_blocks
 
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
         """Convert tools to Responses API format."""
