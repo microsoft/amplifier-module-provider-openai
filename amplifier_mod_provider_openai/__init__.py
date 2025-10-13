@@ -3,6 +3,7 @@ OpenAI provider module for Amplifier.
 Integrates with OpenAI's Responses API.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -58,6 +59,9 @@ class OpenAIProvider:
         self.reasoning = self.config.get("reasoning", None)  # None = not sent (minimal|low|medium|high)
         self.enable_state = self.config.get("enable_state", False)
 
+        # Provider priority for selection (lower = higher priority)
+        self.priority = self.config.get("priority", 100)
+
     async def complete(self, messages: list[dict[str, Any]], **kwargs) -> ProviderResponse:
         """Generate completion using Responses API."""
 
@@ -102,8 +106,13 @@ class OpenAIProvider:
                 params["previous_response_id"] = previous_id
 
         try:
-            # 3. Call Responses API
-            response = await self.client.responses.create(**params)
+            # 3. Call Responses API with timeout
+            try:
+                # Add timeout to prevent hanging (30 seconds)
+                response = await asyncio.wait_for(self.client.responses.create(**params), timeout=30.0)
+            except TimeoutError:
+                logger.error(f"OpenAI Responses API timed out after 30s. Input: {input_text[:200]}...")
+                raise TimeoutError("OpenAI API request timed out after 30 seconds")
 
             # 4. Parse response output
             content, tool_calls, content_blocks = self._parse_response_output(response.output)
