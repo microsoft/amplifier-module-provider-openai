@@ -1,18 +1,38 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "amplifier-module-provider-openai"
 version = "1.0.0"
 description = "Reference provider module - OpenAI GPT integration for Amplifier"
+license = "MIT"
 readme = "README.md"
-requires-python = ">=3.9"
-license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    { name = "Microsoft MADE:Explorations Team" },
+]
 dependencies = [
-    "amplifier-core>=1.0.0",
     "openai>=1.0.0",
+    "amplifier-core",
 ]
 
 [project.entry-points."amplifier.modules"]
-provider-openai = "amplifier_mod_provider_openai:mount"
+provider-openai = "amplifier_module_provider_openai:mount"
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.uv.sources.amplifier-core]
+path = "../amplifier-core"
+editable = true
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "amplifier_module_provider_openai",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true

@@ -2,6 +2,21 @@
 
 GPT model integration for Amplifier via OpenAI's Responses API.
 
+## Prerequisites
+
+- **Python 3.11+**
+- **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
+
+### Installing UV
+
+```bash
+# macOS/Linux/WSL
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
 ## Purpose
 
 Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplifier using the Responses API for enhanced capabilities.
@@ -10,7 +25,7 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 
 **Module Type:** Provider
 **Mount Point:** `providers`
-**Entry Point:** `amplifier_mod_provider_openai:mount`
+**Entry Point:** `amplifier_module_provider_openai:mount`
 
 ## Supported Models
 
