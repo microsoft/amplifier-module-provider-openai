@@ -6,6 +6,7 @@ Integrates with OpenAI's Responses API.
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -30,7 +31,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         logger.warning("No API key found for OpenAI provider")
         return None
 
-    provider = OpenAIProvider(api_key, config)
+    provider = OpenAIProvider(api_key, config, coordinator)
     await coordinator.mount("providers", provider, name="openai")
     logger.info("Mounted OpenAIProvider (Responses API)")
 
@@ -47,10 +48,13 @@ class OpenAIProvider:
 
     name = "openai"
 
-    def __init__(self, api_key: str, config: dict[str, Any] | None = None):
+    def __init__(
+        self, api_key: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
+    ):
         """Initialize OpenAI provider with Responses API client."""
         self.client = AsyncOpenAI(api_key=api_key)
         self.config = config or {}
+        self.coordinator = coordinator
 
         # Configuration with sensible defaults
         self.default_model = self.config.get("default_model", "gpt-5-codex")
@@ -105,17 +109,71 @@ class OpenAIProvider:
             if previous_id := kwargs.get("previous_response_id"):
                 params["previous_response_id"] = previous_id
 
+        # Emit llm:request event if coordinator is available
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            await self.coordinator.hooks.emit(
+                "llm:request",
+                {
+                    "provider": "openai",
+                    "model": params["model"],
+                    "messages": len(remaining_messages),  # Count only, not content (privacy)
+                    "reasoning": params.get("reasoning") is not None,
+                },
+            )
+
+        start_time = time.time()
         try:
             # 3. Call Responses API with timeout
             try:
                 # Add timeout to prevent hanging (30 seconds)
                 response = await asyncio.wait_for(self.client.responses.create(**params), timeout=30.0)
+                elapsed_ms = int((time.time() - start_time) * 1000)
             except TimeoutError:
                 logger.error(f"OpenAI Responses API timed out after 30s. Input: {input_text[:200]}...")
+                # Emit error response event
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "llm:response",
+                        {
+                            "provider": "openai",
+                            "model": params["model"],
+                            "status": "error",
+                            "duration_ms": int((time.time() - start_time) * 1000),
+                            "error": "Timeout after 30 seconds",
+                        },
+                    )
                 raise TimeoutError("OpenAI API request timed out after 30 seconds")
 
             # 4. Parse response output
             content, tool_calls, content_blocks = self._parse_response_output(response.output)
+
+            # Check if we have reasoning/thinking blocks and emit events
+            has_reasoning = False
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                for block in content_blocks or []:
+                    if isinstance(block, ThinkingContent):
+                        has_reasoning = True
+                        # Emit thinking:final event for reasoning blocks
+                        await self.coordinator.hooks.emit("thinking:final", {"text": block.text})
+
+            # Emit llm:response success event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "openai",
+                        "model": params["model"],
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                        "usage": {
+                            "input": getattr(response.usage, "prompt_tokens", 0) if hasattr(response, "usage") else 0,
+                            "output": getattr(response.usage, "completion_tokens", 0)
+                            if hasattr(response, "usage")
+                            else 0,
+                        },
+                        "has_reasoning": has_reasoning,
+                    },
+                )
 
             # 5. Return standardized response
             return ProviderResponse(
@@ -132,6 +190,20 @@ class OpenAIProvider:
 
         except Exception as e:
             logger.error(f"OpenAI Responses API error: {e}")
+
+            # Emit llm:response event with error
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "openai",
+                        "model": params.get("model", self.default_model),
+                        "status": "error",
+                        "duration_ms": int((time.time() - start_time) * 1000),
+                        "error": str(e),
+                    },
+                )
+
             raise
 
     def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
