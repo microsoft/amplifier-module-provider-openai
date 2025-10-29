@@ -32,8 +32,8 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 - `gpt-5-codex` - GPT-5 optimized for code (default)
 - `gpt-5` - Latest GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5
-- `gpt-4.1` - GPT-4.1 series
-- `gpt-4o` - GPT-4 optimized
+- `gpt-5-codex` - Code-optimized GPT-5
+- `gpt-5-nano` - Smallest GPT-5 variant
 
 ## Configuration
 
