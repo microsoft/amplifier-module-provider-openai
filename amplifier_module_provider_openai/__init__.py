@@ -362,13 +362,16 @@ class OpenAIProvider:
                 elif block_type in {"tool_call", "function_call"}:
                     arguments = getattr(block, "input", None)
                     if arguments is None and hasattr(block, "arguments"):
-                        arguments = getattr(block, "arguments")
+                        arguments = block.arguments
                     if isinstance(arguments, str):
                         try:
                             arguments = json.loads(arguments)
                         except json.JSONDecodeError:
                             logger.debug("Failed to decode tool call arguments: %s", arguments)
                     if arguments is None:
+                        arguments = {}
+                    # Ensure arguments is dict for type safety
+                    if not isinstance(arguments, dict):
                         arguments = {}
 
                     call_id = getattr(block, "id", "") or getattr(block, "call_id", "")
@@ -422,12 +425,13 @@ class OpenAIProvider:
                             logger.debug("Failed to decode tool call arguments: %s", arguments)
                     if arguments is None:
                         arguments = {}
+                    # Ensure arguments is dict for type safety
+                    if not isinstance(arguments, dict):
+                        arguments = {}
 
                     call_id = block.get("id") or block.get("call_id", "")
                     tool_name = block.get("name", "")
-                    tool_calls.append(
-                        ToolCall(tool=tool_name, arguments=arguments, id=call_id)
-                    )
+                    tool_calls.append(ToolCall(tool=tool_name, arguments=arguments, id=call_id))
                     content_blocks.append(
                         ToolCallContent(
                             id=call_id,
@@ -702,13 +706,16 @@ class OpenAIProvider:
                     tool_name = getattr(block, "name", "")
                     tool_input = getattr(block, "input", None)
                     if tool_input is None and hasattr(block, "arguments"):
-                        tool_input = getattr(block, "arguments")
+                        tool_input = block.arguments
                     if isinstance(tool_input, str):
                         try:
                             tool_input = json.loads(tool_input)
                         except json.JSONDecodeError:
                             logger.debug("Failed to decode tool call arguments: %s", tool_input)
                     if tool_input is None:
+                        tool_input = {}
+                    # Ensure tool_input is dict after json.loads or default
+                    if not isinstance(tool_input, dict):
                         tool_input = {}
                     content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
                     tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
@@ -743,6 +750,9 @@ class OpenAIProvider:
                         except json.JSONDecodeError:
                             logger.debug("Failed to decode tool call arguments: %s", tool_input)
                     if tool_input is None:
+                        tool_input = {}
+                    # Ensure tool_input is dict after json.loads or default
+                    if not isinstance(tool_input, dict):
                         tool_input = {}
                     content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
                     tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
