@@ -4,6 +4,7 @@ Integrates with OpenAI's Responses API.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -358,20 +359,32 @@ class OpenAIProvider:
                     if reasoning_text:
                         content_blocks.append(ThinkingContent(text=reasoning_text, raw=block))
 
-                elif block_type == "tool_call":
-                    # Native tool call from Responses API
+                elif block_type in {"tool_call", "function_call"}:
+                    arguments = getattr(block, "input", None)
+                    if arguments is None and hasattr(block, "arguments"):
+                        arguments = getattr(block, "arguments")
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            logger.debug("Failed to decode tool call arguments: %s", arguments)
+                    if arguments is None:
+                        arguments = {}
+
+                    call_id = getattr(block, "id", "") or getattr(block, "call_id", "")
+                    tool_name = getattr(block, "name", "")
                     tool_calls.append(
                         ToolCall(
-                            tool=getattr(block, "name", ""),
-                            arguments=getattr(block, "input", {}),
-                            id=getattr(block, "id", ""),
+                            tool=tool_name,
+                            arguments=arguments,
+                            id=call_id,
                         )
                     )
                     content_blocks.append(
                         ToolCallContent(
-                            id=getattr(block, "id", ""),
-                            name=getattr(block, "name", ""),
-                            arguments=getattr(block, "input", {}),
+                            id=call_id,
+                            name=tool_name,
+                            arguments=arguments,
                             raw=block,
                         )
                     )
@@ -398,16 +411,28 @@ class OpenAIProvider:
                     if reasoning_text:
                         content_blocks.append(ThinkingContent(text=reasoning_text, raw=block))
 
-                elif block_type == "tool_call":
-                    # Native tool call from Responses API
+                elif block_type in {"tool_call", "function_call"}:
+                    arguments = block.get("input")
+                    if arguments is None:
+                        arguments = block.get("arguments", {})
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            logger.debug("Failed to decode tool call arguments: %s", arguments)
+                    if arguments is None:
+                        arguments = {}
+
+                    call_id = block.get("id") or block.get("call_id", "")
+                    tool_name = block.get("name", "")
                     tool_calls.append(
-                        ToolCall(tool=block.get("name", ""), arguments=block.get("input", {}), id=block.get("id", ""))
+                        ToolCall(tool=tool_name, arguments=arguments, id=call_id)
                     )
                     content_blocks.append(
                         ToolCallContent(
-                            id=block.get("id", ""),
-                            name=block.get("name", ""),
-                            arguments=block.get("input", {}),
+                            id=call_id,
+                            name=tool_name,
+                            arguments=arguments,
                             raw=block,
                         )
                     )
@@ -672,11 +697,19 @@ class OpenAIProvider:
                     if reasoning_text:
                         content_blocks.append(ThinkingBlock(thinking=reasoning_text, signature=None))
 
-                elif block_type == "tool_call":
-                    # Native tool call from Responses API
-                    tool_id = getattr(block, "id", "")
+                elif block_type in {"tool_call", "function_call"}:
+                    tool_id = getattr(block, "id", "") or getattr(block, "call_id", "")
                     tool_name = getattr(block, "name", "")
-                    tool_input = getattr(block, "input", {})
+                    tool_input = getattr(block, "input", None)
+                    if tool_input is None and hasattr(block, "arguments"):
+                        tool_input = getattr(block, "arguments")
+                    if isinstance(tool_input, str):
+                        try:
+                            tool_input = json.loads(tool_input)
+                        except json.JSONDecodeError:
+                            logger.debug("Failed to decode tool call arguments: %s", tool_input)
+                    if tool_input is None:
+                        tool_input = {}
                     content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
                     tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
             else:
@@ -698,10 +731,19 @@ class OpenAIProvider:
                     if reasoning_text:
                         content_blocks.append(ThinkingBlock(thinking=reasoning_text, signature=None))
 
-                elif block_type == "tool_call":
-                    tool_id = block.get("id", "")
+                elif block_type in {"tool_call", "function_call"}:
+                    tool_id = block.get("id") or block.get("call_id", "")
                     tool_name = block.get("name", "")
-                    tool_input = block.get("input", {})
+                    tool_input = block.get("input")
+                    if tool_input is None:
+                        tool_input = block.get("arguments", {})
+                    if isinstance(tool_input, str):
+                        try:
+                            tool_input = json.loads(tool_input)
+                        except json.JSONDecodeError:
+                            logger.debug("Failed to decode tool call arguments: %s", tool_input)
+                    if tool_input is None:
+                        tool_input = {}
                     content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
                     tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
 

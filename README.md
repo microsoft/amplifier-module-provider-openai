@@ -76,6 +76,14 @@ model = "gpt-5-codex"
 - **Function Calling** - Custom tool use support
 - **Token Counting** - Usage tracking and management
 
+### Tool Calling
+
+The provider detects OpenAI Responses API `function_call` / `tool_call`
+blocks automatically, decodes JSON arguments, and returns standard
+`ToolCall` objects to Amplifier. No extra configuration is required—tools
+declared in your config or profiles execute as soon as the model requests
+them.
+
 ## Dependencies
 
 - `amplifier-core>=1.0.0`
