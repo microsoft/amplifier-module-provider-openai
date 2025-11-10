@@ -46,8 +46,33 @@ config = {
     max_tokens = 4096,
     temperature = 0.7,
     reasoning = "low",
-    enable_state = false
+    enable_state = false,
+    debug = false,      # Enable standard debug events
+    raw_debug = false   # Enable ultra-verbose raw API I/O logging
 }
+```
+
+### Debug Configuration
+
+**Standard Debug** (`debug: true`):
+- Emits `llm:request:debug` and `llm:response:debug` events
+- Contains request/response summaries with message counts, model info, usage stats
+- Moderate log volume, suitable for development
+
+**Raw Debug** (`debug: true, raw_debug: true`):
+- Emits `llm:request:raw` and `llm:response:raw` events
+- Contains complete, unmodified request params and response objects
+- Extreme log volume, use only for deep provider integration debugging
+- Captures the exact data sent to/from OpenAI API before any processing
+
+**Example**:
+```yaml
+providers:
+  - module: provider-openai
+    config:
+      debug: true      # Enable debug events
+      raw_debug: true  # Enable raw API I/O capture
+      default_model: gpt-5-codex
 ```
 
 ## Environment Variables
