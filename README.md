@@ -95,6 +95,7 @@ model = "gpt-5-codex"
 ### Responses API Capabilities
 
 - **Reasoning Control** - Adjust reasoning effort (minimal, low, medium, high)
+- **Extended Thinking Toggle** - Enables high-effort reasoning with automatic token budgeting
 - **Stateful Conversations** - Optional conversation persistence
 - **Native Tools** - Built-in web search, image generation, code interpreter
 - **Structured Output** - JSON schema-based output formatting
