@@ -44,7 +44,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         logger.warning("No API key found for OpenAI provider")
         return None
 
-    provider = OpenAIProvider(api_key, config, coordinator)
+    provider = OpenAIProvider(api_key=api_key, config=config, coordinator=coordinator)
     await coordinator.mount("providers", provider, name="openai")
     logger.info("Mounted OpenAIProvider (Responses API)")
 
@@ -60,12 +60,25 @@ class OpenAIProvider:
     """OpenAI Responses API integration."""
 
     name = "openai"
+    api_label = "OpenAI"
 
     def __init__(
-        self, api_key: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
+        self,
+        api_key: str | None = None,
+        *,
+        config: dict[str, Any] | None = None,
+        coordinator: ModuleCoordinator | None = None,
+        client: AsyncOpenAI | None = None,
     ):
         """Initialize OpenAI provider with Responses API client."""
-        self.client = AsyncOpenAI(api_key=api_key)
+        if client is None:
+            if api_key is None:
+                raise ValueError("api_key or client must be provided")
+            self.client = AsyncOpenAI(api_key=api_key)
+        else:
+            self.client = client
+            if api_key is None:
+                api_key = "injected-client"
         self.config = config or {}
         self.coordinator = coordinator
 
@@ -96,12 +109,20 @@ class OpenAIProvider:
         if isinstance(messages, ChatRequest):
             return await self._complete_chat_request(messages, **kwargs)
 
+        messages, removed_incomplete = self._sanitize_incomplete_tool_sequences(messages)
+        if removed_incomplete:
+            logger.warning(
+                "Removed %d incomplete tool-call message(s) before sending %s request.",
+                removed_incomplete,
+                self.api_label,
+            )
+
         try:
             self._validate_tool_message_sequence(messages)
         except ValueError as exc:
             await self._emit_validation_error("tool_call_sequence", str(exc), len(messages))
             raise RuntimeError(
-                f"Cannot send messages to OpenAI Responses API: {exc}\n\n"
+                f"Cannot send messages to {self.api_label} Responses API: {exc}\n\n"
                 f"This usually indicates missing or out-of-order tool responses."
             ) from exc
 
@@ -153,7 +174,8 @@ class OpenAIProvider:
                     params["max_output_tokens"] = target_tokens
 
             logger.info(
-                "Extended thinking enabled for OpenAI Responses API (effort=%s, budget=%s, buffer=%s)",
+                "Extended thinking enabled for %s Responses API (effort=%s, budget=%s, buffer=%s)",
+                self.api_label,
                 params["reasoning"]["effort"],
                 thinking_budget or "default",
                 buffer_tokens,
@@ -178,7 +200,7 @@ class OpenAIProvider:
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
-                    "provider": "openai",
+                    "provider": self.name,
                     "model": params["model"],
                     "message_count": len(remaining_messages),
                     "reasoning_enabled": params.get("reasoning") is not None,
@@ -193,7 +215,7 @@ class OpenAIProvider:
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
-                        "provider": "openai",
+                        "provider": self.name,
                         "request": {
                             "model": params["model"],
                             "input": input_text,
@@ -206,13 +228,13 @@ class OpenAIProvider:
                     },
                 )
 
-        # RAW DEBUG: Complete request params sent to OpenAI API (ultra-verbose)
+        # RAW DEBUG: Complete request params sent to API (ultra-verbose)
         if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
             await self.coordinator.hooks.emit(
                 "llm:request:raw",
                 {
                     "lvl": "DEBUG",
-                    "provider": "openai",
+                    "provider": self.name,
                     "params": params,  # Complete params dict as-is
                 },
             )
@@ -224,33 +246,37 @@ class OpenAIProvider:
                 # Add timeout to prevent hanging (30 seconds)
                 response = await asyncio.wait_for(self.client.responses.create(**params), timeout=self.timeout)
 
-                # RAW DEBUG: Complete raw response from OpenAI API (ultra-verbose)
+                # RAW DEBUG: Complete raw response from API (ultra-verbose)
                 if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
                     await self.coordinator.hooks.emit(
                         "llm:response:raw",
                         {
                             "lvl": "DEBUG",
-                            "provider": "openai",
+                            "provider": self.name,
                             "response": response,  # Complete response object as-is
                         },
                     )
 
                 elapsed_ms = int((time.time() - start_time) * 1000)
             except TimeoutError:
-                logger.error(f"OpenAI Responses API timed out after 30s. Input: {input_text[:200]}...")
+                logger.error(
+                    "%s Responses API timed out after 30s. Input: %s...",
+                    self.api_label,
+                    input_text[:200],
+                )
                 # Emit error response event
                 if self.coordinator and hasattr(self.coordinator, "hooks"):
                     await self.coordinator.hooks.emit(
                         "llm:response",
                         {
-                            "provider": "openai",
+                            "provider": self.name,
                             "model": params["model"],
                             "status": "error",
                             "duration_ms": int((time.time() - start_time) * 1000),
                             "error": f"Timeout after {self.timeout} seconds",
                         },
                     )
-                raise TimeoutError(f"OpenAI API request timed out after {self.timeout} seconds")
+                raise TimeoutError(f"{self.api_label} API request timed out after {self.timeout} seconds")
 
             # 4. Parse response output
             content, tool_calls, content_blocks = self._parse_response_output(response.output)
@@ -272,7 +298,7 @@ class OpenAIProvider:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "provider": "openai",
+                        "provider": self.name,
                         "model": params["model"],
                         "usage": {"input": usage_counts["input"], "output": usage_counts["output"]},
                         "has_reasoning": has_reasoning,
@@ -287,7 +313,7 @@ class OpenAIProvider:
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
-                            "provider": "openai",
+                            "provider": self.name,
                             "response": {
                                 "content": content[:500] + "..." if len(content) > 500 else content,
                                 "tool_calls": [{"tool": tc.tool, "id": tc.id} for tc in tool_calls]
@@ -309,7 +335,7 @@ class OpenAIProvider:
             )
 
         except Exception as e:
-            logger.error(f"OpenAI Responses API error: {e}")
+            logger.error("%s Responses API error: %s", self.api_label, e)
 
             # Emit llm:response event with error
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -319,7 +345,7 @@ class OpenAIProvider:
                         "status": "error",
                         "duration_ms": int((time.time() - start_time) * 1000),
                         "error": str(e),
-                        "provider": "openai",
+                        "provider": self.name,
                         "model": params.get("model", self.default_model),
                     },
                 )
@@ -329,6 +355,70 @@ class OpenAIProvider:
     def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
         """Parse tool calls from provider response."""
         return response.tool_calls or []
+
+    def _sanitize_incomplete_tool_sequences(self, messages: list[Any]) -> tuple[list[Any], int]:
+        """Remove assistant/tool messages with unresolved tool call sequences.
+
+        Aborted sessions can leave an assistant message with tool_calls but no
+        corresponding tool results. The provider should drop these messages so
+        downstream validation and providers do not fail.
+        """
+        if not messages:
+            return messages, 0
+
+        drop_indices: set[int] = set()
+        i = 0
+
+        while i < len(messages):
+            message = messages[i]
+            role = self._normalize_role(self._get_message_attr(message, "role"))
+
+            if role == "assistant":
+                tool_ids = self._extract_tool_call_ids(message)
+                if tool_ids:
+                    matched: set[str] = set()
+                    j = i + 1
+
+                    while j < len(messages):
+                        next_message = messages[j]
+                        next_role = self._normalize_role(self._get_message_attr(next_message, "role"))
+
+                        if next_role == "tool":
+                            call_id = self._extract_tool_result_id(next_message)
+                            if call_id and call_id in tool_ids:
+                                matched.add(call_id)
+                            j += 1
+                            if matched == tool_ids:
+                                break
+                            continue
+
+                        # Encountered another role before resolving tool calls
+                        break
+
+                    if matched != tool_ids:
+                        unresolved = sorted(tool_ids - matched) or ["unknown"]
+                        logger.warning(
+                            "Dropping assistant tool-call message at index %d (unresolved tool results: %s).",
+                            i,
+                            unresolved,
+                        )
+                        drop_indices.add(i)
+                        for k in range(i + 1, j):
+                            if self._normalize_role(self._get_message_attr(messages[k], "role")) == "tool":
+                                drop_indices.add(k)
+                        i = j
+                        continue
+
+                    i = j
+                    continue
+
+            i += 1
+
+        if not drop_indices:
+            return messages, 0
+
+        sanitized = [msg for idx, msg in enumerate(messages) if idx not in drop_indices]
+        return sanitized, len(drop_indices)
 
     def _extract_system_instructions(self, messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
         """Extract system messages as instructions."""
@@ -447,7 +537,7 @@ class OpenAIProvider:
             await self.coordinator.hooks.emit(
                 "provider:validation_error",
                 {
-                    "provider": "openai",
+                    "provider": self.name,
                     "validation": validation,
                     "error": error,
                     "message_count": message_count,
@@ -728,19 +818,28 @@ class OpenAIProvider:
         logger.info(f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages")
         logger.info(f"[PROVIDER] Message roles: {[m.role for m in request.messages]}")
 
+        message_list = list(request.messages)
+        message_list, removed_incomplete = self._sanitize_incomplete_tool_sequences(message_list)
+        if removed_incomplete:
+            logger.warning(
+                "Removed %d incomplete tool-call message(s) before sending %s ChatRequest.",
+                removed_incomplete,
+                self.api_label,
+            )
+
         try:
-            self._validate_tool_message_sequence(request.messages)
+            self._validate_tool_message_sequence(message_list)
         except ValueError as exc:
-            await self._emit_validation_error("tool_call_sequence", str(exc), len(request.messages))
+            await self._emit_validation_error("tool_call_sequence", str(exc), len(message_list))
             raise RuntimeError(
-                "Cannot send ChatRequest to OpenAI Responses API: "
+                f"Cannot send ChatRequest to {self.api_label} Responses API: "
                 f"{exc}\n\nPlease inspect the conversation history for tool call/results ordering issues."
             ) from exc
 
         # Separate messages by role
-        system_msgs = [m for m in request.messages if m.role == "system"]
-        developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [m for m in request.messages if m.role in ("user", "assistant")]
+        system_msgs = [m for m in message_list if m.role == "system"]
+        developer_msgs = [m for m in message_list if m.role == "developer"]
+        conversation = [m for m in message_list if m.role in ("user", "assistant")]
 
         logger.info(
             f"[PROVIDER] Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
@@ -800,7 +899,9 @@ class OpenAIProvider:
         if request.tools:
             params["tools"] = self._convert_tools_from_request(request.tools)
 
-        logger.info(f"[PROVIDER] OpenAI API call - model: {params['model']}, has_instructions: {bool(instructions)}")
+        logger.info(
+            f"[PROVIDER] {self.api_label} API call - model: {params['model']}, has_instructions: {bool(instructions)}"
+        )
 
         thinking_enabled = bool(kwargs.get("extended_thinking"))
         thinking_budget = None
@@ -834,7 +935,7 @@ class OpenAIProvider:
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
-                    "provider": "openai",
+                    "provider": self.name,
                     "model": params["model"],
                     "message_count": len(request.messages),
                     "has_instructions": bool(instructions),
@@ -850,7 +951,7 @@ class OpenAIProvider:
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
-                        "provider": "openai",
+                        "provider": self.name,
                         "request": {
                             "model": params["model"],
                             "input": input_text,
@@ -868,26 +969,26 @@ class OpenAIProvider:
                 "llm:request:raw",
                 {
                     "lvl": "DEBUG",
-                    "provider": "openai",
+                    "provider": self.name,
                     "params": params,
                 },
             )
 
         start_time = time.time()
 
-        # Call OpenAI API
+        # Call provider API
         try:
             response = await asyncio.wait_for(self.client.responses.create(**params), timeout=self.timeout)
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-            logger.info("[PROVIDER] Received response from OpenAI API")
+            logger.info("[PROVIDER] Received response from %s API", self.api_label)
 
             if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
                 await self.coordinator.hooks.emit(
                     "llm:response:raw",
                     {
                         "lvl": "DEBUG",
-                        "provider": "openai",
+                        "provider": self.name,
                         "response": response,
                     },
                 )
@@ -900,7 +1001,7 @@ class OpenAIProvider:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "provider": "openai",
+                        "provider": self.name,
                         "model": params["model"],
                         "usage": {"input": usage_counts["input"], "output": usage_counts["output"]},
                         "status": "ok",
@@ -915,7 +1016,7 @@ class OpenAIProvider:
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
-                            "provider": "openai",
+                            "provider": self.name,
                             "response": {
                                 "content_preview": content_preview,
                             },
@@ -929,7 +1030,7 @@ class OpenAIProvider:
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"[PROVIDER] OpenAI API error: {e}")
+            logger.error("[PROVIDER] %s API error: %s", self.api_label, e)
 
             # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -939,7 +1040,7 @@ class OpenAIProvider:
                         "status": "error",
                         "duration_ms": elapsed_ms,
                         "error": str(e),
-                        "provider": "openai",
+                        "provider": self.name,
                         "model": params["model"],
                     },
                 )

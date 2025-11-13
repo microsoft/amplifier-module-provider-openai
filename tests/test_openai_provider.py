@@ -136,7 +136,7 @@ def test_tool_call_validation_requires_followup_tool_message():
     assert fake_coordinator.hooks.events
     event_name, payload = fake_coordinator.hooks.events[0]
     assert event_name == "provider:validation_error"
-    assert payload["provider"] == "openai"
+    assert payload["provider"] == provider.name
     assert payload["validation"] == "tool_call_sequence"
 
 
@@ -154,3 +154,26 @@ def test_tool_calls_with_empty_arguments_are_filtered():
     assert content == ""
     assert tool_calls == []
     assert content_blocks == []
+
+
+def test_incomplete_tool_call_is_removed_before_request():
+    provider = OpenAIProvider(api_key="test-key")
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    messages = [
+        {"role": "user", "content": "start"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "function": {"name": "do_something", "arguments": "{}"}},
+            ],
+        },
+        {"role": "user", "content": "resume after abort"},
+    ]
+
+    asyncio.run(provider.complete(messages))
+
+    provider.client.responses.create.assert_awaited_once()
+    call_kwargs = provider.client.responses.create.await_args_list[0].kwargs
+    assert "Called tools" not in call_kwargs["input"]
