@@ -134,12 +134,10 @@ class OpenAIProvider:
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
-                    "data": {
-                        "provider": "openai",
-                        "model": params["model"],
-                        "message_count": len(remaining_messages),
-                        "reasoning_enabled": params.get("reasoning") is not None,
-                    }
+                    "provider": "openai",
+                    "model": params["model"],
+                    "message_count": len(remaining_messages),
+                    "reasoning_enabled": params.get("reasoning") is not None,
                 },
             )
 
@@ -149,16 +147,14 @@ class OpenAIProvider:
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
-                        "data": {
-                            "provider": "openai",
-                            "request": {
-                                "model": params["model"],
-                                "input": input_text,
-                                "instructions": instructions,
-                                "max_output_tokens": params.get("max_output_tokens"),
-                                "temperature": params.get("temperature"),
-                                "reasoning": params.get("reasoning"),
-                            },
+                        "provider": "openai",
+                        "request": {
+                            "model": params["model"],
+                            "input": input_text,
+                            "instructions": instructions,
+                            "max_output_tokens": params.get("max_output_tokens"),
+                            "temperature": params.get("temperature"),
+                            "reasoning": params.get("reasoning"),
                         },
                     },
                 )
@@ -169,10 +165,8 @@ class OpenAIProvider:
                 "llm:request:raw",
                 {
                     "lvl": "DEBUG",
-                    "data": {
-                        "provider": "openai",
-                        "params": params,  # Complete params dict as-is
-                    },
+                    "provider": "openai",
+                    "params": params,  # Complete params dict as-is
                 },
             )
 
@@ -189,10 +183,8 @@ class OpenAIProvider:
                         "llm:response:raw",
                         {
                             "lvl": "DEBUG",
-                            "data": {
-                                "provider": "openai",
-                                "response": response,  # Complete response object as-is
-                            },
+                            "provider": "openai",
+                            "response": response,  # Complete response object as-is
                         },
                     )
 
@@ -204,10 +196,8 @@ class OpenAIProvider:
                     await self.coordinator.hooks.emit(
                         "llm:response",
                         {
-                            "data": {
-                                "provider": "openai",
-                                "model": params["model"],
-                            },
+                            "provider": "openai",
+                            "model": params["model"],
                             "status": "error",
                             "duration_ms": int((time.time() - start_time) * 1000),
                             "error": f"Timeout after {self.timeout} seconds",
@@ -233,19 +223,15 @@ class OpenAIProvider:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "data": {
-                            "provider": "openai",
-                            "model": params["model"],
-                            "usage": {
-                                "input": getattr(response.usage, "prompt_tokens", 0)
-                                if hasattr(response, "usage")
-                                else 0,
-                                "output": getattr(response.usage, "completion_tokens", 0)
-                                if hasattr(response, "usage")
-                                else 0,
-                            },
-                            "has_reasoning": has_reasoning,
+                        "provider": "openai",
+                        "model": params["model"],
+                        "usage": {
+                            "input": getattr(response.usage, "prompt_tokens", 0) if hasattr(response, "usage") else 0,
+                            "output": getattr(response.usage, "completion_tokens", 0)
+                            if hasattr(response, "usage")
+                            else 0,
                         },
+                        "has_reasoning": has_reasoning,
                         "status": "ok",
                         "duration_ms": elapsed_ms,
                     },
@@ -257,14 +243,12 @@ class OpenAIProvider:
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
-                            "data": {
-                                "provider": "openai",
-                                "response": {
-                                    "content": content[:500] + "..." if len(content) > 500 else content,
-                                    "tool_calls": [{"tool": tc.tool, "id": tc.id} for tc in tool_calls]
-                                    if tool_calls
-                                    else [],
-                                },
+                            "provider": "openai",
+                            "response": {
+                                "content": content[:500] + "..." if len(content) > 500 else content,
+                                "tool_calls": [{"tool": tc.tool, "id": tc.id} for tc in tool_calls]
+                                if tool_calls
+                                else [],
                             },
                             "status": "ok",
                             "duration_ms": elapsed_ms,
@@ -292,13 +276,11 @@ class OpenAIProvider:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "data": {
-                            "provider": "openai",
-                            "model": params.get("model", self.default_model),
-                        },
                         "status": "error",
                         "duration_ms": int((time.time() - start_time) * 1000),
                         "error": str(e),
+                        "provider": "openai",
+                        "model": params.get("model", self.default_model),
                     },
                 )
 
@@ -566,12 +548,10 @@ class OpenAIProvider:
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
-                    "data": {
-                        "provider": "openai",
-                        "model": params["model"],
-                        "message_count": len(request.messages),
-                        "has_instructions": bool(instructions),
-                    }
+                    "provider": "openai",
+                    "model": params["model"],
+                    "message_count": len(request.messages),
+                    "has_instructions": bool(instructions),
                 },
             )
 
@@ -581,15 +561,13 @@ class OpenAIProvider:
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
-                        "data": {
-                            "provider": "openai",
-                            "request": {
-                                "model": params["model"],
-                                "input": input_text,
-                                "instructions": instructions,
-                                "max_output_tokens": params.get("max_output_tokens"),
-                                "temperature": params.get("temperature"),
-                            },
+                        "provider": "openai",
+                        "request": {
+                            "model": params["model"],
+                            "input": input_text,
+                            "instructions": instructions,
+                            "max_output_tokens": params.get("max_output_tokens"),
+                            "temperature": params.get("temperature"),
                         },
                     },
                 )
@@ -609,17 +587,13 @@ class OpenAIProvider:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "data": {
-                            "provider": "openai",
-                            "model": params["model"],
-                            "usage": {
-                                "input": getattr(response.usage, "prompt_tokens", 0)
-                                if hasattr(response, "usage")
-                                else 0,
-                                "output": getattr(response.usage, "completion_tokens", 0)
-                                if hasattr(response, "usage")
-                                else 0,
-                            },
+                        "provider": "openai",
+                        "model": params["model"],
+                        "usage": {
+                            "input": getattr(response.usage, "prompt_tokens", 0) if hasattr(response, "usage") else 0,
+                            "output": getattr(response.usage, "completion_tokens", 0)
+                            if hasattr(response, "usage")
+                            else 0,
                         },
                         "status": "ok",
                         "duration_ms": elapsed_ms,
@@ -633,11 +607,9 @@ class OpenAIProvider:
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
-                            "data": {
-                                "provider": "openai",
-                                "response": {
-                                    "content_preview": content_preview,
-                                },
+                            "provider": "openai",
+                            "response": {
+                                "content_preview": content_preview,
                             },
                             "status": "ok",
                             "duration_ms": elapsed_ms,
@@ -656,13 +628,11 @@ class OpenAIProvider:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "data": {
-                            "provider": "openai",
-                            "model": params["model"],
-                        },
                         "status": "error",
                         "duration_ms": elapsed_ms,
                         "error": str(e),
+                        "provider": "openai",
+                        "model": params["model"],
                     },
                 )
             raise
