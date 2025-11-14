@@ -109,12 +109,16 @@ class OpenAIProvider:
         if isinstance(messages, ChatRequest):
             return await self._complete_chat_request(messages, **kwargs)
 
-        messages, removed_incomplete = self._sanitize_incomplete_tool_sequences(messages)
-        if removed_incomplete:
-            logger.warning(
-                "Removed %d incomplete tool-call message(s) before sending %s request.",
-                removed_incomplete,
-                self.api_label,
+        messages, repair_count, repairs_made = self._sanitize_incomplete_tool_sequences(messages)
+        if repair_count and self.coordinator and hasattr(self.coordinator, "hooks"):
+            # Emit observability event for repair
+            await self.coordinator.hooks.emit(
+                "provider:tool_sequence_repaired",
+                {
+                    "provider": self.name,
+                    "repair_count": repair_count,
+                    "repairs": repairs_made,
+                },
             )
 
         try:
@@ -356,69 +360,82 @@ class OpenAIProvider:
         """Parse tool calls from provider response."""
         return response.tool_calls or []
 
-    def _sanitize_incomplete_tool_sequences(self, messages: list[Any]) -> tuple[list[Any], int]:
-        """Remove assistant/tool messages with unresolved tool call sequences.
+    def _sanitize_incomplete_tool_sequences(self, messages: list[Any]) -> tuple[list[Any], int, list[dict]]:
+        """Repair incomplete tool call sequences by injecting synthetic tool results.
 
-        Aborted sessions can leave an assistant message with tool_calls but no
-        corresponding tool results. The provider should drop these messages so
-        downstream validation and providers do not fail.
+        When assistant messages have tool_calls without matching tool results, inject
+        synthetic results that make the failure visible to the LLM while allowing the
+        conversation to continue (graceful degradation).
+
+        Returns:
+            (repaired_messages, count_of_repairs_made, list_of_repairs)
         """
         if not messages:
-            return messages, 0
+            return messages, 0, []
 
-        drop_indices: set[int] = set()
+        repaired = list(messages)
+        repair_count = 0
+        repairs_made = []
         i = 0
 
-        while i < len(messages):
-            message = messages[i]
+        while i < len(repaired):
+            message = repaired[i]
             role = self._normalize_role(self._get_message_attr(message, "role"))
 
             if role == "assistant":
-                tool_ids = self._extract_tool_call_ids(message)
-                if tool_ids:
-                    matched: set[str] = set()
+                tool_calls = self._get_message_attr(message, "tool_calls")
+                if tool_calls:
+                    # Extract tool_call IDs
+                    expected_ids = {
+                        self._get_message_attr(tc, "id") for tc in tool_calls if self._get_message_attr(tc, "id")
+                    }
+
+                    # Scan forward for matching tool results
+                    found_ids = set()
                     j = i + 1
-
-                    while j < len(messages):
-                        next_message = messages[j]
+                    while j < len(repaired):
+                        next_message = repaired[j]
                         next_role = self._normalize_role(self._get_message_attr(next_message, "role"))
-
                         if next_role == "tool":
-                            call_id = self._extract_tool_result_id(next_message)
-                            if call_id and call_id in tool_ids:
-                                matched.add(call_id)
+                            result_id = self._extract_tool_result_id(next_message)
+                            if result_id and result_id in expected_ids:
+                                found_ids.add(result_id)
                             j += 1
-                            if matched == tool_ids:
-                                break
-                            continue
+                        else:
+                            break
 
-                        # Encountered another role before resolving tool calls
-                        break
+                    # Find missing tool results
+                    missing_ids = expected_ids - found_ids
+                    if missing_ids:
+                        # Inject synthetic tool results for each missing ID
+                        insert_position = i + 1
+                        for tool_call in tool_calls:
+                            tc_id = self._get_message_attr(tool_call, "id")
+                            if tc_id in missing_ids:
+                                synthetic_result = self._create_synthetic_tool_result(tool_call)
+                                repaired.insert(insert_position, synthetic_result)
+                                insert_position += 1
+                                repair_count += 1
 
-                    if matched != tool_ids:
-                        unresolved = sorted(tool_ids - matched) or ["unknown"]
+                                # Track repair for observability
+                                repairs_made.append(
+                                    {
+                                        "tool_call_id": str(tc_id),
+                                        "tool_name": self._extract_tool_name(tool_call),
+                                        "message_index": i,
+                                    }
+                                )
+
                         logger.warning(
-                            "Dropping assistant tool-call message at index %d (unresolved tool results: %s).",
-                            i,
-                            unresolved,
+                            "Injected %d synthetic tool result(s) for %s API (missing IDs: %s)",
+                            len(missing_ids),
+                            self.api_label,
+                            sorted(missing_ids),
                         )
-                        drop_indices.add(i)
-                        for k in range(i + 1, j):
-                            if self._normalize_role(self._get_message_attr(messages[k], "role")) == "tool":
-                                drop_indices.add(k)
-                        i = j
-                        continue
-
-                    i = j
-                    continue
 
             i += 1
 
-        if not drop_indices:
-            return messages, 0
-
-        sanitized = [msg for idx, msg in enumerate(messages) if idx not in drop_indices]
-        return sanitized, len(drop_indices)
+        return repaired, repair_count, repairs_made
 
     def _extract_system_instructions(self, messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
         """Extract system messages as instructions."""
@@ -532,6 +549,74 @@ class OpenAIProvider:
             return None
         return str(tool_call_id)
 
+    def _extract_tool_name(self, tool_call: Any) -> str:
+        """Extract tool name from a tool_call object."""
+        function = self._get_message_attr(tool_call, "function")
+        if function:
+            name = self._get_message_attr(function, "name")
+            if name:
+                return str(name)
+        # Fallback: try direct 'tool' or 'name' attribute
+        tool = self._get_message_attr(tool_call, "tool")
+        if tool:
+            return str(tool)
+        name = self._get_message_attr(tool_call, "name")
+        if name:
+            return str(name)
+        return "unknown"
+
+    def _safe_stringify(self, value: Any) -> str:
+        """Safely convert value to string for error messages."""
+        if value is None:
+            return "null"
+        if isinstance(value, str):
+            return value[:500] + ("..." if len(value) > 500 else "")
+        if isinstance(value, dict):
+            try:
+                json_str = json.dumps(value, ensure_ascii=False)
+                return json_str[:500] + ("..." if len(json_str) > 500 else "")
+            except Exception:
+                return str(value)[:500]
+        return str(value)[:500]
+
+    def _create_synthetic_tool_result(self, tool_call: Any) -> dict[str, Any]:
+        """Create synthetic tool result for missing tool call result.
+
+        Makes the failure visible to the LLM while maintaining conversation validity.
+        This is graceful degradation - the session continues but the error is observable.
+
+        Args:
+            tool_call: The tool call that's missing its result
+
+        Returns:
+            Synthetic tool result message in OpenAI format
+        """
+        tool_call_id = self._get_message_attr(tool_call, "id")
+        tool_name = self._extract_tool_name(tool_call)
+
+        # Extract arguments
+        function = self._get_message_attr(tool_call, "function")
+        if function:
+            arguments = self._get_message_attr(function, "arguments")
+        else:
+            arguments = self._get_message_attr(tool_call, "arguments")
+
+        return {
+            "role": "tool",
+            "tool_call_id": str(tool_call_id) if tool_call_id else "unknown",
+            "content": (
+                f"[SYSTEM ERROR: Tool result missing from conversation history]\n\n"
+                f"Tool: {tool_name}\n"
+                f"Arguments: {self._safe_stringify(arguments)}\n\n"
+                f"This likely indicates:\n"
+                f"- Context compaction dropped this result\n"
+                f"- Parsing error in message history\n"
+                f"- State corruption during session\n\n"
+                f"The tool may have executed successfully, but the result was lost.\n"
+                f"Please acknowledge this error and ask the user to retry if needed."
+            ),
+        }
+
     async def _emit_validation_error(self, validation: str, error: str, message_count: int) -> None:
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             await self.coordinator.hooks.emit(
@@ -557,7 +642,7 @@ class OpenAIProvider:
             # Handle both SDK objects and dictionaries
             if hasattr(block, "type"):
                 # SDK object (like ResponseReasoningItem, ResponseMessageItem, etc.)
-                block_type = block.type
+                block_type = getattr(block, "type", "")
 
                 if block_type == "message":
                     # Extract text from message content
@@ -581,11 +666,17 @@ class OpenAIProvider:
                     reasoning_text = self._extract_reasoning_text(block)
                     if reasoning_text:
                         content_blocks.append(ThinkingContent(text=reasoning_text, raw=block))
+                    else:
+                        # Reasoning block exists but content not available (encrypted/hidden)
+                        # Create placeholder to show reasoning occurred
+                        content_blocks.append(
+                            ThinkingContent(text="[Internal reasoning occurred - content not available]", raw=block)
+                        )
 
                 elif block_type in {"tool_call", "function_call"}:
                     arguments = getattr(block, "input", None)
                     if arguments is None and hasattr(block, "arguments"):
-                        arguments = block.arguments
+                        arguments = getattr(block, "arguments", None)
                     if isinstance(arguments, str):
                         try:
                             arguments = json.loads(arguments)
@@ -637,25 +728,33 @@ class OpenAIProvider:
                     reasoning_text = self._extract_reasoning_text(block)
                     if reasoning_text:
                         content_blocks.append(ThinkingContent(text=reasoning_text, raw=block))
+                    else:
+                        # Reasoning block exists but content not available (encrypted/hidden)
+                        content_blocks.append(
+                            ThinkingContent(text="[Internal reasoning occurred - content not available]", raw=block)
+                        )
 
                 elif block_type in {"tool_call", "function_call"}:
                     arguments = block.get("input")
                     if arguments is None:
                         arguments = block.get("arguments", {})
+
                     if isinstance(arguments, str):
                         try:
                             arguments = json.loads(arguments)
                         except json.JSONDecodeError:
-                            logger.debug("Failed to decode tool call arguments: %s", arguments)
+                            logger.debug("Failed to decode tool call arguments: %s", arguments[:500])
                             arguments = {}
                     if arguments is None or not isinstance(arguments, dict):
                         arguments = {}
 
                     call_id = block.get("id") or block.get("call_id", "")
                     tool_name = block.get("name", "")
+
                     if not arguments:
                         logger.debug("Skipping tool call '%s' with empty arguments", tool_name)
                         continue
+
                     tool_calls.append(ToolCall(tool=tool_name, arguments=arguments, id=call_id))
                     content_blocks.append(
                         ToolCallContent(
@@ -819,12 +918,16 @@ class OpenAIProvider:
         logger.info(f"[PROVIDER] Message roles: {[m.role for m in request.messages]}")
 
         message_list = list(request.messages)
-        message_list, removed_incomplete = self._sanitize_incomplete_tool_sequences(message_list)
-        if removed_incomplete:
-            logger.warning(
-                "Removed %d incomplete tool-call message(s) before sending %s ChatRequest.",
-                removed_incomplete,
-                self.api_label,
+        message_list, repair_count, repairs_made = self._sanitize_incomplete_tool_sequences(message_list)
+        if repair_count and self.coordinator and hasattr(self.coordinator, "hooks"):
+            # Emit observability event for repair
+            await self.coordinator.hooks.emit(
+                "provider:tool_sequence_repaired",
+                {
+                    "provider": self.name,
+                    "repair_count": repair_count,
+                    "repairs": repairs_made,
+                },
             )
 
         try:
@@ -937,7 +1040,7 @@ class OpenAIProvider:
                 {
                     "provider": self.name,
                     "model": params["model"],
-                    "message_count": len(request.messages),
+                    "message_count": len(message_list),
                     "has_instructions": bool(instructions),
                     "reasoning_enabled": params.get("reasoning") is not None,
                     "thinking_enabled": thinking_enabled,
@@ -1129,6 +1232,14 @@ class OpenAIProvider:
                             )
                             event_blocks.append(ThinkingContent(text=reasoning_text))
                             text_accumulator.append(reasoning_text)
+                        else:
+                            # Reasoning block exists but no extractable content
+                            placeholder = "[Internal reasoning occurred - content not available]"
+                            content_blocks.append(
+                                ThinkingBlock(thinking=placeholder, signature=None, visibility=visibility)
+                            )
+                            event_blocks.append(ThinkingContent(text=placeholder))
+                            text_accumulator.append(placeholder)
 
                 elif block_type in {"tool_call", "function_call"}:
                     tool_id = getattr(block, "id", "") or getattr(block, "call_id", "")
@@ -1186,6 +1297,14 @@ class OpenAIProvider:
                             )
                             event_blocks.append(ThinkingContent(text=reasoning_text))
                             text_accumulator.append(reasoning_text)
+                        else:
+                            # Reasoning block exists but no extractable content
+                            placeholder = "[Internal reasoning occurred - content not available]"
+                            content_blocks.append(
+                                ThinkingBlock(thinking=placeholder, signature=None, visibility=visibility)
+                            )
+                            event_blocks.append(ThinkingContent(text=placeholder))
+                            text_accumulator.append(placeholder)
 
                 elif block_type in {"tool_call", "function_call"}:
                     tool_id = block.get("id") or block.get("call_id", "")

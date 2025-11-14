@@ -110,6 +110,43 @@ blocks automatically, decodes JSON arguments, and returns standard
 declared in your config or profiles execute as soon as the model requests
 them.
 
+### Graceful Error Recovery
+
+The provider implements graceful degradation for incomplete tool call sequences:
+
+**The Problem**: If tool results are missing from conversation history (due to context compaction bugs, parsing errors, or state corruption), the OpenAI API rejects the entire request, breaking the user's session.
+
+**The Solution**: The provider automatically detects missing tool results and injects synthetic results that:
+
+1. **Make the failure visible** - LLM sees `[SYSTEM ERROR: Tool result missing]` message
+2. **Maintain conversation validity** - API accepts the request, session continues
+3. **Enable recovery** - LLM can acknowledge the error and ask user to retry
+4. **Provide observability** - Emits `provider:tool_sequence_repaired` event with details
+
+**Example**:
+```python
+# Broken conversation history (missing tool result)
+messages = [
+    {"role": "assistant", "tool_calls": [{"id": "call_123", "function": {"name": "get_weather", ...}}]},
+    # MISSING: {"role": "tool", "tool_call_id": "call_123", "content": "..."}
+    {"role": "user", "content": "Thanks"}
+]
+
+# Provider injects synthetic result:
+{
+    "role": "tool",
+    "tool_call_id": "call_123",
+    "content": "[SYSTEM ERROR: Tool result missing from conversation history]\n\nTool: get_weather\n..."
+}
+
+# LLM responds: "I notice the weather tool failed. Let me try again..."
+# Session continues instead of crashing
+```
+
+**Observability**: Repairs are logged as warnings and emit `provider:tool_sequence_repaired` events for monitoring.
+
+**Philosophy**: This is **graceful degradation** following kernel philosophy - errors in other modules (context management) don't crash the provider or kill the user's session.
+
 ## Dependencies
 
 - `amplifier-core>=1.0.0`

@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
 
-import pytest
 from amplifier_core import ModuleCoordinator
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.message_models import ReasoningBlock
@@ -112,9 +111,10 @@ def test_reasoning_not_in_provider_response_content():
     assert any(isinstance(cb, ThinkingContent) for cb in content_blocks)
 
 
-def test_tool_call_validation_requires_followup_tool_message():
+def test_tool_call_sequence_missing_tool_message_is_repaired():
+    """Missing tool results should be repaired with synthetic results and emit event."""
     provider = OpenAIProvider(api_key="test-key")
-    provider.client.responses.create = AsyncMock()
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
@@ -129,15 +129,20 @@ def test_tool_call_validation_requires_followup_tool_message():
         {"role": "user", "content": "No tool result present"},
     ]
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(provider.complete(messages))
+    asyncio.run(provider.complete(messages))
 
-    provider.client.responses.create.assert_not_called()
-    assert fake_coordinator.hooks.events
-    event_name, payload = fake_coordinator.hooks.events[0]
-    assert event_name == "provider:validation_error"
-    assert payload["provider"] == provider.name
-    assert payload["validation"] == "tool_call_sequence"
+    # Should succeed (not raise validation error)
+    provider.client.responses.create.assert_awaited_once()
+
+    # Should not emit validation error
+    assert all(event_name != "provider:validation_error" for event_name, _ in fake_coordinator.hooks.events)
+
+    # Should emit repair event
+    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    assert len(repair_events) == 1
+    assert repair_events[0][1]["provider"] == "openai"
+    assert repair_events[0][1]["repair_count"] == 1
+    assert repair_events[0][1]["repairs"][0]["tool_name"] == "do_something"
 
 
 def test_tool_calls_with_empty_arguments_are_filtered():
@@ -154,26 +159,3 @@ def test_tool_calls_with_empty_arguments_are_filtered():
     assert content == ""
     assert tool_calls == []
     assert content_blocks == []
-
-
-def test_incomplete_tool_call_is_removed_before_request():
-    provider = OpenAIProvider(api_key="test-key")
-    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
-
-    messages = [
-        {"role": "user", "content": "start"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "call_1", "function": {"name": "do_something", "arguments": "{}"}},
-            ],
-        },
-        {"role": "user", "content": "resume after abort"},
-    ]
-
-    asyncio.run(provider.complete(messages))
-
-    provider.client.responses.create.assert_awaited_once()
-    call_kwargs = provider.client.responses.create.await_args_list[0].kwargs
-    assert "Called tools" not in call_kwargs["input"]
