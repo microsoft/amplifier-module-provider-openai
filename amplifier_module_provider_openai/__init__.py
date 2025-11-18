@@ -670,7 +670,7 @@ class OpenAIProvider:
                         # Reasoning block exists but content not available (encrypted/hidden)
                         # Create placeholder to show reasoning occurred
                         content_blocks.append(
-                            ThinkingContent(text="[Internal reasoning occurred - content not available]", raw=block)
+                            ThinkingContent(text="[Internal reasoning encrypted or hidden by provider]", raw=block)
                         )
 
                 elif block_type in {"tool_call", "function_call"}:
@@ -731,7 +731,7 @@ class OpenAIProvider:
                     else:
                         # Reasoning block exists but content not available (encrypted/hidden)
                         content_blocks.append(
-                            ThinkingContent(text="[Internal reasoning occurred - content not available]", raw=block)
+                            ThinkingContent(text="[Internal reasoning encrypted or hidden by provider]", raw=block)
                         )
 
                 elif block_type in {"tool_call", "function_call"}:
@@ -1234,7 +1234,7 @@ class OpenAIProvider:
                             text_accumulator.append(reasoning_text)
                         else:
                             # Reasoning block exists but no extractable content
-                            placeholder = "[Internal reasoning occurred - content not available]"
+                            placeholder = "[Internal reasoning encrypted or hidden by provider]"
                             content_blocks.append(
                                 ThinkingBlock(thinking=placeholder, signature=None, visibility=visibility)
                             )
@@ -1299,7 +1299,7 @@ class OpenAIProvider:
                             text_accumulator.append(reasoning_text)
                         else:
                             # Reasoning block exists but no extractable content
-                            placeholder = "[Internal reasoning occurred - content not available]"
+                            placeholder = "[Internal reasoning encrypted or hidden by provider]"
                             content_blocks.append(
                                 ThinkingBlock(thinking=placeholder, signature=None, visibility=visibility)
                             )
