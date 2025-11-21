@@ -90,10 +90,38 @@ class OpenAIProvider:
         self.enable_state = self.config.get("enable_state", False)
         self.debug = self.config.get("debug", False)  # Enable full request/response logging
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
+        self.debug_truncate_length = self.config.get("debug_truncate_length", 180)  # Max string length in debug logs
         self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
 
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
+
+    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
+        """Recursively truncate string values in nested structures.
+
+        Preserves structure, only truncates leaf string values longer than max_length.
+        Uses self.debug_truncate_length if max_length not specified.
+
+        Args:
+            obj: Any JSON-serializable structure (dict, list, primitives)
+            max_length: Maximum string length (defaults to self.debug_truncate_length)
+
+        Returns:
+            Structure with truncated string values
+        """
+        if max_length is None:
+            max_length = self.debug_truncate_length
+
+        if isinstance(obj, str):
+            if len(obj) > max_length:
+                return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+            return obj
+        elif isinstance(obj, dict):
+            return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._truncate_values(item, max_length) for item in obj]
+        else:
+            return obj  # Numbers, booleans, None pass through unchanged
 
     def _find_missing_tool_results(self, messages: list) -> list[tuple[str, str, dict]]:
         """Find tool calls without matching results.
@@ -334,36 +362,27 @@ class OpenAIProvider:
                 },
             )
 
-            # DEBUG level: Full request payload (if debug enabled)
+            # DEBUG level: Full request payload with truncated values (if debug enabled)
             if self.debug:
                 await self.coordinator.hooks.emit(
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
                         "provider": self.name,
-                        "request": {
-                            "model": params["model"],
-                            "input": input_messages,  # Message array, not text
-                            "instructions": instructions,
-                            "max_output_tokens": params.get("max_output_tokens"),
-                            "temperature": params.get("temperature"),
-                            "reasoning": params.get("reasoning"),
-                            "thinking_enabled": thinking_enabled,
-                            "tools": params.get("tools"),
-                            "tool_choice": params.get("tool_choice"),
-                        },
+                        "request": self._truncate_values(params),
                     },
                 )
 
-        if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
-            await self.coordinator.hooks.emit(
-                "llm:request:raw",
-                {
-                    "lvl": "DEBUG",
-                    "provider": self.name,
-                    "params": params,
-                },
-            )
+            # RAW level: Complete params dict as sent to OpenAI API (if debug AND raw_debug enabled)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": self.name,
+                        "params": params,  # Complete untruncated params
+                    },
+                )
 
         start_time = time.time()
 
@@ -374,13 +393,14 @@ class OpenAIProvider:
 
             logger.info("[PROVIDER] Received response from %s API", self.api_label)
 
+            # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
             if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
                 await self.coordinator.hooks.emit(
                     "llm:response:raw",
                     {
                         "lvl": "DEBUG",
                         "provider": self.name,
-                        "response": response,
+                        "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
                     },
                 )
 
@@ -408,17 +428,15 @@ class OpenAIProvider:
                     },
                 )
 
-                # DEBUG level: Full response (if debug enabled)
+                # DEBUG level: Full response with truncated values (if debug enabled)
                 if self.debug:
-                    content_preview = str(response.output)[:500] if response.output else ""
+                    response_dict = response.model_dump()  # Pydantic model → dict
                     await self.coordinator.hooks.emit(
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
                             "provider": self.name,
-                            "response": {
-                                "content_preview": content_preview,
-                            },
+                            "response": self._truncate_values(response_dict),
                             "status": "ok",
                             "duration_ms": elapsed_ms,
                         },
@@ -616,7 +634,7 @@ class OpenAIProvider:
                             ThinkingBlock(thinking=reasoning_text, signature=None, visibility="internal")
                         )
                         event_blocks.append(ThinkingContent(text=reasoning_text))
-                        text_accumulator.append(reasoning_text)
+                        # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
                     tool_id = getattr(block, "id", "") or getattr(block, "call_id", "")
@@ -684,7 +702,7 @@ class OpenAIProvider:
                             ThinkingBlock(thinking=reasoning_text, signature=None, visibility="internal")
                         )
                         event_blocks.append(ThinkingContent(text=reasoning_text))
-                        text_accumulator.append(reasoning_text)
+                        # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
                     tool_id = block.get("id") or block.get("call_id", "")
