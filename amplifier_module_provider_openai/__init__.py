@@ -94,6 +94,57 @@ class OpenAIProvider:
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
 
+    def _find_missing_tool_results(self, messages: list) -> list[tuple[str, str, dict]]:
+        """Find tool calls without matching results.
+
+        Scans conversation for assistant tool calls and validates each has
+        a corresponding tool result message. Returns missing pairs.
+
+        Returns:
+            List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
+        """
+        from amplifier_core.message_models import Message
+
+        tool_calls = {}  # {call_id: (name, args)}
+        tool_results = set()  # {call_id}
+
+        for msg in messages:
+            # Check assistant messages for ToolCallBlock in content
+            if msg.role == "assistant" and isinstance(msg.content, list):
+                for block in msg.content:
+                    if hasattr(block, "type") and block.type == "tool_call":
+                        tool_calls[block.id] = (block.name, block.input)
+
+            # Check tool messages for tool_call_id
+            elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
+                tool_results.add(msg.tool_call_id)
+
+        return [(call_id, name, args) for call_id, (name, args) in tool_calls.items() if call_id not in tool_results]
+
+    def _create_synthetic_result(self, call_id: str, tool_name: str):
+        """Create synthetic error result for missing tool response.
+
+        This is a BACKUP for when tool results go missing AFTER execution.
+        The orchestrator should handle tool execution errors at runtime,
+        so this should only trigger on context/parsing bugs.
+        """
+        from amplifier_core.message_models import Message
+
+        return Message(
+            role="tool",
+            content=(
+                f"[SYSTEM ERROR: Tool result missing from conversation history]\n\n"
+                f"Tool: {tool_name}\n"
+                f"Call ID: {call_id}\n\n"
+                f"This indicates the tool result was lost after execution.\n"
+                f"Likely causes: context compaction bug, message parsing error, or state corruption.\n\n"
+                f"The tool may have executed successfully, but the result was lost.\n"
+                f"Please acknowledge this error and offer to retry the operation."
+            ),
+            tool_call_id=call_id,
+            name=tool_name,
+        )
+
     async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """Generate completion using Responses API.
 
@@ -104,6 +155,34 @@ class OpenAIProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
+        missing = self._find_missing_tool_results(request.messages)
+
+        if missing:
+            logger.warning(
+                f"[PROVIDER] OpenAI: Detected {len(missing)} missing tool result(s). "
+                f"Injecting synthetic errors. This indicates a bug in context management. "
+                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+            )
+
+            # Inject synthetic results
+            for call_id, tool_name, _ in missing:
+                synthetic = self._create_synthetic_result(call_id, tool_name)
+                request.messages.append(synthetic)
+
+            # Emit observability event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:tool_sequence_repaired",
+                    {
+                        "provider": self.name,
+                        "repair_count": len(missing),
+                        "repairs": [
+                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                        ],
+                    },
+                )
+
         return await self._complete_chat_request(request, **kwargs)
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
@@ -138,7 +217,7 @@ class OpenAIProvider:
         # Separate messages by role
         system_msgs = [m for m in message_list if m.role == "system"]
         developer_msgs = [m for m in message_list if m.role == "developer"]
-        conversation = [m for m in message_list if m.role in ("user", "assistant")]
+        conversation = [m for m in message_list if m.role in ("user", "assistant", "tool")]
 
         logger.info(
             f"[PROVIDER] Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
@@ -149,43 +228,28 @@ class OpenAIProvider:
             "\n\n".join(m.content if isinstance(m.content, str) else "" for m in system_msgs) if system_msgs else None
         )
 
-        # Convert developer messages to XML-wrapped format
-        developer_input = []
-        for i, dev_msg in enumerate(developer_msgs):
-            content = dev_msg.content if isinstance(dev_msg.content, str) else ""
-            logger.info(f"[PROVIDER] Converting developer message {i + 1}/{len(developer_msgs)}: length={len(content)}")
-            wrapped = f"<context_file>\n{content}\n</context_file>"
-            developer_input.append(f"USER: {wrapped}")
+        # Convert all messages (developer + conversation) to Responses API format
+        # Developer messages become XML-wrapped user messages, tools are batched
+        all_messages_for_conversion = []
 
-        # Convert conversation messages to text format
-        conversation_parts = []
-        for m in conversation:
-            role_label = m.role.upper()
-            if isinstance(m.content, str):
-                conversation_parts.append(f"{role_label}: {m.content}")
-            elif isinstance(m.content, list):
-                # Extract text from content blocks
-                text_parts = []
-                for block in m.content:
-                    if block.type == "text":
-                        text_parts.append(block.text)
-                if text_parts:
-                    conversation_parts.append(f"{role_label}: {' '.join(text_parts)}")
+        # Add developer messages first
+        for dev_msg in developer_msgs:
+            all_messages_for_conversion.append(dev_msg.model_dump())
 
-        # Combine: developer context THEN conversation
-        input_parts = []
-        if developer_input:
-            input_parts.extend(developer_input)
-        if conversation_parts:
-            input_parts.extend(conversation_parts)
+        # Add conversation messages
+        for conv_msg in conversation:
+            all_messages_for_conversion.append(conv_msg.model_dump())
 
-        input_text = "\n\n".join(input_parts)
-        logger.info(f"[PROVIDER] Final input length: {len(input_text)}")
+        # Convert to OpenAI Responses API message format
+        input_messages = self._convert_messages(all_messages_for_conversion)
+        logger.info(
+            f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
+        )
 
-        # Prepare request parameters
+        # Prepare request parameters per Responses API spec
         params = {
             "model": kwargs.get("model", self.default_model),
-            "input": input_text,
+            "input": input_messages,  # Array of message objects, not text string
         }
 
         if instructions:
@@ -204,13 +268,21 @@ class OpenAIProvider:
         reasoning_effort = kwargs.get("reasoning", getattr(request, "reasoning", None)) or self.reasoning
         if reasoning_effort:
             params["reasoning"] = {"effort": reasoning_effort}
+            # Request reasoning content if available
+            params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
 
         # Add tools if provided
         if request.tools:
             params["tools"] = self._convert_tools_from_request(request.tools)
+            # Add tool-related parameters per Responses API spec
+            params["tool_choice"] = kwargs.get("tool_choice", "auto")
+            params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
+
+        # Add store parameter (required for some providers like Azure)
+        params["store"] = kwargs.get("store", False)
 
         logger.info(
-            f"[PROVIDER] {self.api_label} API call - model: {params['model']}, has_instructions: {bool(instructions)}"
+            f"[PROVIDER] {self.api_label} API call - model: {params['model']}, has_instructions: {bool(instructions)}, tools: {len(request.tools) if request.tools else 0}"
         )
 
         thinking_enabled = bool(kwargs.get("extended_thinking"))
@@ -264,12 +336,14 @@ class OpenAIProvider:
                         "provider": self.name,
                         "request": {
                             "model": params["model"],
-                            "input": input_text,
+                            "input": input_messages,  # Message array, not text
                             "instructions": instructions,
                             "max_output_tokens": params.get("max_output_tokens"),
                             "temperature": params.get("temperature"),
                             "reasoning": params.get("reasoning"),
                             "thinking_enabled": thinking_enabled,
+                            "tools": params.get("tools"),
+                            "tool_choice": params.get("tool_choice"),
                         },
                     },
                 )
@@ -364,6 +438,84 @@ class OpenAIProvider:
                 )
             raise
 
+    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert messages to OpenAI Responses API format.
+
+        Handles:
+        - User messages: Simple text content
+        - Assistant messages: Reconstructs with tool calls if present
+        - Tool messages: Converts to appropriate format
+
+        Args:
+            messages: List of message dicts from ChatRequest
+
+        Returns:
+            List of OpenAI-formatted message objects per Responses API spec
+        """
+        openai_messages = []
+        i = 0
+
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get("role")
+            content = msg.get("content", "")
+
+            # Skip system messages (handled via instructions parameter)
+            if role == "system":
+                i += 1
+                continue
+
+            # Handle tool result messages
+            if role == "tool":
+                # For OpenAI Responses API, convert tool results to text
+                # API doesn't support tool_result content type - use input_text
+                tool_results_parts = []
+                while i < len(messages) and messages[i].get("role") == "tool":
+                    tool_msg = messages[i]
+                    tool_name = tool_msg.get("tool_name", "unknown")
+                    tool_content = tool_msg.get("content", "")
+
+                    # Format as text for API
+                    tool_results_parts.append(f"[Tool: {tool_name}]\n{tool_content}")
+                    i += 1
+
+                # Add as user message with combined tool results as text
+                if tool_results_parts:
+                    combined_text = "\n\n".join(tool_results_parts)
+                    openai_messages.append({"role": "user", "content": [{"type": "input_text", "text": combined_text}]})
+                continue
+
+            # Handle assistant messages
+            if role == "assistant":
+                # For Responses API, only include text content in input
+                # Tool call details are inferred from tool definitions and results
+                if content:
+                    openai_messages.append({"role": "assistant", "content": [{"type": "output_text", "text": content}]})
+                # Skip assistant messages with no text content (tool-only messages)
+                i += 1
+
+            # Handle developer messages as XML-wrapped user messages
+            elif role == "developer":
+                wrapped = f"<context_file>\n{content}\n</context_file>"
+                openai_messages.append({"role": "user", "content": [{"type": "input_text", "text": wrapped}]})
+                i += 1
+
+            # Handle user messages
+            elif role == "user":
+                openai_messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": content}] if isinstance(content, str) else content,
+                    }
+                )
+                i += 1
+            else:
+                # Unknown role - skip
+                logger.warning(f"Unknown message role: {role}")
+                i += 1
+
+        return openai_messages
+
     def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
         """Convert ToolSpec objects from ChatRequest to OpenAI format.
 
@@ -428,11 +580,15 @@ class OpenAIProvider:
                         event_blocks.append(TextContent(text=block_content))
 
                 elif block_type == "reasoning":
-                    # Simplified reasoning handling - just create a placeholder
-                    placeholder = "[Reasoning content from o-series model]"
-                    content_blocks.append(ThinkingBlock(thinking=placeholder, signature=None, visibility="internal"))
-                    event_blocks.append(ThinkingContent(text=placeholder))
-                    text_accumulator.append(placeholder)
+                    # Extract reasoning summary if available
+                    reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
+                    # Only create thinking block if there's actual content
+                    if reasoning_summary:
+                        content_blocks.append(
+                            ThinkingBlock(thinking=reasoning_summary, signature=None, visibility="internal")
+                        )
+                        event_blocks.append(ThinkingContent(text=reasoning_summary))
+                        text_accumulator.append(reasoning_summary)
 
                 elif block_type in {"tool_call", "function_call"}:
                     tool_id = getattr(block, "id", "") or getattr(block, "call_id", "")
@@ -471,11 +627,15 @@ class OpenAIProvider:
                         event_blocks.append(TextContent(text=block_content, raw=block))
 
                 elif block_type == "reasoning":
-                    # Simplified reasoning handling - just create a placeholder
-                    placeholder = "[Reasoning content from o-series model]"
-                    content_blocks.append(ThinkingBlock(thinking=placeholder, signature=None, visibility="internal"))
-                    event_blocks.append(ThinkingContent(text=placeholder))
-                    text_accumulator.append(placeholder)
+                    # Extract reasoning summary if available
+                    reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
+                    # Only create thinking block if there's actual content
+                    if reasoning_summary:
+                        content_blocks.append(
+                            ThinkingBlock(thinking=reasoning_summary, signature=None, visibility="internal")
+                        )
+                        event_blocks.append(ThinkingContent(text=reasoning_summary))
+                        text_accumulator.append(reasoning_summary)
 
                 elif block_type in {"tool_call", "function_call"}:
                     tool_id = block.get("id") or block.get("call_id", "")
