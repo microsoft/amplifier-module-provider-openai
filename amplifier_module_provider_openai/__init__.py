@@ -86,6 +86,7 @@ class OpenAIProvider:
         self.max_tokens = self.config.get("max_tokens", 4096)
         self.temperature = self.config.get("temperature", None)  # None = not sent (some models don't support it)
         self.reasoning = self.config.get("reasoning", None)  # None = not sent (minimal|low|medium|high)
+        self.reasoning_summary = self.config.get("reasoning_summary", "detailed")  # auto|concise|detailed
         self.enable_state = self.config.get("enable_state", False)
         self.debug = self.config.get("debug", False)  # Enable full request/response logging
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
@@ -267,7 +268,12 @@ class OpenAIProvider:
 
         reasoning_effort = kwargs.get("reasoning", getattr(request, "reasoning", None)) or self.reasoning
         if reasoning_effort:
-            params["reasoning"] = {"effort": reasoning_effort}
+            # DEBUG: Log reasoning configuration
+            logger.info(f"[PROVIDER] Setting reasoning: effort={reasoning_effort}, summary={self.reasoning_summary}")
+            params["reasoning"] = {
+                "effort": reasoning_effort,
+                "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
+            }
             # Request reasoning content if available
             params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
 
@@ -290,7 +296,8 @@ class OpenAIProvider:
         if thinking_enabled:
             if "reasoning" not in params:
                 params["reasoning"] = {
-                    "effort": kwargs.get("reasoning_effort") or self.config.get("reasoning_effort", "high")
+                    "effort": kwargs.get("reasoning_effort") or self.config.get("reasoning_effort", "high"),
+                    "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
                 }
 
             budget_tokens = kwargs.get("thinking_budget_tokens") or self.config.get("thinking_budget_tokens") or 0
@@ -582,13 +589,34 @@ class OpenAIProvider:
                 elif block_type == "reasoning":
                     # Extract reasoning summary if available
                     reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
+
+                    # OpenAI returns summary as list of objects with 'text' fields
+                    reasoning_text = None
+                    if isinstance(reasoning_summary, list):
+                        # Extract text from list of summary objects (dict or Pydantic models)
+                        texts = []
+                        for item in reasoning_summary:
+                            if isinstance(item, dict):
+                                texts.append(item.get("text", ""))
+                            elif hasattr(item, "text"):
+                                texts.append(getattr(item, "text", ""))
+                            elif isinstance(item, str):
+                                texts.append(item)
+                        reasoning_text = "\n".join(filter(None, texts))
+                    elif isinstance(reasoning_summary, str):
+                        reasoning_text = reasoning_summary
+                    elif isinstance(reasoning_summary, dict):
+                        reasoning_text = reasoning_summary.get("text", str(reasoning_summary))
+                    elif hasattr(reasoning_summary, "text"):
+                        reasoning_text = getattr(reasoning_summary, "text", str(reasoning_summary))
+
                     # Only create thinking block if there's actual content
-                    if reasoning_summary:
+                    if reasoning_text:
                         content_blocks.append(
-                            ThinkingBlock(thinking=reasoning_summary, signature=None, visibility="internal")
+                            ThinkingBlock(thinking=reasoning_text, signature=None, visibility="internal")
                         )
-                        event_blocks.append(ThinkingContent(text=reasoning_summary))
-                        text_accumulator.append(reasoning_summary)
+                        event_blocks.append(ThinkingContent(text=reasoning_text))
+                        text_accumulator.append(reasoning_text)
 
                 elif block_type in {"tool_call", "function_call"}:
                     tool_id = getattr(block, "id", "") or getattr(block, "call_id", "")
@@ -629,13 +657,34 @@ class OpenAIProvider:
                 elif block_type == "reasoning":
                     # Extract reasoning summary if available
                     reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
+
+                    # OpenAI returns summary as list of objects with 'text' fields
+                    reasoning_text = None
+                    if isinstance(reasoning_summary, list):
+                        # Extract text from list of summary objects (dict or Pydantic models)
+                        texts = []
+                        for item in reasoning_summary:
+                            if isinstance(item, dict):
+                                texts.append(item.get("text", ""))
+                            elif hasattr(item, "text"):
+                                texts.append(getattr(item, "text", ""))
+                            elif isinstance(item, str):
+                                texts.append(item)
+                        reasoning_text = "\n".join(filter(None, texts))
+                    elif isinstance(reasoning_summary, str):
+                        reasoning_text = reasoning_summary
+                    elif isinstance(reasoning_summary, dict):
+                        reasoning_text = reasoning_summary.get("text", str(reasoning_summary))
+                    elif hasattr(reasoning_summary, "text"):
+                        reasoning_text = getattr(reasoning_summary, "text", str(reasoning_summary))
+
                     # Only create thinking block if there's actual content
-                    if reasoning_summary:
+                    if reasoning_text:
                         content_blocks.append(
-                            ThinkingBlock(thinking=reasoning_summary, signature=None, visibility="internal")
+                            ThinkingBlock(thinking=reasoning_text, signature=None, visibility="internal")
                         )
-                        event_blocks.append(ThinkingContent(text=reasoning_summary))
-                        text_accumulator.append(reasoning_summary)
+                        event_blocks.append(ThinkingContent(text=reasoning_text))
+                        text_accumulator.append(reasoning_text)
 
                 elif block_type in {"tool_call", "function_call"}:
                     tool_id = block.get("id") or block.get("call_id", "")

@@ -45,7 +45,8 @@ config = {
     default_model = "gpt-5-codex",
     max_tokens = 4096,
     temperature = 0.7,
-    reasoning = "low",
+    reasoning = "low",              # Reasoning effort: minimal|low|medium|high
+    reasoning_summary = "detailed",  # Reasoning verbosity: auto|concise|detailed
     enable_state = false,
     debug = false,      # Enable standard debug events
     raw_debug = false   # Enable ultra-verbose raw API I/O logging
@@ -95,12 +96,41 @@ model = "gpt-5-codex"
 ### Responses API Capabilities
 
 - **Reasoning Control** - Adjust reasoning effort (minimal, low, medium, high)
+- **Reasoning Summary Verbosity** - Control detail level of reasoning output (auto, concise, detailed)
 - **Extended Thinking Toggle** - Enables high-effort reasoning with automatic token budgeting
 - **Stateful Conversations** - Optional conversation persistence
 - **Native Tools** - Built-in web search, image generation, code interpreter
 - **Structured Output** - JSON schema-based output formatting
 - **Function Calling** - Custom tool use support
 - **Token Counting** - Usage tracking and management
+
+### Reasoning Summary Levels
+
+The `reasoning_summary` config controls the verbosity of reasoning blocks in the model's response:
+
+- **`auto`** (default if not specified) - Model decides appropriate detail level
+- **`concise`** - Brief reasoning summaries (faster, fewer tokens)
+- **`detailed`** - Verbose reasoning output similar to Anthropic's extended thinking blocks
+
+**Example comparison:**
+
+```yaml
+# Concise reasoning (brief summaries)
+providers:
+  - module: provider-openai
+    config:
+      reasoning: "medium"
+      reasoning_summary: "concise"
+
+# Detailed reasoning (verbose like Anthropic's thinking blocks)
+providers:
+  - module: provider-openai
+    config:
+      reasoning: "high"
+      reasoning_summary: "detailed"
+```
+
+**Note:** Detailed reasoning consumes more output tokens but provides deeper insight into the model's thought process, useful for complex problem-solving and debugging.
 
 ### Tool Calling
 
