@@ -817,7 +817,7 @@ class OpenAIProvider:
 
                 # FALLBACK: If no reasoning items in content but metadata has them, log for visibility
                 # (Cannot reconstruct without encrypted_content, so previous_response_id is the fallback)
-                if metadata.get(METADATA_REASONING_ITEMS):
+                if metadata and metadata.get(METADATA_REASONING_ITEMS):
                     has_reasoning_in_content = any(
                         (isinstance(item, dict) and item.get("type") == "reasoning")
                         or (hasattr(item, "get") and item.get("type") == "reasoning")
