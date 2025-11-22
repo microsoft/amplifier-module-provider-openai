@@ -52,7 +52,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Write a one-sentence bedtime story about a unicorn.",
 });
 
@@ -81,7 +81,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Write a one-sentence bedtime story about a unicorn."
 )
 
@@ -366,7 +366,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Write a one-sentence bedtime story about a unicorn.",
 });
 
@@ -378,7 +378,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Write a one-sentence bedtime story about a unicorn."
 )
 
@@ -390,7 +390,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "input": "Write a one-sentence bedtime story about a unicorn."
     }'
 ```
@@ -447,7 +447,7 @@ strongly recommend:
 
 - Pinning your production applications to specific
   [model snapshots](https://platform.openai.com/docs/models) (like
-  `gpt-5-2025-08-07` for example) to ensure consistent behavior
+  `gpt-5.1-2025-08-07` for example) to ensure consistent behavior
 - Building [evals](https://platform.openai.com/docs/guides/evals) that measure
   the behavior of your prompts so you can monitor prompt performance as you
   iterate, or when you change and upgrade model versions
@@ -470,7 +470,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   reasoning: { effort: "low" },
   instructions: "Talk like a pirate.",
   input: "Are semicolons optional in JavaScript?",
@@ -484,7 +484,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     reasoning={"effort": "low"},
     instructions="Talk like a pirate.",
     input="Are semicolons optional in JavaScript?",
@@ -498,7 +498,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "reasoning": {"effort": "low"},
         "instructions": "Talk like a pirate.",
         "input": "Are semicolons optional in JavaScript?"
@@ -513,7 +513,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   reasoning: { effort: "low" },
   input: [
     {
@@ -535,7 +535,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     reasoning={"effort": "low"},
     input=[
         {
@@ -557,7 +557,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "reasoning": {"effort": "low"},
         "input": [
             {
@@ -638,7 +638,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   prompt: {
     id: "pmpt_abc123",
     version: "2",
@@ -657,7 +657,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     prompt={
         "id": "pmpt_abc123",
         "version": "2",
@@ -676,7 +676,7 @@ curl https://api.openai.com/v1/responses \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "prompt": {
       "id": "pmpt_abc123",
       "version": "2",
@@ -702,7 +702,7 @@ const file = await client.files.create({
 });
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   prompt: {
     id: "pmpt_abc123",
     variables: {
@@ -730,7 +730,7 @@ file = client.files.create(
 )
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     prompt={
         "id": "pmpt_abc123",
         "variables": {
@@ -749,7 +749,7 @@ print(response.output_text)
 ```bash
 # Assume you have already uploaded the PDF and obtained FILE_ID
 curl https://api.openai.com/v1/responses   -H "Authorization: Bearer $OPENAI_API_KEY"   -H "Content-Type: application/json"   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "prompt": {
       "id": "pmpt_abc123",
       "variables": {
@@ -6836,7 +6836,7 @@ additional discounts from
 [prompt caching](https://platform.openai.com/docs/guides/prompt-caching).
 
 Flex processing is in beta and currently only available for
-[GPT-5](https://platform.openai.com/docs/models/gpt-5),
+[GPT-5](https://platform.openai.com/docs/models/gpt-5.1),
 [o3](https://platform.openai.com/docs/models/o3), and
 [o4-mini](https://platform.openai.com/docs/models/o4-mini) models.
 
@@ -7068,7 +7068,7 @@ input_list = [
 
 # 2. Prompt the model with tools defined
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=tools,
     input=input_list,
 )
@@ -7102,7 +7102,7 @@ print("Final input:")
 print(input_list)
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     instructions="Respond only with a horoscope generated by a tool.",
     tools=tools,
     input=input_list,
@@ -7144,7 +7144,7 @@ let input = [
 
 // 2. Prompt the model with tools defined
 let response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools,
   input,
 });
@@ -7177,7 +7177,7 @@ console.log("Final input:");
 console.log(JSON.stringify(input, null, 2));
 
 response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   instructions: "Respond only with a horoscope generated by a tool.",
   tools,
   input,
@@ -7747,7 +7747,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Use the code_exec tool to print hello world to the console.",
     tools=[
         {
@@ -7765,7 +7765,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Use the code_exec tool to print hello world to the console.",
   tools: [
     {
@@ -7832,7 +7832,7 @@ MUL: "*"
 """
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Use the math_exp tool to add four plus four.",
     tools=[
         {
@@ -7868,7 +7868,7 @@ MUL: "*"
 `;
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Use the math_exp tool to add four plus four.",
   tools: [
     {
@@ -8038,7 +8038,7 @@ client = OpenAI()
 grammar = r"^(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+(?P<year>\d{4})\s+at\s+(?P<hour>0?[1-9]|1[0-2])(?P<ampm>AM|PM)$"
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Use the timestamp tool to save a timestamp for August 7th 2025 at 10AM.",
     tools=[
         {
@@ -8064,7 +8064,7 @@ const grammar =
   "^(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)s+(?P<day>d{1,2})(?:st|nd|rd|th)?s+(?P<year>d{4})s+ats+(?P<hour>0?[1-9]|1[0-2])(?P<ampm>AM|PM)$";
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "Use the timestamp tool to save a timestamp for August 7th 2025 at 10AM.",
   tools: [
@@ -8957,7 +8957,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "Generate an image of gray tabby cat hugging an otter with an orange scarf",
   tools: [{ type: "image_generation" }],
@@ -8982,7 +8982,7 @@ import base64
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Generate an image of gray tabby cat hugging an otter with an orange scarf",
     tools=[{"type": "image_generation"}],
 )
@@ -9073,7 +9073,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "Generate an image of gray tabby cat hugging an otter with an orange scarf",
   tools: [{ type: "image_generation" }],
@@ -9092,7 +9092,7 @@ if (imageData.length > 0) {
 // Follow up
 
 const response_fwup = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   previous_response_id: response.id,
   input: "Now make it look realistic",
   tools: [{ type: "image_generation" }],
@@ -9119,7 +9119,7 @@ import base64
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Generate an image of gray tabby cat hugging an otter with an orange scarf",
     tools=[{"type": "image_generation"}],
 )
@@ -9140,7 +9140,7 @@ if image_data:
 # Follow up
 
 response_fwup = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     previous_response_id=response.id,
     input="Now make it look realistic",
     tools=[{"type": "image_generation"}],
@@ -9165,7 +9165,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "Generate an image of gray tabby cat hugging an otter with an orange scarf",
   tools: [{ type: "image_generation" }],
@@ -9186,7 +9186,7 @@ if (imageData.length > 0) {
 // Follow up
 
 const response_fwup = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -9219,7 +9219,7 @@ import openai
 import base64
 
 response = openai.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Generate an image of gray tabby cat hugging an otter with an orange scarf",
     tools=[{"type": "image_generation"}],
 )
@@ -9242,7 +9242,7 @@ if image_data:
 # Follow up
 
 response_fwup = openai.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -10096,7 +10096,7 @@ import openai
 import base64
 
 response = openai.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Draw a 2D pixel art style sprite sheet of a tabby gray cat",
     tools=[
         {
@@ -10127,7 +10127,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Draw a 2D pixel art style sprite sheet of a tabby gray cat",
   tools: [
     {
@@ -10758,7 +10758,7 @@ varies by model (see chart below). To calculate the cost of an image with
 
 | Model                    | Base tokens | Tile tokens |
 | ------------------------ | ----------- | ----------- |
-| gpt-5, gpt-5-chat-latest | 70          | 140         |
+| gpt-5.1, gpt-5.1-chat-latest | 70          | 140         |
 | 4o, 4.1, 4.5             | 85          | 170         |
 | 4o-mini                  | 2833        | 5667        |
 | o1, o1-pro, o3           | 75          | 150         |
@@ -11347,7 +11347,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const result = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Write a haiku about code.",
   reasoning: { effort: "low" },
   text: { verbosity: "low" },
@@ -11361,7 +11361,7 @@ from openai import OpenAI
 client = OpenAI()
 
 result = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Write a haiku about code.",
     reasoning={ "effort": "low" },
     text={ "verbosity": "low" },
@@ -11375,7 +11375,7 @@ curl https://api.openai.com/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "input": "Write a haiku about code.",
     "reasoning": { "effort": "low" }
   }'
@@ -11395,7 +11395,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const result = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Find the null pointer exception: ...your code here...",
   reasoning: { effort: "high" },
 });
@@ -11408,7 +11408,7 @@ from openai import OpenAI
 client = OpenAI()
 
 result = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Find the null pointer exception: ...your code here...",
     reasoning={ "effort": "high" },
 )
@@ -11421,7 +11421,7 @@ curl https://api.openai.com/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "input": "Find the null pointer exception: ...your code here...",
     "reasoning": { "effort": "high" }
   }'
@@ -11429,7 +11429,7 @@ curl https://api.openai.com/v1/responses \
 
 ## Meet the models
 
-There are three models in the GPT-5 series. In general, `gpt-5` is best for your
+There are three models in the GPT-5 series. In general, `gpt-5.1` is best for your
 most complex tasks that require broad world knowledge. The smaller mini and nano
 models trade off some general world knowledge for lower cost and lower latency.
 Small models will tend to perform better for more well defined tasks.
@@ -11439,7 +11439,7 @@ tradeoffs:
 
 | Variant                                                          | Best for                                                                             |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| [gpt-5](https://platform.openai.com/docs/models/gpt-5)           | Complex reasoning, broad world knowledge, and code-heavy or multi-step agentic tasks |
+| [gpt-5.1](https://platform.openai.com/docs/models/gpt-5.1)           | Complex reasoning, broad world knowledge, and code-heavy or multi-step agentic tasks |
 | [gpt-5-mini](https://platform.openai.com/docs/models/gpt-5-mini) | Cost-optimized reasoning and chat; balances speed, cost, and capability              |
 | [gpt-5-nano](https://platform.openai.com/docs/models/gpt-5-nano) | High-throughput tasks, especially simple instruction-following or classification     |
 
@@ -11450,11 +11450,11 @@ between them:
 
 | System card name      | API alias                 |
 | --------------------- | ------------------------- |
-| `gpt-5-thinking`      | `gpt-5`                   |
-| `gpt-5-thinking-mini` | `gpt-5-mini`              |
-| `gpt-5-thinking-nano` | `gpt-5-nano`              |
-| `gpt-5-main`          | `gpt-5-chat-latest`       |
-| `gpt-5-main-mini`     | \[not available via API\] |
+| `gpt-5.1-thinking`      | `gpt-5.1`                   |
+| `gpt-5.1-thinking-mini` | `gpt-5-mini`              |
+| `gpt-5.1-thinking-nano` | `gpt-5-nano`              |
+| `gpt-5.1-main`          | `gpt-5.1-chat-latest`       |
+| `gpt-5.1-main-mini`     | \[not available via API\] |
 
 ### New API features in GPT-5
 
@@ -11486,7 +11486,7 @@ before answering.
 
 ```bash
 curl --request POST   --url https://api.openai.com/v1/responses   --header "Authorization: Bearer $OPENAI_API_KEY"   --header 'Content-type: application/json'   --data '{
-	"model": "gpt-5",
+	"model": "gpt-5.1",
 	"input": "How much gold would it take to coat the Statue of Liberty in a 1mm layer?",
 	"reasoning": {
 		"effort": "minimal"
@@ -11499,7 +11499,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "How much gold would it take to coat the Statue of Liberty in a 1mm layer?",
   reasoning: {
@@ -11515,7 +11515,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="How much gold would it take to coat the Statue of Liberty in a 1mm layer?",
     reasoning={
         "effort": "minimal"
@@ -11547,7 +11547,7 @@ shorter, more concise code with minimal commentary.
 
 ```bash
 curl --request POST   --url https://api.openai.com/v1/responses   --header "Authorization: Bearer $OPENAI_API_KEY"   --header 'Content-type: application/json'   --data '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
   "input": "What is the answer to the ultimate question of life, the universe, and everything?",
   "text": {
     "verbosity": "low"
@@ -11560,7 +11560,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "What is the answer to the ultimate question of life, the universe, and everything?",
   text: {
@@ -11576,7 +11576,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="What is the answer to the ultimate question of life, the universe, and everything?",
     text={
         "verbosity": "low"
@@ -11708,10 +11708,10 @@ reasoning levels and prompting strategies. Based on our testing, we recommend
 using our prompt optimizer—which automatically updates your prompts for GPT-5
 based on our best practices—and following this model-specific guidance:
 
-- **o3**: `gpt-5` with `medium` or `high` reasoning is a great replacement.
+- **o3**: `gpt-5.1` with `medium` or `high` reasoning is a great replacement.
   Start with `medium` reasoning with prompt tuning, then increasing to `high` if
   you aren't getting the results you want.
-- **gpt-4.1**: `gpt-5` with `minimal` or `low` reasoning is a strong
+- **gpt-4.1**: `gpt-5.1` with `minimal` or `low` reasoning is a strong
   alternative. Start with `minimal` and tune your prompts; increase to `low` if
   you need better performance.
 - **o4-mini or gpt-4.1-mini**: `gpt-5-mini` with prompt tuning is a great
@@ -11741,7 +11741,7 @@ curl --request POST \
 --header "Authorization: Bearer $OPENAI_API_KEY" \
 --header 'Content-type: application/json' \
 --data '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
   "input": "How much gold would it take to coat the Statue of Liberty in a 1mm layer?",
   "reasoning": {
     "effort": "minimal"
@@ -11757,7 +11757,7 @@ curl --request POST \
 --header "Authorization: Bearer $OPENAI_API_KEY" \
 --header 'Content-type: application/json' \
 --data '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
   "messages": [
     {
       "role": "user",
@@ -11778,7 +11778,7 @@ curl --request POST \
 --header "Authorization: Bearer $OPENAI_API_KEY" \
 --header 'Content-type: application/json' \
 --data '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
   "input": "What is the answer to the ultimate question of life, the universe, and everything?",
   "text": {
     "verbosity": "low"
@@ -11794,7 +11794,7 @@ curl --request POST \
 --header "Authorization: Bearer $OPENAI_API_KEY" \
 --header 'Content-type: application/json' \
 --data '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
   "messages": [
     { "role": "user", "content": "What is the answer to the ultimate question of life, the universe, and everything?" }
   ],
@@ -11808,7 +11808,7 @@ Responses API
 
 ```json
 curl --request POST --url https://api.openai.com/v1/responses --header "Authorization: Bearer $OPENAI_API_KEY" --header 'Content-type: application/json' --data '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
   "input": "Use the code_exec tool to calculate the area of a circle with radius equal to the number of r letters in blueberry",
   "tools": [
     {
@@ -11824,7 +11824,7 @@ Chat Completions
 
 ```json
 curl --request POST --url https://api.openai.com/v1/chat/completions --header "Authorization: Bearer $OPENAI_API_KEY" --header 'Content-type: application/json' --data '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
   "messages": [
     { "role": "user", "content": "Use the code_exec tool to calculate the area of a circle with radius equal to the number of r letters in blueberry" }
   ],
@@ -11847,8 +11847,8 @@ tool-calling for agentic tasks. We also recommend iterating on prompts for GPT-5
 using the [prompt optimizer](/chat/edit?optimize=true).
 
 [GPT-5 prompt optimizer](/chat/edit?optimize=true)
-[GPT-5 prompting guide](https://cookbook.openai.com/examples/gpt-5/gpt-5_prompting_guide)
-[Frontend prompting for GPT-5](https://cookbook.openai.com/examples/gpt-5/gpt-5_frontend)
+[GPT-5 prompting guide](https://cookbook.openai.com/examples/gpt-5.1/gpt-5_prompting_guide)
+[Frontend prompting for GPT-5](https://cookbook.openai.com/examples/gpt-5.1/gpt-5_frontend)
 
 ### GPT-5 is a reasoning model
 
@@ -11880,14 +11880,14 @@ Cookbook on reasoning models
 
 1.  **How are these models integrated into ChatGPT?**
 
-    In ChatGPT, there are two models: `gpt-5-chat` and `gpt-5-thinking`. They
+    In ChatGPT, there are two models: `gpt-5.1-chat` and `gpt-5.1-thinking`. They
     offer reasoning and minimal-reasoning capabilities, with a routing layer
     that selects the best model based on the user's question. Users can also
     invoke reasoning directly through the ChatGPT UI.
 
 2.  **Will these models be supported in Codex?**
 
-    Yes, `gpt-5` will be available in Codex and Codex CLI.
+    Yes, `gpt-5.1` will be available in Codex and Codex CLI.
 
 3.  **What is the deprecation plan for previous models?**
 
@@ -13182,7 +13182,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "input": [
             {
                 "role": "user",
@@ -13206,7 +13206,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -13232,7 +13232,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -13269,7 +13269,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "input": [
             {
                 "role": "user",
@@ -13299,7 +13299,7 @@ const file = await client.files.create({
 });
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -13330,7 +13330,7 @@ file = client.files.create(
 )
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -13360,7 +13360,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "input": [
             {
                 "role": "user",
@@ -13389,7 +13389,7 @@ const data = fs.readFileSync("draconomicon.pdf");
 const base64String = data.toString("base64");
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -13422,7 +13422,7 @@ with open("draconomicon.pdf", "rb") as f:
 base64_string = base64.b64encode(data).decode("utf-8")
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -13907,7 +13907,7 @@ used for data processing, evaluations, or other highly erratic traffic.
 
 ```bash
 curl https://api.openai.com/v1/responses   -H "Authorization: Bearer $OPENAI_API_KEY"   -H "Content-Type: application/json"   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "input": "What does 'fit check for my napalm era' mean?",
     "service_tier": "priority"
   }'
@@ -13919,7 +13919,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "What does 'fit check for my napalm era' mean?",
   service_tier: "priority",
 });
@@ -13933,7 +13933,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="What does 'fit check for my napalm era' mean?",
     service_tier="priority"
 )
@@ -14476,7 +14476,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Write a one-sentence bedtime story about a unicorn.",
 });
 
@@ -14488,7 +14488,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Write a one-sentence bedtime story about a unicorn."
 )
 
@@ -14500,7 +14500,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "input": "Write a one-sentence bedtime story about a unicorn."
     }'
 ```
@@ -14601,7 +14601,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   reasoning: { effort: "low" },
   instructions: "Talk like a pirate.",
   input: "Are semicolons optional in JavaScript?",
@@ -14615,7 +14615,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     reasoning={"effort": "low"},
     instructions="Talk like a pirate.",
     input="Are semicolons optional in JavaScript?",
@@ -14629,7 +14629,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "reasoning": {"effort": "low"},
         "instructions": "Talk like a pirate.",
         "input": "Are semicolons optional in JavaScript?"
@@ -14644,7 +14644,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   reasoning: { effort: "low" },
   input: [
     {
@@ -14666,7 +14666,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     reasoning={"effort": "low"},
     input=[
         {
@@ -14688,7 +14688,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "reasoning": {"effort": "low"},
         "input": [
             {
@@ -14756,7 +14756,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   prompt: {
     id: "pmpt_abc123",
     version: "2",
@@ -14775,7 +14775,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     prompt={
         "id": "pmpt_abc123",
         "version": "2",
@@ -14794,7 +14794,7 @@ curl https://api.openai.com/v1/responses \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "prompt": {
       "id": "pmpt_abc123",
       "version": "2",
@@ -14820,7 +14820,7 @@ const file = await client.files.create({
 });
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   prompt: {
     id: "pmpt_abc123",
     variables: {
@@ -14848,7 +14848,7 @@ file = client.files.create(
 )
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     prompt={
         "id": "pmpt_abc123",
         "variables": {
@@ -14867,7 +14867,7 @@ print(response.output_text)
 ```bash
 # Assume you have already uploaded the PDF and obtained FILE_ID
 curl https://api.openai.com/v1/responses   -H "Authorization: Bearer $OPENAI_API_KEY"   -H "Content-Type: application/json"   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "prompt": {
       "id": "pmpt_abc123",
       "variables": {
@@ -14955,7 +14955,7 @@ const client = new OpenAI();
 const instructions = await fs.readFile("prompt.txt", "utf-8");
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   instructions,
   input: "How would I declare a variable for a last name?",
 });
@@ -14971,7 +14971,7 @@ with open("prompt.txt", "r", encoding="utf-8") as f:
     instructions = f.read()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     instructions=instructions,
     input="How would I declare a variable for a last name?",
 )
@@ -14984,7 +14984,7 @@ curl https://api.openai.com/v1/responses \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "instructions": "'"$(< prompt.txt)"'",
     "input": "How would I declare a variable for a last name?"
   }'
@@ -15085,13 +15085,13 @@ context window sizes per model.
 
 ## Prompting GPT-5 models
 
-GPT models like [gpt-5](https://platform.openai.com/docs/models/gpt-5) benefit
+GPT models like [gpt-5.1](https://platform.openai.com/docs/models/gpt-5.1) benefit
 from precise instructions that explicitly provide the logic and data required to
 complete the task in the prompt. GPT-5 in particular is highly steerable and
 responsive to well-specified prompts. To get the most out of GPT-5, refer to the
 prompting guide in the cookbook.
 
-[GPT-5 prompting guide](https://cookbook.openai.com/examples/gpt-5/gpt-5_prompting_guide)
+[GPT-5 prompting guide](https://cookbook.openai.com/examples/gpt-5.1/gpt-5_prompting_guide)
 
 ### GPT-5 prompting best practices
 
@@ -17920,7 +17920,7 @@ capabilities:
 
 Explore advanced reasoning and problem-solving models.
 
-**Reasoning models** like [GPT-5](https://platform.openai.com/docs/models/gpt-5)
+**Reasoning models** like [GPT-5](https://platform.openai.com/docs/models/gpt-5.1)
 are LLMs trained with reinforcement learning to perform reasoning. Reasoning
 models think before they answer, producing a long internal chain of thought
 before responding to the user. Reasoning models excel in complex problem
@@ -17929,7 +17929,7 @@ workflows. They're also the best models for Codex CLI, our lightweight coding
 agent.
 
 We provide smaller, faster models (`gpt-5-mini` and `gpt-5-nano`) that are less
-expensive per token. The larger model (`gpt-5`) is slower and more expensive but
+expensive per token. The larger model (`gpt-5.1`) is slower and more expensive but
 often generates better responses for complex tasks and broad domains.
 
 ## Get started with reasoning
@@ -17949,7 +17949,7 @@ format '[1,2],[3,4],[5,6]' and prints the transpose in the same format.
 `;
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   reasoning: { effort: "medium" },
   input: [
     {
@@ -17973,7 +17973,7 @@ format '[1,2],[3,4],[5,6]' and prints the transpose in the same format.
 """
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     reasoning={"effort": "medium"},
     input=[
         {
@@ -17991,7 +17991,7 @@ curl https://api.openai.com/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "reasoning": {"effort": "medium"},
     "input": [
       {
@@ -18095,7 +18095,7 @@ format '[1,2],[3,4],[5,6]' and prints the transpose in the same format.
 `;
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   reasoning: { effort: "medium" },
   input: [
     {
@@ -18130,7 +18130,7 @@ format '[1,2],[3,4],[5,6]' and prints the transpose in the same format.
 """
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     reasoning={"effort": "medium"},
     input=[
         {
@@ -18236,7 +18236,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "What is the capital of France?",
   reasoning: {
     effort: "low",
@@ -18252,7 +18252,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="What is the capital of France?",
     reasoning={
         "effort": "low",
@@ -18268,7 +18268,7 @@ curl https://api.openai.com/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "input": "What is the capital of France?",
     "reasoning": {
         "effort": "low",
@@ -18369,7 +18369,7 @@ export default function BookList() {
 `.trim();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -18415,7 +18415,7 @@ export default function BookList() {
 """
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -18449,7 +18449,7 @@ your reasoning at the beginning and end, not throughout the code.
 `.trim();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -18477,7 +18477,7 @@ your reasoning at the beginning and end, not throughout the code.
 """
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -18506,7 +18506,7 @@ them?
 `;
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -18530,7 +18530,7 @@ them?
 """
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -21475,7 +21475,7 @@ violations.
 
 ## Safety classifiers for GPT-5 and forward
 
-With the introduction of [GPT-5](https://platform.openai.com/docs/models/gpt-5),
+With the introduction of [GPT-5](https://platform.openai.com/docs/models/gpt-5.1),
 we added some checks to find and halt hazardous information from being accessed.
 It's likely some users will eventually try to use your application for things
 outside of OpenAI’s policies, especially in applications with a wide range of
@@ -22302,7 +22302,7 @@ import { OpenAI } from "openai";
 const client = new OpenAI();
 
 const stream = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -22322,7 +22322,7 @@ from openai import OpenAI
 client = OpenAI()
 
 stream = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -26618,7 +26618,7 @@ curl https://api.openai.com/v1/responses \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
     "tools": [
       {
         "type": "mcp",
@@ -26637,7 +26637,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const resp = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [
     {
       type: "mcp",
@@ -26660,7 +26660,7 @@ from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[
         {
             "type": "mcp",
@@ -26691,7 +26691,7 @@ curl https://api.openai.com/v1/responses \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "tools": [
       {
         "type": "mcp",
@@ -26710,7 +26710,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const resp = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [
     {
       type: "mcp",
@@ -26732,7 +26732,7 @@ from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[
         {
             "type": "mcp",
@@ -26868,7 +26868,7 @@ curl https://api.openai.com/v1/responses \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "tools": [
       {
         "type": "mcp",
@@ -26888,7 +26888,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const resp = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [
     {
       type: "mcp",
@@ -26912,7 +26912,7 @@ from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[{
         "type": "mcp",
         "server_label": "dmcp",
@@ -26984,7 +26984,7 @@ curl https://api.openai.com/v1/responses \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "tools": [
       {
         "type": "mcp",
@@ -27008,7 +27008,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const resp = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [
     {
       type: "mcp",
@@ -27039,7 +27039,7 @@ from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[{
         "type": "mcp",
         "server_label": "dmcp",
@@ -27075,7 +27075,7 @@ curl https://api.openai.com/v1/responses \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "tools": [
       {
         "type": "mcp",
@@ -27097,7 +27097,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const resp = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [
     {
       type: "mcp",
@@ -27123,7 +27123,7 @@ from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[
         {
             "type": "mcp",
@@ -27153,7 +27153,7 @@ curl https://api.openai.com/v1/responses \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "input": "Create a payment link for $20",
     "tools": [
       {
@@ -27171,7 +27171,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const resp = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: "Create a payment link for $20",
   tools: [
     {
@@ -27192,7 +27192,7 @@ from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Create a payment link for $20",
     tools=[
         {
@@ -27269,7 +27269,7 @@ curl https://api.openai.com/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "tools": [
       {
         "type": "mcp",
@@ -27288,7 +27288,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const resp = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [
     {
       type: "mcp",
@@ -27310,7 +27310,7 @@ from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[
         {
             "type": "mcp",
@@ -28017,7 +28017,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "Generate an image of gray tabby cat hugging an otter with an orange scarf",
   tools: [{ type: "image_generation" }],
@@ -28042,7 +28042,7 @@ import base64
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Generate an image of gray tabby cat hugging an otter with an orange scarf",
     tools=[{"type": "image_generation"}],
 )
@@ -28123,7 +28123,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "Generate an image of gray tabby cat hugging an otter with an orange scarf",
   tools: [{ type: "image_generation" }],
@@ -28142,7 +28142,7 @@ if (imageData.length > 0) {
 // Follow up
 
 const response_fwup = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   previous_response_id: response.id,
   input: "Now make it look realistic",
   tools: [{ type: "image_generation" }],
@@ -28169,7 +28169,7 @@ import base64
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Generate an image of gray tabby cat hugging an otter with an orange scarf",
     tools=[{"type": "image_generation"}],
 )
@@ -28190,7 +28190,7 @@ if image_data:
 # Follow up
 
 response_fwup = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     previous_response_id=response.id,
     input="Now make it look realistic",
     tools=[{"type": "image_generation"}],
@@ -28215,7 +28215,7 @@ import OpenAI from "openai";
 const openai = new OpenAI();
 
 const response = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input:
     "Generate an image of gray tabby cat hugging an otter with an orange scarf",
   tools: [{ type: "image_generation" }],
@@ -28236,7 +28236,7 @@ if (imageData.length > 0) {
 // Follow up
 
 const response_fwup = await openai.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     {
       role: "user",
@@ -28269,7 +28269,7 @@ import openai
 import base64
 
 response = openai.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input="Generate an image of gray tabby cat hugging an otter with an orange scarf",
     tools=[{"type": "image_generation"}],
 )
@@ -28292,7 +28292,7 @@ if image_data:
 # Follow up
 
 response_fwup = openai.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {
             "role": "user",
@@ -28557,7 +28557,7 @@ There are three main types of web search available with OpenAI models:
     of its chain of thought, often tapping into hundreds of sources. Deep
     research can run for several minutes and is best used with background mode.
     These tasks typically use models like `o3-deep-research`,
-    `o4-mini-deep-research`, or `gpt-5` with reasoning level set to `high`.
+    `o4-mini-deep-research`, or `gpt-5.1` with reasoning level set to `high`.
 
 Using the
 [Responses API](https://platform.openai.com/docs/api-reference/responses), you
@@ -28570,7 +28570,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [{ type: "web_search" }],
   input: "What was a positive news story from today?",
 });
@@ -28583,7 +28583,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[{"type": "web_search"}],
     input="What was a positive news story from today?"
 )
@@ -28596,7 +28596,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "tools": [{"type": "web_search"}],
         "input": "what was a positive news story from today?"
     }'
@@ -28613,7 +28613,7 @@ compatible with the models:
 - gpt-4.1
 - o4-mini
 - o3
-- gpt-5 with reasoning levels `low`, `medium` and `high`
+- gpt-5.1 with reasoning levels `low`, `medium` and `high`
 
 The previous version the web search tool, `web_search_preview` , is still
 available with both the Chat Completions API and the Responses API; it points to
@@ -28700,7 +28700,7 @@ Sources are available with both the `web_search` and `web_search_preview` tools.
 
 ```bash
 curl "https://api.openai.com/v1/responses" -H "Content-Type: application/json" -H "Authorization: Bearer $OPENAI_API_KEY" -d '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
   "reasoning": { "effort": "low" },
   "tools": [
     {
@@ -28727,7 +28727,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   reasoning: { effort: "low" },
   tools: [
     {
@@ -28757,7 +28757,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-model="gpt-5",
+model="gpt-5.1",
 reasoning={"effort": "low"},
 tools=[
 {
@@ -28959,7 +28959,7 @@ Same as tiered rate limits for underlying
 #### Limitations
 
 - Web search is currently not supported in
-  [gpt-5](https://platform.openai.com/docs/models/gpt-5) with `minimal`
+  [gpt-5.1](https://platform.openai.com/docs/models/gpt-5.1) with `minimal`
   [gpt-4.1-nano](https://platform.openai.com/docs/models/gpt-4.1-nano) model.
 - When used as a tool in the
   [Responses API](https://platform.openai.com/docs/api-reference/responses), web
@@ -28986,7 +28986,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [{ type: "web_search" }],
   input: "What was a positive news story from today?",
 });
@@ -28999,7 +28999,7 @@ from openai import OpenAI
 client = OpenAI()
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[{"type": "web_search"}],
     input="What was a positive news story from today?"
 )
@@ -29012,7 +29012,7 @@ curl "https://api.openai.com/v1/responses" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d '{
-        "model": "gpt-5",
+        "model": "gpt-5.1",
         "tools": [{"type": "web_search"}],
         "input": "what was a positive news story from today?"
     }'
@@ -29079,7 +29079,7 @@ const tools = [
 ];
 
 const response = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   input: [
     { role: "user", content: "What is the weather like in Paris today?" },
   ],
@@ -29115,7 +29115,7 @@ tools = [
 ]
 
 response = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     input=[
         {"role": "user", "content": "What is the weather like in Paris today?"},
     ],
@@ -29130,7 +29130,7 @@ curl -X POST https://api.openai.com/v1/responses \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-5.1",
     "input": [
       {"role": "user", "content": "What is the weather like in Paris today?"}
     ],
@@ -29163,7 +29163,7 @@ curl https://api.openai.com/v1/responses \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
-  "model": "gpt-5",
+  "model": "gpt-5.1",
     "tools": [
       {
         "type": "mcp",
@@ -29182,7 +29182,7 @@ import OpenAI from "openai";
 const client = new OpenAI();
 
 const resp = await client.responses.create({
-  model: "gpt-5",
+  model: "gpt-5.1",
   tools: [
     {
       type: "mcp",
@@ -29205,7 +29205,7 @@ from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[
         {
             "type": "mcp",
@@ -30357,10 +30357,10 @@ Retention or enhanced Modified Abuse Monitoring.
 whisper-1
 gpt-4o-tts
 gpt-4o-transcribe
-gpt-4o-mini-transcribe | All | | /v1/batches | gpt-5-2025-08-07
+gpt-4o-mini-transcribe | All | | /v1/batches | gpt-5.1-2025-08-07
 gpt-5-mini-2025-08-07
 gpt-5-nano-2025-08-07
-gpt-5-chat-latest-2025-08-07
+gpt-5.1-chat-latest-2025-08-07
 gpt-4.1-2025-04-14
 gpt-4.1-mini-2025-04-14
 gpt-4.1-nano-2025-04-14
@@ -30377,10 +30377,10 @@ gpt-4o-2024-08-06
 gpt-4o-mini-2024-07-18
 gpt-4-turbo-2024-04-09
 gpt-4-0613
-gpt-3.5-turbo-0125 | All | | /v1/chat/completions | gpt-5-2025-08-07
+gpt-3.5-turbo-0125 | All | | /v1/chat/completions | gpt-5.1-2025-08-07
 gpt-5-mini-2025-08-07
 gpt-5-nano-2025-08-07
-gpt-5-chat-latest-2025-08-07
+gpt-5.1-chat-latest-2025-08-07
 gpt-4.1-2025-04-14
 gpt-4.1-mini-2025-04-14
 gpt-4.1-nano-2025-04-14
@@ -30405,10 +30405,10 @@ gpt-4.1-mini-2025-04-14 | All | | /v1/images/edits | gpt-image-1 | All | |
 /v1/images/generations | dall-e-3
 gpt-image-1 | All | | /v1/moderations | text-moderation-007
 omni-moderation-latest | All | | /v1/realtime (beta) | gpt-4o-realtime-preview
-gpt-4o-mini-realtime-preview | US | | /v1/responses | gpt-5-2025-08-07
+gpt-4o-mini-realtime-preview | US | | /v1/responses | gpt-5.1-2025-08-07
 gpt-5-mini-2025-08-07
 gpt-5-nano-2025-08-07
-gpt-5-chat-latest-2025-08-07
+gpt-5.1-chat-latest-2025-08-07
 gpt-4.1-2025-04-14
 gpt-4.1-mini-2025-04-14
 gpt-4.1-nano-2025-04-14
@@ -31043,7 +31043,7 @@ customers should use GPT-3.5 or GPT-4.
 **Current Snapshot:** chatgpt-4o-latest
 
 ChatGPT-4o points to the GPT-4o snapshot currently used in ChatGPT. We recommend
-using an API model like [GPT-5](/docs/models/gpt-5) or
+using an API model like [GPT-5](/docs/models/gpt-5.1) or
 [GPT-4o](/docs/models/gpt-4o) for most API integrations, but feel free to use
 this ChatGPT-4o model to test our latest improvements for chat use cases.
 
@@ -31498,7 +31498,7 @@ GPT-4.1 excels at instruction following and tool calling, with broad knowledge
 across domains. It features a 1M token context window, and low latency without a
 reasoning step.
 
-Note that we recommend starting with [GPT-5](/docs/models/gpt-5) for complex
+Note that we recommend starting with [GPT-5](/docs/models/gpt-5.1) for complex
 tasks.
 
 ## Snapshots
@@ -32138,10 +32138,10 @@ capable model outside of our o-series models.
 
 # GPT-5 Chat
 
-**Current Snapshot:** gpt-5-chat-latest
+**Current Snapshot:** gpt-5.1-chat-latest
 
 GPT-5 Chat points to the GPT-5 snapshot currently used in ChatGPT. We recommend
-[GPT-5](/docs/models/gpt-5) for most API usage, but feel free to use this GPT-5
+[GPT-5](/docs/models/gpt-5.1) for most API usage, but feel free to use this GPT-5
 Chat model to test our latest improvements for chat use cases.
 
 ## Snapshots
@@ -32150,7 +32150,7 @@ Chat model to test our latest improvements for chat use cases.
 
 ## Rate Limits
 
-### gpt-5-chat-latest
+### gpt-5.1-chat-latest
 
 | Tier   | RPM   | TPM      | Batch Queue Limit |
 | ------ | ----- | -------- | ----------------- |
@@ -32166,7 +32166,7 @@ Chat model to test our latest improvements for chat use cases.
 
 GPT-5 mini is a faster, more cost-efficient version of GPT-5. It's great for
 well-defined tasks and precise prompts. Learn more in our
-[GPT-5 usage guide](/docs/guides/gpt-5).
+[GPT-5 usage guide](/docs/guides/gpt-5.1).
 
 ## Snapshots
 
@@ -32204,7 +32204,7 @@ well-defined tasks and precise prompts. Learn more in our
 
 GPT-5 Nano is our fastest, cheapest version of GPT-5. It's great for
 summarization and classification tasks. Learn more in our
-[GPT-5 usage guide](/docs/guides/gpt-5).
+[GPT-5 usage guide](/docs/guides/gpt-5.1).
 
 ## Snapshots
 
@@ -32238,14 +32238,14 @@ summarization and classification tasks. Learn more in our
 
 # GPT-5
 
-**Current Snapshot:** gpt-5-2025-08-07
+**Current Snapshot:** gpt-5.1-2025-08-07
 
 GPT-5 is our flagship model for coding, reasoning, and agentic tasks across
-domains. Learn more in our [GPT-5 usage guide](/docs/guides/gpt-5).
+domains. Learn more in our [GPT-5 usage guide](/docs/guides/gpt-5.1).
 
 ## Snapshots
 
-### gpt-5-2025-08-07
+### gpt-5.1-2025-08-07
 
 - Context window size: 400000
 - Knowledge cutoff date: 2024-09-30
@@ -32254,7 +32254,7 @@ domains. Learn more in our [GPT-5 usage guide](/docs/guides/gpt-5).
   function_calling, file_search, file_uploads, image_input, web_search,
   prompt_caching
 
-### gpt-5-chat-latest
+### gpt-5.1-chat-latest
 
 - Context window size: 128000
 - Knowledge cutoff date: 2024-09-30
@@ -32288,7 +32288,7 @@ domains. Learn more in our [GPT-5 usage guide](/docs/guides/gpt-5).
 
 ## Rate Limits
 
-### gpt-5
+### gpt-5.1
 
 | Tier   | RPM   | TPM      | Batch Queue Limit |
 | ------ | ----- | -------- | ----------------- |
@@ -32705,7 +32705,7 @@ for math, science, coding, and visual reasoning tasks. It also excels at
 technical writing and instruction-following. Use it to think through multi-step
 problems that involve analysis across text, code, and images.
 
-o3 is succeeded by [GPT-5](/docs/models/gpt-5).
+o3 is succeeded by [GPT-5](/docs/models/gpt-5.1).
 
 Learn more about how to use our reasoning models in our
 [reasoning](/docs/guides/reasoning?api-mode=responses) guide.
@@ -33163,11 +33163,11 @@ identification.
 | computer-use-preview-2025-03-11          | 3     |              | 12     | 1M tokens |
 | computer-use-preview-2025-03-11 (batch)  | 1.5   |              | 6      | 1M tokens |
 | gpt-image-1                              | 5     | 1.25         |        | 1M tokens |
-| gpt-5                                    | 1.25  | 0.125        | 10     | 1M tokens |
-| gpt-5 (batch)                            | 0.625 | 0.0625       | 5      | 1M tokens |
-| gpt-5-2025-08-07                         | 1.25  | 0.125        | 10     | 1M tokens |
-| gpt-5-2025-08-07 (batch)                 | 0.625 | 0.0625       | 5      | 1M tokens |
-| gpt-5-latest                             | 1.25  | 0.125        | 10     | 1M tokens |
+| gpt-5.1                                    | 1.25  | 0.125        | 10     | 1M tokens |
+| gpt-5.1 (batch)                            | 0.625 | 0.0625       | 5      | 1M tokens |
+| gpt-5.1-2025-08-07                         | 1.25  | 0.125        | 10     | 1M tokens |
+| gpt-5.1-2025-08-07 (batch)                 | 0.625 | 0.0625       | 5      | 1M tokens |
+| gpt-5.1-latest                             | 1.25  | 0.125        | 10     | 1M tokens |
 | gpt-5-mini                               | 0.25  | 0.025        | 2      | 1M tokens |
 | gpt-5-mini (batch)                       | 0.125 | 0.0125       | 1      | 1M tokens |
 | gpt-5-mini-2025-08-07                    | 0.25  | 0.025        | 2      | 1M tokens |

@@ -22,6 +22,21 @@ from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import ToolCall
 from openai import AsyncOpenAI
 
+from ._constants import DEFAULT_DEBUG_TRUNCATE_LENGTH
+from ._constants import DEFAULT_MAX_TOKENS
+from ._constants import DEFAULT_MODEL
+from ._constants import DEFAULT_REASONING_SUMMARY
+from ._constants import DEFAULT_TIMEOUT
+from ._constants import DEFAULT_TRUNCATION
+from ._constants import MAX_CONTINUATION_ATTEMPTS
+from ._constants import METADATA_CONTINUATION_COUNT
+from ._constants import METADATA_INCOMPLETE_REASON
+from ._constants import METADATA_REASONING_ITEMS
+from ._constants import METADATA_RESPONSE_ID
+from ._constants import METADATA_STATUS
+from ._response_handling import convert_response_with_accumulated_output
+from ._response_handling import extract_reasoning_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,20 +96,83 @@ class OpenAIProvider:
         self.config = config or {}
         self.coordinator = coordinator
 
-        # Configuration with sensible defaults
-        self.default_model = self.config.get("default_model", "gpt-5-codex")
-        self.max_tokens = self.config.get("max_tokens", 4096)
+        # Configuration with sensible defaults (from _constants.py - single source of truth)
+        self.default_model = self.config.get("default_model", DEFAULT_MODEL)
+        self.max_tokens = self.config.get("max_tokens", DEFAULT_MAX_TOKENS)
         self.temperature = self.config.get("temperature", None)  # None = not sent (some models don't support it)
         self.reasoning = self.config.get("reasoning", None)  # None = not sent (minimal|low|medium|high)
-        self.reasoning_summary = self.config.get("reasoning_summary", "detailed")  # auto|concise|detailed
+        self.reasoning_summary = self.config.get("reasoning_summary", DEFAULT_REASONING_SUMMARY)
+        self.truncation = self.config.get("truncation", DEFAULT_TRUNCATION)  # Automatic context management
         self.enable_state = self.config.get("enable_state", False)
         self.debug = self.config.get("debug", False)  # Enable full request/response logging
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
-        self.debug_truncate_length = self.config.get("debug_truncate_length", 180)  # Max string length in debug logs
-        self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
+        self.debug_truncate_length = self.config.get("debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH)
+        self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
 
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
+
+    def _build_continuation_input(self, original_input: list, accumulated_output: list) -> list:
+        """Build input for continuation call in stateless mode.
+
+        Instead of using previous_response_id (requires store:true), we include
+        the accumulated output in the next request's input to preserve context.
+        This allows continuation to work in stateless mode.
+
+        Per OpenAI Responses API docs: "context += response.output" - the API
+        accepts output items (reasoning, message, tool_call) directly in the
+        input array for continuation.
+
+        Args:
+            original_input: The original input messages from the first call
+            accumulated_output: Output items accumulated from incomplete response(s)
+
+        Returns:
+            New input array with accumulated output included for continuation
+        """
+        # Start with original input (the conversation so far)
+        continuation_input = list(original_input)
+
+        # Convert accumulated output to assistant messages for input
+        # Extract text from message blocks and reasoning summaries
+        assistant_content = []
+
+        for item in accumulated_output:
+            if hasattr(item, "type"):
+                item_type = item.type
+                if item_type == "message":
+                    # Extract text from message content
+                    content = getattr(item, "content", [])
+                    for content_item in content:
+                        if hasattr(content_item, "type") and content_item.type == "output_text":
+                            text = getattr(content_item, "text", "")
+                            if text:
+                                assistant_content.append({"type": "output_text", "text": text})
+                elif item_type == "reasoning":
+                    # For reasoning, we can't really include it in input as text
+                    # The reasoning trace is internal and not meant for reinsertion
+                    # Skip for now - continuation will lose reasoning context
+                    pass
+                elif item_type in {"tool_call", "function_call"}:
+                    # Tool calls - we'd need to include these but this is complex
+                    # For now, skip - incomplete with tool calls is edge case
+                    pass
+            else:
+                # Dictionary format
+                item_type = item.get("type")
+                if item_type == "message":
+                    content = item.get("content", [])
+                    for content_item in content:
+                        if content_item.get("type") == "output_text":
+                            text = content_item.get("text", "")
+                            if text:
+                                assistant_content.append({"type": "output_text", "text": text})
+
+        # If we extracted any assistant content, add as assistant message
+        if assistant_content:
+            continuation_input.append({"role": "assistant", "content": assistant_content})
+
+        return continuation_input
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
@@ -112,16 +190,18 @@ class OpenAIProvider:
         if max_length is None:
             max_length = self.debug_truncate_length
 
+        # Type guard: max_length is guaranteed to be int after this point
+        assert max_length is not None, "max_length should never be None after initialization"
+
         if isinstance(obj, str):
             if len(obj) > max_length:
                 return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
             return obj
-        elif isinstance(obj, dict):
+        if isinstance(obj, dict):
             return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
-        elif isinstance(obj, list):
+        if isinstance(obj, list):
             return [self._truncate_values(item, max_length) for item in obj]
-        else:
-            return obj  # Numbers, booleans, None pass through unchanged
+        return obj  # Numbers, booleans, None pass through unchanged
 
     def _find_missing_tool_results(self, messages: list) -> list[tuple[str, str, dict]]:
         """Find tool calls without matching results.
@@ -275,11 +355,45 @@ class OpenAIProvider:
             f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
         )
 
+        # Check for previous response metadata to preserve reasoning state across turns
+        previous_response_id = None
+        if message_list:
+            # Look at the last assistant message for metadata
+            for msg in reversed(message_list):
+                if msg.role == "assistant":
+                    # Check if message has our metadata
+                    msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else msg
+                    if isinstance(msg_dict, dict) and msg_dict.get("metadata"):
+                        metadata = msg_dict["metadata"]
+                        prev_id = metadata.get(METADATA_RESPONSE_ID)
+                        if prev_id:
+                            previous_response_id = prev_id
+                            logger.info(
+                                f"[PROVIDER] Found previous_response_id={prev_id} "
+                                f"from last assistant message - will preserve reasoning state"
+                            )
+                            break
+
         # Prepare request parameters per Responses API spec
         params = {
             "model": kwargs.get("model", self.default_model),
             "input": input_messages,  # Array of message objects, not text string
         }
+
+        # Determine store parameter early (needed for previous_response_id logic)
+        store_enabled = kwargs.get("store", self.enable_state)
+        params["store"] = store_enabled
+
+        # Add previous_response_id ONLY if store is enabled (server-side state)
+        # With store=False, we rely on explicit reasoning re-insertion instead
+        if previous_response_id and store_enabled:
+            params["previous_response_id"] = previous_response_id
+            logger.debug("[PROVIDER] Using previous_response_id (store=True)")
+        elif previous_response_id and not store_enabled:
+            logger.debug(
+                "[PROVIDER] Skipping previous_response_id (store=False). "
+                "Relying on explicit reasoning re-insertion from metadata/content."
+            )
 
         if instructions:
             params["instructions"] = instructions
@@ -302,8 +416,12 @@ class OpenAIProvider:
                 "effort": reasoning_effort,
                 "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
             }
-            # Request reasoning content if available
+
+        # CRITICAL: Always request encrypted_content with store=False for stateless reasoning preservation
+        # This is separate from reasoning effort - we need encrypted content even if effort not explicitly set
+        if not store_enabled:
             params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
+            logger.debug("[PROVIDER] Requesting encrypted_content (store=False, enables stateless reasoning)")
 
         # Add tools if provided
         if request.tools:
@@ -312,8 +430,9 @@ class OpenAIProvider:
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
             params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
 
-        # Add store parameter (required for some providers like Azure)
-        params["store"] = kwargs.get("store", False)
+        # Add truncation parameter for automatic context management
+        if self.truncation:
+            params["truncation"] = kwargs.get("truncation", self.truncation)
 
         logger.info(
             f"[PROVIDER] {self.api_label} API call - model: {params['model']}, has_instructions: {bool(instructions)}, tools: {len(request.tools) if request.tools else 0}"
@@ -404,6 +523,120 @@ class OpenAIProvider:
                     },
                 )
 
+            # Handle incomplete responses via auto-continuation
+            # OpenAI Responses API may return status="incomplete" with reason like "max_output_tokens"
+            # We automatically continue until complete to provide seamless experience
+            accumulated_output = list(response.output) if hasattr(response, "output") else []
+            final_response = response
+            continuation_count = 0
+
+            while (
+                hasattr(final_response, "status")
+                and final_response.status == "incomplete"
+                and continuation_count < MAX_CONTINUATION_ATTEMPTS
+            ):
+                continuation_count += 1
+
+                # Extract incomplete reason for logging
+                incomplete_reason = "unknown"
+                if hasattr(final_response, "incomplete_details"):
+                    details = final_response.incomplete_details
+                    if isinstance(details, dict):
+                        incomplete_reason = details.get("reason", "unknown")
+                    elif hasattr(details, "reason"):
+                        incomplete_reason = details.reason
+
+                logger.info(
+                    f"[PROVIDER] Response incomplete (reason: {incomplete_reason}), "
+                    f"auto-continuing with previous_response_id={final_response.id} "
+                    f"(continuation {continuation_count}/{MAX_CONTINUATION_ATTEMPTS})"
+                )
+
+                # Emit continuation event for observability
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "provider:incomplete_continuation",
+                        {
+                            "provider": self.name,
+                            "response_id": final_response.id,
+                            "reason": incomplete_reason,
+                            "continuation_number": continuation_count,
+                            "max_attempts": MAX_CONTINUATION_ATTEMPTS,
+                        },
+                    )
+
+                # Build continuation params using input-based pattern (stateless-compatible)
+                # Instead of previous_response_id (requires store:true), we include the
+                # accumulated output in the input to preserve context
+                continuation_input = self._build_continuation_input(input_messages, accumulated_output)
+
+                continue_params = {
+                    "model": params["model"],
+                    "input": continuation_input,
+                }
+
+                # Inherit important params if they were set
+                if "instructions" in params:
+                    continue_params["instructions"] = params["instructions"]
+                if "max_output_tokens" in params:
+                    continue_params["max_output_tokens"] = params["max_output_tokens"]
+                if "temperature" in params:
+                    continue_params["temperature"] = params["temperature"]
+                if "reasoning" in params:
+                    continue_params["reasoning"] = params["reasoning"]
+                if "include" in params:
+                    continue_params["include"] = params["include"]
+                if "tools" in params:
+                    continue_params["tools"] = params["tools"]
+                    continue_params["tool_choice"] = params.get("tool_choice", "auto")
+                    continue_params["parallel_tool_calls"] = params.get("parallel_tool_calls", True)
+                if "store" in params:
+                    continue_params["store"] = params["store"]
+
+                # Make continuation call
+                try:
+                    continue_start = time.time()
+                    final_response = await asyncio.wait_for(
+                        self.client.responses.create(**continue_params),
+                        timeout=self.timeout,
+                    )
+                    continue_elapsed = int((time.time() - continue_start) * 1000)
+                    elapsed_ms += continue_elapsed
+
+                    # Accumulate output from continuation
+                    if hasattr(final_response, "output"):
+                        accumulated_output.extend(final_response.output)
+
+                    # Emit raw debug for continuation if enabled
+                    if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
+                        await self.coordinator.hooks.emit(
+                            "llm:response:raw",
+                            {
+                                "lvl": "DEBUG",
+                                "provider": self.name,
+                                "response": final_response.model_dump(),
+                                "continuation": continuation_count,
+                            },
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
+                        f"Returning partial response from {continuation_count} continuation(s)"
+                    )
+                    break  # Return what we have so far
+
+            # Log completion summary
+            if continuation_count > 0:
+                final_status = getattr(final_response, "status", "unknown")
+                logger.info(
+                    f"[PROVIDER] Completed after {continuation_count} continuation(s), "
+                    f"final status: {final_status}, total time: {elapsed_ms}ms"
+                )
+
+            # Use the final response and accumulated output for conversion
+            response = final_response
+
             # Extract usage counts
             usage_obj = response.usage if hasattr(response, "usage") else None
             usage_counts = {"input": 0, "output": 0, "total": 0}
@@ -425,6 +658,7 @@ class OpenAIProvider:
                         "usage": {"input": usage_counts["input"], "output": usage_counts["output"]},
                         "status": "ok",
                         "duration_ms": elapsed_ms,
+                        "continuation_count": continuation_count if continuation_count > 0 else None,
                     },
                 )
 
@@ -439,10 +673,18 @@ class OpenAIProvider:
                             "response": self._truncate_values(response_dict),
                             "status": "ok",
                             "duration_ms": elapsed_ms,
+                            "continuation_count": continuation_count if continuation_count > 0 else None,
                         },
                     )
 
-            # Convert to ChatResponse
+            # Convert to ChatResponse with accumulated output
+            # If there were continuations, use the accumulated output; otherwise use response.output directly
+            if continuation_count > 0:
+                # Use new helper for accumulated output
+                return convert_response_with_accumulated_output(
+                    response, accumulated_output, continuation_count, OpenAIChatResponse
+                )
+            # Use existing conversion for normal (non-continued) responses
             return self._convert_to_chat_response(response)
 
         except Exception as e:
@@ -512,11 +754,91 @@ class OpenAIProvider:
 
             # Handle assistant messages
             if role == "assistant":
-                # For Responses API, only include text content in input
-                # Tool call details are inferred from tool definitions and results
-                if content:
-                    openai_messages.append({"role": "assistant", "content": [{"type": "output_text", "text": content}]})
-                # Skip assistant messages with no text content (tool-only messages)
+                assistant_content = []
+                reasoning_items_to_add = []  # Top-level reasoning items (not in message content)
+                metadata = msg.get("metadata", {})
+
+                # Handle structured content (list of blocks)
+                if isinstance(content, list):
+                    for block in content:
+                        # Handle dict blocks (from context storage)
+                        if isinstance(block, dict):
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                assistant_content.append({"type": "output_text", "text": block.get("text", "")})
+                            elif block_type == "thinking":
+                                # Extract reasoning state for top-level insertion
+                                # Reasoning items must be top-level in input, not in message content!
+                                block_content = block.get("content")
+                                if block_content and len(block_content) >= 2:
+                                    encrypted_content = block_content[0]
+                                    reasoning_id = block_content[1]
+                                    if reasoning_id:
+                                        reasoning_item = {"type": "reasoning", "id": reasoning_id}
+                                        if encrypted_content:
+                                            reasoning_item["encrypted_content"] = encrypted_content
+                                        # Add summary from thinking text
+                                        if block.get("thinking"):
+                                            reasoning_item["summary"] = [
+                                                {"type": "summary_text", "text": block["thinking"]}
+                                            ]
+                                        reasoning_items_to_add.append(reasoning_item)
+                        elif hasattr(block, "type"):
+                            # Handle ContentBlock objects (TextBlock, ThinkingBlock, etc.)
+                            if block.type == "text":
+                                assistant_content.append({"type": "output_text", "text": block.text})
+                            elif (
+                                block.type == "thinking"
+                                and hasattr(block, "content")
+                                and block.content
+                                and len(block.content) >= 2
+                            ):
+                                # Extract reasoning state for top-level insertion
+                                # Reasoning items must be top-level in input, not in message content!
+                                encrypted_content = block.content[0]
+                                reasoning_id = block.content[1]
+
+                                if reasoning_id:  # Only include if we have a reasoning ID
+                                    reasoning_item = {"type": "reasoning", "id": reasoning_id}
+
+                                    # Add encrypted content if available
+                                    if encrypted_content:
+                                        reasoning_item["encrypted_content"] = encrypted_content
+
+                                    # Add summary from thinking text
+                                    if hasattr(block, "thinking") and block.thinking:
+                                        reasoning_item["summary"] = [{"type": "summary_text", "text": block.thinking}]
+
+                                    reasoning_items_to_add.append(reasoning_item)
+
+                # Handle simple string content
+                elif isinstance(content, str) and content:
+                    assistant_content.append({"type": "output_text", "text": content})
+
+                # FALLBACK: If no reasoning items in content but metadata has them, log for visibility
+                # (Cannot reconstruct without encrypted_content, so previous_response_id is the fallback)
+                if metadata.get(METADATA_REASONING_ITEMS):
+                    has_reasoning_in_content = any(
+                        (isinstance(item, dict) and item.get("type") == "reasoning")
+                        or (hasattr(item, "get") and item.get("type") == "reasoning")
+                        for item in assistant_content
+                    )
+                    if not has_reasoning_in_content:
+                        logger.debug(
+                            "[PROVIDER] Reasoning IDs in metadata but not in content blocks. "
+                            "Using previous_response_id fallback for reasoning preservation. "
+                            "Consider updating orchestrator to preserve content blocks for optimal reasoning re-insertion."
+                        )
+
+                # Add reasoning items as TOP-LEVEL entries (before assistant message)
+                # Per OpenAI Responses API: reasoning items must be top-level, not in message content
+                for reasoning_item in reasoning_items_to_add:
+                    openai_messages.append(reasoning_item)
+
+                # Only add assistant message if there's content
+                if assistant_content:
+                    openai_messages.append({"role": "assistant", "content": assistant_content})
+
                 i += 1
 
             # Handle developer messages as XML-wrapped user messages
@@ -582,6 +904,7 @@ class OpenAIProvider:
         tool_calls = []
         event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
         text_accumulator: list[str] = []
+        reasoning_item_ids: list[str] = []  # Track reasoning IDs for metadata
 
         # Parse output blocks
         for block in response.output:
@@ -605,12 +928,22 @@ class OpenAIProvider:
                         event_blocks.append(TextContent(text=block_content))
 
                 elif block_type == "reasoning":
+                    # Extract reasoning ID and encrypted content for state preservation
+                    reasoning_id = getattr(block, "id", None)
+                    encrypted_content = getattr(block, "encrypted_content", None)
+
+                    # Track reasoning item ID for metadata (backward compat)
+                    if reasoning_id:
+                        reasoning_item_ids.append(reasoning_id)
+
                     # Extract reasoning summary if available
                     reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
 
-                    # OpenAI returns summary as list of objects with 'text' fields
-                    reasoning_text = None
-                    if isinstance(reasoning_summary, list):
+                    # Use helper to extract reasoning text
+                    reasoning_text = extract_reasoning_text(reasoning_summary)
+
+                    # Fallback to original logic if helper didn't find text
+                    if reasoning_text is None and isinstance(reasoning_summary, list):
                         # Extract text from list of summary objects (dict or Pydantic models)
                         texts = []
                         for item in reasoning_summary:
@@ -630,9 +963,21 @@ class OpenAIProvider:
 
                     # Only create thinking block if there's actual content
                     if reasoning_text:
-                        content_blocks.append(
-                            ThinkingBlock(thinking=reasoning_text, signature=None, visibility="internal")
+                        # Store reasoning state in content field for re-insertion
+                        # content[0] = encrypted_content (for full reasoning continuity)
+                        # content[1] = reasoning_id (rs_* ID for OpenAI)
+                        thinking_block = ThinkingBlock(
+                            thinking=reasoning_text,
+                            signature=None,
+                            visibility="internal",
+                            content=[encrypted_content, reasoning_id],
                         )
+                        logger.info(
+                            f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
+                            f"has_encrypted={encrypted_content is not None}, "
+                            f"enc_len={len(encrypted_content) if encrypted_content else 0}"
+                        )
+                        content_blocks.append(thinking_block)
                         event_blocks.append(ThinkingContent(text=reasoning_text))
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
@@ -673,12 +1018,22 @@ class OpenAIProvider:
                         event_blocks.append(TextContent(text=block_content, raw=block))
 
                 elif block_type == "reasoning":
-                    # Extract reasoning summary if available
-                    reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
+                    # Extract reasoning ID and encrypted content for state preservation
+                    reasoning_id = block.get("id")
+                    encrypted_content = block.get("encrypted_content")
 
-                    # OpenAI returns summary as list of objects with 'text' fields
-                    reasoning_text = None
-                    if isinstance(reasoning_summary, list):
+                    # Track reasoning item ID for metadata (backward compat)
+                    if reasoning_id:
+                        reasoning_item_ids.append(reasoning_id)
+
+                    # Extract reasoning summary if available
+                    reasoning_summary = block.get("summary") or block.get("text")
+
+                    # Use helper to extract reasoning text
+                    reasoning_text = extract_reasoning_text(reasoning_summary)
+
+                    # Fallback to original logic if helper didn't find text
+                    if reasoning_text is None and isinstance(reasoning_summary, list):
                         # Extract text from list of summary objects (dict or Pydantic models)
                         texts = []
                         for item in reasoning_summary:
@@ -698,9 +1053,21 @@ class OpenAIProvider:
 
                     # Only create thinking block if there's actual content
                     if reasoning_text:
-                        content_blocks.append(
-                            ThinkingBlock(thinking=reasoning_text, signature=None, visibility="internal")
+                        # Store reasoning state in content field for re-insertion
+                        # content[0] = encrypted_content (for full reasoning continuity)
+                        # content[1] = reasoning_id (rs_* ID for OpenAI)
+                        thinking_block = ThinkingBlock(
+                            thinking=reasoning_text,
+                            signature=None,
+                            visibility="internal",
+                            content=[encrypted_content, reasoning_id],
                         )
+                        logger.info(
+                            f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
+                            f"has_encrypted={encrypted_content is not None}, "
+                            f"enc_len={len(encrypted_content) if encrypted_content else 0}"
+                        )
+                        content_blocks.append(thinking_block)
                         event_blocks.append(ThinkingContent(text=reasoning_text))
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
@@ -742,13 +1109,45 @@ class OpenAIProvider:
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
+        # Build metadata with provider-specific state
+        metadata = {}
+
+        # Response ID (for next turn's previous_response_id)
+        if hasattr(response, "id"):
+            metadata[METADATA_RESPONSE_ID] = response.id
+
+        # Status (completed/incomplete)
+        if hasattr(response, "status"):
+            metadata[METADATA_STATUS] = response.status
+
+            # If incomplete, record the reason
+            if response.status == "incomplete":
+                incomplete_details = getattr(response, "incomplete_details", None)
+                if incomplete_details:
+                    if isinstance(incomplete_details, dict):
+                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get("reason")
+                    elif hasattr(incomplete_details, "reason"):
+                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.reason
+
+        # Reasoning item IDs (for explicit passing if needed)
+        if reasoning_item_ids:
+            metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
+
+        # DEBUG: Log what we're returning
+        logger.info(f"[PROVIDER] Returning ChatResponse with {len(content_blocks)} content blocks")
+        for i, block in enumerate(content_blocks):
+            block_type = block.type if hasattr(block, "type") else "unknown"
+            has_content = hasattr(block, "content") and block.content is not None
+            logger.info(f"[PROVIDER]   Block {i}: type={block_type}, has_content_field={has_content}")
+
         chat_response = OpenAIChatResponse(
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
-            finish_reason=getattr(response, "stop_reason", None),
+            finish_reason=getattr(response, "finish_reason", None),
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
+            metadata=metadata if metadata else None,
         )
 
         return chat_response

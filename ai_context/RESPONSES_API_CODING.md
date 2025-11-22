@@ -6,7 +6,7 @@ This guide is a practical reference for formatting a `/v1/responses` request tha
 
 A well-formed Responses API request typically includes:
 
-- `model` – the model slug (e.g., `gpt-5-codex`, `o4-mini`).
+- `model` – the model slug (e.g., `gpt-5.1-codex`, `o4-mini`).
 - `instructions` – global guidance (AGENTS.md, developer instructions, etc.).
 - `input` – the conversation history, expressed as an array of message objects.
 - `tools` – a list of available tool definitions, each with JSON Schema metadata.
@@ -19,7 +19,7 @@ Example request assembled from `temp.json`, simplified for readability:
 
 ```json
 {
-  "model": "gpt-5-codex",
+  "model": "gpt-5.1-codex",
   "instructions": "# AGENTS.md instructions...\n<INSTRUCTIONS> ...",
   "input": [
     {
