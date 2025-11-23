@@ -88,7 +88,9 @@ class OpenAIProvider:
         if client is None:
             if api_key is None:
                 raise ValueError("api_key or client must be provided")
-            self.client = AsyncOpenAI(api_key=api_key)
+            # Get base_url from config for custom endpoints (Azure OpenAI, local APIs, etc.)
+            base_url = config.get("base_url") if config else None
+            self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         else:
             self.client = client
             if api_key is None:
@@ -97,6 +99,7 @@ class OpenAIProvider:
         self.coordinator = coordinator
 
         # Configuration with sensible defaults (from _constants.py - single source of truth)
+        self.base_url = self.config.get("base_url", None)  # Optional custom endpoint (None = OpenAI default)
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
         self.max_tokens = self.config.get("max_tokens", DEFAULT_MAX_TOKENS)
         self.temperature = self.config.get("temperature", None)  # None = not sent (some models don't support it)

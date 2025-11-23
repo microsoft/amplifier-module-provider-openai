@@ -41,6 +41,7 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 module = "provider-openai"
 name = "openai"
 config = {
+    base_url = null,                 # Optional custom endpoint (null = OpenAI default)
     default_model = "gpt-5.1-codex",
     max_tokens = 4096,
     temperature = 0.7,
@@ -56,23 +57,26 @@ config = {
 ### Debug Configuration
 
 **Standard Debug** (`debug: true`):
+
 - Emits `llm:request:debug` and `llm:response:debug` events
 - Contains request/response summaries with message counts, model info, usage stats
 - Moderate log volume, suitable for development
 
 **Raw Debug** (`debug: true, raw_debug: true`):
+
 - Emits `llm:request:raw` and `llm:response:raw` events
 - Contains complete, unmodified request params and response objects
 - Extreme log volume, use only for deep provider integration debugging
 - Captures the exact data sent to/from OpenAI API before any processing
 
 **Example**:
+
 ```yaml
 providers:
   - module: provider-openai
     config:
-      debug: true      # Enable debug events
-      raw_debug: true  # Enable raw API I/O capture
+      debug: true # Enable debug events
+      raw_debug: true # Enable raw API I/O capture
       default_model: gpt-5.1-codex
 ```
 
@@ -147,6 +151,7 @@ them.
 The provider automatically handles incomplete responses from the OpenAI Responses API:
 
 **The Problem**: OpenAI may return `status: "incomplete"` when generation is cut off due to:
+
 - `max_output_tokens` limit reached
 - Content filter triggered
 - Other API constraints
@@ -159,6 +164,7 @@ The provider automatically handles incomplete responses from the OpenAI Response
 4. **Full observability** - Emits `provider:incomplete_continuation` events for each continuation
 
 **Example flow**:
+
 ```python
 # User request triggers large response
 response = await provider.complete(request)
@@ -173,12 +179,14 @@ response = await provider.complete(request)
 ```
 
 **Configuration**: Set maximum continuation attempts (default: 5):
+
 ```python
 # In _constants.py
 MAX_CONTINUATION_ATTEMPTS = 5  # Prevents infinite loops
 ```
 
 **Observability**: Monitor via events in session logs:
+
 ```json
 {
   "event": "provider:incomplete_continuation",
@@ -194,9 +202,10 @@ MAX_CONTINUATION_ATTEMPTS = 5  # Prevents infinite loops
 
 The provider preserves reasoning state across conversation **steps** for improved multi-turn performance:
 
-**The Problem**: Reasoning models (o3, o4, gpt-5.1) produce internal reasoning traces (rs_* IDs) that improve subsequent responses by ~3-5% when preserved. This is especially critical when tool calls are involved.
+**The Problem**: Reasoning models (o3, o4, gpt-5.1) produce internal reasoning traces (rs\_\* IDs) that improve subsequent responses by ~3-5% when preserved. This is especially critical when tool calls are involved.
 
 **Important Distinction**:
+
 - **Turn**: A user prompt → (possibly multiple API calls) → final assistant response
 - **Step**: Each individual API call within a turn (tool call loops = multiple steps per turn)
 - **Reasoning items must be preserved across STEPS, not just TURNS**
@@ -209,6 +218,7 @@ The provider preserves reasoning state across conversation **steps** for improve
 4. **Maintains metadata** - Also tracks reasoning IDs in metadata for backward compatibility
 
 **How it works** (tool call example showing step-by-step preservation):
+
 ```python
 # Step 1: User asks question requiring tool
 response_1 = await provider.complete(request)
@@ -239,8 +249,8 @@ response_2 = await provider.complete(request_with_tool_result)
 
 **Key insight from OpenAI docs**: "While this is another API call, we consider this as a single turn in the conversation." Reasoning must be preserved across steps (API calls) within the same turn, especially when tools are involved.
 
-
 **Benefits**:
+
 - **More robust** - Explicit re-insertion doesn't rely on server-side state
 - **Stateless compatible** - Works with `store: false` configuration
 - **Better multi-turn performance** - ~5% improvement per OpenAI benchmarks
@@ -256,6 +266,7 @@ The provider supports automatic conversation history management via the `truncat
 **The Solution**: OpenAI's `truncation: "auto"` parameter automatically drops older messages when approaching context limits.
 
 **Configuration**:
+
 ```yaml
 providers:
   - module: provider-openai
@@ -266,18 +277,21 @@ providers:
 ```
 
 **How it works**:
+
 - OpenAI automatically removes oldest messages when context limit approached
 - FIFO (first-in, first-out) - most recent messages preserved
 - Transparent to application - no errors or warnings
 - Works with all conversation types (reasoning, tools, multi-turn)
 
 **Trade-offs**:
+
 - ✅ **Simplicity** - No manual context management needed
 - ✅ **Reliability** - Never hits context limit errors
 - ❌ **Control** - Can't specify which messages to drop
 - ❌ **Predictability** - Drop timing depends on token counts
 
 **When to use**:
+
 - **Auto truncation** - For user-facing applications where simplicity matters
 - **Manual control** - For debugging, analysis, or when specific messages must be preserved
 
@@ -287,15 +301,16 @@ providers:
 
 The provider populates `ChatResponse.metadata` with OpenAI-specific state:
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `openai:response_id` | `str` | Response ID for continuation and reasoning preservation |
-| `openai:status` | `str` | Response status: `"completed"` or `"incomplete"` |
-| `openai:incomplete_reason` | `str` | Reason if incomplete: `"max_output_tokens"` or `"content_filter"` |
-| `openai:reasoning_items` | `list[str]` | Reasoning item IDs (rs_*) for state preservation |
-| `openai:continuation_count` | `int` | Number of auto-continuations performed (if > 0) |
+| Key                         | Type        | Description                                                       |
+| --------------------------- | ----------- | ----------------------------------------------------------------- |
+| `openai:response_id`        | `str`       | Response ID for continuation and reasoning preservation           |
+| `openai:status`             | `str`       | Response status: `"completed"` or `"incomplete"`                  |
+| `openai:incomplete_reason`  | `str`       | Reason if incomplete: `"max_output_tokens"` or `"content_filter"` |
+| `openai:reasoning_items`    | `list[str]` | Reasoning item IDs (rs\_\*) for state preservation                |
+| `openai:continuation_count` | `int`       | Number of auto-continuations performed (if > 0)                   |
 
 **Example metadata**:
+
 ```python
 {
     "openai:response_id": "resp_05fb664e4d9dca6a016920b9b1153c819487f88da867114925",
@@ -321,6 +336,7 @@ The provider implements graceful degradation for incomplete tool call sequences:
 4. **Provide observability** - Emits `provider:tool_sequence_repaired` event with details
 
 **Example**:
+
 ```python
 # Broken conversation history (missing tool result)
 messages = [
