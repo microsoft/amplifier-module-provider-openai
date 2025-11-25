@@ -13,7 +13,9 @@ import time
 from typing import Any
 from typing import cast
 
+from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
+from amplifier_core import ProviderInfo
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
@@ -114,6 +116,79 @@ class OpenAIProvider:
 
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
+
+    def get_info(self) -> ProviderInfo:
+        """Get provider metadata."""
+        return ProviderInfo(
+            id="openai",
+            display_name="OpenAI",
+            credential_env_vars=["OPENAI_API_KEY"],
+            capabilities=["streaming", "tools", "vision", "reasoning", "batch", "json_mode"],
+            defaults={
+                "model": "gpt-4.1",
+                "max_tokens": 16384,
+                "temperature": None,  # Model default
+                "timeout": 300.0,
+            },
+        )
+
+    async def list_models(self) -> list[ModelInfo]:
+        """
+        List available OpenAI models.
+
+        Returns hardcoded list of known models since OpenAI models API
+        returns many fine-tunes and deprecated models.
+        """
+        return [
+            ModelInfo(
+                id="gpt-4.1",
+                display_name="GPT-4.1",
+                context_window=1047576,
+                max_output_tokens=32768,
+                capabilities=["tools", "vision", "reasoning", "streaming", "json_mode"],
+                defaults={"max_tokens": 16384},
+            ),
+            ModelInfo(
+                id="gpt-4.1-mini",
+                display_name="GPT-4.1 Mini",
+                context_window=1047576,
+                max_output_tokens=32768,
+                capabilities=["tools", "vision", "reasoning", "streaming", "json_mode", "fast"],
+                defaults={"max_tokens": 16384},
+            ),
+            ModelInfo(
+                id="gpt-4o",
+                display_name="GPT-4o",
+                context_window=128000,
+                max_output_tokens=16384,
+                capabilities=["tools", "vision", "streaming", "json_mode"],
+                defaults={"max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="gpt-4o-mini",
+                display_name="GPT-4o Mini",
+                context_window=128000,
+                max_output_tokens=16384,
+                capabilities=["tools", "vision", "streaming", "json_mode", "fast"],
+                defaults={"max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="o3",
+                display_name="o3",
+                context_window=200000,
+                max_output_tokens=100000,
+                capabilities=["tools", "reasoning", "streaming"],
+                defaults={"reasoning": "medium"},
+            ),
+            ModelInfo(
+                id="o4-mini",
+                display_name="o4-mini",
+                context_window=200000,
+                max_output_tokens=100000,
+                capabilities=["tools", "reasoning", "streaming", "fast"],
+                defaults={"reasoning": "medium"},
+            ),
+        ]
 
     def _build_continuation_input(self, original_input: list, accumulated_output: list) -> list:
         """Build input for continuation call in stateless mode.
