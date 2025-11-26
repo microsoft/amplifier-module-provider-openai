@@ -140,6 +140,15 @@ class OpenAIProvider:
                     env_var="OPENAI_API_KEY",
                 ),
                 ConfigField(
+                    id="base_url",
+                    display_name="API Base URL",
+                    field_type="text",
+                    prompt="API base URL",
+                    env_var="OPENAI_BASE_URL",
+                    required=False,
+                    default="https://api.openai.com/v1",
+                ),
+                ConfigField(
                     id="reasoning_effort",
                     display_name="Reasoning Effort",
                     field_type="choice",
@@ -147,6 +156,7 @@ class OpenAIProvider:
                     choices=["none", "minimal", "low", "medium", "high"],
                     default="none",
                     required=False,
+                    requires_model=True,  # Shown after model selection
                 ),
             ],
         )
@@ -155,12 +165,51 @@ class OpenAIProvider:
         """
         List available OpenAI models.
 
-        Returns hardcoded list of current models with reasoning support.
+        Queries the OpenAI API for available models and filters to GPT-5+ series.
+        Falls back to hardcoded list if API query fails.
         """
+        try:
+            # Query OpenAI models API
+            models_response = await self.client.models.list()
+            models = []
+
+            for model in models_response.data:
+                model_id = model.id
+
+                # Filter to GPT-5+ series models only
+                if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6")):
+                    continue
+
+                # Generate display name from model ID
+                display_name = self._model_id_to_display_name(model_id)
+
+                # Determine capabilities based on model type
+                capabilities = ["tools", "vision", "reasoning", "streaming", "json_mode"]
+                if "mini" in model_id:
+                    capabilities.append("fast")
+
+                models.append(
+                    ModelInfo(
+                        id=model_id,
+                        display_name=display_name,
+                        context_window=400000,  # GPT-5 series default
+                        max_output_tokens=128000,
+                        capabilities=capabilities,
+                        defaults={"max_tokens": 16384, "reasoning_effort": "none"},
+                    )
+                )
+
+            if models:
+                return models
+
+        except Exception as e:
+            logger.debug(f"Failed to list OpenAI models dynamically: {e}")
+
+        # Fallback to hardcoded list
         return [
             ModelInfo(
                 id="gpt-5.1",
-                display_name="GPT-5.1",
+                display_name="GPT 5.1",
                 context_window=400000,
                 max_output_tokens=128000,
                 capabilities=["tools", "vision", "reasoning", "streaming", "json_mode"],
@@ -168,7 +217,7 @@ class OpenAIProvider:
             ),
             ModelInfo(
                 id="gpt-5.1-codex",
-                display_name="GPT-5.1 Codex",
+                display_name="GPT-5.1 codex",
                 context_window=400000,
                 max_output_tokens=128000,
                 capabilities=["tools", "vision", "reasoning", "streaming", "json_mode"],
@@ -176,13 +225,38 @@ class OpenAIProvider:
             ),
             ModelInfo(
                 id="gpt-5-mini",
-                display_name="GPT-5 Mini",
+                display_name="GPT-5 mini",
                 context_window=400000,
                 max_output_tokens=128000,
                 capabilities=["tools", "vision", "reasoning", "streaming", "json_mode", "fast"],
                 defaults={"max_tokens": 16384, "reasoning_effort": "none"},
             ),
         ]
+
+    def _model_id_to_display_name(self, model_id: str) -> str:
+        """Convert model ID to display name with proper capitalization.
+
+        Examples:
+            gpt-5.1 -> GPT 5.1
+            gpt-5.1-codex -> GPT-5.1 codex
+            gpt-5-mini -> GPT-5 mini
+        """
+        # Known display name mappings
+        display_names = {
+            "gpt-5.1": "GPT 5.1",
+            "gpt-5.1-codex": "GPT-5.1 codex",
+            "gpt-5-mini": "GPT-5 mini",
+        }
+
+        if model_id in display_names:
+            return display_names[model_id]
+
+        # Generate from ID: capitalize GPT, keep rest lowercase
+        if model_id.startswith("gpt-"):
+            parts = model_id.split("-", 1)
+            if len(parts) == 2:
+                return f"GPT-{parts[1]}"
+        return model_id
 
     def _build_continuation_input(self, original_input: list, accumulated_output: list) -> list:
         """Build input for continuation call in stateless mode.
