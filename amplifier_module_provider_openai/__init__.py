@@ -13,6 +13,7 @@ import time
 from typing import Any
 from typing import cast
 
+from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
@@ -125,68 +126,61 @@ class OpenAIProvider:
             credential_env_vars=["OPENAI_API_KEY"],
             capabilities=["streaming", "tools", "vision", "reasoning", "batch", "json_mode"],
             defaults={
-                "model": "gpt-4.1",
+                "model": "gpt-5.1",
                 "max_tokens": 16384,
                 "temperature": None,  # Model default
                 "timeout": 300.0,
             },
+            config_fields=[
+                ConfigField(
+                    id="api_key",
+                    display_name="API Key",
+                    field_type="secret",
+                    prompt="Enter your OpenAI API key",
+                    env_var="OPENAI_API_KEY",
+                ),
+                ConfigField(
+                    id="reasoning_effort",
+                    display_name="Reasoning Effort",
+                    field_type="choice",
+                    prompt="Select reasoning effort level",
+                    choices=["none", "minimal", "low", "medium", "high"],
+                    default="none",
+                    required=False,
+                ),
+            ],
         )
 
     async def list_models(self) -> list[ModelInfo]:
         """
         List available OpenAI models.
 
-        Returns hardcoded list of known models since OpenAI models API
-        returns many fine-tunes and deprecated models.
+        Returns hardcoded list of current models with reasoning support.
         """
         return [
             ModelInfo(
-                id="gpt-4.1",
-                display_name="GPT-4.1",
-                context_window=1047576,
-                max_output_tokens=32768,
+                id="gpt-5.1",
+                display_name="GPT-5.1",
+                context_window=400000,
+                max_output_tokens=128000,
                 capabilities=["tools", "vision", "reasoning", "streaming", "json_mode"],
-                defaults={"max_tokens": 16384},
+                defaults={"max_tokens": 16384, "reasoning_effort": "none"},
             ),
             ModelInfo(
-                id="gpt-4.1-mini",
-                display_name="GPT-4.1 Mini",
-                context_window=1047576,
-                max_output_tokens=32768,
+                id="gpt-5.1-codex",
+                display_name="GPT-5.1 Codex",
+                context_window=400000,
+                max_output_tokens=128000,
+                capabilities=["tools", "vision", "reasoning", "streaming", "json_mode"],
+                defaults={"max_tokens": 16384, "reasoning_effort": "none"},
+            ),
+            ModelInfo(
+                id="gpt-5-mini",
+                display_name="GPT-5 Mini",
+                context_window=400000,
+                max_output_tokens=128000,
                 capabilities=["tools", "vision", "reasoning", "streaming", "json_mode", "fast"],
-                defaults={"max_tokens": 16384},
-            ),
-            ModelInfo(
-                id="gpt-4o",
-                display_name="GPT-4o",
-                context_window=128000,
-                max_output_tokens=16384,
-                capabilities=["tools", "vision", "streaming", "json_mode"],
-                defaults={"max_tokens": 4096},
-            ),
-            ModelInfo(
-                id="gpt-4o-mini",
-                display_name="GPT-4o Mini",
-                context_window=128000,
-                max_output_tokens=16384,
-                capabilities=["tools", "vision", "streaming", "json_mode", "fast"],
-                defaults={"max_tokens": 4096},
-            ),
-            ModelInfo(
-                id="o3",
-                display_name="o3",
-                context_window=200000,
-                max_output_tokens=100000,
-                capabilities=["tools", "reasoning", "streaming"],
-                defaults={"reasoning": "medium"},
-            ),
-            ModelInfo(
-                id="o4-mini",
-                display_name="o4-mini",
-                context_window=200000,
-                max_output_tokens=100000,
-                capabilities=["tools", "reasoning", "streaming", "fast"],
-                defaults={"reasoning": "medium"},
+                defaults={"max_tokens": 16384, "reasoning_effort": "none"},
             ),
         ]
 
