@@ -5,6 +5,9 @@ Integrates with OpenAI's Responses API.
 
 __all__ = ["mount", "OpenAIProvider"]
 
+# Amplifier module metadata
+__amplifier_module_type__ = "provider"
+
 import asyncio
 import json
 import logging
