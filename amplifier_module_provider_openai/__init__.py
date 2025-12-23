@@ -899,31 +899,66 @@ class OpenAIProvider:
                 i += 1
                 continue
 
-            # Handle tool result messages
+            # Handle tool result messages - use native function_call_output format
             if role == "tool":
-                # For OpenAI Responses API, convert tool results to text
-                # API doesn't support tool_result content type - use input_text
-                tool_results_parts = []
                 while i < len(messages) and messages[i].get("role") == "tool":
                     tool_msg = messages[i]
-                    tool_name = tool_msg.get("tool_name", "unknown")
+                    tool_call_id = tool_msg.get("tool_call_id")
                     tool_content = tool_msg.get("content", "")
+                    tool_name = tool_msg.get("tool_name", "unknown")
 
-                    # Format as text for API
-                    tool_results_parts.append(f"[Tool: {tool_name}]\n{tool_content}")
+                    if tool_call_id:
+                        # Native format: function_call_output with call_id for explicit correlation
+                        # Per OpenAI Responses API spec (see ai_context/openai-api-guide.txt)
+                        output_str = tool_content if isinstance(tool_content, str) else json.dumps(tool_content)
+                        openai_messages.append(
+                            {
+                                "type": "function_call_output",
+                                "call_id": tool_call_id,
+                                "output": output_str,
+                            }
+                        )
+                    else:
+                        # Fallback for messages without tool_call_id (legacy/compacted messages)
+                        logger.warning(
+                            f"Tool result missing tool_call_id for '{tool_name}', using text fallback. "
+                            "This may reduce model accuracy for multi-tool scenarios."
+                        )
+                        openai_messages.append(
+                            {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": f"[Tool: {tool_name}]\n{tool_content}"}],
+                            }
+                        )
                     i += 1
-
-                # Add as user message with combined tool results as text
-                if tool_results_parts:
-                    combined_text = "\n\n".join(tool_results_parts)
-                    openai_messages.append({"role": "user", "content": [{"type": "input_text", "text": combined_text}]})
                 continue
 
             # Handle assistant messages
             if role == "assistant":
                 assistant_content = []
                 reasoning_items_to_add = []  # Top-level reasoning items (not in message content)
+                function_call_items = []  # function_call items to add as top-level
                 metadata = msg.get("metadata", {})
+
+                # Handle tool_calls field (from context storage, Anthropic-style)
+                tool_calls_field = msg.get("tool_calls", [])
+                for tc in tool_calls_field:
+                    tc_id = tc.get("id") or tc.get("tool_call_id", "")
+                    tc_name = tc.get("name", "")
+                    tc_args = tc.get("arguments") or tc.get("input", {})
+                    if isinstance(tc_args, str):
+                        tc_args_str = tc_args
+                    else:
+                        tc_args_str = json.dumps(tc_args) if tc_args else "{}"
+                    if tc_id and tc_name:
+                        function_call_items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": tc_id,
+                                "name": tc_name,
+                                "arguments": tc_args_str,
+                            }
+                        )
 
                 # Handle structured content (list of blocks)
                 if isinstance(content, list):
@@ -933,6 +968,24 @@ class OpenAIProvider:
                             block_type = block.get("type")
                             if block_type == "text":
                                 assistant_content.append({"type": "output_text", "text": block.get("text", "")})
+                            elif block_type == "tool_call":
+                                # Convert tool_call block to function_call item
+                                tc_id = block.get("id", "")
+                                tc_name = block.get("name", "")
+                                tc_input = block.get("input", {})
+                                if isinstance(tc_input, str):
+                                    tc_args_str = tc_input
+                                else:
+                                    tc_args_str = json.dumps(tc_input) if tc_input else "{}"
+                                if tc_id and tc_name:
+                                    function_call_items.append(
+                                        {
+                                            "type": "function_call",
+                                            "call_id": tc_id,
+                                            "name": tc_name,
+                                            "arguments": tc_args_str,
+                                        }
+                                    )
                             elif block_type == "thinking":
                                 # Extract reasoning state for top-level insertion
                                 # Reasoning items must be top-level in input, not in message content!
@@ -951,9 +1004,27 @@ class OpenAIProvider:
                                             ]
                                         reasoning_items_to_add.append(reasoning_item)
                         elif hasattr(block, "type"):
-                            # Handle ContentBlock objects (TextBlock, ThinkingBlock, etc.)
+                            # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
                             if block.type == "text":
                                 assistant_content.append({"type": "output_text", "text": block.text})
+                            elif block.type == "tool_call":
+                                # Convert ToolCallBlock to function_call item
+                                tc_id = getattr(block, "id", "")
+                                tc_name = getattr(block, "name", "")
+                                tc_input = getattr(block, "input", {})
+                                if isinstance(tc_input, str):
+                                    tc_args_str = tc_input
+                                else:
+                                    tc_args_str = json.dumps(tc_input) if tc_input else "{}"
+                                if tc_id and tc_name:
+                                    function_call_items.append(
+                                        {
+                                            "type": "function_call",
+                                            "call_id": tc_id,
+                                            "name": tc_name,
+                                            "arguments": tc_args_str,
+                                        }
+                                    )
                             elif (
                                 block.type == "thinking"
                                 and hasattr(block, "content")
@@ -1005,6 +1076,11 @@ class OpenAIProvider:
                 # Only add assistant message if there's content
                 if assistant_content:
                     openai_messages.append({"role": "assistant", "content": assistant_content})
+
+                # Add function_call items as TOP-LEVEL entries (after assistant message)
+                # Per OpenAI Responses API: function_call items are separate from message content
+                for fc_item in function_call_items:
+                    openai_messages.append(fc_item)
 
                 i += 1
 
