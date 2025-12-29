@@ -90,17 +90,13 @@ class OpenAIProvider:
         coordinator: ModuleCoordinator | None = None,
         client: AsyncOpenAI | None = None,
     ):
-        """Initialize OpenAI provider with Responses API client."""
-        if client is None:
-            if api_key is None:
-                raise ValueError("api_key or client must be provided")
-            # Get base_url from config for custom endpoints (Azure OpenAI, local APIs, etc.)
-            base_url = config.get("base_url") if config else None
-            self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        else:
-            self.client = client
-            if api_key is None:
-                api_key = "injected-client"
+        """Initialize OpenAI provider with Responses API client.
+        
+        The SDK client is created lazily on first use, allowing get_info()
+        to work without valid credentials.
+        """
+        self._api_key = api_key
+        self._client: AsyncOpenAI | None = client  # Lazy init if None
         self.config = config or {}
         self.coordinator = coordinator
 
@@ -126,6 +122,15 @@ class OpenAIProvider:
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Lazily initialize the OpenAI client on first access."""
+        if self._client is None:
+            if self._api_key is None:
+                raise ValueError("api_key or client must be provided for API calls")
+            self._client = AsyncOpenAI(api_key=self._api_key, base_url=self.base_url)
+        return self._client
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
