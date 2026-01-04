@@ -221,7 +221,8 @@ class OpenAIProvider:
                 )
             )
 
-        return models
+        # Sort alphabetically by display name
+        return sorted(models, key=lambda m: m.display_name.lower())
 
     def _model_id_to_display_name(self, model_id: str) -> str:
         """Convert model ID to display name with proper capitalization.
