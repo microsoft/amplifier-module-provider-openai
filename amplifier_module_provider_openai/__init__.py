@@ -182,72 +182,39 @@ class OpenAIProvider:
         List available OpenAI models.
 
         Queries the OpenAI API for available models and filters to GPT-5+ series.
-        Falls back to hardcoded list if API query fails.
+        Raises exception if API query fails (no fallback - caller handles empty lists).
         """
-        try:
-            # Query OpenAI models API
-            models_response = await self.client.models.list()
-            models = []
+        # Query OpenAI models API - let exceptions propagate
+        models_response = await self.client.models.list()
+        models = []
 
-            for model in models_response.data:
-                model_id = model.id
+        for model in models_response.data:
+            model_id = model.id
 
-                # Filter to GPT-5+ series models only
-                if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6")):
-                    continue
+            # Filter to GPT-5+ series models only
+            if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6")):
+                continue
 
-                # Generate display name from model ID
-                display_name = self._model_id_to_display_name(model_id)
+            # Generate display name from model ID
+            display_name = self._model_id_to_display_name(model_id)
 
-                # Determine capabilities based on model type
-                capabilities = ["tools", "vision", "reasoning", "streaming", "json_mode"]
-                if "mini" in model_id:
-                    capabilities.append("fast")
+            # Determine capabilities based on model type
+            capabilities = ["tools", "vision", "reasoning", "streaming", "json_mode"]
+            if "mini" in model_id:
+                capabilities.append("fast")
 
-                models.append(
-                    ModelInfo(
-                        id=model_id,
-                        display_name=display_name,
-                        context_window=400000,  # GPT-5 series default
-                        max_output_tokens=128000,
-                        capabilities=capabilities,
-                        defaults={"max_tokens": 16384, "reasoning_effort": "none"},
-                    )
+            models.append(
+                ModelInfo(
+                    id=model_id,
+                    display_name=display_name,
+                    context_window=400000,  # GPT-5 series default
+                    max_output_tokens=128000,
+                    capabilities=capabilities,
+                    defaults={"max_tokens": 16384, "reasoning_effort": "none"},
                 )
+            )
 
-            if models:
-                return models
-
-        except Exception as e:
-            logger.debug(f"Failed to list OpenAI models dynamically: {e}")
-
-        # Fallback to hardcoded list
-        return [
-            ModelInfo(
-                id="gpt-5.1",
-                display_name="GPT 5.1",
-                context_window=400000,
-                max_output_tokens=128000,
-                capabilities=["tools", "vision", "reasoning", "streaming", "json_mode"],
-                defaults={"max_tokens": 16384, "reasoning_effort": "none"},
-            ),
-            ModelInfo(
-                id="gpt-5.1-codex",
-                display_name="GPT-5.1 codex",
-                context_window=400000,
-                max_output_tokens=128000,
-                capabilities=["tools", "vision", "reasoning", "streaming", "json_mode"],
-                defaults={"max_tokens": 16384, "reasoning_effort": "none"},
-            ),
-            ModelInfo(
-                id="gpt-5-mini",
-                display_name="GPT-5 mini",
-                context_window=400000,
-                max_output_tokens=128000,
-                capabilities=["tools", "vision", "reasoning", "streaming", "json_mode", "fast"],
-                defaults={"max_tokens": 16384, "reasoning_effort": "none"},
-            ),
-        ]
+        return models
 
     def _model_id_to_display_name(self, model_id: str) -> str:
         """Convert model ID to display name with proper capitalization.
