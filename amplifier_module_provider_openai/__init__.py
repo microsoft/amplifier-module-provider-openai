@@ -113,6 +113,7 @@ class OpenAIProvider:
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
         self.debug_truncate_length = self.config.get("debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH)
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
+        self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
 
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
@@ -138,7 +139,7 @@ class OpenAIProvider:
             id="openai",
             display_name="OpenAI",
             credential_env_vars=["OPENAI_API_KEY"],
-            capabilities=["streaming", "tools", "vision", "reasoning", "batch", "json_mode"],
+            capabilities=["streaming", "tools", "reasoning", "batch", "json_mode"],
             defaults={
                 "model": "gpt-5.1",
                 "max_tokens": 16384,
@@ -188,6 +189,8 @@ class OpenAIProvider:
         models_response = await self.client.models.list()
         models = []
 
+        import re as regex_module
+
         for model in models_response.data:
             model_id = model.id
 
@@ -195,12 +198,16 @@ class OpenAIProvider:
             if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6")):
                 continue
 
+            # Skip dated versions when filtered (e.g., gpt-5-2025-08-07) - duplicates of aliases
+            if self.filtered and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id):
+                continue
+
             # Generate display name from model ID
             display_name = self._model_id_to_display_name(model_id)
 
             # Determine capabilities based on model type
-            capabilities = ["tools", "vision", "reasoning", "streaming", "json_mode"]
-            if "mini" in model_id:
+            capabilities = ["tools", "reasoning", "streaming", "json_mode"]
+            if "mini" in model_id or "nano" in model_id:
                 capabilities.append("fast")
 
             models.append(
