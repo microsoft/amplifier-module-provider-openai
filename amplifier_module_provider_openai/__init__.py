@@ -1097,12 +1097,38 @@ class OpenAIProvider:
 
             # Handle user messages
             elif role == "user":
-                openai_messages.append(
-                    {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": content}] if isinstance(content, str) else content,
-                    }
-                )
+                # Handle structured content (list of blocks including text and images)
+                if isinstance(content, list):
+                    content_items = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                content_items.append({"type": "input_text", "text": block.get("text", "")})
+                            elif block_type == "image":
+                                # Convert ImageBlock to OpenAI Responses API input_image format
+                                source = block.get("source", {})
+                                if source.get("type") == "base64":
+                                    # OpenAI uses data URI format: data:image/jpeg;base64,{data}
+                                    media_type = source.get("media_type", "image/jpeg")
+                                    data = source.get("data", "")
+                                    content_items.append({
+                                        "type": "input_image",
+                                        "image_url": f"data:{media_type};base64,{data}"
+                                    })
+                                else:
+                                    logger.warning(f"Unsupported image source type: {source.get('type')}")
+                    
+                    if content_items:
+                        openai_messages.append({"role": "user", "content": content_items})
+                else:
+                    # Simple string content
+                    openai_messages.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": content}],
+                        }
+                    )
                 i += 1
             else:
                 # Unknown role - skip
