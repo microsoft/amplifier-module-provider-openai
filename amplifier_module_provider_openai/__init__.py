@@ -28,18 +28,25 @@ from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import ToolCall
 from openai import AsyncOpenAI
 
+from ._constants import BACKGROUND_POLLING_STATUSES
+from ._constants import BACKGROUND_STATUS_COMPLETED
+from ._constants import BACKGROUND_STATUS_FAILED
+from ._constants import DEFAULT_BACKGROUND_TIMEOUT
 from ._constants import DEFAULT_DEBUG_TRUNCATE_LENGTH
 from ._constants import DEFAULT_MAX_TOKENS
 from ._constants import DEFAULT_MODEL
+from ._constants import DEFAULT_POLL_INTERVAL
 from ._constants import DEFAULT_REASONING_SUMMARY
 from ._constants import DEFAULT_TIMEOUT
 from ._constants import DEFAULT_TRUNCATION
+from ._constants import DEEP_RESEARCH_MODELS
 from ._constants import MAX_CONTINUATION_ATTEMPTS
 from ._constants import METADATA_CONTINUATION_COUNT
 from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
+from ._constants import NATIVE_TOOL_TYPES
 from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import extract_reasoning_text
 
@@ -115,6 +122,10 @@ class OpenAIProvider:
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
         self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
 
+        # Deep research / background mode configuration
+        self.poll_interval = self.config.get("poll_interval", DEFAULT_POLL_INTERVAL)
+        self.background_timeout = self.config.get("background_timeout", DEFAULT_BACKGROUND_TIMEOUT)
+
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
 
@@ -182,7 +193,8 @@ class OpenAIProvider:
         """
         List available OpenAI models.
 
-        Queries the OpenAI API for available models and filters to GPT-5+ series.
+        Queries the OpenAI API for available models and filters to GPT-5+ series
+        and deep research models.
         Raises exception if API query fails (no fallback - caller handles empty lists).
         """
         # Query OpenAI models API - let exceptions propagate
@@ -194,30 +206,45 @@ class OpenAIProvider:
         for model in models_response.data:
             model_id = model.id
 
-            # Filter to GPT-5+ series models only
-            if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6")):
+            # Check if this is a deep research model
+            is_deep_research = model_id in DEEP_RESEARCH_MODELS or model_id.startswith(
+                ("o3-deep-research", "o4-mini-deep-research")
+            )
+
+            # Filter to GPT-5+ series models or deep research models
+            if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6") or is_deep_research):
                 continue
 
             # Skip dated versions when filtered (e.g., gpt-5-2025-08-07) - duplicates of aliases
-            if self.filtered and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id):
+            # But always include deep research aliases (o3-deep-research, o4-mini-deep-research)
+            if self.filtered and not is_deep_research and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id):
                 continue
 
             # Generate display name from model ID
             display_name = self._model_id_to_display_name(model_id)
 
             # Determine capabilities based on model type
-            capabilities = ["tools", "reasoning", "streaming", "json_mode"]
-            if "mini" in model_id or "nano" in model_id:
-                capabilities.append("fast")
+            if is_deep_research:
+                capabilities = ["deep_research", "web_search", "reasoning"]
+                context_window = 200000
+                max_output_tokens = 100000
+                defaults = {"max_tokens": 32768, "background": True}
+            else:
+                capabilities = ["tools", "reasoning", "streaming", "json_mode"]
+                if "mini" in model_id or "nano" in model_id:
+                    capabilities.append("fast")
+                context_window = 400000
+                max_output_tokens = 128000
+                defaults = {"max_tokens": 16384, "reasoning_effort": "none"}
 
             models.append(
                 ModelInfo(
                     id=model_id,
                     display_name=display_name,
-                    context_window=400000,  # GPT-5 series default
-                    max_output_tokens=128000,
+                    context_window=context_window,
+                    max_output_tokens=max_output_tokens,
                     capabilities=capabilities,
-                    defaults={"max_tokens": 16384, "reasoning_effort": "none"},
+                    defaults=defaults,
                 )
             )
 
@@ -231,16 +258,32 @@ class OpenAIProvider:
             gpt-5.1 -> GPT 5.1
             gpt-5.1-codex -> GPT-5.1 codex
             gpt-5-mini -> GPT-5 mini
+            o3-deep-research -> o3 Deep Research
+            o4-mini-deep-research -> o4-mini Deep Research
         """
         # Known display name mappings
         display_names = {
             "gpt-5.1": "GPT 5.1",
             "gpt-5.1-codex": "GPT-5.1 codex",
             "gpt-5-mini": "GPT-5 mini",
+            "o3-deep-research": "o3 Deep Research",
+            "o3-deep-research-2025-06-26": "o3 Deep Research (2025-06-26)",
+            "o4-mini-deep-research": "o4-mini Deep Research",
+            "o4-mini-deep-research-2025-06-26": "o4-mini Deep Research (2025-06-26)",
         }
 
         if model_id in display_names:
             return display_names[model_id]
+
+        # Handle deep research model variants
+        if "deep-research" in model_id:
+            # Extract base model (o3, o4-mini, etc.) and format nicely
+            if model_id.startswith("o3-deep-research"):
+                suffix = model_id.replace("o3-deep-research", "")
+                return f"o3 Deep Research{suffix}"
+            if model_id.startswith("o4-mini-deep-research"):
+                suffix = model_id.replace("o4-mini-deep-research", "")
+                return f"o4-mini Deep Research{suffix}"
 
         # Generate from ID: capitalize GPT, keep rest lowercase
         if model_id.startswith("gpt-"):
@@ -527,8 +570,23 @@ class OpenAIProvider:
             "input": input_messages,  # Array of message objects, not text string
         }
 
+        # Check for background mode (used for deep research and long-running requests)
+        # Background mode requires store=True per OpenAI API requirements
+        background_mode = kwargs.get("background", False)
+
+        # Auto-enable background mode for deep research models
+        model_name = kwargs.get("model", self.default_model)
+        if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(("o3-deep-research", "o4-mini-deep-research")):
+            # Deep research models should use background mode by default
+            background_mode = kwargs.get("background", True)
+            logger.info(f"[PROVIDER] Deep research model detected: {model_name}, background={background_mode}")
+
         # Determine store parameter early (needed for previous_response_id logic)
+        # Background mode requires store=True
         store_enabled = kwargs.get("store", self.enable_state)
+        if background_mode:
+            store_enabled = True  # Background mode requires store=True
+            logger.info("[PROVIDER] Background mode enabled, forcing store=True")
         params["store"] = store_enabled
 
         # Add previous_response_id ONLY if store is enabled (server-side state)
@@ -570,9 +628,15 @@ class OpenAIProvider:
             params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
             logger.debug("[PROVIDER] Requesting encrypted_content (store=False, enables stateless reasoning)")
 
-        # Add tools if provided
-        if request.tools:
-            params["tools"] = self._convert_tools_from_request(request.tools)
+        # Add tools if provided (from request or kwargs)
+        # Native tools (web_search_preview, file_search, code_interpreter) can be passed via kwargs["tools"]
+        tools_list = list(request.tools) if request.tools else []
+        native_tools = kwargs.get("tools", [])
+        if native_tools:
+            tools_list.extend(native_tools)
+
+        if tools_list:
+            params["tools"] = self._convert_tools_from_request(tools_list)
             # Add tool-related parameters per Responses API spec
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
             params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
@@ -581,8 +645,12 @@ class OpenAIProvider:
         if self.truncation:
             params["truncation"] = kwargs.get("truncation", self.truncation)
 
+        # Add background mode parameter for long-running requests (deep research)
+        if background_mode:
+            params["background"] = True
+
         logger.info(
-            f"[PROVIDER] {self.api_label} API call - model: {params['model']}, has_instructions: {bool(instructions)}, tools: {len(request.tools) if request.tools else 0}"
+            f"[PROVIDER] {self.api_label} API call - model: {params['model']}, has_instructions: {bool(instructions)}, tools: {len(tools_list)}, background={background_mode}"
         )
 
         thinking_enabled = bool(kwargs.get("extended_thinking"))
@@ -625,6 +693,7 @@ class OpenAIProvider:
                     "reasoning_enabled": params.get("reasoning") is not None,
                     "thinking_enabled": thinking_enabled,
                     "thinking_budget": thinking_budget,
+                    "background_mode": background_mode,
                 },
             )
 
@@ -652,12 +721,16 @@ class OpenAIProvider:
 
         start_time = time.time()
 
+        # Use appropriate timeout for background mode (deep research can take minutes)
+        effective_timeout = self.background_timeout if background_mode else self.timeout
+        poll_interval = kwargs.get("poll_interval", self.poll_interval)
+
         # Call provider API
         try:
-            response = await asyncio.wait_for(self.client.responses.create(**params), timeout=self.timeout)
+            response = await asyncio.wait_for(self.client.responses.create(**params), timeout=effective_timeout)
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-            logger.info("[PROVIDER] Received response from %s API", self.api_label)
+            logger.info("[PROVIDER] Received response from %s API (status=%s)", self.api_label, getattr(response, "status", "unknown"))
 
             # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
             if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
@@ -669,6 +742,66 @@ class OpenAIProvider:
                         "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
                     },
                 )
+
+            # Handle background mode polling for long-running requests (deep research)
+            # Background responses start in queued/in_progress state and need polling until completion
+            if background_mode and hasattr(response, "status"):
+                poll_count = 0
+                response_id = getattr(response, "id", None)
+
+                while response.status in BACKGROUND_POLLING_STATUSES:
+                    poll_count += 1
+                    current_status = response.status
+
+                    # Check timeout
+                    elapsed_total = time.time() - start_time
+                    if elapsed_total >= effective_timeout:
+                        logger.warning(
+                            f"[PROVIDER] Background request timed out after {elapsed_total:.1f}s "
+                            f"(status={current_status}, polls={poll_count})"
+                        )
+                        break
+
+                    # Emit status update event
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "provider:background_status",
+                            {
+                                "provider": self.name,
+                                "response_id": response_id,
+                                "status": current_status,
+                                "poll_count": poll_count,
+                                "elapsed_ms": int((time.time() - start_time) * 1000),
+                            },
+                        )
+
+                    logger.info(
+                        f"[PROVIDER] Background request status: {current_status} "
+                        f"(poll {poll_count}, waiting {poll_interval}s)"
+                    )
+
+                    # Wait before next poll
+                    await asyncio.sleep(poll_interval)
+
+                    # Poll for updated status
+                    try:
+                        response = await self.client.responses.retrieve(response_id)
+                    except Exception as poll_error:
+                        logger.error(f"[PROVIDER] Failed to poll background request: {poll_error}")
+                        break
+
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                logger.info(
+                    f"[PROVIDER] Background request completed: status={response.status}, "
+                    f"polls={poll_count}, elapsed={elapsed_ms}ms"
+                )
+
+                # Check for failed/cancelled status
+                if response.status == BACKGROUND_STATUS_FAILED:
+                    error_msg = f"Background request failed after {poll_count} polls"
+                    if hasattr(response, "error") and response.error:
+                        error_msg = f"{error_msg}: {response.error}"
+                    raise RuntimeError(error_msg)
 
             # Handle incomplete responses via auto-continuation
             # OpenAI Responses API may return status="incomplete" with reason like "max_output_tokens"
@@ -1140,22 +1273,51 @@ class OpenAIProvider:
     def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
         """Convert ToolSpec objects from ChatRequest to OpenAI format.
 
+        Handles both user-defined function tools and native OpenAI-hosted tools
+        (web_search_preview, file_search, code_interpreter).
+
+        Native tools are passed through directly when specified as dicts with
+        a recognized 'type' field. User-defined tools are converted to function
+        tool format.
+
         Args:
-            tools: List of ToolSpec objects
+            tools: List of ToolSpec objects or native tool dicts
 
         Returns:
             List of OpenAI-formatted tool definitions
         """
         openai_tools = []
         for tool in tools:
-            openai_tools.append(
-                {
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "parameters": tool.parameters,
-                }
-            )
+            # Check if this is a native OpenAI tool (dict with recognized type)
+            if isinstance(tool, dict):
+                tool_type = tool.get("type", "")
+                if tool_type in NATIVE_TOOL_TYPES:
+                    # Pass through native tools directly (web_search_preview, file_search, code_interpreter)
+                    openai_tools.append(tool)
+                    continue
+                # Fall through to handle as function tool if type is "function" or unrecognized
+
+            # Handle ToolSpec objects (user-defined function tools)
+            if hasattr(tool, "name"):
+                openai_tools.append(
+                    {
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": tool.parameters,
+                    }
+                )
+            elif isinstance(tool, dict) and "name" in tool:
+                # Handle dict-format function tool
+                openai_tools.append(
+                    {
+                        "type": "function",
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {}),
+                    }
+                )
+
         return openai_tools
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
