@@ -58,6 +58,9 @@ class OpenAIChatResponse(ChatResponse):
 
     content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
     text: str | None = None
+    # Per OpenAI docs: "response.output_text is the safest way to retrieve the final answer"
+    # Exposed directly for tools like deep_research that need reliable text extraction
+    output_text: str | None = None
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -98,7 +101,7 @@ class OpenAIProvider:
         client: AsyncOpenAI | None = None,
     ):
         """Initialize OpenAI provider with Responses API client.
-        
+
         The SDK client is created lazily on first use, allowing get_info()
         to work without valid credentials.
         """
@@ -108,23 +111,43 @@ class OpenAIProvider:
         self.coordinator = coordinator
 
         # Configuration with sensible defaults (from _constants.py - single source of truth)
-        self.base_url = self.config.get("base_url", None)  # Optional custom endpoint (None = OpenAI default)
+        self.base_url = self.config.get(
+            "base_url", None
+        )  # Optional custom endpoint (None = OpenAI default)
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
         self.max_tokens = self.config.get("max_tokens", DEFAULT_MAX_TOKENS)
-        self.temperature = self.config.get("temperature", None)  # None = not sent (some models don't support it)
-        self.reasoning = self.config.get("reasoning", None)  # None = not sent (minimal|low|medium|high)
-        self.reasoning_summary = self.config.get("reasoning_summary", DEFAULT_REASONING_SUMMARY)
-        self.truncation = self.config.get("truncation", DEFAULT_TRUNCATION)  # Automatic context management
+        self.temperature = self.config.get(
+            "temperature", None
+        )  # None = not sent (some models don't support it)
+        self.reasoning = self.config.get(
+            "reasoning", None
+        )  # None = not sent (minimal|low|medium|high)
+        self.reasoning_summary = self.config.get(
+            "reasoning_summary", DEFAULT_REASONING_SUMMARY
+        )
+        self.truncation = self.config.get(
+            "truncation", DEFAULT_TRUNCATION
+        )  # Automatic context management
         self.enable_state = self.config.get("enable_state", False)
-        self.debug = self.config.get("debug", False)  # Enable full request/response logging
-        self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
-        self.debug_truncate_length = self.config.get("debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH)
+        self.debug = self.config.get(
+            "debug", False
+        )  # Enable full request/response logging
+        self.raw_debug = self.config.get(
+            "raw_debug", False
+        )  # Enable ultra-verbose raw API I/O logging
+        self.debug_truncate_length = self.config.get(
+            "debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH
+        )
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
-        self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
+        self.filtered = self.config.get(
+            "filtered", True
+        )  # Filter to curated model list by default
 
         # Deep research / background mode configuration
         self.poll_interval = self.config.get("poll_interval", DEFAULT_POLL_INTERVAL)
-        self.background_timeout = self.config.get("background_timeout", DEFAULT_BACKGROUND_TIMEOUT)
+        self.background_timeout = self.config.get(
+            "background_timeout", DEFAULT_BACKGROUND_TIMEOUT
+        )
 
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
@@ -212,12 +235,20 @@ class OpenAIProvider:
             )
 
             # Filter to GPT-5+ series models or deep research models
-            if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6") or is_deep_research):
+            if not (
+                model_id.startswith("gpt-5")
+                or model_id.startswith("gpt-6")
+                or is_deep_research
+            ):
                 continue
 
             # Skip dated versions when filtered (e.g., gpt-5-2025-08-07) - duplicates of aliases
             # But always include deep research aliases (o3-deep-research, o4-mini-deep-research)
-            if self.filtered and not is_deep_research and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id):
+            if (
+                self.filtered
+                and not is_deep_research
+                and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id)
+            ):
                 continue
 
             # Generate display name from model ID
@@ -292,7 +323,9 @@ class OpenAIProvider:
                 return f"GPT-{parts[1]}"
         return model_id
 
-    def _build_continuation_input(self, original_input: list, accumulated_output: list) -> list:
+    def _build_continuation_input(
+        self, original_input: list, accumulated_output: list
+    ) -> list:
         """Build input for continuation call in stateless mode.
 
         Instead of using previous_response_id (requires store:true), we include
@@ -324,10 +357,15 @@ class OpenAIProvider:
                     # Extract text from message content
                     content = getattr(item, "content", [])
                     for content_item in content:
-                        if hasattr(content_item, "type") and content_item.type == "output_text":
+                        if (
+                            hasattr(content_item, "type")
+                            and content_item.type == "output_text"
+                        ):
                             text = getattr(content_item, "text", "")
                             if text:
-                                assistant_content.append({"type": "output_text", "text": text})
+                                assistant_content.append(
+                                    {"type": "output_text", "text": text}
+                                )
                 elif item_type == "reasoning":
                     # For reasoning, we can't really include it in input as text
                     # The reasoning trace is internal and not meant for reinsertion
@@ -346,11 +384,15 @@ class OpenAIProvider:
                         if content_item.get("type") == "output_text":
                             text = content_item.get("text", "")
                             if text:
-                                assistant_content.append({"type": "output_text", "text": text})
+                                assistant_content.append(
+                                    {"type": "output_text", "text": text}
+                                )
 
         # If we extracted any assistant content, add as assistant message
         if assistant_content:
-            continuation_input.append({"role": "assistant", "content": assistant_content})
+            continuation_input.append(
+                {"role": "assistant", "content": assistant_content}
+            )
 
         return continuation_input
 
@@ -371,11 +413,15 @@ class OpenAIProvider:
             max_length = self.debug_truncate_length
 
         # Type guard: max_length is guaranteed to be int after this point
-        assert max_length is not None, "max_length should never be None after initialization"
+        assert max_length is not None, (
+            "max_length should never be None after initialization"
+        )
 
         if isinstance(obj, str):
             if len(obj) > max_length:
-                return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+                return (
+                    obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+                )
             return obj
         if isinstance(obj, dict):
             return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
@@ -408,7 +454,9 @@ class OpenAIProvider:
                         tool_calls[block.id] = (block.name, block.input)
 
             # Check tool messages for tool_call_id
-            elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
+            elif (
+                msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id
+            ):
                 tool_results.add(msg.tool_call_id)
 
         # Exclude IDs that have already been repaired to prevent infinite loops
@@ -477,7 +525,8 @@ class OpenAIProvider:
                         "provider": self.name,
                         "repair_count": len(missing),
                         "repairs": [
-                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                            {"tool_call_id": call_id, "tool_name": tool_name}
+                            for call_id, tool_name, _ in missing
                         ],
                     },
                 )
@@ -498,7 +547,9 @@ class OpenAIProvider:
             return []
         return response.tool_calls
 
-    async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
+    async def _complete_chat_request(
+        self, request: ChatRequest, **kwargs
+    ) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
 
         Args:
@@ -508,7 +559,9 @@ class OpenAIProvider:
         Returns:
             ChatResponse with content blocks
         """
-        logger.info(f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages")
+        logger.info(
+            f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages"
+        )
         logger.info(f"[PROVIDER] Message roles: {[m.role for m in request.messages]}")
 
         message_list = list(request.messages)
@@ -516,7 +569,9 @@ class OpenAIProvider:
         # Separate messages by role
         system_msgs = [m for m in message_list if m.role == "system"]
         developer_msgs = [m for m in message_list if m.role == "developer"]
-        conversation = [m for m in message_list if m.role in ("user", "assistant", "tool")]
+        conversation = [
+            m for m in message_list if m.role in ("user", "assistant", "tool")
+        ]
 
         logger.info(
             f"[PROVIDER] Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
@@ -524,7 +579,11 @@ class OpenAIProvider:
 
         # Combine system messages as instructions
         instructions = (
-            "\n\n".join(m.content if isinstance(m.content, str) else "" for m in system_msgs) if system_msgs else None
+            "\n\n".join(
+                m.content if isinstance(m.content, str) else "" for m in system_msgs
+            )
+            if system_msgs
+            else None
         )
 
         # Convert all messages (developer + conversation) to Responses API format
@@ -576,10 +635,14 @@ class OpenAIProvider:
 
         # Auto-enable background mode for deep research models
         model_name = kwargs.get("model", self.default_model)
-        if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(("o3-deep-research", "o4-mini-deep-research")):
+        if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
+            ("o3-deep-research", "o4-mini-deep-research")
+        ):
             # Deep research models should use background mode by default
             background_mode = kwargs.get("background", True)
-            logger.info(f"[PROVIDER] Deep research model detected: {model_name}, background={background_mode}")
+            logger.info(
+                f"[PROVIDER] Deep research model detected: {model_name}, background={background_mode}"
+            )
 
         # Determine store parameter early (needed for previous_response_id logic)
         # Background mode requires store=True
@@ -613,26 +676,41 @@ class OpenAIProvider:
         elif temperature := kwargs.get("temperature", self.temperature):
             params["temperature"] = temperature
 
-        reasoning_effort = kwargs.get("reasoning", getattr(request, "reasoning", None)) or self.reasoning
-        if reasoning_effort:
-            # DEBUG: Log reasoning configuration
-            logger.info(f"[PROVIDER] Setting reasoning: effort={reasoning_effort}, summary={self.reasoning_summary}")
-            params["reasoning"] = {
-                "effort": reasoning_effort,
-                "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
-            }
+        reasoning_param = (
+            kwargs.get("reasoning", getattr(request, "reasoning", None))
+            or self.reasoning
+        )
+        if reasoning_param:
+            # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
+            if isinstance(reasoning_param, dict):
+                # Dict format: use as-is, but apply defaults for missing keys
+                params["reasoning"] = {
+                    "effort": reasoning_param.get("effort", "medium"),
+                    "summary": reasoning_param.get("summary", self.reasoning_summary),
+                }
+            else:
+                # String format: use as effort level with default summary
+                params["reasoning"] = {
+                    "effort": reasoning_param,
+                    "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
+                }
+            logger.info(f"[PROVIDER] Setting reasoning: {params['reasoning']}")
 
         # CRITICAL: Always request encrypted_content with store=False for stateless reasoning preservation
         # This is separate from reasoning effort - we need encrypted content even if effort not explicitly set
         if not store_enabled:
             params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
-            logger.debug("[PROVIDER] Requesting encrypted_content (store=False, enables stateless reasoning)")
+            logger.debug(
+                "[PROVIDER] Requesting encrypted_content (store=False, enables stateless reasoning)"
+            )
 
         # Add tools if provided (from request or kwargs)
         # Native tools (web_search_preview, file_search, code_interpreter) can be passed via kwargs["tools"]
         tools_list = list(request.tools) if request.tools else []
         native_tools = kwargs.get("tools", [])
-        logger.info(f"[PROVIDER] Tools from request: {len(list(request.tools) if request.tools else [])}, native_tools from kwargs: {native_tools}")
+        logger.info(
+            f"[PROVIDER] Tools from request: {len(list(request.tools) if request.tools else [])}, native_tools from kwargs: {native_tools}"
+        )
         if native_tools:
             tools_list.extend(native_tools)
 
@@ -641,6 +719,10 @@ class OpenAIProvider:
             # Add tool-related parameters per Responses API spec
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
             params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
+            # max_tool_calls limits how many tool calls the model can make
+            # Important for deep research to prevent excessive searching that consumes token budget
+            if max_tool_calls := kwargs.get("max_tool_calls"):
+                params["max_tool_calls"] = max_tool_calls
 
         # Add truncation parameter for automatic context management
         if self.truncation:
@@ -659,18 +741,27 @@ class OpenAIProvider:
         if thinking_enabled:
             if "reasoning" not in params:
                 params["reasoning"] = {
-                    "effort": kwargs.get("reasoning_effort") or self.config.get("reasoning_effort", "high"),
+                    "effort": kwargs.get("reasoning_effort")
+                    or self.config.get("reasoning_effort", "high"),
                     "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
                 }
 
-            budget_tokens = kwargs.get("thinking_budget_tokens") or self.config.get("thinking_budget_tokens") or 0
-            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get("thinking_budget_buffer", 1024)
+            budget_tokens = (
+                kwargs.get("thinking_budget_tokens")
+                or self.config.get("thinking_budget_tokens")
+                or 0
+            )
+            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
+                "thinking_budget_buffer", 1024
+            )
 
             if budget_tokens:
                 thinking_budget = budget_tokens
                 target_tokens = budget_tokens + buffer_tokens
                 if params.get("max_output_tokens"):
-                    params["max_output_tokens"] = max(params["max_output_tokens"], target_tokens)
+                    params["max_output_tokens"] = max(
+                        params["max_output_tokens"], target_tokens
+                    )
                 else:
                     params["max_output_tokens"] = target_tokens
 
@@ -728,13 +819,24 @@ class OpenAIProvider:
 
         # Call provider API
         try:
-            response = await asyncio.wait_for(self.client.responses.create(**params), timeout=effective_timeout)
+            response = await asyncio.wait_for(
+                self.client.responses.create(**params), timeout=effective_timeout
+            )
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-            logger.info("[PROVIDER] Received response from %s API (status=%s)", self.api_label, getattr(response, "status", "unknown"))
+            logger.info(
+                "[PROVIDER] Received response from %s API (status=%s)",
+                self.api_label,
+                getattr(response, "status", "unknown"),
+            )
 
             # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
-            if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
+            if (
+                self.coordinator
+                and hasattr(self.coordinator, "hooks")
+                and self.debug
+                and self.raw_debug
+            ):
                 await self.coordinator.hooks.emit(
                     "llm:response:raw",
                     {
@@ -788,7 +890,9 @@ class OpenAIProvider:
                     try:
                         response = await self.client.responses.retrieve(response_id)
                     except Exception as poll_error:
-                        logger.error(f"[PROVIDER] Failed to poll background request: {poll_error}")
+                        logger.error(
+                            f"[PROVIDER] Failed to poll background request: {poll_error}"
+                        )
                         break
 
                 elapsed_ms = int((time.time() - start_time) * 1000)
@@ -807,7 +911,9 @@ class OpenAIProvider:
             # Handle incomplete responses via auto-continuation
             # OpenAI Responses API may return status="incomplete" with reason like "max_output_tokens"
             # We automatically continue until complete to provide seamless experience
-            accumulated_output = list(response.output) if hasattr(response, "output") else []
+            accumulated_output = (
+                list(response.output) if hasattr(response, "output") else []
+            )
             final_response = response
             continuation_count = 0
 
@@ -849,7 +955,9 @@ class OpenAIProvider:
                 # Build continuation params using input-based pattern (stateless-compatible)
                 # Instead of previous_response_id (requires store:true), we include the
                 # accumulated output in the input to preserve context
-                continuation_input = self._build_continuation_input(input_messages, accumulated_output)
+                continuation_input = self._build_continuation_input(
+                    input_messages, accumulated_output
+                )
 
                 continue_params = {
                     "model": params["model"],
@@ -870,7 +978,9 @@ class OpenAIProvider:
                 if "tools" in params:
                     continue_params["tools"] = params["tools"]
                     continue_params["tool_choice"] = params.get("tool_choice", "auto")
-                    continue_params["parallel_tool_calls"] = params.get("parallel_tool_calls", True)
+                    continue_params["parallel_tool_calls"] = params.get(
+                        "parallel_tool_calls", True
+                    )
                 if "store" in params:
                     continue_params["store"] = params["store"]
 
@@ -889,7 +999,12 @@ class OpenAIProvider:
                         accumulated_output.extend(final_response.output)
 
                     # Emit raw debug for continuation if enabled
-                    if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
+                    if (
+                        self.coordinator
+                        and hasattr(self.coordinator, "hooks")
+                        and self.debug
+                        and self.raw_debug
+                    ):
                         await self.coordinator.hooks.emit(
                             "llm:response:raw",
                             {
@@ -936,10 +1051,15 @@ class OpenAIProvider:
                     {
                         "provider": self.name,
                         "model": params["model"],
-                        "usage": {"input": usage_counts["input"], "output": usage_counts["output"]},
+                        "usage": {
+                            "input": usage_counts["input"],
+                            "output": usage_counts["output"],
+                        },
                         "status": "ok",
                         "duration_ms": elapsed_ms,
-                        "continuation_count": continuation_count if continuation_count > 0 else None,
+                        "continuation_count": continuation_count
+                        if continuation_count > 0
+                        else None,
                     },
                 )
 
@@ -954,7 +1074,9 @@ class OpenAIProvider:
                             "response": self._truncate_values(response_dict),
                             "status": "ok",
                             "duration_ms": elapsed_ms,
-                            "continuation_count": continuation_count if continuation_count > 0 else None,
+                            "continuation_count": continuation_count
+                            if continuation_count > 0
+                            else None,
                         },
                     )
 
@@ -1049,7 +1171,11 @@ class OpenAIProvider:
                     if tool_call_id:
                         # Native format: function_call_output with call_id for explicit correlation
                         # Per OpenAI Responses API spec (see ai_context/openai-api-guide.txt)
-                        output_str = tool_content if isinstance(tool_content, str) else json.dumps(tool_content)
+                        output_str = (
+                            tool_content
+                            if isinstance(tool_content, str)
+                            else json.dumps(tool_content)
+                        )
                         openai_messages.append(
                             {
                                 "type": "function_call_output",
@@ -1066,7 +1192,12 @@ class OpenAIProvider:
                         openai_messages.append(
                             {
                                 "role": "user",
-                                "content": [{"type": "input_text", "text": f"[Tool: {tool_name}]\n{tool_content}"}],
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": f"[Tool: {tool_name}]\n{tool_content}",
+                                    }
+                                ],
                             }
                         )
                     i += 1
@@ -1106,7 +1237,12 @@ class OpenAIProvider:
                         if isinstance(block, dict):
                             block_type = block.get("type")
                             if block_type == "text":
-                                assistant_content.append({"type": "output_text", "text": block.get("text", "")})
+                                assistant_content.append(
+                                    {
+                                        "type": "output_text",
+                                        "text": block.get("text", ""),
+                                    }
+                                )
                             elif block_type == "tool_call":
                                 # Convert tool_call block to function_call item
                                 tc_id = block.get("id", "")
@@ -1115,7 +1251,9 @@ class OpenAIProvider:
                                 if isinstance(tc_input, str):
                                     tc_args_str = tc_input
                                 else:
-                                    tc_args_str = json.dumps(tc_input) if tc_input else "{}"
+                                    tc_args_str = (
+                                        json.dumps(tc_input) if tc_input else "{}"
+                                    )
                                 if tc_id and tc_name:
                                     function_call_items.append(
                                         {
@@ -1133,19 +1271,29 @@ class OpenAIProvider:
                                     encrypted_content = block_content[0]
                                     reasoning_id = block_content[1]
                                     if reasoning_id:
-                                        reasoning_item = {"type": "reasoning", "id": reasoning_id}
+                                        reasoning_item = {
+                                            "type": "reasoning",
+                                            "id": reasoning_id,
+                                        }
                                         if encrypted_content:
-                                            reasoning_item["encrypted_content"] = encrypted_content
+                                            reasoning_item["encrypted_content"] = (
+                                                encrypted_content
+                                            )
                                         # Add summary from thinking text
                                         if block.get("thinking"):
                                             reasoning_item["summary"] = [
-                                                {"type": "summary_text", "text": block["thinking"]}
+                                                {
+                                                    "type": "summary_text",
+                                                    "text": block["thinking"],
+                                                }
                                             ]
                                         reasoning_items_to_add.append(reasoning_item)
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
                             if block.type == "text":
-                                assistant_content.append({"type": "output_text", "text": block.text})
+                                assistant_content.append(
+                                    {"type": "output_text", "text": block.text}
+                                )
                             elif block.type == "tool_call":
                                 # Convert ToolCallBlock to function_call item
                                 tc_id = getattr(block, "id", "")
@@ -1154,7 +1302,9 @@ class OpenAIProvider:
                                 if isinstance(tc_input, str):
                                     tc_args_str = tc_input
                                 else:
-                                    tc_args_str = json.dumps(tc_input) if tc_input else "{}"
+                                    tc_args_str = (
+                                        json.dumps(tc_input) if tc_input else "{}"
+                                    )
                                 if tc_id and tc_name:
                                     function_call_items.append(
                                         {
@@ -1175,16 +1325,28 @@ class OpenAIProvider:
                                 encrypted_content = block.content[0]
                                 reasoning_id = block.content[1]
 
-                                if reasoning_id:  # Only include if we have a reasoning ID
-                                    reasoning_item = {"type": "reasoning", "id": reasoning_id}
+                                if (
+                                    reasoning_id
+                                ):  # Only include if we have a reasoning ID
+                                    reasoning_item = {
+                                        "type": "reasoning",
+                                        "id": reasoning_id,
+                                    }
 
                                     # Add encrypted content if available
                                     if encrypted_content:
-                                        reasoning_item["encrypted_content"] = encrypted_content
+                                        reasoning_item["encrypted_content"] = (
+                                            encrypted_content
+                                        )
 
                                     # Add summary from thinking text
                                     if hasattr(block, "thinking") and block.thinking:
-                                        reasoning_item["summary"] = [{"type": "summary_text", "text": block.thinking}]
+                                        reasoning_item["summary"] = [
+                                            {
+                                                "type": "summary_text",
+                                                "text": block.thinking,
+                                            }
+                                        ]
 
                                     reasoning_items_to_add.append(reasoning_item)
 
@@ -1214,7 +1376,9 @@ class OpenAIProvider:
 
                 # Only add assistant message if there's content
                 if assistant_content:
-                    openai_messages.append({"role": "assistant", "content": assistant_content})
+                    openai_messages.append(
+                        {"role": "assistant", "content": assistant_content}
+                    )
 
                 # Add function_call items as TOP-LEVEL entries (after assistant message)
                 # Per OpenAI Responses API: function_call items are separate from message content
@@ -1226,7 +1390,12 @@ class OpenAIProvider:
             # Handle developer messages as XML-wrapped user messages
             elif role == "developer":
                 wrapped = f"<context_file>\n{content}\n</context_file>"
-                openai_messages.append({"role": "user", "content": [{"type": "input_text", "text": wrapped}]})
+                openai_messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": wrapped}],
+                    }
+                )
                 i += 1
 
             # Handle user messages
@@ -1238,7 +1407,12 @@ class OpenAIProvider:
                         if isinstance(block, dict):
                             block_type = block.get("type")
                             if block_type == "text":
-                                content_items.append({"type": "input_text", "text": block.get("text", "")})
+                                content_items.append(
+                                    {
+                                        "type": "input_text",
+                                        "text": block.get("text", ""),
+                                    }
+                                )
                             elif block_type == "image":
                                 # Convert ImageBlock to OpenAI Responses API input_image format
                                 source = block.get("source", {})
@@ -1246,15 +1420,21 @@ class OpenAIProvider:
                                     # OpenAI uses data URI format: data:image/jpeg;base64,{data}
                                     media_type = source.get("media_type", "image/jpeg")
                                     data = source.get("data", "")
-                                    content_items.append({
-                                        "type": "input_image",
-                                        "image_url": f"data:{media_type};base64,{data}"
-                                    })
+                                    content_items.append(
+                                        {
+                                            "type": "input_image",
+                                            "image_url": f"data:{media_type};base64,{data}",
+                                        }
+                                    )
                                 else:
-                                    logger.warning(f"Unsupported image source type: {source.get('type')}")
-                    
+                                    logger.warning(
+                                        f"Unsupported image source type: {source.get('type')}"
+                                    )
+
                     if content_items:
-                        openai_messages.append({"role": "user", "content": content_items})
+                        openai_messages.append(
+                            {"role": "user", "content": content_items}
+                        )
                 else:
                     # Simple string content
                     openai_messages.append(
@@ -1330,7 +1510,9 @@ class OpenAIProvider:
         Returns:
             ChatResponse with content blocks
         """
-        from amplifier_core.message_models import ReasoningBlock as ResponseReasoningBlock
+        from amplifier_core.message_models import (
+            ReasoningBlock as ResponseReasoningBlock,
+        )
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ThinkingBlock
         from amplifier_core.message_models import ToolCall
@@ -1354,11 +1536,19 @@ class OpenAIProvider:
                     block_content = getattr(block, "content", [])
                     if isinstance(block_content, list):
                         for content_item in block_content:
-                            if hasattr(content_item, "type") and content_item.type == "output_text":
+                            if (
+                                hasattr(content_item, "type")
+                                and content_item.type == "output_text"
+                            ):
                                 text = getattr(content_item, "text", "")
                                 content_blocks.append(TextBlock(text=text))
                                 text_accumulator.append(text)
-                                event_blocks.append(TextContent(text=text, raw=getattr(content_item, "raw", None)))
+                                event_blocks.append(
+                                    TextContent(
+                                        text=text,
+                                        raw=getattr(content_item, "raw", None),
+                                    )
+                                )
                     elif isinstance(block_content, str):
                         content_blocks.append(TextBlock(text=block_content))
                         text_accumulator.append(block_content)
@@ -1374,7 +1564,9 @@ class OpenAIProvider:
                         reasoning_item_ids.append(reasoning_id)
 
                     # Extract reasoning summary if available
-                    reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
+                    reasoning_summary = getattr(block, "summary", None) or getattr(
+                        block, "text", None
+                    )
 
                     # Use helper to extract reasoning text
                     reasoning_text = extract_reasoning_text(reasoning_summary)
@@ -1394,9 +1586,13 @@ class OpenAIProvider:
                     elif isinstance(reasoning_summary, str):
                         reasoning_text = reasoning_summary
                     elif isinstance(reasoning_summary, dict):
-                        reasoning_text = reasoning_summary.get("text", str(reasoning_summary))
+                        reasoning_text = reasoning_summary.get(
+                            "text", str(reasoning_summary)
+                        )
                     elif hasattr(reasoning_summary, "text"):
-                        reasoning_text = getattr(reasoning_summary, "text", str(reasoning_summary))
+                        reasoning_text = getattr(
+                            reasoning_summary, "text", str(reasoning_summary)
+                        )
 
                     # Only create thinking block if there's actual content
                     if reasoning_text:
@@ -1428,14 +1624,20 @@ class OpenAIProvider:
                         try:
                             tool_input = json.loads(tool_input)
                         except json.JSONDecodeError:
-                            logger.debug("Failed to decode tool call arguments: %s", tool_input)
+                            logger.debug(
+                                "Failed to decode tool call arguments: %s", tool_input
+                            )
                     if tool_input is None:
                         tool_input = {}
                     # Ensure tool_input is dict after json.loads or default
                     if not isinstance(tool_input, dict):
                         tool_input = {}
-                    content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
-                    tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
+                    content_blocks.append(
+                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
+                    )
             else:
                 # Dictionary format
                 block_type = block.get("type")
@@ -1448,7 +1650,9 @@ class OpenAIProvider:
                                 text = content_item.get("text", "")
                                 content_blocks.append(TextBlock(text=text))
                                 text_accumulator.append(text)
-                                event_blocks.append(TextContent(text=text, raw=content_item))
+                                event_blocks.append(
+                                    TextContent(text=text, raw=content_item)
+                                )
                     elif isinstance(block_content, str):
                         content_blocks.append(TextBlock(text=block_content))
                         text_accumulator.append(block_content)
@@ -1484,9 +1688,13 @@ class OpenAIProvider:
                     elif isinstance(reasoning_summary, str):
                         reasoning_text = reasoning_summary
                     elif isinstance(reasoning_summary, dict):
-                        reasoning_text = reasoning_summary.get("text", str(reasoning_summary))
+                        reasoning_text = reasoning_summary.get(
+                            "text", str(reasoning_summary)
+                        )
                     elif hasattr(reasoning_summary, "text"):
-                        reasoning_text = getattr(reasoning_summary, "text", str(reasoning_summary))
+                        reasoning_text = getattr(
+                            reasoning_summary, "text", str(reasoning_summary)
+                        )
 
                     # Only create thinking block if there's actual content
                     if reasoning_text:
@@ -1518,15 +1726,25 @@ class OpenAIProvider:
                         try:
                             tool_input = json.loads(tool_input)
                         except json.JSONDecodeError:
-                            logger.debug("Failed to decode tool call arguments: %s", tool_input)
+                            logger.debug(
+                                "Failed to decode tool call arguments: %s", tool_input
+                            )
                     if tool_input is None:
                         tool_input = {}
                     # Ensure tool_input is dict after json.loads or default
                     if not isinstance(tool_input, dict):
                         tool_input = {}
-                    content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
-                    tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
-                    event_blocks.append(ToolCallContent(id=tool_id, name=tool_name, arguments=tool_input, raw=block))
+                    content_blocks.append(
+                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
+                    )
+                    event_blocks.append(
+                        ToolCallContent(
+                            id=tool_id, name=tool_name, arguments=tool_input, raw=block
+                        )
+                    )
 
         # Extract usage counts
         usage_obj = response.usage if hasattr(response, "usage") else None
@@ -1546,6 +1764,10 @@ class OpenAIProvider:
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
+        # Per OpenAI docs: "response.output_text is the safest way to retrieve the final answer"
+        # Extract it directly from the response if available
+        raw_output_text = getattr(response, "output_text", None)
+
         # Build metadata with provider-specific state
         metadata = {}
 
@@ -1562,7 +1784,9 @@ class OpenAIProvider:
                 incomplete_details = getattr(response, "incomplete_details", None)
                 if incomplete_details:
                     if isinstance(incomplete_details, dict):
-                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get("reason")
+                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get(
+                            "reason"
+                        )
                     elif hasattr(incomplete_details, "reason"):
                         metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.reason
 
@@ -1571,11 +1795,15 @@ class OpenAIProvider:
             metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
 
         # DEBUG: Log what we're returning
-        logger.info(f"[PROVIDER] Returning ChatResponse with {len(content_blocks)} content blocks")
+        logger.info(
+            f"[PROVIDER] Returning ChatResponse with {len(content_blocks)} content blocks"
+        )
         for i, block in enumerate(content_blocks):
             block_type = block.type if hasattr(block, "type") else "unknown"
             has_content = hasattr(block, "content") and block.content is not None
-            logger.info(f"[PROVIDER]   Block {i}: type={block_type}, has_content_field={has_content}")
+            logger.info(
+                f"[PROVIDER]   Block {i}: type={block_type}, has_content_field={has_content}"
+            )
 
         chat_response = OpenAIChatResponse(
             content=content_blocks,
@@ -1584,6 +1812,7 @@ class OpenAIProvider:
             finish_reason=getattr(response, "finish_reason", None),
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
+            output_text=raw_output_text,  # Per OpenAI docs: safest way to get final answer
             metadata=metadata if metadata else None,
         )
 
