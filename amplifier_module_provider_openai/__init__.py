@@ -632,6 +632,7 @@ class OpenAIProvider:
         # Native tools (web_search_preview, file_search, code_interpreter) can be passed via kwargs["tools"]
         tools_list = list(request.tools) if request.tools else []
         native_tools = kwargs.get("tools", [])
+        logger.info(f"[PROVIDER] Tools from request: {len(list(request.tools) if request.tools else [])}, native_tools from kwargs: {native_tools}")
         if native_tools:
             tools_list.extend(native_tools)
 
