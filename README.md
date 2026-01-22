@@ -7,6 +7,16 @@ GPT model integration for Amplifier via OpenAI's Responses API.
 - **Python 3.11+**
 - **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
 
+## Install
+
+```bash
+# OpenAI Responses API provider
+amplifier module add provider-openai --source git+https://github.com/shohei81/amplifier-module-provider-codex@main
+
+# Codex CLI provider (subscription-based)
+amplifier module add provider-codex --source git+https://github.com/shohei81/amplifier-module-provider-codex@main
+```
+
 ### Installing UV
 
 ```bash
