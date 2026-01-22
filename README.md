@@ -86,6 +86,46 @@ providers:
 export OPENAI_API_KEY="your-api-key-here"
 ```
 
+## Codex CLI Provider (Subscription-based)
+
+This repo also includes a Codex CLI provider that uses a signed-in Codex
+subscription instead of API keys. It runs `codex exec --json` and parses the
+JSONL stream to build Amplifier responses.
+
+### Prerequisites
+
+- **Codex CLI** installed and authenticated
+- **Node.js** (for the CLI install)
+
+```bash
+npm i -g @openai/codex
+codex login
+```
+
+### Configuration
+
+```toml
+[[providers]]
+module = "provider-codex"
+name = "codex"
+config = {
+    default_model = "gpt-5.2-codex",
+    timeout = 300,
+    full_auto = false,
+    skip_git_repo_check = true
+}
+```
+
+### Notes
+
+- Uses Codex CLI sessions for caching when available.
+- Tool calls are emitted as `<tool_use>...</tool_use>` blocks and parsed from
+  the JSONL stream.
+- Codex CLI runs in read-only mode by default; you can pass `sandbox` in config
+  to allow broader access if desired.
+- Set `full_auto = true` only if you intentionally want Codex to run commands
+  and edit files directly.
+
 ## Usage
 
 ```python
