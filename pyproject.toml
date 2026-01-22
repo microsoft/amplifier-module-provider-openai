@@ -1,7 +1,7 @@
 [project]
-name = "amplifier-module-provider-openai"
+name = "amplifier-module-provider-codex"
 version = "1.0.0"
-description = "Reference provider module - OpenAI GPT integration for Amplifier"
+description = "Codex CLI provider module for Amplifier"
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -9,13 +9,11 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    "openai>=1.0.0",
     "pydantic>=2.0.0",
     "amplifier-core @ git+https://github.com/microsoft/amplifier-core",
 ]
 
 [project.entry-points."amplifier.modules"]
-provider-openai = "amplifier_module_provider_openai:mount"
 provider-codex = "amplifier_module_provider_codex:mount"
 
 [build-system]
@@ -29,7 +27,6 @@ package = true
 
 [tool.hatch.build.targets.wheel]
 packages = [
-    "amplifier_module_provider_openai",
     "amplifier_module_provider_codex",
 ]
 
