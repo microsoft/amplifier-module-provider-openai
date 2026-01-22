@@ -1,4 +1,4 @@
-"""Structural validation tests for openai provider.
+"""Structural validation tests for codex provider.
 
 Inherits authoritative tests from amplifier-core.
 """
@@ -6,8 +6,8 @@ Inherits authoritative tests from amplifier-core.
 from amplifier_core.validation.structural import ProviderStructuralTests
 
 
-class TestOpenAIProviderStructural(ProviderStructuralTests):
-    """Run standard provider structural tests for openai.
+class TestCodexProviderStructural(ProviderStructuralTests):
+    """Run standard provider structural tests for codex.
 
     All tests from ProviderStructuralTests run automatically.
     Add module-specific structural tests below if needed.
