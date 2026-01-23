@@ -127,9 +127,7 @@ async def mount(
 
     cli_path = shutil.which("codex")
     if not cli_path:
-        logger.warning(
-            "Codex CLI not found. Install with: npm i -g @openai/codex"
-        )
+        logger.warning("Codex CLI not found. Install with: npm i -g @openai/codex")
         return None
 
     provider = CodexProvider(config=config, coordinator=coordinator)
@@ -381,7 +379,9 @@ class CodexProvider:
 
         cli_path = shutil.which("codex")
         if not cli_path:
-            raise RuntimeError("Codex CLI not found. Install with: npm i -g @openai/codex")
+            raise RuntimeError(
+                "Codex CLI not found. Install with: npm i -g @openai/codex"
+            )
 
         model = (
             kwargs.get("model") or getattr(request, "model", None) or self.default_model
@@ -656,7 +656,7 @@ class CodexProvider:
         )
 
         return (
-            "<system-reminder source=\"tools-context\">\n"
+            '<system-reminder source="tools-context">\n'
             "Available tools:\n"
             "<tools>\n"
             f"{tools_json}\n"
@@ -665,7 +665,7 @@ class CodexProvider:
             "<tool_use>\n"
             f"{tool_use_example}\n"
             "</tool_use>\n\n"
-            "Generate a unique ID for each call (e.g., \"call_1\", \"call_2\").\n"
+            'Generate a unique ID for each call (e.g., "call_1", "call_2").\n'
             "Tool results will be provided in <tool_result> blocks.\n"
             "</system-reminder>"
         )
@@ -741,7 +741,9 @@ class CodexProvider:
                 event_data = json.loads(line_str)
             except json.JSONDecodeError:
                 if self.debug:
-                    logger.warning("[PROVIDER] Failed to parse JSONL: %s", line_str[:100])
+                    logger.warning(
+                        "[PROVIDER] Failed to parse JSONL: %s", line_str[:100]
+                    )
                 continue
 
             event_type = event_data.get("type")
@@ -798,6 +800,19 @@ class CodexProvider:
 
         if not response_text and last_assistant_text:
             response_text = last_assistant_text
+
+        # De-duplicate tool calls by ID across all events
+        if tool_calls:
+            seen_ids: set[str] = set()
+            deduped_calls: list[dict[str, Any]] = []
+            for tc in tool_calls:
+                call_id = tc.get("id")
+                if call_id and call_id in seen_ids:
+                    continue
+                if call_id:
+                    seen_ids.add(call_id)
+                deduped_calls.append(tc)
+            tool_calls = deduped_calls
 
         return {
             "text": response_text,
