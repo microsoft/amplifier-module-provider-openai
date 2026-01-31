@@ -111,9 +111,8 @@ class OpenAIProvider:
         self.coordinator = coordinator
 
         # Configuration with sensible defaults (from _constants.py - single source of truth)
-        self.base_url = self.config.get(
-            "base_url", None
-        )  # Optional custom endpoint (None = OpenAI default)
+        # Fall back to OPENAI_BASE_URL env var for ollama launch support
+        self.base_url = self.config.get("base_url") or os.environ.get("OPENAI_BASE_URL")
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
         self.max_tokens = self.config.get("max_tokens", DEFAULT_MAX_TOKENS)
         self.temperature = self.config.get(
