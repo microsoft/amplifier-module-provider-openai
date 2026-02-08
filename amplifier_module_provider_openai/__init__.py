@@ -178,7 +178,7 @@ class OpenAIProvider:
                 "model": "gpt-5.1",
                 "max_tokens": 16384,
                 "temperature": None,  # Model default
-                "timeout": 300.0,
+                "timeout": 600.0,
                 "context_window": 400000,
                 "max_output_tokens": 128000,
             },
