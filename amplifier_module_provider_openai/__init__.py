@@ -709,12 +709,12 @@ class OpenAIProvider:
         # Phase 2: Reasoning parameter precedence chain
         # kwargs["reasoning"] > request.reasoning_effort > config default > None
         reasoning_param = kwargs.get("reasoning", getattr(request, "reasoning", None))
-        if not reasoning_param and request.reasoning_effort:
+        if reasoning_param is None and request.reasoning_effort:
             reasoning_param = {
                 "effort": request.reasoning_effort,
                 "summary": self.reasoning_summary,
             }
-        if not reasoning_param:
+        if reasoning_param is None:
             reasoning_param = self.reasoning
         if reasoning_param:
             # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")

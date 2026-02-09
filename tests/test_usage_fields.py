@@ -209,8 +209,8 @@ def test_cache_read_tokens_none_when_no_input_details():
     assert result.usage.cache_read_tokens is None
 
 
-def test_cache_read_tokens_none_when_cached_tokens_zero():
-    """cache_read_tokens is None when cached_tokens is 0 (falsy coercion)."""
+def test_cache_read_tokens_zero_is_preserved():
+    """cache_read_tokens=0 is preserved (0 means 'measured, no caching occurred')."""
     provider = _make_provider()
 
     usage_obj = SimpleNamespace(
@@ -225,5 +225,4 @@ def test_cache_read_tokens_none_when_cached_tokens_zero():
     result = asyncio.run(provider.complete(_simple_request()))
 
     assert result.usage is not None
-    # 0 is coerced to None via `or None` (semantically: no caching occurred)
-    assert result.usage.cache_read_tokens is None
+    assert result.usage.cache_read_tokens == 0
