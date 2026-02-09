@@ -12,10 +12,12 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 from typing import Any
 from typing import cast
 
+import openai
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
@@ -23,6 +25,7 @@ from amplifier_core import ProviderInfo
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
+from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import ToolCall
@@ -152,6 +155,12 @@ class OpenAIProvider:
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
 
+        # Phase 2: Retry configuration
+        self._max_retries = int(self.config.get("max_retries", 5))
+        self._min_retry_delay = float(self.config.get("min_retry_delay", 1.0))
+        self._max_retry_delay = float(self.config.get("max_retry_delay", 60.0))
+        self._retry_jitter = bool(self.config.get("retry_jitter", True))
+
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
         # detected repeatedly across LLM iterations (since synthetic results
@@ -164,7 +173,9 @@ class OpenAIProvider:
         if self._client is None:
             if self._api_key is None:
                 raise ValueError("api_key or client must be provided for API calls")
-            self._client = AsyncOpenAI(api_key=self._api_key, base_url=self.base_url)
+            self._client = AsyncOpenAI(
+                api_key=self._api_key, base_url=self.base_url, max_retries=0
+            )
         return self._client
 
     def get_info(self) -> ProviderInfo:
@@ -490,6 +501,25 @@ class OpenAIProvider:
             name=tool_name,
         )
 
+    def _calculate_retry_delay(self, retry_after: float | None, attempt: int) -> float:
+        """Calculate retry delay with exponential backoff and optional jitter.
+
+        Args:
+            retry_after: Server-suggested delay (from Retry-After header), or None.
+            attempt: Current attempt number (1-based).
+
+        Returns:
+            Delay in seconds before the next retry.
+        """
+        if retry_after is not None and retry_after > 0:
+            delay = retry_after
+        else:
+            delay = self._min_retry_delay * (2 ** (attempt - 1))
+        delay = min(delay, self._max_retry_delay)
+        if self._retry_jitter:
+            delay *= random.uniform(0.8, 1.2)
+        return delay
+
     async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """Generate completion using Responses API.
 
@@ -676,10 +706,16 @@ class OpenAIProvider:
         elif temperature := kwargs.get("temperature", self.temperature):
             params["temperature"] = temperature
 
-        reasoning_param = (
-            kwargs.get("reasoning", getattr(request, "reasoning", None))
-            or self.reasoning
-        )
+        # Phase 2: Reasoning parameter precedence chain
+        # kwargs["reasoning"] > request.reasoning_effort > config default > None
+        reasoning_param = kwargs.get("reasoning", getattr(request, "reasoning", None))
+        if reasoning_param is None and request.reasoning_effort:
+            reasoning_param = {
+                "effort": request.reasoning_effort,
+                "summary": self.reasoning_summary,
+            }
+        if reasoning_param is None:
+            reasoning_param = self.reasoning
         if reasoning_param:
             # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
             if isinstance(reasoning_param, dict):
@@ -817,11 +853,118 @@ class OpenAIProvider:
         effective_timeout = self.background_timeout if background_mode else self.timeout
         poll_interval = kwargs.get("poll_interval", self.poll_interval)
 
-        # Call provider API
+        # Call provider API with Phase 2 retry loop and error translation
         try:
-            response = await asyncio.wait_for(
-                self.client.responses.create(**params), timeout=effective_timeout
-            )
+            for attempt in range(1, self._max_retries + 2):
+                try:
+                    # Phase 2 inner try: translate native SDK errors to kernel types
+                    try:
+                        response = await asyncio.wait_for(
+                            self.client.responses.create(**params),
+                            timeout=effective_timeout,
+                        )
+                    except openai.RateLimitError as e:
+                        retry_after = None
+                        if hasattr(e, "response") and e.response is not None:
+                            ra_header = e.response.headers.get("retry-after")
+                            if ra_header:
+                                try:
+                                    retry_after = float(ra_header)
+                                except (ValueError, TypeError):
+                                    pass
+                        raise kernel_errors.RateLimitError(
+                            str(e),
+                            provider=self.name,
+                            status_code=429,
+                            retryable=True,
+                            retry_after=retry_after,
+                        ) from e
+                    except openai.AuthenticationError as e:
+                        raise kernel_errors.AuthenticationError(
+                            str(e),
+                            provider=self.name,
+                            status_code=getattr(e, "status_code", 401),
+                        ) from e
+                    except openai.BadRequestError as e:
+                        msg = str(e).lower()
+                        if (
+                            "context length" in msg
+                            or "too many tokens" in msg
+                            or "maximum context" in msg
+                        ):
+                            raise kernel_errors.ContextLengthError(
+                                str(e),
+                                provider=self.name,
+                                status_code=400,
+                            ) from e
+                        elif (
+                            "content filter" in msg
+                            or "safety" in msg
+                            or "blocked" in msg
+                        ):
+                            raise kernel_errors.ContentFilterError(
+                                str(e),
+                                provider=self.name,
+                                status_code=400,
+                            ) from e
+                        else:
+                            raise kernel_errors.InvalidRequestError(
+                                str(e),
+                                provider=self.name,
+                                status_code=400,
+                            ) from e
+                    except openai.APIStatusError as e:
+                        status = getattr(e, "status_code", 500)
+                        if status >= 500:
+                            raise kernel_errors.ProviderUnavailableError(
+                                str(e),
+                                provider=self.name,
+                                status_code=status,
+                                retryable=True,
+                            ) from e
+                        raise kernel_errors.LLMError(
+                            str(e),
+                            provider=self.name,
+                            status_code=status,
+                            retryable=False,
+                        ) from e
+                    except asyncio.TimeoutError as e:
+                        raise kernel_errors.LLMTimeoutError(
+                            f"Request timed out after {effective_timeout}s",
+                            provider=self.name,
+                            retryable=True,
+                        ) from e
+                    except kernel_errors.LLMError:
+                        raise  # Already translated, don't double-wrap
+                    except Exception as e:
+                        raise kernel_errors.LLMError(
+                            str(e) or f"{type(e).__name__}: (no message)",
+                            provider=self.name,
+                            retryable=True,
+                        ) from e
+
+                    break  # Success — exit retry loop
+
+                except kernel_errors.LLMError as e:
+                    if not e.retryable or attempt > self._max_retries:
+                        raise
+                    retry_after = getattr(e, "retry_after", None)
+                    if retry_after is not None and retry_after > self._max_retry_delay:
+                        raise  # Don't silently wait minutes — fail fast
+                    delay = self._calculate_retry_delay(retry_after, attempt)
+                    # Emit provider:retry event for observability
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "provider:retry",
+                            {
+                                "provider": self.name,
+                                "attempt": attempt,
+                                "delay": delay,
+                                "error_type": type(e).__name__,
+                            },
+                        )
+                    await asyncio.sleep(delay)
+
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             logger.info(
@@ -1090,13 +1233,12 @@ class OpenAIProvider:
             # Use existing conversion for normal (non-continued) responses
             return self._convert_to_chat_response(response)
 
-        except TimeoutError:
-            # Handle timeout specifically - TimeoutError has empty str() representation
+        except kernel_errors.LLMError as e:
+            # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = f"Request timed out after {self.timeout}s"
+            error_msg = str(e) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
-            # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "llm:response",
@@ -1108,7 +1250,7 @@ class OpenAIProvider:
                         "model": params["model"],
                     },
                 )
-            raise TimeoutError(error_msg) from None
+            raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -1756,10 +1898,26 @@ class OpenAIProvider:
                 usage_counts["output"] = usage_obj.output_tokens
             usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
 
+        # Phase 2: Extract reasoning_tokens from output_tokens_details
+        reasoning_tokens = None
+        if usage_obj and hasattr(usage_obj, "output_tokens_details"):
+            details = usage_obj.output_tokens_details
+            if details and hasattr(details, "reasoning_tokens"):
+                reasoning_tokens = details.reasoning_tokens
+
+        # Extract cache_read_tokens from input_tokens_details
+        cache_read_tokens = None
+        if usage_obj and hasattr(usage_obj, "input_tokens_details"):
+            details = usage_obj.input_tokens_details
+            if details and hasattr(details, "cached_tokens"):
+                cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
+
         usage = Usage(
             input_tokens=usage_counts["input"],
             output_tokens=usage_counts["output"],
             total_tokens=usage_counts["total"],
+            reasoning_tokens=reasoning_tokens,
+            cache_read_tokens=cache_read_tokens,
         )
 
         combined_text = "\n\n".join(text_accumulator).strip()
