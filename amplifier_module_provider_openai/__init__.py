@@ -1910,7 +1910,7 @@ class OpenAIProvider:
         if usage_obj and hasattr(usage_obj, "input_tokens_details"):
             details = usage_obj.input_tokens_details
             if details and hasattr(details, "cached_tokens"):
-                cache_read_tokens = details.cached_tokens or None
+                cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
 
         usage = Usage(
             input_tokens=usage_counts["input"],
