@@ -734,7 +734,7 @@ class OpenAIProvider:
 
         # CRITICAL: Always request encrypted_content with store=False for stateless reasoning preservation
         # This is separate from reasoning effort - we need encrypted content even if effort not explicitly set
-        if not store_enabled:
+        if not store_enabled and "reasoning" in params:
             params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
             logger.debug(
                 "[PROVIDER] Requesting encrypted_content (store=False, enables stateless reasoning)"
