@@ -1448,14 +1448,19 @@ class OpenAIProvider:
                                             reasoning_item["encrypted_content"] = (
                                                 encrypted_content
                                             )
-                                        # Add summary from thinking text
-                                        if block.get("thinking"):
-                                            reasoning_item["summary"] = [
+                                        # Always include summary (required by OpenAI API).
+                                        # Use thinking text when available, empty list otherwise.
+                                        thinking_text = block.get("thinking")
+                                        reasoning_item["summary"] = (
+                                            [
                                                 {
                                                     "type": "summary_text",
-                                                    "text": block["thinking"],
+                                                    "text": thinking_text,
                                                 }
                                             ]
+                                            if thinking_text
+                                            else []
+                                        )
                                         reasoning_items_to_add.append(reasoning_item)
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
@@ -1508,14 +1513,23 @@ class OpenAIProvider:
                                             encrypted_content
                                         )
 
-                                    # Add summary from thinking text
-                                    if hasattr(block, "thinking") and block.thinking:
-                                        reasoning_item["summary"] = [
+                                    # Always include summary (required by OpenAI API).
+                                    # Use thinking text when available, empty list otherwise.
+                                    thinking_text = (
+                                        getattr(block, "thinking", None)
+                                        if hasattr(block, "thinking")
+                                        else None
+                                    )
+                                    reasoning_item["summary"] = (
+                                        [
                                             {
                                                 "type": "summary_text",
-                                                "text": block.thinking,
+                                                "text": thinking_text,
                                             }
                                         ]
+                                        if thinking_text
+                                        else []
+                                    )
 
                                     reasoning_items_to_add.append(reasoning_item)
 

@@ -134,7 +134,10 @@ def test_orphaned_reasoning_ids_stripped():
                 {
                     "type": "thinking",
                     "thinking": "Let me think...",
-                    "content": [None, "rs_orphan_123"],  # [no encrypted_content, reasoning_id]
+                    "content": [
+                        None,
+                        "rs_orphan_123",
+                    ],  # [no encrypted_content, reasoning_id]
                 },
                 {
                     "type": "text",
@@ -174,7 +177,10 @@ def test_reasoning_continuity_with_encrypted_content():
                 {
                     "type": "thinking",
                     "thinking": "Let me calculate...",
-                    "content": ["encrypted_data_here", "rs_abc123"],  # [encrypted_content, reasoning_id]
+                    "content": [
+                        "encrypted_data_here",
+                        "rs_abc123",
+                    ],  # [encrypted_content, reasoning_id]
                 },
                 {
                     "type": "text",
@@ -200,3 +206,83 @@ def test_reasoning_continuity_with_encrypted_content():
     assert reasoning_items[0]["summary"] == [
         {"type": "summary_text", "text": "Let me calculate..."}
     ]
+
+
+def test_summary_field_always_present_even_without_thinking_text():
+    """Regression: reasoning items sent back to the API MUST always include
+    a 'summary' field. When thinking text is empty (encrypted_content only),
+    summary should be an empty list, not omitted.
+
+    Without this, the API returns:
+        Missing required parameter: 'input[N].summary'
+    """
+    provider = _make_provider()
+
+    # Dict-format block: encrypted_content present, thinking is empty string
+    messages_dict = [
+        {"role": "user", "content": "Hello"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "",  # Empty — no summary text from API
+                    "content": ["encrypted_blob", "rs_no_summary"],
+                },
+                {"type": "text", "text": "Hi there"},
+            ],
+            "metadata": {"openai:reasoning_items": ["rs_no_summary"]},
+        },
+        {"role": "user", "content": "Follow-up"},
+    ]
+
+    result = provider._convert_messages(messages_dict)
+    reasoning_items = [item for item in result if item.get("type") == "reasoning"]
+    assert len(reasoning_items) == 1, (
+        f"Expected 1 reasoning item, got {len(reasoning_items)}"
+    )
+    assert "summary" in reasoning_items[0], (
+        "Reasoning item MUST always include 'summary' field, even when empty. "
+        f"Keys present: {list(reasoning_items[0].keys())}"
+    )
+    assert reasoning_items[0]["summary"] == [], (
+        f"Expected empty summary list for empty thinking text, "
+        f"got: {reasoning_items[0]['summary']}"
+    )
+
+
+def test_summary_field_always_present_object_path():
+    """Same as above but exercises the object (hasattr) code path
+    in _convert_messages."""
+    from types import SimpleNamespace
+
+    provider = _make_provider()
+
+    # Object-format block: ThinkingBlock-like object with empty thinking
+    thinking_block = SimpleNamespace(
+        type="thinking",
+        thinking="",  # Empty — no summary text
+        content=["encrypted_blob_obj", "rs_obj_no_summary"],
+    )
+    text_block = SimpleNamespace(type="text", text="Response text")
+
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {
+            "role": "assistant",
+            "content": [thinking_block, text_block],
+            "metadata": {"openai:reasoning_items": ["rs_obj_no_summary"]},
+        },
+        {"role": "user", "content": "Follow-up"},
+    ]
+
+    result = provider._convert_messages(messages)
+    reasoning_items = [item for item in result if item.get("type") == "reasoning"]
+    assert len(reasoning_items) == 1, (
+        f"Expected 1 reasoning item (object path), got {len(reasoning_items)}"
+    )
+    assert "summary" in reasoning_items[0], (
+        "Reasoning item MUST always include 'summary' field (object path). "
+        f"Keys present: {list(reasoning_items[0].keys())}"
+    )
+    assert reasoning_items[0]["summary"] == []
