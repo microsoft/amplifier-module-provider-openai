@@ -89,8 +89,10 @@ def test_reasoning_effort_medium():
 
 
 def test_reasoning_effort_none_no_reasoning_param():
-    """reasoning_effort=None and no config -> no reasoning param sent."""
-    provider = _make_provider()
+    """reasoning_effort=None and no config -> no reasoning param sent.
+    Uses a non-reasoning model since reasoning-capable models (gpt-5.*, o-series,
+    codex) now auto-set reasoning={summary: 'auto'} for observability."""
+    provider = _make_provider(default_model="gpt-4.1-mini")  # non-reasoning model
     asyncio.run(provider.complete(_request_with_effort(None)))
 
     kwargs = _get_call_kwargs(provider)
