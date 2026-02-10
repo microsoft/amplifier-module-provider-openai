@@ -828,6 +828,13 @@ class OpenAIProvider:
                 buffer_tokens,
             )
 
+        # Auto-enable reasoning summary for models that reason by default.
+        # Without this, models like gpt-5.2-codex return encrypted_content but no
+        # summary text, making reasoning invisible for observability/debugging.
+        # Placed AFTER extended_thinking so it doesn't interfere with effort-based reasoning.
+        if self._model_may_reason(model_name) and "reasoning" not in params:
+            params["reasoning"] = {"summary": "auto"}
+
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             # INFO level: Summary only
@@ -1760,13 +1767,13 @@ class OpenAIProvider:
                             reasoning_summary, "text", str(reasoning_summary)
                         )
 
-                    # Only create thinking block if there's actual content
-                    if reasoning_text:
+                    # Create thinking block if there's reasoning text OR encrypted state to preserve
+                    if reasoning_text or encrypted_content:
                         # Store reasoning state in content field for re-insertion
                         # content[0] = encrypted_content (for full reasoning continuity)
                         # content[1] = reasoning_id (rs_* ID for OpenAI)
                         thinking_block = ThinkingBlock(
-                            thinking=reasoning_text,
+                            thinking=reasoning_text or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
                             content=[encrypted_content, reasoning_id],
@@ -1777,7 +1784,7 @@ class OpenAIProvider:
                             f"enc_len={len(encrypted_content) if encrypted_content else 0}"
                         )
                         content_blocks.append(thinking_block)
-                        event_blocks.append(ThinkingContent(text=reasoning_text))
+                        event_blocks.append(ThinkingContent(text=reasoning_text or ""))
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
@@ -1862,13 +1869,13 @@ class OpenAIProvider:
                             reasoning_summary, "text", str(reasoning_summary)
                         )
 
-                    # Only create thinking block if there's actual content
-                    if reasoning_text:
+                    # Create thinking block if there's reasoning text OR encrypted state to preserve
+                    if reasoning_text or encrypted_content:
                         # Store reasoning state in content field for re-insertion
                         # content[0] = encrypted_content (for full reasoning continuity)
                         # content[1] = reasoning_id (rs_* ID for OpenAI)
                         thinking_block = ThinkingBlock(
-                            thinking=reasoning_text,
+                            thinking=reasoning_text or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
                             content=[encrypted_content, reasoning_id],
@@ -1879,7 +1886,7 @@ class OpenAIProvider:
                             f"enc_len={len(encrypted_content) if encrypted_content else 0}"
                         )
                         content_blocks.append(thinking_block)
-                        event_blocks.append(ThinkingContent(text=reasoning_text))
+                        event_blocks.append(ThinkingContent(text=reasoning_text or ""))
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:

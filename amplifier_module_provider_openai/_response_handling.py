@@ -134,20 +134,21 @@ def convert_response_with_accumulated_output(
                 )
                 reasoning_text = extract_reasoning_text(reasoning_summary)
 
-                # Only create thinking block if there's actual content
-                if reasoning_text:
+                # Create thinking block if there's reasoning text OR encrypted state to preserve
+                if reasoning_text or encrypted_content:
                     # Store reasoning state in content field for re-insertion
                     # content[0] = encrypted_content (for full reasoning continuity)
                     # content[1] = reasoning_id (rs_* ID for OpenAI)
                     content_blocks.append(
                         ThinkingBlock(
-                            thinking=reasoning_text,
+                            thinking=reasoning_text
+                            or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
                             content=[encrypted_content, reasoning_id],
                         )
                     )
-                    event_blocks.append(ThinkingContent(text=reasoning_text))
+                    event_blocks.append(ThinkingContent(text=reasoning_text or ""))
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
@@ -211,20 +212,20 @@ def convert_response_with_accumulated_output(
                 reasoning_summary = block.get("summary") or block.get("text")
                 reasoning_text = extract_reasoning_text(reasoning_summary)
 
-                # Only create thinking block if there's actual content
-                if reasoning_text:
+                # Create thinking block if there's reasoning text OR encrypted state to preserve
+                if reasoning_text or encrypted_content:
                     # Store reasoning state in content field for re-insertion
                     # content[0] = encrypted_content (for full reasoning continuity)
                     # content[1] = reasoning_id (rs_* ID for OpenAI)
                     content_blocks.append(
                         ThinkingBlock(
-                            thinking=reasoning_text,
+                            thinking=reasoning_text or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
                             content=[encrypted_content, reasoning_id],
                         )
                     )
-                    event_blocks.append(ThinkingContent(text=reasoning_text))
+                    event_blocks.append(ThinkingContent(text=reasoning_text or ""))
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
