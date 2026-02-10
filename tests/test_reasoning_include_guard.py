@@ -55,9 +55,11 @@ def _get_call_kwargs(provider: OpenAIProvider) -> dict:
 
 
 def test_no_include_for_non_reasoning_model():
-    """When reasoning is NOT active, include parameter should NOT be sent,
-    even when store=false (the default)."""
-    provider = _make_provider()  # store defaults to false
+    """When reasoning is NOT active on a non-reasoning model, include parameter
+    should NOT be sent, even when store=false (the default).
+    Note: must use a non-reasoning model — reasoning-capable models (gpt-5.*,
+    o-series, codex) now get include automatically via model capability detection."""
+    provider = _make_provider(default_model="gpt-4.1-mini")  # non-reasoning model
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
         reasoning_effort=None,  # No reasoning requested

@@ -334,6 +334,20 @@ class OpenAIProvider:
                 return f"GPT-{parts[1]}"
         return model_id
 
+    def _model_may_reason(self, model_name: str) -> bool:
+        """Check if a model may produce reasoning output by default.
+
+        Models like gpt-5.2-codex and o-series reason without explicit
+        reasoning_effort being set.  We need to request encrypted_content
+        for these models even when no reasoning param is in the request.
+        """
+        if not model_name:
+            return False
+        name = model_name.lower()
+        # Models known to reason by default
+        reasoning_prefixes = ("o1", "o3", "o4", "codex", "gpt-5")
+        return any(name.startswith(p) or f"-{p}" in name for p in reasoning_prefixes)
+
     def _build_continuation_input(
         self, original_input: list, accumulated_output: list
     ) -> list:
@@ -732,13 +746,19 @@ class OpenAIProvider:
                 }
             logger.info(f"[PROVIDER] Setting reasoning: {params['reasoning']}")
 
-        # CRITICAL: Always request encrypted_content with store=False for stateless reasoning preservation
-        # This is separate from reasoning effort - we need encrypted content even if effort not explicitly set
-        if not store_enabled and "reasoning" in params:
-            params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
-            logger.debug(
-                "[PROVIDER] Requesting encrypted_content (store=False, enables stateless reasoning)"
+        # CRITICAL: Request encrypted_content for ANY model that may reason, not just when explicitly configured.
+        # Models like gpt-5.2-codex and o-series reason by default without "reasoning" appearing in params.
+        if not store_enabled:
+            model_may_reason = (
+                "reasoning" in params
+                or self._model_may_reason(model_name)
             )
+            if model_may_reason:
+                params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
+                logger.debug(
+                    "[PROVIDER] Requesting encrypted_content (store=False, model may reason: %s)",
+                    model_name,
+                )
 
         # Add tools if provided (from request or kwargs)
         # Native tools (web_search_preview, file_search, code_interpreter) can be passed via kwargs["tools"]
@@ -1496,20 +1516,24 @@ class OpenAIProvider:
                 elif isinstance(content, str) and content:
                     assistant_content.append({"type": "output_text", "text": content})
 
-                # FALLBACK: If no reasoning items in content but metadata has them, log for visibility
-                # (Cannot reconstruct without encrypted_content, so previous_response_id is the fallback)
+                # Defensive: strip orphaned reasoning items that have no encrypted_content.
+                # These occur when the model reasoned but include=[reasoning.encrypted_content]
+                # was not requested — the reasoning ID exists but can't be sent back, causing 404s.
                 if metadata and metadata.get(METADATA_REASONING_ITEMS):
-                    has_reasoning_in_content = any(
-                        (isinstance(item, dict) and item.get("type") == "reasoning")
-                        or (hasattr(item, "get") and item.get("type") == "reasoning")
-                        for item in assistant_content
+                    has_usable_reasoning = any(
+                        isinstance(item, dict)
+                        and item.get("type") == "reasoning"
+                        and item.get("encrypted_content")
+                        for item in reasoning_items_to_add
                     )
-                    if not has_reasoning_in_content:
-                        logger.debug(
-                            "[PROVIDER] Reasoning IDs in metadata but not in content blocks. "
-                            "Using previous_response_id fallback for reasoning preservation. "
-                            "Consider updating orchestrator to preserve content blocks for optimal reasoning re-insertion."
+                    if not has_usable_reasoning:
+                        logger.warning(
+                            "[PROVIDER] Reasoning IDs in metadata but encrypted_content unavailable. "
+                            "Stripping orphaned reasoning references to prevent API errors. "
+                            "Ensure include=[reasoning.encrypted_content] is requested for store=false."
                         )
+                        # Strip orphaned reasoning items that would cause 404 errors
+                        reasoning_items_to_add.clear()
 
                 # Add reasoning items as TOP-LEVEL entries (before assistant message)
                 # Per OpenAI Responses API: reasoning items must be top-level, not in message content
