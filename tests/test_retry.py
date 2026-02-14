@@ -1,8 +1,10 @@
-"""Phase 2: Retry pattern tests.
+"""Retry pattern tests: shared retry_with_backoff from amplifier-core.
 
 Verifies exponential backoff, jitter, retry-after > max_delay fast-fail,
 non-retryable errors propagating immediately, provider:retry event emission,
-and final failure raising the kernel error type (not RuntimeError).
+final failure raising the kernel error type (not RuntimeError),
+_retry_config is a RetryConfig instance, _calculate_retry_delay removed,
+and new error types (403 -> AccessDeniedError, 404 -> NotFoundError).
 """
 
 import asyncio
@@ -12,9 +14,11 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import openai
+import pytest
 from amplifier_core import ModuleCoordinator
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message
+from amplifier_core.utils.retry import RetryConfig
 
 from amplifier_module_provider_openai import OpenAIProvider
 
@@ -110,8 +114,6 @@ def test_non_retryable_error_not_retried():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    import pytest
-
     with pytest.raises(kernel_errors.AuthenticationError):
         asyncio.run(provider.complete(_simple_request()))
 
@@ -128,8 +130,6 @@ def test_retry_after_exceeds_max_delay_raises_immediately():
         body=None,
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
-
-    import pytest
 
     with pytest.raises(kernel_errors.RateLimitError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
@@ -219,8 +219,6 @@ def test_max_retries_exhausted_raises_kernel_error():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    import pytest
-
     with patch("asyncio.sleep", new_callable=AsyncMock):
         with pytest.raises(kernel_errors.RateLimitError):
             asyncio.run(provider.complete(_simple_request()))
@@ -269,3 +267,123 @@ def test_sdk_retries_disabled():
     """OpenAI SDK max_retries is set to 0 (we handle retries ourselves)."""
     provider = _make_provider()
     assert provider.client.max_retries == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Shared retry_with_backoff adoption tests
+# ---------------------------------------------------------------------------
+
+
+class TestRetryConfigAttribute:
+    """Verify _retry_config is a RetryConfig from amplifier-core."""
+
+    def test_retry_config_exists_and_is_retry_config(self):
+        """Provider should have a _retry_config attribute of type RetryConfig."""
+        provider = _make_provider()
+        assert hasattr(provider, "_retry_config")
+        assert isinstance(provider._retry_config, RetryConfig)
+
+    def test_retry_config_values_from_config(self):
+        """RetryConfig fields should match provider config values."""
+        provider = OpenAIProvider(
+            api_key="test-key",
+            config={
+                "max_retries": 7,
+                "min_retry_delay": 2.0,
+                "max_retry_delay": 120.0,
+                "retry_jitter": 0.3,
+            },
+        )
+        assert provider._retry_config.max_retries == 7
+        assert provider._retry_config.min_delay == 2.0
+        assert provider._retry_config.max_delay == 120.0
+        assert provider._retry_config.jitter == 0.3
+
+    def test_retry_config_defaults(self):
+        """RetryConfig should use sensible defaults when config is empty."""
+        provider = OpenAIProvider(api_key="test-key", config={})
+        assert provider._retry_config.max_retries == 5
+        assert provider._retry_config.min_delay == 1.0
+        assert provider._retry_config.max_delay == 60.0
+
+
+class TestCalculateRetryDelayRemoved:
+    """_calculate_retry_delay should be removed (replaced by shared utility)."""
+
+    def test_no_calculate_retry_delay_method(self):
+        """Provider should NOT have _calculate_retry_delay anymore."""
+        provider = _make_provider()
+        assert not hasattr(provider, "_calculate_retry_delay")
+
+
+class TestNewErrorTypes:
+    """Verify new error types for specific HTTP status codes."""
+
+    def test_403_translates_to_access_denied_error(self):
+        """HTTP 403 should raise AccessDeniedError (subclass of AuthenticationError)."""
+        provider = _make_provider(max_retries=0)
+        native = openai.APIStatusError(
+            "permission denied",
+            response=_mock_httpx_response(403),
+            body=None,
+        )
+        provider.client.responses.create = AsyncMock(side_effect=native)
+
+        with pytest.raises(kernel_errors.AccessDeniedError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        e = exc_info.value
+        assert e.provider == "openai"
+        assert e.status_code == 403
+        assert e.retryable is False
+        # AccessDeniedError is a subclass of AuthenticationError
+        assert isinstance(e, kernel_errors.AuthenticationError)
+
+    def test_404_translates_to_not_found_error(self):
+        """HTTP 404 should raise NotFoundError."""
+        provider = _make_provider(max_retries=0)
+        native = openai.APIStatusError(
+            "model not found",
+            response=_mock_httpx_response(404),
+            body=None,
+        )
+        provider.client.responses.create = AsyncMock(side_effect=native)
+
+        with pytest.raises(kernel_errors.NotFoundError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        e = exc_info.value
+        assert e.provider == "openai"
+        assert e.status_code == 404
+        assert e.retryable is False
+
+
+class TestRetryEventPayloadHasMaxRetries:
+    """provider:retry event payload should include max_retries and error_message."""
+
+    def test_retry_event_has_max_retries_and_error_message(self):
+        provider = _make_provider()
+        provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
+
+        native = openai.RateLimitError(
+            "Rate limit",
+            response=_mock_httpx_response(429),
+            body=None,
+        )
+        provider.client.responses.create = AsyncMock(
+            side_effect=[native, DummyResponse()]
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            asyncio.run(provider.complete(_simple_request()))
+
+        retry_events = [
+            (name, payload)
+            for name, payload in provider.coordinator.hooks.events
+            if name == "provider:retry"
+        ]
+        assert len(retry_events) == 1
+        payload = retry_events[0][1]
+        assert "max_retries" in payload
+        assert payload["max_retries"] == 3
+        assert "error_message" in payload
