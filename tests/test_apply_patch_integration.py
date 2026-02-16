@@ -6,6 +6,8 @@ Tests the three localized changes:
 3. _convert_messages: emits apply_patch_call_output for native tool results
 """
 
+# pyright: reportAttributeAccessIssue=false
+
 from __future__ import annotations
 
 from typing import Any
@@ -24,7 +26,9 @@ def _make_provider(**overrides: Any) -> OpenAIProvider:
     coordinator.get_capability = MagicMock(return_value=None)
     coordinator.hooks = MagicMock()
     config = {**overrides}
-    provider = OpenAIProvider(api_key="test-key", config=config, coordinator=coordinator)
+    provider = OpenAIProvider(
+        api_key="test-key", config=config, coordinator=coordinator
+    )
     return provider
 
 
@@ -125,6 +129,8 @@ class TestConvertResponseApplyPatchCall:
         mock_response.id = "resp_123"
         mock_response.status = "completed"
         mock_response.incomplete_details = None
+        mock_response.finish_reason = None
+        mock_response.output_text = None
 
         chat_response = provider._convert_to_chat_response(mock_response)
 
@@ -162,6 +168,8 @@ class TestConvertResponseApplyPatchCall:
         mock_response.id = "resp_456"
         mock_response.status = "completed"
         mock_response.incomplete_details = None
+        mock_response.finish_reason = None
+        mock_response.output_text = None
 
         provider._convert_to_chat_response(mock_response)
         assert "call_xyz789" in provider._native_call_ids

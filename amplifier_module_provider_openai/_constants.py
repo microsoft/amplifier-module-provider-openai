@@ -26,25 +26,32 @@ MAX_CONTINUATION_ATTEMPTS = 5
 
 # Deep research / background mode constants
 DEFAULT_POLL_INTERVAL = 5.0  # seconds between status polls
-DEFAULT_BACKGROUND_TIMEOUT = 1800.0  # 30 minutes for background requests (deep research can be slow)
+DEFAULT_BACKGROUND_TIMEOUT = (
+    1800.0  # 30 minutes for background requests (deep research can be slow)
+)
 
 # Native tool types that should be passed through to OpenAI without conversion
 # These are OpenAI-hosted tools, not user-defined function tools
-NATIVE_TOOL_TYPES = frozenset({
-    "web_search_preview",
-    "web_search_preview_2025_03_11",
-    "web_search",
-    "file_search",
-    "code_interpreter",
-})
+NATIVE_TOOL_TYPES = frozenset(
+    {
+        "web_search_preview",
+        "web_search_preview_2025_03_11",
+        "web_search",
+        "file_search",
+        "code_interpreter",
+        "apply_patch",
+    }
+)
 
 # Deep research model identifiers
-DEEP_RESEARCH_MODELS = frozenset({
-    "o3-deep-research",
-    "o3-deep-research-2025-06-26",
-    "o4-mini-deep-research",
-    "o4-mini-deep-research-2025-06-26",
-})
+DEEP_RESEARCH_MODELS = frozenset(
+    {
+        "o3-deep-research",
+        "o3-deep-research-2025-06-26",
+        "o4-mini-deep-research",
+        "o4-mini-deep-research-2025-06-26",
+    }
+)
 
 # Background response status values
 BACKGROUND_STATUS_QUEUED = "queued"
@@ -55,8 +62,10 @@ BACKGROUND_STATUS_FAILED = "failed"
 BACKGROUND_STATUS_CANCELLED = "cancelled"
 
 # Non-terminal statuses that require continued polling
-BACKGROUND_POLLING_STATUSES = frozenset({
-    BACKGROUND_STATUS_QUEUED,
-    BACKGROUND_STATUS_IN_PROGRESS,
-    BACKGROUND_STATUS_SEARCHING,
-})
+BACKGROUND_POLLING_STATUSES = frozenset(
+    {
+        BACKGROUND_STATUS_QUEUED,
+        BACKGROUND_STATUS_IN_PROGRESS,
+        BACKGROUND_STATUS_SEARCHING,
+    }
+)

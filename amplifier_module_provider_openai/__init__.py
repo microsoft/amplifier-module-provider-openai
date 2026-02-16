@@ -175,6 +175,10 @@ class OpenAIProvider:
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
 
+        # Apply patch native mode detection — set during tool conversion
+        self._apply_patch_native = False
+        self._native_call_ids: set[str] = set()
+
     @property
     def client(self) -> AsyncOpenAI:
         """Lazily initialize the OpenAI client on first access."""
@@ -1348,20 +1352,30 @@ class OpenAIProvider:
                     tool_name = tool_msg.get("tool_name", "unknown")
 
                     if tool_call_id:
-                        # Native format: function_call_output with call_id for explicit correlation
-                        # Per OpenAI Responses API spec (see ai_context/openai-api-guide.txt)
                         output_str = (
                             tool_content
                             if isinstance(tool_content, str)
                             else json.dumps(tool_content)
                         )
-                        openai_messages.append(
-                            {
-                                "type": "function_call_output",
-                                "call_id": tool_call_id,
-                                "output": output_str,
-                            }
-                        )
+                        # Use apply_patch_call_output for native apply_patch calls
+                        if tool_call_id in self._native_call_ids:
+                            openai_messages.append(
+                                {
+                                    "type": "apply_patch_call_output",
+                                    "call_id": tool_call_id,
+                                    "output": output_str,
+                                }
+                            )
+                        else:
+                            # Standard function_call_output format
+                            # Per OpenAI Responses API spec (see ai_context/openai-api-guide.txt)
+                            openai_messages.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": tool_call_id,
+                                    "output": output_str,
+                                }
+                            )
                     else:
                         # Fallback for messages without tool_call_id (legacy/compacted messages)
                         logger.warning(
@@ -1677,6 +1691,11 @@ class OpenAIProvider:
 
             # Handle ToolSpec objects (user-defined function tools)
             if hasattr(tool, "name"):
+                # Special handling for apply_patch with native engine
+                if tool.name == "apply_patch" and self._apply_patch_native:
+                    openai_tools.append({"type": "apply_patch"})
+                    continue
+
                 openai_tools.append(
                     {
                         "type": "function",
@@ -1835,6 +1854,24 @@ class OpenAIProvider:
                     tool_calls.append(
                         ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
                     )
+
+                elif block_type == "apply_patch_call":
+                    call_id = getattr(block, "call_id", "")
+                    operation = block.operation
+                    args = {
+                        "type": getattr(operation, "type", ""),
+                        "path": getattr(operation, "path", ""),
+                        "diff": getattr(operation, "diff", ""),
+                    }
+                    content_blocks.append(
+                        ToolCallBlock(id=call_id, name="apply_patch", input=args)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=call_id, name="apply_patch", arguments=args)
+                    )
+                    # Track for round-trip output format
+                    self._native_call_ids.add(call_id)
+
             else:
                 # Dictionary format
                 block_type = block.get("type")
@@ -1942,6 +1979,22 @@ class OpenAIProvider:
                             id=tool_id, name=tool_name, arguments=tool_input, raw=block
                         )
                     )
+
+                elif block_type == "apply_patch_call":
+                    call_id = block.get("call_id", "")
+                    operation = block.get("operation", {})
+                    args = {
+                        "type": operation.get("type", ""),
+                        "path": operation.get("path", ""),
+                        "diff": operation.get("diff", ""),
+                    }
+                    content_blocks.append(
+                        ToolCallBlock(id=call_id, name="apply_patch", input=args)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=call_id, name="apply_patch", arguments=args)
+                    )
+                    self._native_call_ids.add(call_id)
 
         # Extract usage counts
         usage_obj = response.usage if hasattr(response, "usage") else None
