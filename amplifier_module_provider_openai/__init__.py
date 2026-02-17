@@ -1679,6 +1679,14 @@ class OpenAIProvider:
             List of OpenAI-formatted tool definitions
         """
         openai_tools = []
+
+        # Lazy detection of native apply_patch engine via coordinator capability.
+        # Once detected, the flag persists — no repeated lookups.
+        if not self._apply_patch_native:
+            engine = self.coordinator.get_capability("apply_patch.engine")
+            if engine == "native":
+                self._apply_patch_native = True
+
         for tool in tools:
             # Check if this is a native OpenAI tool (dict with recognized type)
             if isinstance(tool, dict):
