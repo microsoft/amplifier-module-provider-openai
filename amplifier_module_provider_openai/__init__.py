@@ -742,12 +742,13 @@ class OpenAIProvider:
         # CRITICAL: Request encrypted_content for ANY model that may reason, not just when explicitly configured.
         # Models like gpt-5.2-codex and o-series reason by default without "reasoning" appearing in params.
         if not store_enabled:
-            model_may_reason = (
-                "reasoning" in params
-                or self._model_may_reason(model_name)
+            model_may_reason = "reasoning" in params or self._model_may_reason(
+                model_name
             )
             if model_may_reason:
-                params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
+                params["include"] = kwargs.get(
+                    "include", ["reasoning.encrypted_content"]
+                )
                 logger.debug(
                     "[PROVIDER] Requesting encrypted_content (store=False, model may reason: %s)",
                     model_name,
@@ -926,11 +927,7 @@ class OpenAIProvider:
                         provider=self.name,
                         status_code=400,
                     ) from e
-                elif (
-                    "content filter" in msg
-                    or "safety" in msg
-                    or "blocked" in msg
-                ):
+                elif "content filter" in msg or "safety" in msg or "blocked" in msg:
                     raise kernel_errors.ContentFilterError(
                         str(e),
                         provider=self.name,
@@ -1359,11 +1356,30 @@ class OpenAIProvider:
                         )
                         # Use apply_patch_call_output for native apply_patch calls
                         if tool_call_id in self._native_call_ids:
+                            # Determine status: "failed" if content signals error, else "completed"
+                            _patch_status = "completed"
+                            if (
+                                isinstance(tool_content, dict)
+                                and tool_content.get("success") is False
+                            ):
+                                _patch_status = "failed"
+                            elif isinstance(tool_content, str):
+                                try:
+                                    _parsed = json.loads(tool_content)
+                                    if (
+                                        isinstance(_parsed, dict)
+                                        and _parsed.get("success") is False
+                                    ):
+                                        _patch_status = "failed"
+                                except (json.JSONDecodeError, TypeError):
+                                    pass  # Not JSON — treat as success output
+
                             openai_messages.append(
                                 {
                                     "type": "apply_patch_call_output",
                                     "call_id": tool_call_id,
                                     "output": output_str,
+                                    "status": _patch_status,
                                 }
                             )
                         else:
@@ -1824,7 +1840,8 @@ class OpenAIProvider:
                         # content[0] = encrypted_content (for full reasoning continuity)
                         # content[1] = reasoning_id (rs_* ID for OpenAI)
                         thinking_block = ThinkingBlock(
-                            thinking=reasoning_text or "",  # May be empty when only encrypted_content exists
+                            thinking=reasoning_text
+                            or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
                             content=[encrypted_content, reasoning_id],
@@ -1944,7 +1961,8 @@ class OpenAIProvider:
                         # content[0] = encrypted_content (for full reasoning continuity)
                         # content[1] = reasoning_id (rs_* ID for OpenAI)
                         thinking_block = ThinkingBlock(
-                            thinking=reasoning_text or "",  # May be empty when only encrypted_content exists
+                            thinking=reasoning_text
+                            or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
                             content=[encrypted_content, reasoning_id],

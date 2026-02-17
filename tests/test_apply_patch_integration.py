@@ -205,6 +205,54 @@ class TestConvertMessagesApplyPatchOutput:
         assert patch_outputs[0]["call_id"] == "call_abc123"
         assert patch_outputs[0]["output"] == "M src/main.py"
 
+    def test_apply_patch_call_output_includes_status_completed(self) -> None:
+        """apply_patch_call_output must include status field for OpenAI API."""
+        provider = _make_provider()
+        provider._native_call_ids = {"call_abc123"}
+
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_abc123",
+                "content": "A new-file.txt",
+                "tool_name": "apply_patch",
+            },
+        ]
+
+        result = provider._convert_messages(messages)
+
+        output_items = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "apply_patch_call_output"
+        ]
+        assert len(output_items) == 1
+        assert output_items[0]["status"] == "completed"
+
+    def test_apply_patch_call_output_status_failed_on_error(self) -> None:
+        """apply_patch_call_output should have status 'failed' when tool errored."""
+        provider = _make_provider()
+        provider._native_call_ids = {"call_err456"}
+
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_err456",
+                "content": '{"success": false, "error": {"message": "File not found"}}',
+                "tool_name": "apply_patch",
+            },
+        ]
+
+        result = provider._convert_messages(messages)
+
+        output_items = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "apply_patch_call_output"
+        ]
+        assert len(output_items) == 1
+        assert output_items[0]["status"] == "failed"
+
     def test_regular_tool_result_uses_function_call_output(self) -> None:
         """Non-native tool results still use function_call_output type."""
         provider = _make_provider()
