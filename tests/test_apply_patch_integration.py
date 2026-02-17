@@ -228,3 +228,82 @@ class TestConvertMessagesApplyPatchOutput:
         ]
         assert len(func_outputs) == 1
         assert func_outputs[0]["call_id"] == "call_other"
+
+
+# --- Test capability-based activation ---
+
+
+class TestCapabilityDetection:
+    """Provider should auto-detect native apply_patch engine via coordinator capability."""
+
+    def test_detects_native_engine_from_capability(self) -> None:
+        """When apply_patch.engine capability is 'native', provider activates native mode."""
+        provider = _make_provider()
+        assert provider._apply_patch_native is False  # starts False
+
+        # Configure coordinator to return "native" for the capability query
+        provider.coordinator.get_capability = MagicMock(
+            side_effect=lambda key: "native" if key == "apply_patch.engine" else None
+        )
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec])
+
+        # Should have auto-detected and activated native mode
+        assert provider._apply_patch_native is True
+        # Should send native tool type, not function tool
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 1
+        assert native_tools[0] == {"type": "apply_patch"}
+
+    def test_no_capability_stays_function_mode(self) -> None:
+        """When apply_patch.engine capability is absent, provider stays in function mode."""
+        provider = _make_provider()
+        provider.coordinator.get_capability = MagicMock(return_value=None)
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec])
+
+        assert provider._apply_patch_native is False
+        func_tools = [t for t in result if t.get("type") == "function"]
+        assert len(func_tools) == 1
+        assert func_tools[0]["name"] == "apply_patch"
+
+    def test_function_engine_capability_stays_function_mode(self) -> None:
+        """When apply_patch.engine capability is 'function', provider stays in function mode."""
+        provider = _make_provider()
+        provider.coordinator.get_capability = MagicMock(
+            side_effect=lambda key: "function" if key == "apply_patch.engine" else None
+        )
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec])
+
+        assert provider._apply_patch_native is False
+        func_tools = [t for t in result if t.get("type") == "function"]
+        assert len(func_tools) == 1
+
+    def test_detection_is_lazy_and_cached(self) -> None:
+        """Once native mode is detected, subsequent calls don't re-query the capability."""
+        provider = _make_provider()
+        call_count = 0
+
+        def mock_get_capability(key: str) -> str | None:
+            nonlocal call_count
+            if key == "apply_patch.engine":
+                call_count += 1
+                return "native"
+            return None
+
+        provider.coordinator.get_capability = MagicMock(side_effect=mock_get_capability)
+
+        tool_spec = _make_apply_patch_tool_spec()
+
+        # First call — should query capability
+        provider._convert_tools_from_request([tool_spec])
+        assert call_count == 1
+        assert provider._apply_patch_native is True
+
+        # Second call — flag is already True, should NOT query again
+        provider._convert_tools_from_request([tool_spec])
+        assert call_count == 1  # No additional query
