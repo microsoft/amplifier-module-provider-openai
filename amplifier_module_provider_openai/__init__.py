@@ -1473,20 +1473,48 @@ class OpenAIProvider:
                                 tc_name = block.get("name", "")
                                 tc_input = block.get("input", {})
                                 if isinstance(tc_input, str):
-                                    tc_args_str = tc_input
-                                else:
-                                    tc_args_str = (
-                                        json.dumps(tc_input) if tc_input else "{}"
-                                    )
+                                    try:
+                                        tc_input = json.loads(tc_input)
+                                    except (json.JSONDecodeError, TypeError):
+                                        tc_input = {}
+                                if not isinstance(tc_input, dict):
+                                    tc_input = {}
                                 if tc_id and tc_name:
-                                    function_call_items.append(
-                                        {
-                                            "type": "function_call",
-                                            "call_id": tc_id,
-                                            "name": tc_name,
-                                            "arguments": tc_args_str,
-                                        }
-                                    )
+                                    # Detect historical native apply_patch_call by operation shape:
+                                    # native calls store {"type": <op>, "path": ..., "diff": ...}
+                                    # where <op> is one of the known operation types.
+                                    _native_op_types = {
+                                        "update_file",
+                                        "create_file",
+                                        "delete_file",
+                                        "rename_file",
+                                    }
+                                    if (
+                                        tc_name == "apply_patch"
+                                        and tc_input.get("type") in _native_op_types
+                                    ):
+                                        # Restore as native apply_patch_call so the output
+                                        # is also replayed with the correct type.
+                                        self._native_call_ids.add(tc_id)
+                                        function_call_items.append(
+                                            {
+                                                "type": "apply_patch_call",
+                                                "call_id": tc_id,
+                                                "operation": tc_input,
+                                            }
+                                        )
+                                    else:
+                                        tc_args_str = (
+                                            json.dumps(tc_input) if tc_input else "{}"
+                                        )
+                                        function_call_items.append(
+                                            {
+                                                "type": "function_call",
+                                                "call_id": tc_id,
+                                                "name": tc_name,
+                                                "arguments": tc_args_str,
+                                            }
+                                        )
                             elif block_type == "thinking":
                                 # Extract reasoning state for top-level insertion
                                 # Reasoning items must be top-level in input, not in message content!
@@ -1529,20 +1557,48 @@ class OpenAIProvider:
                                 tc_name = getattr(block, "name", "")
                                 tc_input = getattr(block, "input", {})
                                 if isinstance(tc_input, str):
-                                    tc_args_str = tc_input
-                                else:
-                                    tc_args_str = (
-                                        json.dumps(tc_input) if tc_input else "{}"
-                                    )
+                                    try:
+                                        tc_input = json.loads(tc_input)
+                                    except (json.JSONDecodeError, TypeError):
+                                        tc_input = {}
+                                if not isinstance(tc_input, dict):
+                                    tc_input = {}
                                 if tc_id and tc_name:
-                                    function_call_items.append(
-                                        {
-                                            "type": "function_call",
-                                            "call_id": tc_id,
-                                            "name": tc_name,
-                                            "arguments": tc_args_str,
-                                        }
-                                    )
+                                    # Detect historical native apply_patch_call by operation shape:
+                                    # native calls store {"type": <op>, "path": ..., "diff": ...}
+                                    # where <op> is one of the known operation types.
+                                    _native_op_types = {
+                                        "update_file",
+                                        "create_file",
+                                        "delete_file",
+                                        "rename_file",
+                                    }
+                                    if (
+                                        tc_name == "apply_patch"
+                                        and tc_input.get("type") in _native_op_types
+                                    ):
+                                        # Restore as native apply_patch_call so the output
+                                        # is also replayed with the correct type.
+                                        self._native_call_ids.add(tc_id)
+                                        function_call_items.append(
+                                            {
+                                                "type": "apply_patch_call",
+                                                "call_id": tc_id,
+                                                "operation": tc_input,
+                                            }
+                                        )
+                                    else:
+                                        tc_args_str = (
+                                            json.dumps(tc_input) if tc_input else "{}"
+                                        )
+                                        function_call_items.append(
+                                            {
+                                                "type": "function_call",
+                                                "call_id": tc_id,
+                                                "name": tc_name,
+                                                "arguments": tc_args_str,
+                                            }
+                                        )
                             elif (
                                 block.type == "thinking"
                                 and hasattr(block, "content")
@@ -1871,7 +1927,7 @@ class OpenAIProvider:
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
-                    tool_id = getattr(block, "id", "") or getattr(block, "call_id", "")
+                    tool_id = getattr(block, "call_id", "") or getattr(block, "id", "")
                     tool_name = getattr(block, "name", "")
                     tool_input = getattr(block, "input", None)
                     if tool_input is None and hasattr(block, "arguments"):
@@ -1992,7 +2048,7 @@ class OpenAIProvider:
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
-                    tool_id = block.get("id") or block.get("call_id", "")
+                    tool_id = block.get("call_id") or block.get("id", "")
                     tool_name = block.get("name", "")
                     tool_input = block.get("input")
                     if tool_input is None:

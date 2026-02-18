@@ -450,3 +450,224 @@ class TestCapabilityDetection:
         # Second call — flag is already True, should NOT query again
         provider._convert_tools_from_request([tool_spec])
         assert call_count == 1  # No additional query
+
+
+# --- Test history replay of apply_patch_call and Bug A (call_id priority) ---
+
+
+class TestApplyPatchCallHistoryReplay:
+    def test_apply_patch_call_replayed_as_apply_patch_call_not_function_call(
+        self,
+    ) -> None:
+        """Historical native apply_patch_call must replay as apply_patch_call, not function_call.
+
+        When _convert_messages encounters a stored assistant 'tool_call' block whose
+        name is 'apply_patch' and whose input has a 'type' key matching a native
+        operation type (e.g. 'update_file'), it must emit an apply_patch_call item
+        rather than a function_call item.
+        """
+        provider = _make_provider()
+        provider._native_call_ids = set()
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_call",
+                        "id": "call_native_123",
+                        "name": "apply_patch",
+                        "input": {
+                            "type": "update_file",
+                            "path": "src/main.py",
+                            "diff": "@@ -1 +1 @@\n-old\n+new",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        result = provider._convert_messages(messages)
+
+        # Must NOT produce a function_call item for this native op
+        function_call_items = [
+            m for m in result if isinstance(m, dict) and m.get("type") == "function_call"
+        ]
+        assert len(function_call_items) == 0, (
+            "Historical native apply_patch_call should not be replayed as function_call"
+        )
+
+        # Must produce an apply_patch_call item with the right shape
+        patch_call_items = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "apply_patch_call"
+        ]
+        assert len(patch_call_items) == 1
+        item = patch_call_items[0]
+        assert item["call_id"] == "call_native_123"
+        assert isinstance(item.get("operation"), dict)
+        assert item["operation"]["type"] == "update_file"
+        assert item["operation"]["path"] == "src/main.py"
+
+    def test_apply_patch_call_output_type_correct_for_historical_native_call(
+        self,
+    ) -> None:
+        """Tool result for a historical native apply_patch_call must use apply_patch_call_output.
+
+        After _convert_messages processes the assistant message containing a native
+        apply_patch_call, the call_id is registered in _native_call_ids.  The
+        subsequent tool-result message for that call_id must therefore be emitted as
+        apply_patch_call_output (not function_call_output).
+        """
+        provider = _make_provider()
+        provider._native_call_ids = set()
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_call",
+                        "id": "call_native_456",
+                        "name": "apply_patch",
+                        "input": {
+                            "type": "create_file",
+                            "path": "new_module.py",
+                            "diff": "+print('hello')",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_native_456",
+                "content": "A new_module.py",
+                "tool_name": "apply_patch",
+            },
+        ]
+
+        result = provider._convert_messages(messages)
+
+        # The tool result must be apply_patch_call_output, not function_call_output
+        func_outputs = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "function_call_output"
+        ]
+        assert len(func_outputs) == 0, (
+            "Historical native apply_patch_call output should not use function_call_output"
+        )
+
+        patch_outputs = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "apply_patch_call_output"
+        ]
+        assert len(patch_outputs) == 1
+        assert patch_outputs[0]["call_id"] == "call_native_456"
+        assert patch_outputs[0]["output"] == "A new_module.py"
+
+    def test_function_call_id_uses_call_id_not_item_id(self) -> None:
+        """Bug A: function_call response items should use call_id, not the server item id.
+
+        When _convert_to_chat_response parses a function_call (or tool_call) response
+        item that carries both 'id' (server-assigned response-item ID, e.g. 'fc_abc...')
+        and 'call_id' (the tool correlation ID, e.g. 'call_abc...'), the resulting
+        ToolCallBlock and ToolCall must use the call_id value, not the item id.
+        """
+        provider = _make_provider()
+        provider._native_call_ids = set()
+
+        # Simulate a response block with both id and call_id set
+        mock_block = MagicMock()
+        mock_block.type = "function_call"
+        mock_block.id = "fc_abc123"
+        mock_block.call_id = "call_abc123"
+        mock_block.name = "read_file"
+        mock_block.input = {"path": "src/main.py"}
+        mock_block.arguments = '{"path": "src/main.py"}'
+
+        mock_response = MagicMock()
+        mock_response.output = [mock_block]
+        mock_response.usage = MagicMock()
+        mock_response.usage.input_tokens = 10
+        mock_response.usage.output_tokens = 5
+        mock_response.usage.total_tokens = 15
+        mock_response.usage.output_tokens_details = None
+        mock_response.usage.input_tokens_details = None
+        mock_response.id = "resp_bugA"
+        mock_response.status = "completed"
+        mock_response.incomplete_details = None
+        mock_response.finish_reason = None
+        mock_response.output_text = None
+
+        chat_response = provider._convert_to_chat_response(mock_response)
+
+        assert chat_response.tool_calls is not None
+        assert len(chat_response.tool_calls) == 1
+        tc = chat_response.tool_calls[0]
+        # Must be call_id ("call_abc123"), NOT item id ("fc_abc123")
+        assert tc.id == "call_abc123", (
+            f"Expected call_id 'call_abc123' but got '{tc.id}' — "
+            "function_call items must use call_id, not the server item id"
+        )
+
+    def test_function_call_apply_patch_without_operation_type_stays_function_call(
+        self,
+    ) -> None:
+        """apply_patch in function-mode (no native op type) must stay as function_call.
+
+        A 'tool_call' block with name='apply_patch' whose input uses the function-mode
+        argument shape (e.g. {'operations': [...]}) does NOT have a 'type' key matching
+        a native operation type.  It must be replayed as a regular function_call, not
+        promoted to apply_patch_call.
+        """
+        provider = _make_provider()
+        provider._native_call_ids = set()
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_call",
+                        "id": "call_func_ap",
+                        "name": "apply_patch",
+                        # Function-mode shape: no top-level 'type' key matching op types
+                        "input": {
+                            "operations": [
+                                {
+                                    "operation": "replace",
+                                    "path": "src/foo.py",
+                                    "content": "new content",
+                                }
+                            ]
+                        },
+                    }
+                ],
+            }
+        ]
+
+        result = provider._convert_messages(messages)
+
+        # Must NOT produce an apply_patch_call item
+        patch_call_items = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "apply_patch_call"
+        ]
+        assert len(patch_call_items) == 0, (
+            "Function-mode apply_patch (no native op type) must not be replayed as apply_patch_call"
+        )
+
+        # Must produce a regular function_call item
+        func_call_items = [
+            m for m in result if isinstance(m, dict) and m.get("type") == "function_call"
+        ]
+        assert len(func_call_items) == 1
+        assert func_call_items[0]["call_id"] == "call_func_ap"
+        assert func_call_items[0]["name"] == "apply_patch"
+
+        # Must NOT have added call_id to native_call_ids
+        assert "call_func_ap" not in provider._native_call_ids
