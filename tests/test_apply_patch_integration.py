@@ -253,6 +253,101 @@ class TestConvertMessagesApplyPatchOutput:
         assert len(output_items) == 1
         assert output_items[0]["status"] == "failed"
 
+    def test_apply_patch_call_output_status_failed_on_plain_string_error(self) -> None:
+        """Plain-string errors (non-JSON) should also get status 'failed'.
+
+        The apply_patch tool returns plain strings like 'File already exists: ...'
+        or 'Context mismatch in ...'. These are not JSON-parseable, but they are
+        errors and must produce status 'failed' — not 'completed'.
+        """
+        provider = _make_provider()
+        provider._native_call_ids = {"call_plain_err"}
+
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_plain_err",
+                "content": (
+                    "File already exists: test.txt. Use update_file to modify "
+                    "existing files.\n\nCurrent content of test.txt (1 lines):\n"
+                    "1\tHello world"
+                ),
+                "tool_name": "apply_patch",
+            },
+        ]
+
+        result = provider._convert_messages(messages)
+
+        output_items = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "apply_patch_call_output"
+        ]
+        assert len(output_items) == 1
+        assert output_items[0]["status"] == "failed"
+
+    def test_apply_patch_call_output_status_failed_on_context_mismatch_string(
+        self,
+    ) -> None:
+        """Context mismatch plain-string errors should get status 'failed'."""
+        provider = _make_provider()
+        provider._native_call_ids = {"call_ctx_err"}
+
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_ctx_err",
+                "content": (
+                    "Context mismatch in main.py: Invalid Context 0:\n"
+                    "old line — your diff does not match the current file.\n\n"
+                    "Current content of main.py (3 lines):\n"
+                    "1\tline one\n2\tline two\n3\tline three\n\n"
+                    "Construct a new diff based on the content above."
+                ),
+                "tool_name": "apply_patch",
+            },
+        ]
+
+        result = provider._convert_messages(messages)
+
+        output_items = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "apply_patch_call_output"
+        ]
+        assert len(output_items) == 1
+        assert output_items[0]["status"] == "failed"
+
+    def test_apply_patch_call_output_status_completed_on_success_string(self) -> None:
+        """Git-style success strings should still get status 'completed'."""
+        provider = _make_provider()
+        provider._native_call_ids = {"call_ok1", "call_ok2", "call_ok3"}
+
+        for call_id, content in [
+            ("call_ok1", "M src/main.py"),
+            ("call_ok2", "A new-file.txt"),
+            ("call_ok3", "D old-file.py"),
+        ]:
+            messages = [
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content,
+                    "tool_name": "apply_patch",
+                },
+            ]
+            result = provider._convert_messages(messages)
+            output_items = [
+                m
+                for m in result
+                if isinstance(m, dict) and m.get("type") == "apply_patch_call_output"
+            ]
+            assert len(output_items) == 1, f"Failed for {content}"
+            assert output_items[0]["status"] == "completed", (
+                f"Expected 'completed' for success output '{content}', "
+                f"got '{output_items[0]['status']}'"
+            )
+
     def test_regular_tool_result_uses_function_call_output(self) -> None:
         """Non-native tool results still use function_call_output type."""
         provider = _make_provider()

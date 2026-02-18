@@ -1372,7 +1372,22 @@ class OpenAIProvider:
                                     ):
                                         _patch_status = "failed"
                                 except (json.JSONDecodeError, TypeError):
-                                    pass  # Not JSON — treat as success output
+                                    # Not JSON — infer status from output format.
+                                    # apply_patch success = git-style status lines
+                                    # ("M file.py", "A new.py", "D old.py", "R a -> b").
+                                    # Any other non-empty string is an error message.
+                                    _first = (
+                                        tool_content.split("\n", 1)[0]
+                                        if tool_content
+                                        else ""
+                                    )
+                                    if _first and _first[:2] not in (
+                                        "M ",
+                                        "A ",
+                                        "D ",
+                                        "R ",
+                                    ):
+                                        _patch_status = "failed"
 
                             openai_messages.append(
                                 {
