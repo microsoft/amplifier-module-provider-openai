@@ -1500,7 +1500,14 @@ class OpenAIProvider:
                                             {
                                                 "type": "apply_patch_call",
                                                 "call_id": tc_id,
-                                                "operation": tc_input,
+                                                "operation": {
+                                                    k: v for k, v in tc_input.items()
+                                                    if not (
+                                                        k == "diff"
+                                                        and tc_input.get("type")
+                                                        not in ("create_file", "update_file")
+                                                    )
+                                                },
                                                 "status": "completed",
                                             }
                                         )
@@ -1585,7 +1592,14 @@ class OpenAIProvider:
                                             {
                                                 "type": "apply_patch_call",
                                                 "call_id": tc_id,
-                                                "operation": tc_input,
+                                                "operation": {
+                                                    k: v for k, v in tc_input.items()
+                                                    if not (
+                                                        k == "diff"
+                                                        and tc_input.get("type")
+                                                        not in ("create_file", "update_file")
+                                                    )
+                                                },
                                                 "status": "completed",
                                             }
                                         )
