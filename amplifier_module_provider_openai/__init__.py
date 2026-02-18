@@ -1501,6 +1501,7 @@ class OpenAIProvider:
                                                 "type": "apply_patch_call",
                                                 "call_id": tc_id,
                                                 "operation": tc_input,
+                                                "status": "completed",
                                             }
                                         )
                                     else:
@@ -1585,6 +1586,7 @@ class OpenAIProvider:
                                                 "type": "apply_patch_call",
                                                 "call_id": tc_id,
                                                 "operation": tc_input,
+                                                "status": "completed",
                                             }
                                         )
                                     else:
