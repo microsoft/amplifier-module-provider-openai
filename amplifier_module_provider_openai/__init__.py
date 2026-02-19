@@ -179,6 +179,34 @@ class OpenAIProvider:
         self._apply_patch_native = False
         self._native_call_ids: set[str] = set()
 
+        # Per-feature compatibility flags for custom endpoints.
+        # When base_url is set (e.g. OpenRouter, DeepSeek proxy), these default to False
+        # since most custom endpoints don't support OpenAI-specific Responses API features.
+        # Users can override individually (e.g. Azure users set base_url but support everything).
+        _is_custom = self.base_url is not None
+        self.enable_native_tools = self._bool_config(
+            "enable_native_tools", default=not _is_custom
+        )
+        self.enable_reasoning_replay = self._bool_config(
+            "enable_reasoning_replay", default=not _is_custom
+        )
+        self.enable_store = self._bool_config(
+            "enable_store", default=not _is_custom
+        )
+        self.enable_background = self._bool_config(
+            "enable_background", default=not _is_custom
+        )
+        self._warned_orphaned_reasoning = False
+
+    def _bool_config(self, key: str, default: bool) -> bool:
+        """Read a boolean config value, accepting bool/str/int."""
+        val = self.config.get(key)
+        if val is None:
+            return default
+        if isinstance(val, bool):
+            return val
+        return str(val).lower() in ("true", "1", "yes")
+
     @property
     def client(self) -> AsyncOpenAI:
         """Lazily initialize the OpenAI client on first access."""
@@ -231,6 +259,38 @@ class OpenAIProvider:
                     default="none",
                     required=False,
                     requires_model=True,  # Shown after model selection
+                ),
+                ConfigField(
+                    id="enable_native_tools",
+                    display_name="Native Tools",
+                    field_type="boolean",
+                    prompt="Enable OpenAI-hosted tools (apply_patch, web_search_preview, etc.)?",
+                    required=False,
+                    default="true",
+                ),
+                ConfigField(
+                    id="enable_reasoning_replay",
+                    display_name="Reasoning Replay",
+                    field_type="boolean",
+                    prompt="Enable reasoning state replay (encrypted_content, reasoning items in history)?",
+                    required=False,
+                    default="true",
+                ),
+                ConfigField(
+                    id="enable_store",
+                    display_name="Server-side Store",
+                    field_type="boolean",
+                    prompt="Enable server-side response storage (store param, previous_response_id)?",
+                    required=False,
+                    default="true",
+                ),
+                ConfigField(
+                    id="enable_background",
+                    display_name="Background Mode",
+                    field_type="boolean",
+                    prompt="Enable background mode for deep research models?",
+                    required=False,
+                    default="true",
                 ),
             ],
         )
@@ -668,18 +728,21 @@ class OpenAIProvider:
 
         # Check for background mode (used for deep research and long-running requests)
         # Background mode requires store=True per OpenAI API requirements
+        model_name = kwargs.get("model", self.default_model)
         background_mode = kwargs.get("background", False)
 
-        # Auto-enable background mode for deep research models
-        model_name = kwargs.get("model", self.default_model)
-        if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
-            ("o3-deep-research", "o4-mini-deep-research")
+        # Auto-enable background mode for deep research models (only when endpoint supports it)
+        if self.enable_background and (
+            model_name in DEEP_RESEARCH_MODELS
+            or model_name.startswith(("o3-deep-research", "o4-mini-deep-research"))
         ):
             # Deep research models should use background mode by default
             background_mode = kwargs.get("background", True)
             logger.info(
                 f"[PROVIDER] Deep research model detected: {model_name}, background={background_mode}"
             )
+        elif not self.enable_background:
+            background_mode = False
 
         # Determine store parameter early (needed for previous_response_id logic)
         # Background mode requires store=True
@@ -687,18 +750,24 @@ class OpenAIProvider:
         if background_mode:
             store_enabled = True  # Background mode requires store=True
             logger.info("[PROVIDER] Background mode enabled, forcing store=True")
-        params["store"] = store_enabled
 
-        # Add previous_response_id ONLY if store is enabled (server-side state)
-        # With store=False, we rely on explicit reasoning re-insertion instead
-        if previous_response_id and store_enabled:
-            params["previous_response_id"] = previous_response_id
-            logger.debug("[PROVIDER] Using previous_response_id (store=True)")
-        elif previous_response_id and not store_enabled:
-            logger.debug(
-                "[PROVIDER] Skipping previous_response_id (store=False). "
-                "Relying on explicit reasoning re-insertion from metadata/content."
-            )
+        # Only send store/previous_response_id when the endpoint supports it.
+        if self.enable_store:
+            params["store"] = store_enabled
+
+            # Add previous_response_id ONLY if store is enabled (server-side state)
+            # With store=False, we rely on explicit reasoning re-insertion instead
+            if previous_response_id and store_enabled:
+                params["previous_response_id"] = previous_response_id
+                logger.debug("[PROVIDER] Using previous_response_id (store=True)")
+            elif previous_response_id and not store_enabled:
+                logger.debug(
+                    "[PROVIDER] Skipping previous_response_id (store=False). "
+                    "Relying on explicit reasoning re-insertion from metadata/content."
+                )
+        else:
+            store_enabled = False
+            logger.debug("[PROVIDER] Store disabled (enable_store=false)")
 
         if instructions:
             params["instructions"] = instructions
@@ -741,7 +810,8 @@ class OpenAIProvider:
 
         # CRITICAL: Request encrypted_content for ANY model that may reason, not just when explicitly configured.
         # Models like gpt-5.2-codex and o-series reason by default without "reasoning" appearing in params.
-        if not store_enabled:
+        # Skip for endpoints that don't support encrypted_content (enable_reasoning_replay=false).
+        if not store_enabled and self.enable_reasoning_replay:
             model_may_reason = "reasoning" in params or self._model_may_reason(
                 model_name
             )
@@ -774,12 +844,14 @@ class OpenAIProvider:
             if max_tool_calls := kwargs.get("max_tool_calls"):
                 params["max_tool_calls"] = max_tool_calls
 
-        # Add truncation parameter for automatic context management
-        if self.truncation:
+        # Add truncation parameter for automatic context management.
+        # Some custom endpoints may not support truncation; gate with enable_store
+        # (truncation is a Responses API feature tied to server-side processing).
+        if self.truncation and self.enable_store:
             params["truncation"] = kwargs.get("truncation", self.truncation)
 
         # Add background mode parameter for long-running requests (deep research)
-        if background_mode:
+        if background_mode and self.enable_background:
             params["background"] = True
 
         logger.info(
@@ -867,6 +939,70 @@ class OpenAIProvider:
                         "params": params,  # Complete untruncated params
                     },
                 )
+
+        # Sanitize input for endpoints with limited Responses API support.
+        # Runs just before the API call to ensure compatibility. Gated by per-feature
+        # flags so each transform only fires when the corresponding feature is disabled.
+        if "input" in params:
+            needs_sanitize = (
+                not self.enable_native_tools or not self.enable_reasoning_replay
+            )
+            if needs_sanitize:
+                sanitized_input = []
+                for item in params["input"]:
+                    if isinstance(item, dict):
+                        item_type = item.get("type", "")
+                        item_role = item.get("role", "")
+
+                        # Strip reasoning items when reasoning replay is disabled
+                        if not self.enable_reasoning_replay and item_type == "reasoning":
+                            continue
+
+                        # Convert apply_patch_call to standard function_call
+                        # when native tools are disabled
+                        if not self.enable_native_tools and item_type == "apply_patch_call":
+                            patch_value = item.get("patch", "")
+                            item = {
+                                "type": "function_call",
+                                "call_id": item.get("call_id", ""),
+                                "name": "apply_patch",
+                                "arguments": json.dumps({"patch": patch_value})
+                                if not isinstance(patch_value, str)
+                                else json.dumps({"patch": patch_value}),
+                            }
+
+                        # Convert apply_patch_call_output to standard function_call_output
+                        if not self.enable_native_tools and item_type == "apply_patch_call_output":
+                            item = {
+                                "type": "function_call_output",
+                                "call_id": item.get("call_id", ""),
+                                "output": item.get("output", ""),
+                            }
+
+                        # Simplify assistant messages with structured content to plain text.
+                        # Some endpoints don't support the output_text content block format.
+                        if not self.enable_reasoning_replay and item_role == "assistant" and isinstance(
+                            item.get("content"), list
+                        ):
+                            text_parts = []
+                            for block in item["content"]:
+                                if isinstance(block, dict):
+                                    text = block.get("text", "")
+                                    if text:
+                                        text_parts.append(text)
+                                elif isinstance(block, str):
+                                    text_parts.append(block)
+                            item = {
+                                "role": "assistant",
+                                "content": "\n".join(text_parts) if text_parts else "",
+                            }
+
+                    sanitized_input.append(item)
+                params["input"] = sanitized_input
+
+                # Strip include parameter when reasoning replay is disabled
+                if not self.enable_reasoning_replay:
+                    params.pop("include", None)
 
         start_time = time.time()
 
@@ -1355,7 +1491,8 @@ class OpenAIProvider:
                             else json.dumps(tool_content)
                         )
                         # Use apply_patch_call_output for native apply_patch calls
-                        if tool_call_id in self._native_call_ids:
+                        # (only when native tools are enabled)
+                        if tool_call_id in self._native_call_ids and self.enable_native_tools:
                             # Determine status: "failed" if content signals error, else "completed"
                             _patch_status = "completed"
                             if (
@@ -1490,7 +1627,8 @@ class OpenAIProvider:
                                         "rename_file",
                                     }
                                     if (
-                                        tc_name == "apply_patch"
+                                        self.enable_native_tools
+                                        and tc_name == "apply_patch"
                                         and tc_input.get("type") in _native_op_types
                                     ):
                                         # Restore as native apply_patch_call so the output
@@ -1582,7 +1720,8 @@ class OpenAIProvider:
                                         "rename_file",
                                     }
                                     if (
-                                        tc_name == "apply_patch"
+                                        self.enable_native_tools
+                                        and tc_name == "apply_patch"
                                         and tc_input.get("type") in _native_op_types
                                     ):
                                         # Restore as native apply_patch_call so the output
@@ -1664,6 +1803,10 @@ class OpenAIProvider:
                 elif isinstance(content, str) and content:
                     assistant_content.append({"type": "output_text", "text": content})
 
+                # Strip all reasoning items when reasoning replay is disabled
+                if not self.enable_reasoning_replay:
+                    reasoning_items_to_add.clear()
+
                 # Defensive: strip orphaned reasoning items that have no encrypted_content.
                 # These occur when the model reasoned but include=[reasoning.encrypted_content]
                 # was not requested — the reasoning ID exists but can't be sent back, causing 404s.
@@ -1675,11 +1818,17 @@ class OpenAIProvider:
                         for item in reasoning_items_to_add
                     )
                     if not has_usable_reasoning:
-                        logger.warning(
-                            "[PROVIDER] Reasoning IDs in metadata but encrypted_content unavailable. "
-                            "Stripping orphaned reasoning references to prevent API errors. "
-                            "Ensure include=[reasoning.encrypted_content] is requested for store=false."
-                        )
+                        if not self._warned_orphaned_reasoning:
+                            logger.warning(
+                                "[PROVIDER] Reasoning IDs in metadata but encrypted_content unavailable. "
+                                "Stripping orphaned reasoning references to prevent API errors. "
+                                "Ensure include=[reasoning.encrypted_content] is requested for store=false."
+                            )
+                            self._warned_orphaned_reasoning = True
+                        else:
+                            logger.debug(
+                                "Stripping orphaned reasoning references (repeated)."
+                            )
                         # Strip orphaned reasoning items that would cause 404 errors
                         reasoning_items_to_add.clear()
 
@@ -1785,7 +1934,8 @@ class OpenAIProvider:
 
         # Lazy detection of native apply_patch engine via coordinator capability.
         # Once detected, the flag persists — no repeated lookups.
-        if not self._apply_patch_native:
+        # Skip detection when native tools are disabled (custom endpoint).
+        if not self._apply_patch_native and self.enable_native_tools:
             engine = self.coordinator.get_capability("apply_patch.engine")
             if engine == "native":
                 self._apply_patch_native = True
@@ -1795,6 +1945,12 @@ class OpenAIProvider:
             if isinstance(tool, dict):
                 tool_type = tool.get("type", "")
                 if tool_type in NATIVE_TOOL_TYPES:
+                    if not self.enable_native_tools:
+                        logger.debug(
+                            "Skipping native tool type '%s' (enable_native_tools=false)",
+                            tool_type,
+                        )
+                        continue
                     # Pass through native tools directly (web_search_preview, file_search, code_interpreter)
                     openai_tools.append(tool)
                     continue
@@ -1803,7 +1959,8 @@ class OpenAIProvider:
             # Handle ToolSpec objects (user-defined function tools)
             if hasattr(tool, "name"):
                 # Special handling for apply_patch with native engine
-                if tool.name == "apply_patch" and self._apply_patch_native:
+                # (only when native tools are enabled)
+                if tool.name == "apply_patch" and self._apply_patch_native and self.enable_native_tools:
                     openai_tools.append({"type": "apply_patch"})
                     continue
 
