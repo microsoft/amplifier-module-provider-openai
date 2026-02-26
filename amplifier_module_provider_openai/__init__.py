@@ -903,9 +903,9 @@ class OpenAIProvider:
                 ):
                     retryable = False
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                error_msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.RateLimitError(
-                    msg,
+                    error_msg,
                     provider=self.name,
                     status_code=429,
                     retryable=retryable,
@@ -913,9 +913,9 @@ class OpenAIProvider:
                 ) from e
             except openai.AuthenticationError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                error_msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.AuthenticationError(
-                    msg,
+                    error_msg,
                     provider=self.name,
                     status_code=getattr(e, "status_code", 401),
                 ) from e
@@ -984,7 +984,10 @@ class OpenAIProvider:
                 raise  # Already translated, don't double-wrap
             except Exception as e:
                 body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else (str(e) or f"{type(e).__name__}: (no message)")
+                if body is not None:
+                    error_msg = json.dumps(body)
+                else:
+                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
                 raise kernel_errors.LLMError(
                     error_msg,
                     provider=self.name,
