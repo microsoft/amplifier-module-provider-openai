@@ -78,9 +78,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         logger.warning("No API key found for OpenAI provider")
         return None
 
+    mount_name = config.get("_instance_name", "openai")
     provider = OpenAIProvider(api_key=api_key, config=config, coordinator=coordinator)
-    await coordinator.mount("providers", provider, name="openai")
-    logger.info("Mounted OpenAIProvider (Responses API)")
+    provider.name = mount_name
+    await coordinator.mount("providers", provider, name=mount_name)
+    logger.info(f"Mounted OpenAIProvider as '{mount_name}' (Responses API)")
 
     # Return cleanup function
     async def cleanup():
