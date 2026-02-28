@@ -246,3 +246,60 @@ def test_llm_response_error_event_emitted_on_kernel_error():
     ]
     assert len(error_events) >= 1
     assert error_events[0][1]["provider"] == "openai"
+
+
+def test_azure_retry_after_ms_header_parsed():
+    """Azure x-ms-retry-after-ms header (milliseconds) is parsed into retry_after (seconds)."""
+    provider = _make_provider()
+    native = openai.RateLimitError(
+        "Rate limit exceeded",
+        response=_mock_httpx_response(429, headers={"x-ms-retry-after-ms": "3000"}),
+        body=None,
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.RateLimitError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    assert exc_info.value.retry_after == 3.0
+
+
+def test_standard_retry_after_takes_precedence_over_azure_ms_header():
+    """When both retry-after and x-ms-retry-after-ms are present, standard wins."""
+    provider = _make_provider()
+    native = openai.RateLimitError(
+        "Rate limit exceeded",
+        response=_mock_httpx_response(
+            429,
+            headers={
+                "retry-after": "10",
+                "x-ms-retry-after-ms": "3000",
+            },
+        ),
+        body=None,
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.RateLimitError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    # Standard header (10s) takes precedence, not Azure header (3s)
+    assert exc_info.value.retry_after == 10.0
+
+
+def test_azure_retry_after_ms_invalid_value_ignored():
+    """Non-numeric x-ms-retry-after-ms is silently ignored."""
+    provider = _make_provider()
+    native = openai.RateLimitError(
+        "Rate limit exceeded",
+        response=_mock_httpx_response(
+            429, headers={"x-ms-retry-after-ms": "not-a-number"}
+        ),
+        body=None,
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.RateLimitError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    assert exc_info.value.retry_after is None

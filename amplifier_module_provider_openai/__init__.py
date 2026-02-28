@@ -888,12 +888,25 @@ class OpenAIProvider:
             except openai.RateLimitError as e:
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:
+                    # Standard header (seconds)
                     ra_header = e.response.headers.get("retry-after")
                     if ra_header:
                         try:
                             retry_after = float(ra_header)
                         except (ValueError, TypeError):
                             pass
+                    # Azure-specific fallback (milliseconds, divide by 1000)
+                    # Azure OpenAI returns x-ms-retry-after-ms instead of
+                    # (or in addition to) the standard retry-after header.
+                    if retry_after is None:
+                        ms_header = e.response.headers.get(
+                            "x-ms-retry-after-ms"
+                        )
+                        if ms_header:
+                            try:
+                                retry_after = float(ms_header) / 1000.0
+                            except (ValueError, TypeError):
+                                pass
                 # Fail-fast: if retry_after exceeds max_delay, mark non-retryable
                 # so retry_with_backoff raises immediately instead of sleeping.
                 retryable = True
