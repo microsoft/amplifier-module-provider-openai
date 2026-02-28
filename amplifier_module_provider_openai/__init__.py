@@ -56,6 +56,28 @@ from ._response_handling import extract_reasoning_text
 
 logger = logging.getLogger(__name__)
 
+# Pricing per token (USD) and cost tiers by model family.
+# Used by list_models() to populate ModelInfo cost fields.
+_OPENAI_PRICING: dict[str, dict[str, Any]] = {
+    "mini": {"input": 0.4e-6, "output": 1.6e-6, "tier": "low"},
+    "nano": {"input": 0.4e-6, "output": 1.6e-6, "tier": "low"},
+    "pro": {"input": 15.0e-6, "output": 60.0e-6, "tier": "high"},
+    "default": {"input": 2.5e-6, "output": 10.0e-6, "tier": "medium"},
+    "deep_research": {"input": None, "output": None, "tier": "extreme"},
+}
+
+
+def _openai_pricing_for_model(model_id: str, is_deep_research: bool) -> dict[str, Any]:
+    """Return pricing dict for an OpenAI model based on its ID."""
+    if is_deep_research:
+        return _OPENAI_PRICING["deep_research"]
+    mid = model_id.lower()
+    if "mini" in mid or "nano" in mid:
+        return _OPENAI_PRICING["mini"]
+    if "-pro" in mid:
+        return _OPENAI_PRICING["pro"]
+    return _OPENAI_PRICING["default"]
+
 
 class OpenAIChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
@@ -278,13 +300,14 @@ class OpenAIProvider:
             display_name = self._model_id_to_display_name(model_id)
 
             # Determine capabilities based on model type
+            pricing = _openai_pricing_for_model(model_id, is_deep_research)
             if is_deep_research:
                 capabilities = ["deep_research", "web_search", "reasoning"]
                 context_window = 200000
                 max_output_tokens = 100000
                 defaults = {"max_tokens": 32768, "background": True}
             else:
-                capabilities = ["tools", "reasoning", "streaming", "json_mode"]
+                capabilities = ["tools", "reasoning", "streaming", "json_mode", "vision"]
                 if "mini" in model_id or "nano" in model_id:
                     capabilities.append("fast")
                 context_window = 400000
@@ -299,6 +322,9 @@ class OpenAIProvider:
                     max_output_tokens=max_output_tokens,
                     capabilities=capabilities,
                     defaults=defaults,
+                    cost_per_input_token=pricing.get("input"),
+                    cost_per_output_token=pricing.get("output"),
+                    metadata={"cost_tier": pricing.get("tier", "medium")},
                 )
             )
 
