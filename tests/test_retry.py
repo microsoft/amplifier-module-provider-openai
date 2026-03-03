@@ -283,27 +283,48 @@ class TestRetryConfigAttribute:
         assert hasattr(provider, "_retry_config")
         assert isinstance(provider._retry_config, RetryConfig)
 
-    def test_retry_config_values_from_config(self):
-        """RetryConfig fields should match provider config values."""
+    def test_retry_config_uses_initial_delay_not_min_delay(self):
+        """RetryConfig must use initial_delay= (Rust field name), not min_delay=."""
         provider = OpenAIProvider(
             api_key="test-key",
             config={
                 "max_retries": 7,
                 "min_retry_delay": 2.0,
                 "max_retry_delay": 120.0,
-                "retry_jitter": 0.3,
             },
         )
         assert provider._retry_config.max_retries == 7
-        assert provider._retry_config.min_delay == 2.0
+        assert provider._retry_config.initial_delay == 2.0
         assert provider._retry_config.max_delay == 120.0
-        assert provider._retry_config.jitter == 0.3
+
+    def test_retry_config_jitter_is_bool(self):
+        """RetryConfig.jitter must be set from bool(config), not float(config)."""
+        # Default retry_jitter should be True
+        provider = OpenAIProvider(api_key="test-key", config={})
+        rc = provider._retry_config
+        # The provider should pass jitter=bool(...) so default is True
+        # RetryConfig internally converts bool to float: True -> 0.2
+        assert rc.jitter == 0.2  # True -> default jitter factor
+
+        # Explicit False should result in 0.0 jitter
+        provider_no_jitter = OpenAIProvider(
+            api_key="test-key", config={"retry_jitter": False}
+        )
+        assert provider_no_jitter._retry_config.jitter == 0.0
+
+    def test_no_jitter_compat_code_in_source(self):
+        """The jitter bool/float compat code must be removed from __init__."""
+        import inspect
+        source = inspect.getsource(OpenAIProvider.__init__)
+        # These patterns should NOT exist anymore
+        assert "jitter_cfg" not in source, "jitter_cfg compat variable should be removed"
+        assert "isinstance(jitter_cfg" not in source, "isinstance check should be removed"
 
     def test_retry_config_defaults(self):
         """RetryConfig should use sensible defaults when config is empty."""
         provider = OpenAIProvider(api_key="test-key", config={})
         assert provider._retry_config.max_retries == 5
-        assert provider._retry_config.min_delay == 1.0
+        assert provider._retry_config.initial_delay == 1.0
         assert provider._retry_config.max_delay == 60.0
 
 

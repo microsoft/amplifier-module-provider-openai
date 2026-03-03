@@ -156,16 +156,11 @@ class OpenAIProvider:
         self.priority = self.config.get("priority", 100)
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
-        # Backward compat: retry_jitter used to be bool (True/False). Now it's a float
-        # for RetryConfig.jitter (0.0-1.0). Accept both: True→0.2, False→0.0, float→as-is.
-        jitter_cfg = self.config.get("retry_jitter", 0.2)
-        if isinstance(jitter_cfg, bool):
-            jitter_cfg = 0.2 if jitter_cfg else 0.0
         self._retry_config = RetryConfig(
             max_retries=int(self.config.get("max_retries", 5)),
-            min_delay=float(self.config.get("min_retry_delay", 1.0)),
+            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
             max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=float(jitter_cfg),
+            jitter=bool(self.config.get("retry_jitter", True)),
         )
 
         # Track tool call IDs that have been repaired with synthetic results.
