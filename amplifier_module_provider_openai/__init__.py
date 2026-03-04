@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from typing import Any
 from typing import cast
 
@@ -497,29 +498,28 @@ class OpenAIProvider:
             return [self._truncate_values(item, max_length) for item in obj]
         return obj  # Numbers, booleans, None pass through unchanged
 
-    def _find_missing_tool_results(self, messages: list) -> list[tuple[str, str, dict]]:
+    def _find_missing_tool_results(self, messages: list) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
 
         Scans conversation for assistant tool calls and validates each has
-        a corresponding tool result message. Returns missing pairs.
+        a corresponding tool result message. Returns missing tuples including
+        the index of the assistant message containing each tool_use block.
 
         Excludes tool call IDs that have already been repaired with synthetic
         results to prevent infinite detection loops.
 
         Returns:
-            List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
+            List of (msg_idx, call_id, tool_name, tool_arguments) tuples for unpaired calls
         """
-        from amplifier_core.message_models import Message
+        tool_calls: dict[str, tuple[int, str, dict]] = {}  # {call_id: (msg_idx, name, args)}
+        tool_results: set[str] = set()  # {call_id}
 
-        tool_calls = {}  # {call_id: (name, args)}
-        tool_results = set()  # {call_id}
-
-        for msg in messages:
+        for idx, msg in enumerate(messages):
             # Check assistant messages for ToolCallBlock in content
             if msg.role == "assistant" and isinstance(msg.content, list):
                 for block in msg.content:
                     if hasattr(block, "type") and block.type == "tool_call":
-                        tool_calls[block.id] = (block.name, block.input)
+                        tool_calls[block.id] = (idx, block.name, block.input)
 
             # Check tool messages for tool_call_id
             elif (
@@ -529,8 +529,8 @@ class OpenAIProvider:
 
         # Exclude IDs that have already been repaired to prevent infinite loops
         return [
-            (call_id, name, args)
-            for call_id, (name, args) in tool_calls.items()
+            (msg_idx, call_id, name, args)
+            for call_id, (msg_idx, name, args) in tool_calls.items()
             if call_id not in tool_results and call_id not in self._repaired_tool_ids
         ]
 
@@ -575,28 +575,71 @@ class OpenAIProvider:
             logger.warning(
                 f"[PROVIDER] OpenAI: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
-                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
 
-            # Inject synthetic results and track repaired IDs to prevent infinite loops
-            for call_id, tool_name, _ in missing:
-                synthetic = self._create_synthetic_result(call_id, tool_name)
-                request.messages.append(synthetic)
-                # Track this ID so we don't detect it as missing again in future iterations
-                self._repaired_tool_ids.add(call_id)
+            # Group missing calls by the assistant message index that contains them.
+            # Insert synthetics right after each assistant message (not at the end),
+            # so ordering requirements are satisfied even when user messages follow.
+            by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
+            for msg_idx, call_id, tool_name, _ in missing:
+                by_msg_idx[msg_idx].append((call_id, tool_name))
+
+            synthetic_assistant_count = 0
+
+            # Process in REVERSE index order so earlier insertions don't shift later indices
+            for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
+                synthetics = []
+                for call_id, tool_name in by_msg_idx[msg_idx]:
+                    synthetics.append(self._create_synthetic_result(call_id, tool_name))
+                    # Track this ID so we don't detect it as missing again in future iterations
+                    self._repaired_tool_ids.add(call_id)
+
+                insert_pos = msg_idx + 1
+                for i, synthetic in enumerate(synthetics):
+                    request.messages.insert(insert_pos + i, synthetic)
+
+                # FM3: If a real user message follows the inserted synthetics, also insert
+                # a synthetic assistant response to close the interrupted turn.
+                next_pos = insert_pos + len(synthetics)
+                if next_pos < len(request.messages):
+                    next_msg = request.messages[next_pos]
+                    is_real_user = (
+                        next_msg.role == "user"
+                        and not getattr(next_msg, "tool_call_id", None)
+                        and not (
+                            isinstance(next_msg.content, str)
+                            and next_msg.content.strip().startswith("<system-reminder>")
+                        )
+                    )
+                    if is_real_user:
+                        from amplifier_core.message_models import Message
+
+                        synthetic_assistant = Message(
+                            role="assistant",
+                            content=(
+                                "The previous tool calls were interrupted due to a session error. "
+                                "This was automatically repaired."
+                            ),
+                        )
+                        request.messages.insert(next_pos, synthetic_assistant)
+                        synthetic_assistant_count += 1
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
+                event_data: dict[str, Any] = {
+                    "provider": self.name,
+                    "repair_count": len(missing),
+                    "repairs": [
+                        {"tool_call_id": call_id, "tool_name": tool_name}
+                        for _, call_id, tool_name, _ in missing
+                    ],
+                }
+                if synthetic_assistant_count > 0:
+                    event_data["synthetic_assistant_count"] = synthetic_assistant_count
                 await self.coordinator.hooks.emit(
                     "provider:tool_sequence_repaired",
-                    {
-                        "provider": self.name,
-                        "repair_count": len(missing),
-                        "repairs": [
-                            {"tool_call_id": call_id, "tool_name": tool_name}
-                            for call_id, tool_name, _ in missing
-                        ],
-                    },
+                    event_data,
                 )
 
         return await self._complete_chat_request(request, **kwargs)
