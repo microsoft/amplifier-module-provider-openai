@@ -376,3 +376,71 @@ def test_real_api_403_raises_access_denied():
     assert err.status_code == 403
     assert err.retryable is False
     assert err.__cause__ is native
+
+
+# ---------------------------------------------------------------------------
+# Direct unit tests for _is_cloudflare_challenge
+# ---------------------------------------------------------------------------
+
+
+class TestIsCloudflareChallenge:
+    """Focused unit tests for OpenAIProvider._is_cloudflare_challenge()."""
+
+    @staticmethod
+    def _make_error(
+        body: Any = None,
+        status_code: int = 403,
+        headers: dict | None = None,
+        text: str | None = None,
+    ) -> openai.APIStatusError:
+        """Build an APIStatusError for direct _is_cloudflare_challenge testing."""
+        return openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(status_code, headers=headers, text=text),
+            body=body,
+        )
+
+    def test_html_content_type_detected(self):
+        """body=None + text/html content-type -> True."""
+        err = self._make_error(headers={"content-type": "text/html"})
+        assert OpenAIProvider._is_cloudflare_challenge(err) is True
+
+    def test_html_content_type_case_insensitive(self):
+        """body=None + Text/HTML (unusual casing) -> True."""
+        err = self._make_error(headers={"content-type": "Text/HTML; charset=utf-8"})
+        assert OpenAIProvider._is_cloudflare_challenge(err) is True
+
+    def test_cloudflare_markers_in_text(self):
+        """body=None + Cloudflare marker in response text -> True."""
+        err = self._make_error(
+            headers={"content-type": "application/octet-stream"},
+            text="<html>Just a moment...</html>",
+        )
+        assert OpenAIProvider._is_cloudflare_challenge(err) is True
+
+    def test_json_body_is_real_api_error(self):
+        """body=dict (real API error) -> False regardless of other signals."""
+        err = self._make_error(
+            body={"error": {"message": "forbidden"}},
+            headers={"content-type": "text/html"},
+        )
+        assert OpenAIProvider._is_cloudflare_challenge(err) is False
+
+    def test_no_response_returns_false(self):
+        """body=None + no response object -> False."""
+        err = openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(403),
+            body=None,
+        )
+        # Simulate missing response attribute
+        err.response = None  # type: ignore[assignment]
+        assert OpenAIProvider._is_cloudflare_challenge(err) is False
+
+    def test_no_signals_returns_false(self):
+        """body=None + application/json + no markers -> False."""
+        err = self._make_error(
+            headers={"content-type": "application/json"},
+            text='{"error": "something"}',
+        )
+        assert OpenAIProvider._is_cloudflare_challenge(err) is False

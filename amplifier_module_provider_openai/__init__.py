@@ -208,7 +208,7 @@ class OpenAIProvider:
         if response is None:
             return False
 
-        content_type = getattr(response, "headers", {}).get("content-type", "")
+        content_type = getattr(response, "headers", {}).get("content-type", "").lower()
         if "text/html" in content_type:
             return True
 
