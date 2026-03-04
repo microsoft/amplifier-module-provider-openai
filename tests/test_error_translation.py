@@ -5,6 +5,7 @@ with correct attributes (provider, status_code, retryable, __cause__).
 """
 
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock
 
 import httpx
@@ -33,15 +34,19 @@ def _simple_request() -> ChatRequest:
 
 
 def _mock_httpx_response(
-    status_code: int = 429, headers: dict | None = None
+    status_code: int = 429,
+    headers: dict | None = None,
+    text: str | None = None,
 ) -> httpx.Response:
     """Build a minimal httpx.Response for OpenAI SDK error constructors."""
-    resp = httpx.Response(
-        status_code=status_code,
-        headers=headers or {},
-        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
-    )
-    return resp
+    kwargs: dict[str, Any] = {
+        "status_code": status_code,
+        "headers": headers or {},
+        "request": httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    }
+    if text is not None:
+        kwargs["text"] = text
+    return httpx.Response(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +316,34 @@ def test_cloudflare_403_raises_provider_unavailable():
     native = openai.APIStatusError(
         "Forbidden",
         response=_mock_httpx_response(403, headers={"content-type": "text/html"}),
+        body=None,
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    err = exc_info.value
+    assert err.provider == "openai"
+    assert err.status_code == 403
+    assert err.retryable is True
+    assert err.__cause__ is native
+
+
+def test_cloudflare_403_text_fallback_raises_provider_unavailable():
+    """403 with body=None + Cloudflare markers in text (no text/html header) -> ProviderUnavailableError.
+
+    Exercises the marker-scanning fallback path when content-type is not text/html.
+    Uses mixed-case 'Cloudflare' to verify case-insensitive matching.
+    """
+    provider = _make_provider()
+    native = openai.APIStatusError(
+        "Forbidden",
+        response=_mock_httpx_response(
+            403,
+            headers={"content-type": "application/json"},
+            text="<html><body>Blocked by Cloudflare</body></html>",
+        ),
         body=None,
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
