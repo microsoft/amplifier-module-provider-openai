@@ -71,7 +71,7 @@ class TestMountCleanupBugFix:
         coordinator = FakeCoordinator()
 
         with patch.dict("os.environ", {"OPENAI_API_KEY": "fake-key-for-test"}):
-            cleanup_ref = await mount(coordinator, config={})
+            cleanup_ref = await mount(coordinator, config={})  # type: ignore[arg-type]
 
         assert cleanup_ref is not None
 

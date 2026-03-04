@@ -83,8 +83,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     # Return cleanup function
     async def cleanup():
-        if provider._client is not None:
-            await provider._client.close()
+        await provider.close()
 
     return cleanup
 
