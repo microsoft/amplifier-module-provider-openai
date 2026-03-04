@@ -5,6 +5,7 @@ with correct attributes (provider, status_code, retryable, __cause__).
 """
 
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock
 
 import httpx
@@ -33,15 +34,19 @@ def _simple_request() -> ChatRequest:
 
 
 def _mock_httpx_response(
-    status_code: int = 429, headers: dict | None = None
+    status_code: int = 429,
+    headers: dict | None = None,
+    text: str | None = None,
 ) -> httpx.Response:
     """Build a minimal httpx.Response for OpenAI SDK error constructors."""
-    resp = httpx.Response(
-        status_code=status_code,
-        headers=headers or {},
-        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
-    )
-    return resp
+    kwargs: dict[str, Any] = {
+        "status_code": status_code,
+        "headers": headers or {},
+        "request": httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    }
+    if text is not None:
+        kwargs["text"] = text
+    return httpx.Response(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +308,139 @@ def test_azure_retry_after_ms_invalid_value_ignored():
         asyncio.run(provider.complete(_simple_request()))
 
     assert exc_info.value.retry_after is None
+
+
+def test_cloudflare_403_raises_provider_unavailable():
+    """403 with body=None + text/html (Cloudflare challenge) -> ProviderUnavailableError (retryable)."""
+    provider = _make_provider()
+    native = openai.APIStatusError(
+        "Forbidden",
+        response=_mock_httpx_response(403, headers={"content-type": "text/html"}),
+        body=None,
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    err = exc_info.value
+    assert err.provider == "openai"
+    assert err.status_code == 403
+    assert err.retryable is True
+    assert err.__cause__ is native
+
+
+def test_cloudflare_403_text_fallback_raises_provider_unavailable():
+    """403 with body=None + Cloudflare markers in text (no text/html header) -> ProviderUnavailableError.
+
+    Exercises the marker-scanning fallback path when content-type is not text/html.
+    Uses mixed-case 'Cloudflare' to verify case-insensitive matching.
+    """
+    provider = _make_provider()
+    native = openai.APIStatusError(
+        "Forbidden",
+        response=_mock_httpx_response(
+            403,
+            headers={"content-type": "application/json"},
+            text="<html><body>Blocked by Cloudflare</body></html>",
+        ),
+        body=None,
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    err = exc_info.value
+    assert err.provider == "openai"
+    assert err.status_code == 403
+    assert err.retryable is True
+    assert err.__cause__ is native
+
+
+def test_real_api_403_raises_access_denied():
+    """403 with body=dict (real API error) -> AccessDeniedError (not retryable)."""
+    provider = _make_provider()
+    native = openai.APIStatusError(
+        "Forbidden",
+        response=_mock_httpx_response(403),
+        body={"error": {"type": "permissions_error", "message": "Access denied"}},
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.AccessDeniedError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    err = exc_info.value
+    assert err.provider == "openai"
+    assert err.status_code == 403
+    assert err.retryable is False
+    assert err.__cause__ is native
+
+
+# ---------------------------------------------------------------------------
+# Direct unit tests for _is_cloudflare_challenge
+# ---------------------------------------------------------------------------
+
+
+class TestIsCloudflareChallenge:
+    """Focused unit tests for OpenAIProvider._is_cloudflare_challenge()."""
+
+    @staticmethod
+    def _make_error(
+        body: Any = None,
+        status_code: int = 403,
+        headers: dict | None = None,
+        text: str | None = None,
+    ) -> openai.APIStatusError:
+        """Build an APIStatusError for direct _is_cloudflare_challenge testing."""
+        return openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(status_code, headers=headers, text=text),
+            body=body,
+        )
+
+    def test_html_content_type_detected(self):
+        """body=None + text/html content-type -> True."""
+        err = self._make_error(headers={"content-type": "text/html"})
+        assert OpenAIProvider._is_cloudflare_challenge(err) is True
+
+    def test_html_content_type_case_insensitive(self):
+        """body=None + Text/HTML (unusual casing) -> True."""
+        err = self._make_error(headers={"content-type": "Text/HTML; charset=utf-8"})
+        assert OpenAIProvider._is_cloudflare_challenge(err) is True
+
+    def test_cloudflare_markers_in_text(self):
+        """body=None + Cloudflare marker in response text -> True."""
+        err = self._make_error(
+            headers={"content-type": "application/octet-stream"},
+            text="<html>Just a moment...</html>",
+        )
+        assert OpenAIProvider._is_cloudflare_challenge(err) is True
+
+    def test_json_body_is_real_api_error(self):
+        """body=dict (real API error) -> False regardless of other signals."""
+        err = self._make_error(
+            body={"error": {"message": "forbidden"}},
+            headers={"content-type": "text/html"},
+        )
+        assert OpenAIProvider._is_cloudflare_challenge(err) is False
+
+    def test_no_response_returns_false(self):
+        """body=None + no response object -> False."""
+        err = openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(403),
+            body=None,
+        )
+        # Simulate missing response attribute
+        err.response = None  # type: ignore[assignment]
+        assert OpenAIProvider._is_cloudflare_challenge(err) is False
+
+    def test_no_signals_returns_false(self):
+        """body=None + application/json + no markers -> False."""
+        err = self._make_error(
+            headers={"content-type": "application/json"},
+            text='{"error": "something"}',
+        )
+        assert OpenAIProvider._is_cloudflare_challenge(err) is False
