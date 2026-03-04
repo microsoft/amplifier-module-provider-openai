@@ -80,6 +80,14 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     assert repair_events[0][1]["repair_count"] == 1
     assert repair_events[0][1]["repairs"][0]["tool_name"] == "do_something"
 
+    # Synthetic tool result must be inserted IMMEDIATELY after the assistant message,
+    # not appended at the end — ordering requirement for LLM APIs.
+    # With FM3: [assistant, synthetic_tool_result, synthetic_assistant_close, user]
+    assert len(request.messages) == 4
+    assert request.messages[1].role == "tool"  # synthetic tool result right after assistant
+    assert request.messages[2].role == "assistant"  # synthetic close before user
+    assert request.messages[3].role == "user"  # original user message remains last
+
 
 def test_repaired_tool_ids_are_not_detected_again():
     """Repaired tool IDs should be tracked and not trigger infinite detection loops.
@@ -112,6 +120,14 @@ def test_repaired_tool_ids_are_not_detected_again():
 
     # Verify repair happened
     assert "call_abc123" in provider._repaired_tool_ids  # pyright: ignore[reportAttributeAccessIssue]
+
+    # Verify synthetic inserted at correct position (before user message, not appended at end)
+    # With FM3: [assistant, synthetic_tool_result, synthetic_assistant_close, user]
+    assert len(request.messages) == 4
+    assert request.messages[1].role == "tool"  # synthetic right after assistant
+    assert request.messages[2].role == "assistant"  # synthetic close
+    assert request.messages[3].role == "user"  # original user still last
+
     repair_events_1 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
     assert len(repair_events_1) == 1
 
@@ -162,7 +178,60 @@ def test_multiple_missing_tool_results_all_tracked():
     # All 3 should be tracked
     assert provider._repaired_tool_ids == {"call_1", "call_2", "call_3"}  # pyright: ignore[reportAttributeAccessIssue]
 
+    # All 3 synthetics inserted right after the assistant, before the user message.
+    # With FM3: [assistant, synthetic_1, synthetic_2, synthetic_3, synthetic_assistant_close, user]
+    assert len(request.messages) == 6
+    assert request.messages[1].role == "tool"  # first synthetic right after assistant
+    assert request.messages[2].role == "tool"
+    assert request.messages[3].role == "tool"
+    assert request.messages[4].role == "assistant"  # synthetic close before user
+    assert request.messages[5].role == "user"  # original user message last
+
     # Verify repair event has all 3
     repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
     assert len(repair_events) == 1
     assert repair_events[0][1]["repair_count"] == 3
+
+
+def test_fm3_synthetic_assistant_response_inserted_before_user_message():
+    """FM3: When a real user message follows missing tool results, a synthetic
+    assistant message is inserted to close the interrupted turn.
+
+    Without this, the API sees: [assistant(tool_calls), tool_results, user]
+    which is valid. But if the user message was there before the synthetic was
+    inserted, the ordering was: [assistant(tool_calls), user, ...] which
+    violates the API's requirement that tool_results follow tool_calls.
+
+    The FM3 fix inserts a synthetic assistant close so the structure is always:
+    [assistant(tool_calls), synthetic_tool_results, synthetic_assistant_close, user_message]
+    """
+    provider = OpenAIProvider(api_key="test-key")
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolCallBlock(id="call_fm3", name="search", input={"query": "test"})],
+        ),
+        Message(role="user", content="What were the results?"),
+    ]
+    request = ChatRequest(messages=messages)
+
+    asyncio.run(provider.complete(request))
+
+    # [assistant, synthetic_tool_result, synthetic_assistant_close, user]
+    assert len(request.messages) == 4
+    assert request.messages[1].role == "tool"
+    assert request.messages[1].tool_call_id == "call_fm3"  # pyright: ignore[reportAttributeAccessIssue]
+    assert request.messages[2].role == "assistant"
+    assert isinstance(request.messages[2].content, str)
+    assert "interrupted" in request.messages[2].content.lower()
+    assert request.messages[3].role == "user"
+    assert request.messages[3].content == "What were the results?"
+
+    # Event should include the synthetic_assistant_count
+    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    assert len(repair_events) == 1
+    assert repair_events[0][1].get("synthetic_assistant_count") == 1
