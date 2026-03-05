@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
 
+import pytest
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
 
@@ -62,17 +63,24 @@ def _simple_request() -> ChatRequest:
     return ChatRequest(messages=[Message(role="user", content="Hello")])
 
 
+@pytest.fixture()
+def provider_with_fake_coordinator():
+    """Set up an OpenAIProvider wired to a FakeCoordinator with a DummyResponse."""
+    provider = _make_provider()
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    return provider, fake_coordinator
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
-def test_response_raw_fires_after_response():
+def test_response_raw_fires_after_response(provider_with_fake_coordinator):
     """llm:response must appear before llm:response:raw in event order."""
-    provider = _make_provider()
-    fake_coordinator = FakeCoordinator()
-    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
-    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    provider, fake_coordinator = provider_with_fake_coordinator
 
     asyncio.run(provider.complete(_simple_request()))
 
@@ -92,12 +100,9 @@ def test_response_raw_fires_after_response():
     )
 
 
-def test_full_emission_cascade_ordering():
+def test_full_emission_cascade_ordering(provider_with_fake_coordinator):
     """The three response emissions must flow: llm:response → llm:response:debug → llm:response:raw."""
-    provider = _make_provider()
-    fake_coordinator = FakeCoordinator()
-    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
-    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    provider, fake_coordinator = provider_with_fake_coordinator
 
     asyncio.run(provider.complete(_simple_request()))
 
