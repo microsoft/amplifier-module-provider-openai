@@ -27,6 +27,7 @@ from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.events import PROVIDER_RETRY
+from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import ToolCall
@@ -37,7 +38,6 @@ from ._constants import BACKGROUND_POLLING_STATUSES
 from ._constants import BACKGROUND_STATUS_COMPLETED
 from ._constants import BACKGROUND_STATUS_FAILED
 from ._constants import DEFAULT_BACKGROUND_TIMEOUT
-from ._constants import DEFAULT_DEBUG_TRUNCATE_LENGTH
 from ._constants import DEFAULT_MAX_TOKENS
 from ._constants import DEFAULT_MODEL
 from ._constants import DEFAULT_POLL_INTERVAL
@@ -133,15 +133,7 @@ class OpenAIProvider:
             "truncation", DEFAULT_TRUNCATION
         )  # Automatic context management
         self.enable_state = self.config.get("enable_state", False)
-        self.debug = self.config.get(
-            "debug", False
-        )  # Enable full request/response logging
-        self.raw_debug = self.config.get(
-            "raw_debug", False
-        )  # Enable ultra-verbose raw API I/O logging
-        self.debug_truncate_length = self.config.get(
-            "debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH
-        )
+        self.raw = self.config.get("raw", False)  # Include raw payload in events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
         self.filtered = self.config.get(
             "filtered", True
@@ -471,39 +463,6 @@ class OpenAIProvider:
             )
 
         return continuation_input
-
-    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
-        """Recursively truncate string values in nested structures.
-
-        Preserves structure, only truncates leaf string values longer than max_length.
-        Uses self.debug_truncate_length if max_length not specified.
-
-        Args:
-            obj: Any JSON-serializable structure (dict, list, primitives)
-            max_length: Maximum string length (defaults to self.debug_truncate_length)
-
-        Returns:
-            Structure with truncated string values
-        """
-        if max_length is None:
-            max_length = self.debug_truncate_length
-
-        # Type guard: max_length is guaranteed to be int after this point
-        assert max_length is not None, (
-            "max_length should never be None after initialization"
-        )
-
-        if isinstance(obj, str):
-            if len(obj) > max_length:
-                return (
-                    obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
-                )
-            return obj
-        if isinstance(obj, dict):
-            return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._truncate_values(item, max_length) for item in obj]
-        return obj  # Numbers, booleans, None pass through unchanged
 
     def _find_missing_tool_results(
         self, messages: list
@@ -916,42 +875,19 @@ class OpenAIProvider:
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
-            # INFO level: Summary only
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "provider": self.name,
-                    "model": params["model"],
-                    "message_count": len(message_list),
-                    "has_instructions": bool(instructions),
-                    "reasoning_enabled": params.get("reasoning") is not None,
-                    "thinking_enabled": thinking_enabled,
-                    "thinking_budget": thinking_budget,
-                    "background_mode": background_mode,
-                },
-            )
-
-            # DEBUG level: Full request payload with truncated values (if debug enabled)
-            if self.debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:debug",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": self.name,
-                        "request": self._truncate_values(params),
-                    },
-                )
-
-            # RAW level: Complete params dict as sent to OpenAI API (if debug AND raw_debug enabled)
-            if self.debug and self.raw_debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": self.name,
-                        "params": params,  # Complete untruncated params
-                    },
-                )
+            request_payload: dict[str, Any] = {
+                "provider": self.name,
+                "model": params["model"],
+                "message_count": len(message_list),
+                "has_instructions": bool(instructions),
+                "reasoning_enabled": params.get("reasoning") is not None,
+                "thinking_enabled": thinking_enabled,
+                "thinking_budget": thinking_budget,
+                "background_mode": background_mode,
+            }
+            if self.raw:
+                request_payload["raw"] = redact_secrets(params)
+            await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
 
@@ -1318,55 +1254,22 @@ class OpenAIProvider:
 
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                # INFO level: Summary only
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": self.name,
-                        "model": params["model"],
-                        "usage": {
-                            "input": usage_counts["input"],
-                            "output": usage_counts["output"],
-                        },
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
-                        "continuation_count": continuation_count
-                        if continuation_count > 0
-                        else None,
+                response_event: dict[str, Any] = {
+                    "provider": self.name,
+                    "model": params["model"],
+                    "usage": {
+                        "input": usage_counts["input"],
+                        "output": usage_counts["output"],
                     },
-                )
-
-                # DEBUG level: Full response with truncated values (if debug enabled)
-                if self.debug:
-                    response_dict = response.model_dump()  # Pydantic model → dict
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": self.name,
-                            "response": self._truncate_values(response_dict),
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                            "continuation_count": continuation_count
-                            if continuation_count > 0
-                            else None,
-                        },
-                    )
-
-                # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
-                # Emitted after llm:response so consumers see the summary before the full dump
-                if self.debug and self.raw_debug:
-                    raw_payload = {
-                        "lvl": "DEBUG",
-                        "provider": self.name,
-                        "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
-                    }
-                    if continuation_count > 0:
-                        raw_payload["continuation"] = continuation_count
-                    await self.coordinator.hooks.emit(
-                        "llm:response:raw",
-                        raw_payload,
-                    )
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                    "continuation_count": continuation_count
+                    if continuation_count > 0
+                    else None,
+                }
+                if self.raw:
+                    response_event["raw"] = redact_secrets(response.model_dump())
+                await self.coordinator.hooks.emit("llm:response", response_event)
 
             # Convert to ChatResponse with accumulated output
             # If there were continuations, use the accumulated output; otherwise use response.output directly

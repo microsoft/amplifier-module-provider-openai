@@ -1,4 +1,13 @@
-"""Tests for emission ordering: llm:response must fire before llm:response:raw."""
+"""Tests for emission behavior after verbosity collapse (Task 13c).
+
+Previously this file tested that llm:response fired before llm:response:raw.
+After the verbosity collapse (Task 13c), tiered :debug/:raw events no longer
+exist. These tests now verify the single-event model works correctly:
+- llm:request and llm:response are emitted exactly once
+- No tiered :debug or :raw events are emitted
+- The `raw` field is present in base events when raw=True
+- Continuation path emits llm:response once with continuation_count
+"""
 
 import asyncio
 from types import SimpleNamespace
@@ -33,7 +42,7 @@ class FakeCoordinator:
 
 
 class DummyResponse:
-    """Minimal response stub with model_dump support for raw debug emission."""
+    """Minimal response stub with model_dump support."""
 
     def __init__(self, status="completed", *, text="Hi", resp_id="resp_test"):
         self.output = [
@@ -55,8 +64,7 @@ class DummyResponse:
 
 def _make_provider(**config_overrides) -> OpenAIProvider:
     config = {
-        "debug": True,
-        "raw_debug": True,
+        "raw": True,  # Enable raw field in events
         **config_overrides,
     }
     return OpenAIProvider(api_key="test-key", config=config)
@@ -81,56 +89,78 @@ def provider_with_fake_coordinator():
 # ---------------------------------------------------------------------------
 
 
-def test_response_raw_fires_after_response(provider_with_fake_coordinator):
-    """llm:response must appear before llm:response:raw in event order."""
+def test_base_events_emitted(provider_with_fake_coordinator):
+    """llm:request and llm:response must both be emitted."""
     provider, fake_coordinator = provider_with_fake_coordinator
 
     asyncio.run(provider.complete(_simple_request()))
 
     event_names = [name for name, _ in fake_coordinator.hooks.events]
 
+    assert "llm:request" in event_names, f"llm:request not found in {event_names}"
     assert "llm:response" in event_names, f"llm:response not found in {event_names}"
-    assert "llm:response:raw" in event_names, (
-        f"llm:response:raw not found in {event_names}"
-    )
-
-    response_idx = event_names.index("llm:response")
-    raw_idx = event_names.index("llm:response:raw")
-
-    assert response_idx < raw_idx, (
-        f"llm:response (index {response_idx}) must fire before "
-        f"llm:response:raw (index {raw_idx}). Events: {event_names}"
-    )
 
 
-def test_full_emission_cascade_ordering(provider_with_fake_coordinator):
-    """The three response emissions must flow: llm:response → llm:response:debug → llm:response:raw."""
+def test_no_tiered_events_emitted(provider_with_fake_coordinator):
+    """After verbosity collapse, no :debug or :raw tiered events should exist."""
     provider, fake_coordinator = provider_with_fake_coordinator
 
     asyncio.run(provider.complete(_simple_request()))
 
     event_names = [name for name, _ in fake_coordinator.hooks.events]
 
+    for name in event_names:
+        assert not name.endswith(":debug"), (
+            f"Unexpected tiered :debug event after verbosity collapse: {name}"
+        )
+        assert not name.endswith(":raw"), (
+            f"Unexpected tiered :raw event after verbosity collapse: {name}"
+        )
+
+
+def test_request_before_response(provider_with_fake_coordinator):
+    """llm:request must appear before llm:response in event order."""
+    provider, fake_coordinator = provider_with_fake_coordinator
+
+    asyncio.run(provider.complete(_simple_request()))
+
+    event_names = [name for name, _ in fake_coordinator.hooks.events]
+
+    assert "llm:request" in event_names, f"llm:request not found in {event_names}"
     assert "llm:response" in event_names, f"llm:response not found in {event_names}"
-    assert "llm:response:debug" in event_names, (
-        f"llm:response:debug not found in {event_names}"
-    )
-    assert "llm:response:raw" in event_names, (
-        f"llm:response:raw not found in {event_names}"
-    )
 
+    request_idx = event_names.index("llm:request")
     response_idx = event_names.index("llm:response")
-    debug_idx = event_names.index("llm:response:debug")
-    raw_idx = event_names.index("llm:response:raw")
 
-    assert response_idx < debug_idx < raw_idx, (
-        f"Expected ordering response({response_idx}) < debug({debug_idx}) < raw({raw_idx}). "
-        f"Events: {event_names}"
+    assert request_idx < response_idx, (
+        f"llm:request (index {request_idx}) must fire before "
+        f"llm:response (index {response_idx}). Events: {event_names}"
     )
+
+
+def test_raw_field_present_in_base_events(provider_with_fake_coordinator):
+    """With raw=True, both llm:request and llm:response should have `raw` field."""
+    provider, fake_coordinator = provider_with_fake_coordinator
+
+    asyncio.run(provider.complete(_simple_request()))
+
+    request_payload = next(
+        payload
+        for name, payload in fake_coordinator.hooks.events
+        if name == "llm:request"
+    )
+    assert "raw" in request_payload, "llm:request must have `raw` field when raw=True"
+
+    response_payload = next(
+        payload
+        for name, payload in fake_coordinator.hooks.events
+        if name == "llm:response"
+    )
+    assert "raw" in response_payload, "llm:response must have `raw` field when raw=True"
 
 
 def test_continuation_path_emission_ordering():
-    """llm:response fires before llm:response:raw even after continuation (continuation_count > 0)."""
+    """llm:response fires once with continuation_count after continuation (incomplete → completed)."""
     provider = _make_provider()
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -148,19 +178,17 @@ def test_continuation_path_emission_ordering():
 
     event_names = [name for name, _ in fake_coordinator.hooks.events]
 
+    assert "llm:request" in event_names, f"llm:request not found in {event_names}"
     assert "llm:response" in event_names, f"llm:response not found in {event_names}"
-    assert "llm:response:raw" in event_names, (
-        f"llm:response:raw not found in {event_names}"
-    )
 
-    response_idx = event_names.index("llm:response")
-    raw_idx = event_names.index("llm:response:raw")
-
-    assert response_idx < raw_idx, (
-        f"llm:response (index {response_idx}) must fire before "
-        f"llm:response:raw (index {raw_idx}) in continuation path. "
-        f"Events: {event_names}"
-    )
+    # No tiered events
+    for name in event_names:
+        assert not name.endswith(":debug"), (
+            f"Unexpected tiered :debug event in continuation path: {name}"
+        )
+        assert not name.endswith(":raw"), (
+            f"Unexpected tiered :raw event in continuation path: {name}"
+        )
 
     # Verify continuation_count is present in the llm:response payload
     response_payload = next(
@@ -173,13 +201,7 @@ def test_continuation_path_emission_ordering():
         f"got {response_payload.get('continuation_count')}"
     )
 
-    # Verify continuation is present in the llm:response:raw payload
-    raw_payload = next(
-        payload
-        for name, payload in fake_coordinator.hooks.events
-        if name == "llm:response:raw"
-    )
-    assert raw_payload.get("continuation") == 1, (
-        f"Expected continuation=1 in llm:response:raw payload, "
-        f"got {raw_payload.get('continuation')}"
+    # Verify raw field is present (raw=True)
+    assert "raw" in response_payload, (
+        "llm:response must have `raw` field in continuation path when raw=True"
     )
