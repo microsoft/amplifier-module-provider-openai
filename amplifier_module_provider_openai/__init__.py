@@ -1340,7 +1340,7 @@ class OpenAIProvider:
                         },
                     )
 
-                # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
+                # RAW level: Complete response object from OpenAI API (if raw_debug enabled)
                 # Emitted after llm:response so consumers see the summary before the full dump
                 if self.raw_debug:
                     await self.coordinator.hooks.emit(

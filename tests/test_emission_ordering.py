@@ -90,3 +90,32 @@ def test_response_raw_fires_after_response():
         f"llm:response (index {response_idx}) must fire before "
         f"llm:response:raw (index {raw_idx}). Events: {event_names}"
     )
+
+
+def test_full_emission_cascade_ordering():
+    """The three response emissions must flow: llm:response → llm:response:debug → llm:response:raw."""
+    provider = _make_provider()
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    asyncio.run(provider.complete(_simple_request()))
+
+    event_names = [name for name, _ in fake_coordinator.hooks.events]
+
+    assert "llm:response" in event_names, f"llm:response not found in {event_names}"
+    assert "llm:response:debug" in event_names, (
+        f"llm:response:debug not found in {event_names}"
+    )
+    assert "llm:response:raw" in event_names, (
+        f"llm:response:raw not found in {event_names}"
+    )
+
+    response_idx = event_names.index("llm:response")
+    debug_idx = event_names.index("llm:response:debug")
+    raw_idx = event_names.index("llm:response:raw")
+
+    assert response_idx < debug_idx < raw_idx, (
+        f"Expected ordering response({response_idx}) < debug({debug_idx}) < raw({raw_idx}). "
+        f"Events: {event_names}"
+    )
