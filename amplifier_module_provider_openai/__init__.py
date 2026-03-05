@@ -57,6 +57,7 @@ from ._response_handling import extract_reasoning_text
 
 logger = logging.getLogger(__name__)
 
+
 class OpenAIChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
 
@@ -316,7 +317,13 @@ class OpenAIProvider:
                 max_output_tokens = 100000
                 defaults = {"max_tokens": 32768, "background": True}
             else:
-                capabilities = ["tools", "reasoning", "streaming", "json_mode", "vision"]
+                capabilities = [
+                    "tools",
+                    "reasoning",
+                    "streaming",
+                    "json_mode",
+                    "vision",
+                ]
                 if "mini" in model_id or "nano" in model_id:
                     capabilities.append("fast")
                 context_window = 400000
@@ -498,7 +505,9 @@ class OpenAIProvider:
             return [self._truncate_values(item, max_length) for item in obj]
         return obj  # Numbers, booleans, None pass through unchanged
 
-    def _find_missing_tool_results(self, messages: list) -> list[tuple[int, str, str, dict]]:
+    def _find_missing_tool_results(
+        self, messages: list
+    ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
 
         Scans conversation for assistant tool calls and validates each has
@@ -511,7 +520,9 @@ class OpenAIProvider:
         Returns:
             List of (msg_idx, call_id, tool_name, tool_arguments) tuples for unpaired calls
         """
-        tool_calls: dict[str, tuple[int, str, dict]] = {}  # {call_id: (msg_idx, name, args)}
+        tool_calls: dict[
+            str, tuple[int, str, dict]
+        ] = {}  # {call_id: (msg_idx, name, args)}
         tool_results: set[str] = set()  # {call_id}
 
         for idx, msg in enumerate(messages):
@@ -973,9 +984,7 @@ class OpenAIProvider:
                     # Azure OpenAI returns x-ms-retry-after-ms instead of
                     # (or in addition to) the standard retry-after header.
                     if retry_after is None:
-                        ms_header = e.response.headers.get(
-                            "x-ms-retry-after-ms"
-                        )
+                        ms_header = e.response.headers.get("x-ms-retry-after-ms")
                         if ms_header:
                             try:
                                 retry_after = float(ms_header) / 1000.0
@@ -1020,7 +1029,11 @@ class OpenAIProvider:
                         provider=self.name,
                         status_code=400,
                     ) from e
-                elif "content filter" in raw_msg or "safety" in raw_msg or "blocked" in raw_msg:
+                elif (
+                    "content filter" in raw_msg
+                    or "safety" in raw_msg
+                    or "blocked" in raw_msg
+                ):
                     raise kernel_errors.ContentFilterError(
                         error_msg,
                         provider=self.name,
@@ -1340,16 +1353,19 @@ class OpenAIProvider:
                         },
                     )
 
-                # RAW level: Complete response object from OpenAI API (if raw_debug enabled)
+                # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
                 # Emitted after llm:response so consumers see the summary before the full dump
-                if self.raw_debug:
+                if self.debug and self.raw_debug:
+                    raw_payload = {
+                        "lvl": "DEBUG",
+                        "provider": self.name,
+                        "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
+                    }
+                    if continuation_count > 0:
+                        raw_payload["continuation"] = continuation_count
                     await self.coordinator.hooks.emit(
                         "llm:response:raw",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": self.name,
-                            "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
-                        },
+                        raw_payload,
                     )
 
             # Convert to ChatResponse with accumulated output
@@ -1592,11 +1608,15 @@ class OpenAIProvider:
                                                 "type": "apply_patch_call",
                                                 "call_id": tc_id,
                                                 "operation": {
-                                                    k: v for k, v in tc_input.items()
+                                                    k: v
+                                                    for k, v in tc_input.items()
                                                     if not (
                                                         k == "diff"
                                                         and tc_input.get("type")
-                                                        not in ("create_file", "update_file")
+                                                        not in (
+                                                            "create_file",
+                                                            "update_file",
+                                                        )
                                                     )
                                                 },
                                                 "status": "completed",
@@ -1684,11 +1704,15 @@ class OpenAIProvider:
                                                 "type": "apply_patch_call",
                                                 "call_id": tc_id,
                                                 "operation": {
-                                                    k: v for k, v in tc_input.items()
+                                                    k: v
+                                                    for k, v in tc_input.items()
                                                     if not (
                                                         k == "diff"
                                                         and tc_input.get("type")
-                                                        not in ("create_file", "update_file")
+                                                        not in (
+                                                            "create_file",
+                                                            "update_file",
+                                                        )
                                                     )
                                                 },
                                                 "status": "completed",
