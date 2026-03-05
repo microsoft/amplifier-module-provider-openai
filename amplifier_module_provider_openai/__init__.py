@@ -1123,22 +1123,6 @@ class OpenAIProvider:
                 getattr(response, "status", "unknown"),
             )
 
-            # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
-            if (
-                self.coordinator
-                and hasattr(self.coordinator, "hooks")
-                and self.debug
-                and self.raw_debug
-            ):
-                await self.coordinator.hooks.emit(
-                    "llm:response:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": self.name,
-                        "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
-                    },
-                )
-
             # Handle background mode polling for long-running requests (deep research)
             # Background responses start in queued/in_progress state and need polling until completion
             if background_mode and hasattr(response, "status"):
@@ -1291,23 +1275,6 @@ class OpenAIProvider:
                     if hasattr(final_response, "output"):
                         accumulated_output.extend(final_response.output)
 
-                    # Emit raw debug for continuation if enabled
-                    if (
-                        self.coordinator
-                        and hasattr(self.coordinator, "hooks")
-                        and self.debug
-                        and self.raw_debug
-                    ):
-                        await self.coordinator.hooks.emit(
-                            "llm:response:raw",
-                            {
-                                "lvl": "DEBUG",
-                                "provider": self.name,
-                                "response": final_response.model_dump(),
-                                "continuation": continuation_count,
-                            },
-                        )
-
                 except Exception as e:
                     logger.error(
                         f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
@@ -1370,6 +1337,18 @@ class OpenAIProvider:
                             "continuation_count": continuation_count
                             if continuation_count > 0
                             else None,
+                        },
+                    )
+
+                # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
+                # Emitted after llm:response so consumers see the summary before the full dump
+                if self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": self.name,
+                            "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
                         },
                     )
 
