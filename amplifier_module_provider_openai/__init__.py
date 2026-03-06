@@ -218,18 +218,19 @@ class OpenAIProvider:
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
+        caps = get_capabilities(self.default_model)
         return ProviderInfo(
             id="openai",
             display_name="OpenAI",
             credential_env_vars=["OPENAI_API_KEY"],
             capabilities=["streaming", "tools", "reasoning", "batch", "json_mode"],
             defaults={
-                "model": "gpt-5.1",
+                "model": self.default_model,
                 "max_tokens": 16384,
-                "temperature": None,  # Model default
+                "temperature": None,
                 "timeout": 600.0,
-                "context_window": 400000,
-                "max_output_tokens": 128000,
+                "context_window": caps.context_window,
+                "max_output_tokens": caps.max_output_tokens,
             },
             config_fields=[
                 ConfigField(
