@@ -29,8 +29,8 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 
 ## Supported Models
 
-- `gpt-5.1-codex` - GPT-5 optimized for code (default)
-- `gpt-5.1` - Latest GPT-5 model
+- `gpt-5.4` - GPT-5 optimized for code (default)
+- `gpt-5.4` - Latest GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5
 - `gpt-5-nano` - Smallest GPT-5 variant
 
@@ -42,7 +42,7 @@ module = "provider-openai"
 name = "openai"
 config = {
     base_url = null,                 # Optional custom endpoint (null = OpenAI default)
-    default_model = "gpt-5.1-codex",
+    default_model = "gpt-5.4",
     max_tokens = 4096,
     temperature = 0.7,
     reasoning = "low",              # Reasoning effort: minimal|low|medium|high
@@ -77,7 +77,7 @@ providers:
     config:
       debug: true # Enable debug events
       raw_debug: true # Enable raw API I/O capture
-      default_model: gpt-5.1-codex
+      default_model: gpt-5.4
 ```
 
 ## Environment Variables
@@ -92,7 +92,7 @@ export OPENAI_API_KEY="your-api-key-here"
 # In amplifier configuration
 [provider]
 name = "openai"
-model = "gpt-5.1-codex"
+model = "gpt-5.4"
 ```
 
 ## Features
@@ -202,7 +202,7 @@ MAX_CONTINUATION_ATTEMPTS = 5  # Prevents infinite loops
 
 The provider preserves reasoning state across conversation **steps** for improved multi-turn performance:
 
-**The Problem**: Reasoning models (o3, o4, gpt-5.1) produce internal reasoning traces (rs\_\* IDs) that improve subsequent responses by ~3-5% when preserved. This is especially critical when tool calls are involved.
+**The Problem**: Reasoning models (o3, o4, gpt-5.4) produce internal reasoning traces (rs\_\* IDs) that improve subsequent responses by ~3-5% when preserved. This is especially critical when tool calls are involved.
 
 **Important Distinction**:
 
