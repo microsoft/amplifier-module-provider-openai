@@ -315,10 +315,15 @@ class TestRetryConfigAttribute:
     def test_no_jitter_compat_code_in_source(self):
         """The jitter bool/float compat code must be removed from __init__."""
         import inspect
+
         source = inspect.getsource(OpenAIProvider.__init__)
         # These patterns should NOT exist anymore
-        assert "jitter_cfg" not in source, "jitter_cfg compat variable should be removed"
-        assert "isinstance(jitter_cfg" not in source, "isinstance check should be removed"
+        assert "jitter_cfg" not in source, (
+            "jitter_cfg compat variable should be removed"
+        )
+        assert "isinstance(jitter_cfg" not in source, (
+            "isinstance check should be removed"
+        )
 
     def test_retry_config_defaults(self):
         """RetryConfig should use sensible defaults when config is empty."""

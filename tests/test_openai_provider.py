@@ -15,7 +15,9 @@ class DummyResponse:
 
     def __init__(self, output=None):
         self.output = output or []
-        self.usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+        self.usage = SimpleNamespace(
+            prompt_tokens=0, completion_tokens=0, total_tokens=0
+        )
         self.stop_reason = "stop"
 
 
@@ -39,7 +41,9 @@ def test_extended_thinking_enables_reasoning_and_budget_adjustment():
     messages = [Message(role="user", content="Hello")]
     request = ChatRequest(messages=messages)
 
-    asyncio.run(provider.complete(request, extended_thinking=True, thinking_budget_tokens=6000))
+    asyncio.run(
+        provider.complete(request, extended_thinking=True, thinking_budget_tokens=6000)
+    )
 
     provider.client.responses.create.assert_awaited()
     call_kwargs = provider.client.responses.create.await_args_list[0].kwargs
@@ -59,7 +63,9 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": 1})],
+            content=[
+                ToolCallBlock(id="call_1", name="do_something", input={"value": 1})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -71,10 +77,17 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     provider.client.responses.create.assert_awaited_once()
 
     # Should not emit validation error
-    assert all(event_name != "provider:validation_error" for event_name, _ in fake_coordinator.hooks.events)
+    assert all(
+        event_name != "provider:validation_error"
+        for event_name, _ in fake_coordinator.hooks.events
+    )
 
     # Should emit repair event
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["provider"] == "openai"
     assert repair_events[0][1]["repair_count"] == 1
@@ -84,7 +97,9 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     # not appended at the end — ordering requirement for LLM APIs.
     # With FM3: [assistant, synthetic_tool_result, synthetic_assistant_close, user]
     assert len(request.messages) == 4
-    assert request.messages[1].role == "tool"  # synthetic tool result right after assistant
+    assert (
+        request.messages[1].role == "tool"
+    )  # synthetic tool result right after assistant
     assert request.messages[2].role == "assistant"  # synthetic close before user
     assert request.messages[3].role == "user"  # original user message remains last
 
@@ -109,7 +124,9 @@ def test_repaired_tool_ids_are_not_detected_again():
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})],
+            content=[
+                ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -128,7 +145,11 @@ def test_repaired_tool_ids_are_not_detected_again():
     assert request.messages[2].role == "assistant"  # synthetic close
     assert request.messages[3].role == "user"  # original user still last
 
-    repair_events_1 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events_1 = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events_1) == 1
 
     # Clear events for second call
@@ -139,7 +160,9 @@ def test_repaired_tool_ids_are_not_detected_again():
     messages_2 = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})],
+            content=[
+                ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -148,7 +171,11 @@ def test_repaired_tool_ids_are_not_detected_again():
     asyncio.run(provider.complete(request_2))
 
     # Should NOT emit another repair event for the same tool ID
-    repair_events_2 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events_2 = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events_2) == 0, "Should not re-detect already-repaired tool IDs"
 
 
@@ -188,7 +215,11 @@ def test_multiple_missing_tool_results_all_tracked():
     assert request.messages[5].role == "user"  # original user message last
 
     # Verify repair event has all 3
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["repair_count"] == 3
 
@@ -213,7 +244,9 @@ def test_fm3_synthetic_assistant_response_inserted_before_user_message():
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_fm3", name="search", input={"query": "test"})],
+            content=[
+                ToolCallBlock(id="call_fm3", name="search", input={"query": "test"})
+            ],
         ),
         Message(role="user", content="What were the results?"),
     ]
@@ -232,6 +265,10 @@ def test_fm3_synthetic_assistant_response_inserted_before_user_message():
     assert request.messages[3].content == "What were the results?"
 
     # Event should include the synthetic_assistant_count
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1].get("synthetic_assistant_count") == 1

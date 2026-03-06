@@ -13,7 +13,7 @@ METADATA_REASONING_ITEMS = "openai:reasoning_items"
 METADATA_CONTINUATION_COUNT = "openai:continuation_count"
 
 # Default configuration values
-DEFAULT_MODEL = "gpt-5.1-codex"
+DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
 DEFAULT_DEBUG_TRUNCATE_LENGTH = 180

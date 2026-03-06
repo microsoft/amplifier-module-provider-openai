@@ -76,7 +76,9 @@ def test_reasoning_effort_low():
     asyncio.run(provider.complete(_request_with_effort("low")))
 
     kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
     assert kwargs["reasoning"]["effort"] == "low"
+    assert "summary" in kwargs["reasoning"]
 
 
 def test_reasoning_effort_medium():
@@ -85,7 +87,9 @@ def test_reasoning_effort_medium():
     asyncio.run(provider.complete(_request_with_effort("medium")))
 
     kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
     assert kwargs["reasoning"]["effort"] == "medium"
+    assert "summary" in kwargs["reasoning"]
 
 
 def test_reasoning_effort_none_no_reasoning_param():
@@ -152,3 +156,39 @@ def test_reasoning_effort_with_extended_thinking():
     kwargs = _get_call_kwargs(provider)
     # reasoning_effort="low" already set reasoning, so it should be "low"
     assert kwargs["reasoning"]["effort"] == "low"
+
+
+def test_reasoning_effort_xhigh():
+    """reasoning_effort='xhigh' -> reasoning={'effort': 'xhigh', 'summary': ...}."""
+    provider = _make_provider()
+    asyncio.run(provider.complete(_request_with_effort("xhigh")))
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
+    assert kwargs["reasoning"]["effort"] == "xhigh"
+    assert "summary" in kwargs["reasoning"]
+
+
+def test_reasoning_effort_none_explicit():
+    """reasoning_effort='none' explicitly set -> reasoning={'effort': 'none', 'summary': ...}.
+    This is different from reasoning_effort=None (Python None = not set).
+    GPT-5.4 uses 'none' as a string value meaning 'no reasoning'."""
+    provider = _make_provider()
+    asyncio.run(provider.complete(_request_with_effort("none")))
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
+    assert kwargs["reasoning"]["effort"] == "none"
+    assert "summary" in kwargs["reasoning"]
+
+
+def test_gpt54_without_effort_omits_reasoning():
+    """GPT-5.4 with no explicit reasoning_effort -> no reasoning param sent.
+
+    GPT-5.4 has default_reasoning_effort=None, meaning it does not reason
+    by default. Unlike older models (gpt-5.2 and below, o-series) which
+    reason by default and get reasoning={summary:'auto'} for observability,
+    GPT-5.4 should only receive reasoning params when explicitly requested.
+    """
+    provider = _make_provider(default_model="gpt-5.4")
+    asyncio.run(provider.complete(_request_with_effort(None)))
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" not in kwargs

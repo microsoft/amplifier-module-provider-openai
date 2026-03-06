@@ -15,7 +15,6 @@ import os
 import time
 from collections import defaultdict
 from typing import Any
-from typing import cast
 
 import openai
 from amplifier_core import ConfigField
@@ -35,7 +34,6 @@ from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 
 from ._constants import BACKGROUND_POLLING_STATUSES
-from ._constants import BACKGROUND_STATUS_COMPLETED
 from ._constants import BACKGROUND_STATUS_FAILED
 from ._constants import DEFAULT_BACKGROUND_TIMEOUT
 from ._constants import DEFAULT_MAX_TOKENS
@@ -46,7 +44,6 @@ from ._constants import DEFAULT_TIMEOUT
 from ._constants import DEFAULT_TRUNCATION
 from ._constants import DEEP_RESEARCH_MODELS
 from ._constants import MAX_CONTINUATION_ATTEMPTS
-from ._constants import METADATA_CONTINUATION_COUNT
 from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
@@ -54,6 +51,7 @@ from ._constants import METADATA_STATUS
 from ._constants import NATIVE_TOOL_TYPES
 from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import extract_reasoning_text
+from ._capabilities import get_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +123,7 @@ class OpenAIProvider:
         )  # None = not sent (some models don't support it)
         self.reasoning = self.config.get(
             "reasoning", None
-        )  # None = not sent (minimal|low|medium|high)
+        )  # None = not sent (none|low|medium|high|xhigh)
         self.reasoning_summary = self.config.get(
             "reasoning_summary", DEFAULT_REASONING_SUMMARY
         )
@@ -217,18 +215,19 @@ class OpenAIProvider:
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
+        caps = get_capabilities(self.default_model)
         return ProviderInfo(
             id="openai",
             display_name="OpenAI",
             credential_env_vars=["OPENAI_API_KEY"],
             capabilities=["streaming", "tools", "reasoning", "batch", "json_mode"],
             defaults={
-                "model": "gpt-5.1",
+                "model": self.default_model,
                 "max_tokens": 16384,
-                "temperature": None,  # Model default
+                "temperature": None,
                 "timeout": 600.0,
-                "context_window": 400000,
-                "max_output_tokens": 128000,
+                "context_window": caps.context_window,
+                "max_output_tokens": caps.max_output_tokens,
             },
             config_fields=[
                 ConfigField(
@@ -252,7 +251,7 @@ class OpenAIProvider:
                     display_name="Reasoning Effort",
                     field_type="choice",
                     prompt="Select reasoning effort level",
-                    choices=["none", "minimal", "low", "medium", "high"],
+                    choices=["none", "low", "medium", "high", "xhigh"],
                     default="none",
                     required=False,
                     requires_model=True,  # Shown after model selection
@@ -302,24 +301,13 @@ class OpenAIProvider:
             # Generate display name from model ID
             display_name = self._model_id_to_display_name(model_id)
 
-            # Determine capabilities based on model type
+            caps = get_capabilities(model_id)
+            capabilities = list(caps.capability_tags)
+            context_window = caps.context_window
+            max_output_tokens = caps.max_output_tokens
             if is_deep_research:
-                capabilities = ["deep_research", "web_search", "reasoning"]
-                context_window = 200000
-                max_output_tokens = 100000
                 defaults = {"max_tokens": 32768, "background": True}
             else:
-                capabilities = [
-                    "tools",
-                    "reasoning",
-                    "streaming",
-                    "json_mode",
-                    "vision",
-                ]
-                if "mini" in model_id or "nano" in model_id:
-                    capabilities.append("fast")
-                context_window = 400000
-                max_output_tokens = 128000
                 defaults = {"max_tokens": 16384, "reasoning_effort": "none"}
 
             models.append(
@@ -348,6 +336,11 @@ class OpenAIProvider:
         """
         # Known display name mappings
         display_names = {
+            "gpt-5.4": "GPT 5.4",
+            "gpt-5.4-pro": "GPT 5.4 Pro",
+            "gpt-5.3-codex": "GPT-5.3 codex",
+            "gpt-5.2": "GPT 5.2",
+            "gpt-5.2-pro": "GPT 5.2 Pro",
             "gpt-5.1": "GPT 5.1",
             "gpt-5.1-codex": "GPT-5.1 codex",
             "gpt-5-mini": "GPT-5 mini",
@@ -378,18 +371,14 @@ class OpenAIProvider:
         return model_id
 
     def _model_may_reason(self, model_name: str) -> bool:
-        """Check if a model may produce reasoning output by default.
+        """Check if the model supports reasoning via capabilities lookup.
 
-        Models like gpt-5.2-codex and o-series reason without explicit
-        reasoning_effort being set.  We need to request encrypted_content
-        for these models even when no reasoning param is in the request.
+        Returns False for empty/unknown model names.
         """
         if not model_name:
             return False
-        name = model_name.lower()
-        # Models known to reason by default
-        reasoning_prefixes = ("o1", "o3", "o4", "codex", "gpt-5")
-        return any(name.startswith(p) or f"-{p}" in name for p in reasoning_prefixes)
+        caps = get_capabilities(model_name)
+        return caps.supports_reasoning
 
     def _build_continuation_input(
         self, original_input: list, accumulated_output: list
@@ -783,19 +772,33 @@ class OpenAIProvider:
                 }
             logger.info(f"[PROVIDER] Setting reasoning: {params['reasoning']}")
 
-        # CRITICAL: Request encrypted_content for ANY model that may reason, not just when explicitly configured.
-        # Models like gpt-5.2-codex and o-series reason by default without "reasoning" appearing in params.
+        # Request encrypted_content only when reasoning will actually produce tokens.
+        # - Explicit non-"none" effort set → reasoning is active → need encrypted_content
+        # - Model reasons by default (default_reasoning_effort is not None) → need encrypted_content
+        # - GPT-5.4+ with no explicit effort (default_reasoning_effort=None) → no reasoning → skip
         if not store_enabled:
-            model_may_reason = "reasoning" in params or self._model_may_reason(
-                model_name
-            )
-            if model_may_reason:
+            caps = get_capabilities(model_name)
+            active_effort: str | None = None
+            if "reasoning" in params:
+                r = params["reasoning"]
+                active_effort = r.get("effort") if isinstance(r, dict) else r
+            # Explicit effort (including "none") overrides the model's default.
+            # Only fall back to the model's default when no effort was set at all.
+            if active_effort is not None:
+                model_will_reason = active_effort != "none"
+            else:
+                model_will_reason = (
+                    caps.supports_reasoning
+                    and caps.default_reasoning_effort is not None
+                )
+            if model_will_reason:
                 params["include"] = kwargs.get(
                     "include", ["reasoning.encrypted_content"]
                 )
                 logger.debug(
-                    "[PROVIDER] Requesting encrypted_content (store=False, model may reason: %s)",
+                    "[PROVIDER] Requesting encrypted_content (store=False, model will reason: %s, effort=%s)",
                     model_name,
+                    active_effort or caps.default_reasoning_effort,
                 )
 
         # Add tools if provided (from request or kwargs)
@@ -870,8 +873,13 @@ class OpenAIProvider:
         # Without this, models like gpt-5.2-codex return encrypted_content but no
         # summary text, making reasoning invisible for observability/debugging.
         # Placed AFTER extended_thinking so it doesn't interfere with effort-based reasoning.
+        # Only applies to models with a non-None default_reasoning_effort (o-series, gpt-5.2
+        # and below). GPT-5.4+ has default_reasoning_effort=None — it doesn't reason by
+        # default, so no reasoning param should be sent unless explicitly requested.
         if self._model_may_reason(model_name) and "reasoning" not in params:
-            params["reasoning"] = {"summary": "auto"}
+            caps_for_auto = get_capabilities(model_name)
+            if caps_for_auto.default_reasoning_effort is not None:
+                params["reasoning"] = {"summary": "auto"}
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -1855,9 +1863,6 @@ class OpenAIProvider:
         Returns:
             ChatResponse with content blocks
         """
-        from amplifier_core.message_models import (
-            ReasoningBlock as ResponseReasoningBlock,
-        )
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ThinkingBlock
         from amplifier_core.message_models import ToolCall
