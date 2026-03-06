@@ -338,6 +338,11 @@ class OpenAIProvider:
         """
         # Known display name mappings
         display_names = {
+            "gpt-5.4": "GPT 5.4",
+            "gpt-5.4-pro": "GPT 5.4 Pro",
+            "gpt-5.3-codex": "GPT-5.3 codex",
+            "gpt-5.2": "GPT 5.2",
+            "gpt-5.2-pro": "GPT 5.2 Pro",
             "gpt-5.1": "GPT 5.1",
             "gpt-5.1-codex": "GPT-5.1 codex",
             "gpt-5-mini": "GPT-5 mini",
