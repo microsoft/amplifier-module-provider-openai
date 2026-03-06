@@ -253,7 +253,7 @@ class OpenAIProvider:
                     display_name="Reasoning Effort",
                     field_type="choice",
                     prompt="Select reasoning effort level",
-                    choices=["none", "minimal", "low", "medium", "high"],
+                    choices=["none", "low", "medium", "high", "xhigh"],
                     default="none",
                     required=False,
                     requires_model=True,  # Shown after model selection

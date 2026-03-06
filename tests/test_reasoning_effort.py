@@ -152,3 +152,23 @@ def test_reasoning_effort_with_extended_thinking():
     kwargs = _get_call_kwargs(provider)
     # reasoning_effort="low" already set reasoning, so it should be "low"
     assert kwargs["reasoning"]["effort"] == "low"
+
+
+def test_reasoning_effort_xhigh():
+    """reasoning_effort='xhigh' -> reasoning={'effort': 'xhigh', 'summary': ...}."""
+    provider = _make_provider()
+    asyncio.run(provider.complete(_request_with_effort("xhigh")))
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
+    assert kwargs["reasoning"]["effort"] == "xhigh"
+
+
+def test_reasoning_effort_none_explicit():
+    """reasoning_effort='none' explicitly set -> reasoning={'effort': 'none', 'summary': ...}.
+    This is different from reasoning_effort=None (Python None = not set).
+    GPT-5.4 uses 'none' as a string value meaning 'no reasoning'."""
+    provider = _make_provider()
+    asyncio.run(provider.complete(_request_with_effort("none")))
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
+    assert kwargs["reasoning"]["effort"] == "none"
