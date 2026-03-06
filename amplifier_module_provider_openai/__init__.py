@@ -775,19 +775,30 @@ class OpenAIProvider:
                 }
             logger.info(f"[PROVIDER] Setting reasoning: {params['reasoning']}")
 
-        # CRITICAL: Request encrypted_content for ANY model that may reason, not just when explicitly configured.
-        # Models like gpt-5.2-codex and o-series reason by default without "reasoning" appearing in params.
+        # Request encrypted_content only when reasoning will actually produce tokens.
+        # - Explicit non-"none" effort set → reasoning is active → need encrypted_content
+        # - Model reasons by default (default_reasoning_effort is not None) → need encrypted_content
+        # - GPT-5.4+ with no explicit effort (default_reasoning_effort=None) → no reasoning → skip
         if not store_enabled:
-            model_may_reason = "reasoning" in params or self._model_may_reason(
-                model_name
+            caps = get_capabilities(model_name)
+            active_effort: str | None = None
+            if "reasoning" in params:
+                r = params["reasoning"]
+                active_effort = r.get("effort") if isinstance(r, dict) else r
+            model_will_reason = (
+                active_effort is not None and active_effort != "none"
+            ) or (
+                self._model_may_reason(model_name)
+                and caps.default_reasoning_effort is not None
             )
-            if model_may_reason:
+            if model_will_reason:
                 params["include"] = kwargs.get(
                     "include", ["reasoning.encrypted_content"]
                 )
                 logger.debug(
-                    "[PROVIDER] Requesting encrypted_content (store=False, model may reason: %s)",
+                    "[PROVIDER] Requesting encrypted_content (store=False, model will reason: %s, effort=%s)",
                     model_name,
+                    active_effort or caps.default_reasoning_effort,
                 )
 
         # Add tools if provided (from request or kwargs)
@@ -862,8 +873,13 @@ class OpenAIProvider:
         # Without this, models like gpt-5.2-codex return encrypted_content but no
         # summary text, making reasoning invisible for observability/debugging.
         # Placed AFTER extended_thinking so it doesn't interfere with effort-based reasoning.
+        # Only applies to models with a non-None default_reasoning_effort (o-series, gpt-5.2
+        # and below). GPT-5.4+ has default_reasoning_effort=None — it doesn't reason by
+        # default, so no reasoning param should be sent unless explicitly requested.
         if self._model_may_reason(model_name) and "reasoning" not in params:
-            params["reasoning"] = {"summary": "auto"}
+            caps_for_auto = get_capabilities(model_name)
+            if caps_for_auto.default_reasoning_effort is not None:
+                params["reasoning"] = {"summary": "auto"}
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
