@@ -161,6 +161,7 @@ def test_reasoning_effort_xhigh():
     kwargs = _get_call_kwargs(provider)
     assert "reasoning" in kwargs
     assert kwargs["reasoning"]["effort"] == "xhigh"
+    assert "summary" in kwargs["reasoning"]
 
 
 def test_reasoning_effort_none_explicit():
@@ -172,3 +173,4 @@ def test_reasoning_effort_none_explicit():
     kwargs = _get_call_kwargs(provider)
     assert "reasoning" in kwargs
     assert kwargs["reasoning"]["effort"] == "none"
+    assert "summary" in kwargs["reasoning"]
