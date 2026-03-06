@@ -368,6 +368,7 @@ class OpenAIProvider:
         return model_id
 
     def _model_may_reason(self, model_name: str) -> bool:
+        """Check if the model supports reasoning via capabilities lookup."""
         if not model_name:
             return False
         caps = get_capabilities(model_name)
