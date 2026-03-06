@@ -126,7 +126,7 @@ class OpenAIProvider:
         )  # None = not sent (some models don't support it)
         self.reasoning = self.config.get(
             "reasoning", None
-        )  # None = not sent (minimal|low|medium|high)
+        )  # None = not sent (none|low|medium|high|xhigh)
         self.reasoning_summary = self.config.get(
             "reasoning_summary", DEFAULT_REASONING_SUMMARY
         )

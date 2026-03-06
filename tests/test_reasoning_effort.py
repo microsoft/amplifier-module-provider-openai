@@ -76,7 +76,9 @@ def test_reasoning_effort_low():
     asyncio.run(provider.complete(_request_with_effort("low")))
 
     kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
     assert kwargs["reasoning"]["effort"] == "low"
+    assert "summary" in kwargs["reasoning"]
 
 
 def test_reasoning_effort_medium():
@@ -85,7 +87,9 @@ def test_reasoning_effort_medium():
     asyncio.run(provider.complete(_request_with_effort("medium")))
 
     kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
     assert kwargs["reasoning"]["effort"] == "medium"
+    assert "summary" in kwargs["reasoning"]
 
 
 def test_reasoning_effort_none_no_reasoning_param():
