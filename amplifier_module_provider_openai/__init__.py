@@ -54,6 +54,7 @@ from ._constants import METADATA_STATUS
 from ._constants import NATIVE_TOOL_TYPES
 from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import extract_reasoning_text
+from ._capabilities import get_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -302,24 +303,13 @@ class OpenAIProvider:
             # Generate display name from model ID
             display_name = self._model_id_to_display_name(model_id)
 
-            # Determine capabilities based on model type
+            caps = get_capabilities(model_id)
+            capabilities = list(caps.capability_tags)
+            context_window = caps.context_window
+            max_output_tokens = caps.max_output_tokens
             if is_deep_research:
-                capabilities = ["deep_research", "web_search", "reasoning"]
-                context_window = 200000
-                max_output_tokens = 100000
                 defaults = {"max_tokens": 32768, "background": True}
             else:
-                capabilities = [
-                    "tools",
-                    "reasoning",
-                    "streaming",
-                    "json_mode",
-                    "vision",
-                ]
-                if "mini" in model_id or "nano" in model_id:
-                    capabilities.append("fast")
-                context_window = 400000
-                max_output_tokens = 128000
                 defaults = {"max_tokens": 16384, "reasoning_effort": "none"}
 
             models.append(
@@ -378,18 +368,10 @@ class OpenAIProvider:
         return model_id
 
     def _model_may_reason(self, model_name: str) -> bool:
-        """Check if a model may produce reasoning output by default.
-
-        Models like gpt-5.2-codex and o-series reason without explicit
-        reasoning_effort being set.  We need to request encrypted_content
-        for these models even when no reasoning param is in the request.
-        """
         if not model_name:
             return False
-        name = model_name.lower()
-        # Models known to reason by default
-        reasoning_prefixes = ("o1", "o3", "o4", "codex", "gpt-5")
-        return any(name.startswith(p) or f"-{p}" in name for p in reasoning_prefixes)
+        caps = get_capabilities(model_name)
+        return caps.supports_reasoning
 
     def _build_continuation_input(
         self, original_input: list, accumulated_output: list
