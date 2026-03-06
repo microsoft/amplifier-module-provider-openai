@@ -118,6 +118,14 @@ class TestGPT5MiniFamily:
             "fast",
         )
 
+    def test_gpt_5_0_mini(self):
+        """The gpt-5.0-mini variant routes to the gpt-5-mini family."""
+        caps = get_capabilities("gpt-5.0-mini")
+        assert caps.family == "gpt-5-mini"
+        assert caps.context_window == 128_000
+        assert caps.max_output_tokens == 64_000
+        assert caps.supports_reasoning is False
+
 
 class TestOSeriesFamily:
     """Test o-series model capabilities."""
