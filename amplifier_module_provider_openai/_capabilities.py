@@ -72,6 +72,27 @@ def _parse_gpt5_version(model_id: str) -> tuple[int, int]:
     return (major, minor)
 
 
+def _detect_version(model_id: str, family: str) -> tuple[int, int]:
+    """Extract ``(major, minor)`` version from a model ID.
+
+    Uses *family* to short-circuit parsing for non-GPT families.
+    For GPT families, delegates to ``_parse_gpt5_version``.
+
+    Examples::
+
+        _detect_version("gpt-5.4", "gpt-5")       -> (5, 4)
+        _detect_version("gpt-5.4-pro", "gpt-5")   -> (5, 4)
+        _detect_version("gpt-5.3-codex", "gpt-5") -> (5, 3)
+        _detect_version("gpt-5-mini", "gpt-5-mini") -> (5, 0)
+        _detect_version("o3", "o-series")          -> (0, 0)
+
+    Returns ``(0, 0)`` for non-GPT families or when parsing fails.
+    """
+    if not family.startswith("gpt-"):
+        return (0, 0)
+    return _parse_gpt5_version(model_id)
+
+
 def get_capabilities(model_id: str) -> ModelCapabilities:
     """Return capabilities for *model_id*.
 
