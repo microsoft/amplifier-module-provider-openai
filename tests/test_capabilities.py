@@ -89,7 +89,7 @@ class TestGPT52Family:
         assert caps.context_window == 200_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
-        assert caps.default_reasoning_effort == "implicit"
+        assert caps.default_reasoning_effort == "medium"
 
     def test_gpt_5_2_pro(self):
         caps = get_capabilities("gpt-5.2-pro")
@@ -97,7 +97,7 @@ class TestGPT52Family:
         assert caps.context_window == 200_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
-        assert caps.default_reasoning_effort == "implicit"
+        assert caps.default_reasoning_effort == "medium"
 
 
 class TestGPT5MiniFamily:
@@ -138,7 +138,7 @@ class TestOSeriesFamily:
         assert caps.context_window == 200_000
         assert caps.max_output_tokens == 100_000
         assert caps.supports_reasoning is True
-        assert caps.default_reasoning_effort == "implicit"
+        assert caps.default_reasoning_effort == "medium"
         assert caps.supports_vision is False
         assert caps.supports_streaming is True
         assert caps.capability_tags == ("tools", "reasoning", "streaming")
@@ -149,7 +149,7 @@ class TestOSeriesFamily:
         assert caps.context_window == 200_000
         assert caps.max_output_tokens == 100_000
         assert caps.supports_reasoning is True
-        assert caps.default_reasoning_effort == "implicit"
+        assert caps.default_reasoning_effort == "medium"
         assert caps.supports_vision is False
         assert caps.supports_streaming is True
 
