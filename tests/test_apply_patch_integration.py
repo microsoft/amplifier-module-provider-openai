@@ -491,7 +491,9 @@ class TestApplyPatchCallHistoryReplay:
 
         # Must NOT produce a function_call item for this native op
         function_call_items = [
-            m for m in result if isinstance(m, dict) and m.get("type") == "function_call"
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "function_call"
         ]
         assert len(function_call_items) == 0, (
             "Historical native apply_patch_call should not be replayed as function_call"
@@ -663,7 +665,9 @@ class TestApplyPatchCallHistoryReplay:
 
         # Must produce a regular function_call item
         func_call_items = [
-            m for m in result if isinstance(m, dict) and m.get("type") == "function_call"
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "function_call"
         ]
         assert len(func_call_items) == 1
         assert func_call_items[0]["call_id"] == "call_func_ap"

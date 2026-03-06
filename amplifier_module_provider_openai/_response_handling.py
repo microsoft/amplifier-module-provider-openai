@@ -219,7 +219,8 @@ def convert_response_with_accumulated_output(
                     # content[1] = reasoning_id (rs_* ID for OpenAI)
                     content_blocks.append(
                         ThinkingBlock(
-                            thinking=reasoning_text or "",  # May be empty when only encrypted_content exists
+                            thinking=reasoning_text
+                            or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
                             content=[encrypted_content, reasoning_id],

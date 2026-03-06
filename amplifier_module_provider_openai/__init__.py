@@ -15,7 +15,6 @@ import os
 import time
 from collections import defaultdict
 from typing import Any
-from typing import cast
 
 import openai
 from amplifier_core import ConfigField
@@ -35,7 +34,6 @@ from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 
 from ._constants import BACKGROUND_POLLING_STATUSES
-from ._constants import BACKGROUND_STATUS_COMPLETED
 from ._constants import BACKGROUND_STATUS_FAILED
 from ._constants import DEFAULT_BACKGROUND_TIMEOUT
 from ._constants import DEFAULT_MAX_TOKENS
@@ -46,7 +44,6 @@ from ._constants import DEFAULT_TIMEOUT
 from ._constants import DEFAULT_TRUNCATION
 from ._constants import DEEP_RESEARCH_MODELS
 from ._constants import MAX_CONTINUATION_ATTEMPTS
-from ._constants import METADATA_CONTINUATION_COUNT
 from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
@@ -785,12 +782,15 @@ class OpenAIProvider:
             if "reasoning" in params:
                 r = params["reasoning"]
                 active_effort = r.get("effort") if isinstance(r, dict) else r
-            model_will_reason = (
-                active_effort is not None and active_effort != "none"
-            ) or (
-                self._model_may_reason(model_name)
-                and caps.default_reasoning_effort is not None
-            )
+            # Explicit effort (including "none") overrides the model's default.
+            # Only fall back to the model's default when no effort was set at all.
+            if active_effort is not None:
+                model_will_reason = active_effort != "none"
+            else:
+                model_will_reason = (
+                    caps.supports_reasoning
+                    and caps.default_reasoning_effort is not None
+                )
             if model_will_reason:
                 params["include"] = kwargs.get(
                     "include", ["reasoning.encrypted_content"]
@@ -1863,9 +1863,6 @@ class OpenAIProvider:
         Returns:
             ChatResponse with content blocks
         """
-        from amplifier_core.message_models import (
-            ReasoningBlock as ResponseReasoningBlock,
-        )
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ThinkingBlock
         from amplifier_core.message_models import ToolCall

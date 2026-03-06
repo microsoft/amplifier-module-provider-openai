@@ -105,6 +105,32 @@ def test_no_include_when_store_true():
     )
 
 
+def test_no_include_when_explicit_none_effort_on_default_reasoning_model():
+    """Regression: explicit reasoning_effort='none' must override default_reasoning_effort.
+
+    gpt-5.2-codex has default_reasoning_effort='medium', so the model *would*
+    reason by default.  But when the caller explicitly sets effort='none', the
+    include-guard MUST NOT send include=[reasoning.encrypted_content].
+
+    Bug: the old second-clause check
+        (self._model_may_reason(model) and caps.default_reasoning_effort is not None)
+    evaluated True for gpt-5.2-codex regardless of the explicit 'none' effort,
+    causing an incorrect 'include' parameter to be sent.
+    """
+    provider = _make_provider(default_model="gpt-5.2-codex")
+    request = ChatRequest(
+        messages=[Message(role="user", content="Hello")],
+        reasoning_effort="none",  # Explicitly disable reasoning
+    )
+    asyncio.run(provider.complete(request))
+
+    kwargs = _get_call_kwargs(provider)
+    assert "include" not in kwargs, (
+        "Explicit reasoning_effort='none' on a reason-by-default model should NOT "
+        f"have 'include' parameter, but got include={kwargs.get('include')}"
+    )
+
+
 def test_include_with_reasoning_effort_low_store_false():
     """reasoning_effort='low' with store=false should include encrypted_content."""
     provider = _make_provider()
