@@ -10,6 +10,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+__all__ = ["ModelCapabilities", "get_capabilities"]
+
+_GPT5_TAGS: tuple[str, ...] = (
+    "tools",
+    "reasoning",
+    "streaming",
+    "json_mode",
+    "vision",
+)
+
 
 @dataclass(frozen=True)
 class ModelCapabilities:
@@ -121,13 +131,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 default_reasoning_effort=None,
                 supports_vision=True,
                 supports_streaming=True,
-                capability_tags=(
-                    "tools",
-                    "reasoning",
-                    "streaming",
-                    "json_mode",
-                    "vision",
-                ),
+                capability_tags=_GPT5_TAGS,
             )
 
         if minor == 3:
@@ -139,13 +143,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 default_reasoning_effort=None,
                 supports_vision=True,
                 supports_streaming=True,
-                capability_tags=(
-                    "tools",
-                    "reasoning",
-                    "streaming",
-                    "json_mode",
-                    "vision",
-                ),
+                capability_tags=_GPT5_TAGS,
             )
 
         # 5.2 and below
@@ -157,7 +155,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
             default_reasoning_effort="implicit",
             supports_vision=True,
             supports_streaming=True,
-            capability_tags=("tools", "reasoning", "streaming", "json_mode", "vision"),
+            capability_tags=_GPT5_TAGS,
         )
 
     # unknown — conservative defaults
