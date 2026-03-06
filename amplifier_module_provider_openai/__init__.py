@@ -27,6 +27,7 @@ from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.events import PROVIDER_RETRY
+from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import ToolCall
@@ -37,7 +38,6 @@ from ._constants import BACKGROUND_POLLING_STATUSES
 from ._constants import BACKGROUND_STATUS_COMPLETED
 from ._constants import BACKGROUND_STATUS_FAILED
 from ._constants import DEFAULT_BACKGROUND_TIMEOUT
-from ._constants import DEFAULT_DEBUG_TRUNCATE_LENGTH
 from ._constants import DEFAULT_MAX_TOKENS
 from ._constants import DEFAULT_MODEL
 from ._constants import DEFAULT_POLL_INTERVAL
@@ -56,6 +56,7 @@ from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import extract_reasoning_text
 
 logger = logging.getLogger(__name__)
+
 
 class OpenAIChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
@@ -132,15 +133,7 @@ class OpenAIProvider:
             "truncation", DEFAULT_TRUNCATION
         )  # Automatic context management
         self.enable_state = self.config.get("enable_state", False)
-        self.debug = self.config.get(
-            "debug", False
-        )  # Enable full request/response logging
-        self.raw_debug = self.config.get(
-            "raw_debug", False
-        )  # Enable ultra-verbose raw API I/O logging
-        self.debug_truncate_length = self.config.get(
-            "debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH
-        )
+        self.raw = self.config.get("raw", False)  # Include raw payload in events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
         self.filtered = self.config.get(
             "filtered", True
@@ -316,7 +309,13 @@ class OpenAIProvider:
                 max_output_tokens = 100000
                 defaults = {"max_tokens": 32768, "background": True}
             else:
-                capabilities = ["tools", "reasoning", "streaming", "json_mode", "vision"]
+                capabilities = [
+                    "tools",
+                    "reasoning",
+                    "streaming",
+                    "json_mode",
+                    "vision",
+                ]
                 if "mini" in model_id or "nano" in model_id:
                     capabilities.append("fast")
                 context_window = 400000
@@ -465,40 +464,9 @@ class OpenAIProvider:
 
         return continuation_input
 
-    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
-        """Recursively truncate string values in nested structures.
-
-        Preserves structure, only truncates leaf string values longer than max_length.
-        Uses self.debug_truncate_length if max_length not specified.
-
-        Args:
-            obj: Any JSON-serializable structure (dict, list, primitives)
-            max_length: Maximum string length (defaults to self.debug_truncate_length)
-
-        Returns:
-            Structure with truncated string values
-        """
-        if max_length is None:
-            max_length = self.debug_truncate_length
-
-        # Type guard: max_length is guaranteed to be int after this point
-        assert max_length is not None, (
-            "max_length should never be None after initialization"
-        )
-
-        if isinstance(obj, str):
-            if len(obj) > max_length:
-                return (
-                    obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
-                )
-            return obj
-        if isinstance(obj, dict):
-            return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._truncate_values(item, max_length) for item in obj]
-        return obj  # Numbers, booleans, None pass through unchanged
-
-    def _find_missing_tool_results(self, messages: list) -> list[tuple[int, str, str, dict]]:
+    def _find_missing_tool_results(
+        self, messages: list
+    ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
 
         Scans conversation for assistant tool calls and validates each has
@@ -511,7 +479,9 @@ class OpenAIProvider:
         Returns:
             List of (msg_idx, call_id, tool_name, tool_arguments) tuples for unpaired calls
         """
-        tool_calls: dict[str, tuple[int, str, dict]] = {}  # {call_id: (msg_idx, name, args)}
+        tool_calls: dict[
+            str, tuple[int, str, dict]
+        ] = {}  # {call_id: (msg_idx, name, args)}
         tool_results: set[str] = set()  # {call_id}
 
         for idx, msg in enumerate(messages):
@@ -905,42 +875,19 @@ class OpenAIProvider:
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
-            # INFO level: Summary only
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "provider": self.name,
-                    "model": params["model"],
-                    "message_count": len(message_list),
-                    "has_instructions": bool(instructions),
-                    "reasoning_enabled": params.get("reasoning") is not None,
-                    "thinking_enabled": thinking_enabled,
-                    "thinking_budget": thinking_budget,
-                    "background_mode": background_mode,
-                },
-            )
-
-            # DEBUG level: Full request payload with truncated values (if debug enabled)
-            if self.debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:debug",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": self.name,
-                        "request": self._truncate_values(params),
-                    },
-                )
-
-            # RAW level: Complete params dict as sent to OpenAI API (if debug AND raw_debug enabled)
-            if self.debug and self.raw_debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": self.name,
-                        "params": params,  # Complete untruncated params
-                    },
-                )
+            request_payload: dict[str, Any] = {
+                "provider": self.name,
+                "model": params["model"],
+                "message_count": len(message_list),
+                "has_instructions": bool(instructions),
+                "reasoning_enabled": params.get("reasoning") is not None,
+                "thinking_enabled": thinking_enabled,
+                "thinking_budget": thinking_budget,
+                "background_mode": background_mode,
+            }
+            if self.raw:
+                request_payload["raw"] = redact_secrets(params)
+            await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
 
@@ -973,9 +920,7 @@ class OpenAIProvider:
                     # Azure OpenAI returns x-ms-retry-after-ms instead of
                     # (or in addition to) the standard retry-after header.
                     if retry_after is None:
-                        ms_header = e.response.headers.get(
-                            "x-ms-retry-after-ms"
-                        )
+                        ms_header = e.response.headers.get("x-ms-retry-after-ms")
                         if ms_header:
                             try:
                                 retry_after = float(ms_header) / 1000.0
@@ -1020,7 +965,11 @@ class OpenAIProvider:
                         provider=self.name,
                         status_code=400,
                     ) from e
-                elif "content filter" in raw_msg or "safety" in raw_msg or "blocked" in raw_msg:
+                elif (
+                    "content filter" in raw_msg
+                    or "safety" in raw_msg
+                    or "blocked" in raw_msg
+                ):
                     raise kernel_errors.ContentFilterError(
                         error_msg,
                         provider=self.name,
@@ -1122,22 +1071,6 @@ class OpenAIProvider:
                 self.api_label,
                 getattr(response, "status", "unknown"),
             )
-
-            # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
-            if (
-                self.coordinator
-                and hasattr(self.coordinator, "hooks")
-                and self.debug
-                and self.raw_debug
-            ):
-                await self.coordinator.hooks.emit(
-                    "llm:response:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": self.name,
-                        "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
-                    },
-                )
 
             # Handle background mode polling for long-running requests (deep research)
             # Background responses start in queued/in_progress state and need polling until completion
@@ -1291,23 +1224,6 @@ class OpenAIProvider:
                     if hasattr(final_response, "output"):
                         accumulated_output.extend(final_response.output)
 
-                    # Emit raw debug for continuation if enabled
-                    if (
-                        self.coordinator
-                        and hasattr(self.coordinator, "hooks")
-                        and self.debug
-                        and self.raw_debug
-                    ):
-                        await self.coordinator.hooks.emit(
-                            "llm:response:raw",
-                            {
-                                "lvl": "DEBUG",
-                                "provider": self.name,
-                                "response": final_response.model_dump(),
-                                "continuation": continuation_count,
-                            },
-                        )
-
                 except Exception as e:
                     logger.error(
                         f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
@@ -1338,40 +1254,22 @@ class OpenAIProvider:
 
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                # INFO level: Summary only
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": self.name,
-                        "model": params["model"],
-                        "usage": {
-                            "input": usage_counts["input"],
-                            "output": usage_counts["output"],
-                        },
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
-                        "continuation_count": continuation_count
-                        if continuation_count > 0
-                        else None,
+                response_event: dict[str, Any] = {
+                    "provider": self.name,
+                    "model": params["model"],
+                    "usage": {
+                        "input": usage_counts["input"],
+                        "output": usage_counts["output"],
                     },
-                )
-
-                # DEBUG level: Full response with truncated values (if debug enabled)
-                if self.debug:
-                    response_dict = response.model_dump()  # Pydantic model → dict
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": self.name,
-                            "response": self._truncate_values(response_dict),
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                            "continuation_count": continuation_count
-                            if continuation_count > 0
-                            else None,
-                        },
-                    )
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                    "continuation_count": continuation_count
+                    if continuation_count > 0
+                    else None,
+                }
+                if self.raw:
+                    response_event["raw"] = redact_secrets(response.model_dump())
+                await self.coordinator.hooks.emit("llm:response", response_event)
 
             # Convert to ChatResponse with accumulated output
             # If there were continuations, use the accumulated output; otherwise use response.output directly
@@ -1613,11 +1511,15 @@ class OpenAIProvider:
                                                 "type": "apply_patch_call",
                                                 "call_id": tc_id,
                                                 "operation": {
-                                                    k: v for k, v in tc_input.items()
+                                                    k: v
+                                                    for k, v in tc_input.items()
                                                     if not (
                                                         k == "diff"
                                                         and tc_input.get("type")
-                                                        not in ("create_file", "update_file")
+                                                        not in (
+                                                            "create_file",
+                                                            "update_file",
+                                                        )
                                                     )
                                                 },
                                                 "status": "completed",
@@ -1705,11 +1607,15 @@ class OpenAIProvider:
                                                 "type": "apply_patch_call",
                                                 "call_id": tc_id,
                                                 "operation": {
-                                                    k: v for k, v in tc_input.items()
+                                                    k: v
+                                                    for k, v in tc_input.items()
                                                     if not (
                                                         k == "diff"
                                                         and tc_input.get("type")
-                                                        not in ("create_file", "update_file")
+                                                        not in (
+                                                            "create_file",
+                                                            "update_file",
+                                                        )
                                                     )
                                                 },
                                                 "status": "completed",
