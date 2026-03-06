@@ -31,6 +31,16 @@ def _fake_models_response(model_ids: list[str]):
     return SimpleNamespace(data=data)
 
 
+def _make_list_models_provider(*model_ids: str) -> OpenAIProvider:
+    """Create a provider wired to return specific model IDs from list_models()."""
+    provider = _make_provider(filtered=False)
+    provider._client = AsyncMock()
+    provider._client.models.list = AsyncMock(
+        return_value=_fake_models_response(list(model_ids))
+    )
+    return provider
+
+
 # ---------------------------------------------------------------------------
 # list_models() wiring tests
 # ---------------------------------------------------------------------------
@@ -41,11 +51,7 @@ class TestListModelsUsesGetCapabilities:
 
     def test_gpt5_model_uses_capabilities_context_window(self):
         """A gpt-5.1 model should get context_window from get_capabilities()."""
-        provider = _make_provider(filtered=False)
-        provider._client = AsyncMock()
-        provider._client.models.list = AsyncMock(
-            return_value=_fake_models_response(["gpt-5.1"])
-        )
+        provider = _make_list_models_provider("gpt-5.1")
 
         models = asyncio.run(provider.list_models())
         assert len(models) == 1
@@ -56,11 +62,7 @@ class TestListModelsUsesGetCapabilities:
 
     def test_gpt5_model_uses_capabilities_tags(self):
         """A gpt-5.1 model should get capability tags from get_capabilities()."""
-        provider = _make_provider(filtered=False)
-        provider._client = AsyncMock()
-        provider._client.models.list = AsyncMock(
-            return_value=_fake_models_response(["gpt-5.1"])
-        )
+        provider = _make_list_models_provider("gpt-5.1")
 
         models = asyncio.run(provider.list_models())
         caps = get_capabilities("gpt-5.1")
@@ -68,11 +70,7 @@ class TestListModelsUsesGetCapabilities:
 
     def test_deep_research_model_uses_capabilities(self):
         """Deep research models should get values from get_capabilities()."""
-        provider = _make_provider(filtered=False)
-        provider._client = AsyncMock()
-        provider._client.models.list = AsyncMock(
-            return_value=_fake_models_response(["o3-deep-research"])
-        )
+        provider = _make_list_models_provider("o3-deep-research")
 
         models = asyncio.run(provider.list_models())
         assert len(models) == 1
@@ -84,11 +82,7 @@ class TestListModelsUsesGetCapabilities:
 
     def test_deep_research_defaults_include_background(self):
         """Deep research models should have background=True in defaults."""
-        provider = _make_provider(filtered=False)
-        provider._client = AsyncMock()
-        provider._client.models.list = AsyncMock(
-            return_value=_fake_models_response(["o3-deep-research"])
-        )
+        provider = _make_list_models_provider("o3-deep-research")
 
         models = asyncio.run(provider.list_models())
         assert models[0].defaults["background"] is True
@@ -96,11 +90,7 @@ class TestListModelsUsesGetCapabilities:
 
     def test_non_deep_research_defaults(self):
         """Non-deep-research models should have reasoning_effort defaults."""
-        provider = _make_provider(filtered=False)
-        provider._client = AsyncMock()
-        provider._client.models.list = AsyncMock(
-            return_value=_fake_models_response(["gpt-5.1"])
-        )
+        provider = _make_list_models_provider("gpt-5.1")
 
         models = asyncio.run(provider.list_models())
         assert models[0].defaults["reasoning_effort"] == "none"
@@ -108,11 +98,7 @@ class TestListModelsUsesGetCapabilities:
 
     def test_get_capabilities_is_called_for_each_model(self):
         """Verify get_capabilities() is actually called during list_models()."""
-        provider = _make_provider(filtered=False)
-        provider._client = AsyncMock()
-        provider._client.models.list = AsyncMock(
-            return_value=_fake_models_response(["gpt-5.1"])
-        )
+        provider = _make_list_models_provider("gpt-5.1")
 
         with patch(
             "amplifier_module_provider_openai.get_capabilities",
