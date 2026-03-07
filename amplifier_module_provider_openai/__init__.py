@@ -146,6 +146,11 @@ class OpenAIProvider:
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
 
+        # Long context flag — when False (default), GPT-5.4 reports 272K context
+        # (the pricing threshold) instead of the full 1,050K window, keeping costs
+        # predictable.  Set to True to advertise the full context window.
+        self.enable_long_context = self.config.get("enable_long_context", False)
+
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
             max_retries=int(self.config.get("max_retries", 5)),
@@ -216,6 +221,12 @@ class OpenAIProvider:
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         caps = get_capabilities(self.default_model)
+        if self.enable_long_context and caps.long_context_pricing_threshold:
+            reported_context = caps.context_window  # 1,050,000 for GPT-5.4
+        else:
+            reported_context = (
+                caps.long_context_pricing_threshold or caps.context_window
+            )
         return ProviderInfo(
             id="openai",
             display_name="OpenAI",
@@ -226,7 +237,7 @@ class OpenAIProvider:
                 "max_tokens": 16384,
                 "temperature": None,
                 "timeout": 600.0,
-                "context_window": caps.context_window,
+                "context_window": reported_context,
                 "max_output_tokens": caps.max_output_tokens,
             },
             config_fields=[
@@ -255,6 +266,14 @@ class OpenAIProvider:
                     default="none",
                     required=False,
                     requires_model=True,  # Shown after model selection
+                ),
+                ConfigField(
+                    id="enable_long_context",
+                    display_name="Enable long context",
+                    field_type="boolean",
+                    prompt="Enable long context (>272K tokens, 2x input / 1.5x output pricing)",
+                    required=False,
+                    default="false",
                 ),
             ],
         )
@@ -303,7 +322,12 @@ class OpenAIProvider:
 
             caps = get_capabilities(model_id)
             capabilities = list(caps.capability_tags)
-            context_window = caps.context_window
+            if self.enable_long_context and caps.long_context_pricing_threshold:
+                reported_context = caps.context_window
+            else:
+                reported_context = (
+                    caps.long_context_pricing_threshold or caps.context_window
+                )
             max_output_tokens = caps.max_output_tokens
             if is_deep_research:
                 defaults = {"max_tokens": 32768, "background": True}
@@ -314,7 +338,7 @@ class OpenAIProvider:
                 ModelInfo(
                     id=model_id,
                     display_name=display_name,
-                    context_window=context_window,
+                    context_window=reported_context,
                     max_output_tokens=max_output_tokens,
                     capabilities=capabilities,
                     defaults=defaults,
