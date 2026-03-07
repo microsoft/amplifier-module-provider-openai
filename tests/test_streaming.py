@@ -7,10 +7,11 @@ preventing timeouts on large context requests without progressive token emission
 
 import asyncio
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from amplifier_core import llm_errors as kernel_errors
+from amplifier_core import ModuleCoordinator, llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -71,6 +72,37 @@ class SuccessStream:
 
     async def get_final_response(self):
         return self._response
+
+
+class SuccessStreamWithHeaders:
+    """A stream that returns a response and exposes a mock HTTP _response with headers.
+
+    Mimics the OpenAI SDK's AsyncResponseStream which stores the underlying
+    httpx response as ``self._response`` (with a ``.headers`` mapping).
+    """
+
+    def __init__(self, api_response, headers):
+        # _response simulates the underlying httpx response; headers is a dict or None.
+        self._response = SimpleNamespace(headers=headers if headers is not None else {})
+        self._api_response = api_response
+
+    async def get_final_response(self):
+        return self._api_response
+
+
+class FakeHooks:
+    """Records every (event_name, payload) pair emitted via hooks."""
+
+    def __init__(self):
+        self.events: list[tuple[str, dict]] = []
+
+    async def emit(self, name: str, payload: dict) -> None:
+        self.events.append((name, payload))
+
+
+class FakeCoordinator:
+    def __init__(self):
+        self.hooks = FakeHooks()
 
 
 # ---------------------------------------------------------------------------
@@ -176,3 +208,81 @@ def test_streaming_no_completed_event_raises():
 
     with pytest.raises(kernel_errors.LLMError):
         asyncio.run(provider.complete(_simple_request()))
+
+
+# ---------------------------------------------------------------------------
+# 7. Rate limit header extraction from streaming response
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_extracts_rate_limit_headers():
+    """Streaming response with rate limit headers → rate_limits in llm:response event."""
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"use_streaming": True, "max_retries": 0},
+    )
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    dummy = DummyResponse()
+    stream = SuccessStreamWithHeaders(
+        dummy,
+        headers={
+            "x-ratelimit-limit-requests": "1000",
+            "x-ratelimit-remaining-requests": "999",
+            "x-ratelimit-reset-requests": "1s",
+            "x-ratelimit-limit-tokens": "100000",
+            "x-ratelimit-remaining-tokens": "95000",
+            "x-ratelimit-reset-tokens": "10ms",
+        },
+    )
+    provider.client.responses.stream = MagicMock(return_value=MockStreamContext(stream))
+
+    asyncio.run(provider.complete(_simple_request()))
+
+    response_payloads = [
+        payload
+        for name, payload in fake_coordinator.hooks.events
+        if name == "llm:response"
+    ]
+    assert len(response_payloads) == 1, "Expected exactly one llm:response event"
+    rate_limits = response_payloads[0].get("rate_limits")
+    assert rate_limits is not None, "rate_limits key missing from llm:response event"
+    assert rate_limits["requests_limit"] == 1000
+    assert rate_limits["requests_remaining"] == 999
+    assert rate_limits["requests_reset"] == "1s"
+    assert rate_limits["tokens_limit"] == 100000
+    assert rate_limits["tokens_remaining"] == 95000
+    assert rate_limits["tokens_reset"] == "10ms"
+
+
+# ---------------------------------------------------------------------------
+# 8. Missing headers → no error (graceful fallback)
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_missing_headers_no_error():
+    """Streaming response without rate limit headers completes without error."""
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"use_streaming": True, "max_retries": 0},
+    )
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    # SuccessStreamWithHeaders with empty headers dict — no x-ratelimit-* values
+    dummy = DummyResponse()
+    stream = SuccessStreamWithHeaders(dummy, headers={})
+    provider.client.responses.stream = MagicMock(return_value=MockStreamContext(stream))
+
+    # Must not raise
+    asyncio.run(provider.complete(_simple_request()))
+
+    response_payloads = [
+        payload
+        for name, payload in fake_coordinator.hooks.events
+        if name == "llm:response"
+    ]
+    assert len(response_payloads) == 1, "Expected exactly one llm:response event"
+    # rate_limits key should be absent (no headers → empty dict → omitted)
+    assert "rate_limits" not in response_payloads[0]

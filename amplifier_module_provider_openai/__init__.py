@@ -936,8 +936,13 @@ class OpenAIProvider:
         # Error translation happens inside _do_complete() so that retry_with_backoff
         # sees LLMError (and checks retryable) rather than raw SDK exceptions.
 
+        # Mutable container for rate-limit headers captured inside _do_complete.
+        # Using a list-of-one so the nonlocal assignment works across retries.
+        captured_rate_limit_info: dict[str, Any] = {}
+
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
+            nonlocal captured_rate_limit_info
             try:
                 if self.use_streaming:
                     # Streaming path — chunked HTTP transport prevents timeouts on
@@ -945,7 +950,15 @@ class OpenAIProvider:
                     # returning, so callers see no difference in the return value.
                     async with asyncio.timeout(effective_timeout):
                         async with self.client.responses.stream(**params) as stream:
-                            return await stream.get_final_response()
+                            response = await stream.get_final_response()
+                            # Extract rate limit headers from the underlying HTTP response.
+                            # The OpenAI SDK stores it as stream._response (httpx.Response).
+                            raw_http = getattr(stream, "_response", None)
+                            headers = getattr(raw_http, "headers", None)
+                            captured_rate_limit_info = self._extract_rate_limit_headers(
+                                headers
+                            )
+                            return response
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
                     return await asyncio.wait_for(
@@ -1315,6 +1328,8 @@ class OpenAIProvider:
                 }
                 if self.raw:
                     response_event["raw"] = redact_secrets(response.model_dump())
+                if captured_rate_limit_info:
+                    response_event["rate_limits"] = captured_rate_limit_info
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
             # Convert to ChatResponse with accumulated output
@@ -1368,6 +1383,61 @@ class OpenAIProvider:
             if not str(e):
                 raise type(e)(error_msg) from e
             raise
+
+    def _extract_rate_limit_headers(self, headers: Any) -> dict[str, Any]:
+        """Extract rate limit information from OpenAI response headers.
+
+        OpenAI returns rate limit headers on every response:
+        - x-ratelimit-limit-requests / x-ratelimit-remaining-requests / x-ratelimit-reset-requests
+        - x-ratelimit-limit-tokens  / x-ratelimit-remaining-tokens  / x-ratelimit-reset-tokens
+
+        Args:
+            headers: Response headers (dict-like object, or None)
+
+        Returns:
+            Dict with parsed rate limit values, or empty dict if unavailable.
+        """
+        if not headers:
+            return {}
+
+        def get_int(key: str) -> int | None:
+            val = headers.get(key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+            return None
+
+        def get_str(key: str) -> str | None:
+            val = headers.get(key)
+            if val is not None and val != "":
+                return str(val)
+            return None
+
+        info: dict[str, Any] = {}
+
+        requests_limit = get_int("x-ratelimit-limit-requests")
+        requests_remaining = get_int("x-ratelimit-remaining-requests")
+        requests_reset = get_str("x-ratelimit-reset-requests")
+        if requests_limit is not None:
+            info["requests_limit"] = requests_limit
+        if requests_remaining is not None:
+            info["requests_remaining"] = requests_remaining
+        if requests_reset is not None:
+            info["requests_reset"] = requests_reset
+
+        tokens_limit = get_int("x-ratelimit-limit-tokens")
+        tokens_remaining = get_int("x-ratelimit-remaining-tokens")
+        tokens_reset = get_str("x-ratelimit-reset-tokens")
+        if tokens_limit is not None:
+            info["tokens_limit"] = tokens_limit
+        if tokens_remaining is not None:
+            info["tokens_remaining"] = tokens_remaining
+        if tokens_reset is not None:
+            info["tokens_reset"] = tokens_reset
+
+        return info
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
