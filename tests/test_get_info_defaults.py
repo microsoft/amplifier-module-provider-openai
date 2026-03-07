@@ -33,11 +33,11 @@ class TestGetInfoUsesCapabilities:
         caps = get_capabilities(DEFAULT_MODEL)
         assert info.defaults["max_output_tokens"] == caps.max_output_tokens
 
-    def test_default_model_is_gpt54_with_272k_context(self):
-        """Default model gpt-5.4 should report 272K context, not the old 400K."""
+    def test_default_model_is_gpt54_with_1050k_context(self):
+        """Default model gpt-5.4 should report 1,050K context (272K is the pricing threshold, not the limit)."""
         provider = _make_provider()
         info = provider.get_info()
-        assert info.defaults["context_window"] == 272_000
+        assert info.defaults["context_window"] == 1_050_000
         assert info.defaults["model"] == "gpt-5.4"
 
     def test_uses_self_default_model_not_hardcoded(self):
