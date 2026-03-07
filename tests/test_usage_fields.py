@@ -19,7 +19,7 @@ from amplifier_module_provider_openai import OpenAIProvider
 
 
 def _make_provider() -> OpenAIProvider:
-    config = {"max_retries": 0}
+    config = {"max_retries": 0, "use_streaming": False}
     return OpenAIProvider(api_key="test-key", config=config)
 
 

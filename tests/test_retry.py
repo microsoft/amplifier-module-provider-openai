@@ -56,6 +56,7 @@ def _make_provider(**config_overrides) -> OpenAIProvider:
         "max_retries": 3,
         "min_retry_delay": 0.01,
         "max_retry_delay": 1.0,
+        "use_streaming": False,  # Use blocking path so tests can mock create()
         **config_overrides,
     }
     provider = OpenAIProvider(api_key="test-key", config=config)

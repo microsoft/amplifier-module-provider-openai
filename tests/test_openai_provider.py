@@ -35,7 +35,9 @@ class FakeCoordinator:
 
 
 def test_extended_thinking_enables_reasoning_and_budget_adjustment():
-    provider = OpenAIProvider(api_key="test-key", config={"max_tokens": 1024})
+    provider = OpenAIProvider(
+        api_key="test-key", config={"max_tokens": 1024, "use_streaming": False}
+    )
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
     messages = [Message(role="user", content="Hello")]
@@ -55,7 +57,7 @@ def test_extended_thinking_enables_reasoning_and_budget_adjustment():
 
 def test_tool_call_sequence_missing_tool_message_is_repaired():
     """Missing tool results should be repaired with synthetic results and emit event."""
-    provider = OpenAIProvider(api_key="test-key")
+    provider = OpenAIProvider(api_key="test-key", config={"use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -115,7 +117,7 @@ def test_repaired_tool_ids_are_not_detected_again():
 
     The fix tracks repaired tool IDs to skip re-detection.
     """
-    provider = OpenAIProvider(api_key="test-key")
+    provider = OpenAIProvider(api_key="test-key", config={"use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -181,7 +183,7 @@ def test_repaired_tool_ids_are_not_detected_again():
 
 def test_multiple_missing_tool_results_all_tracked():
     """Multiple missing tool results should all be tracked to prevent infinite loops."""
-    provider = OpenAIProvider(api_key="test-key")
+    provider = OpenAIProvider(api_key="test-key", config={"use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -236,7 +238,7 @@ def test_fm3_synthetic_assistant_response_inserted_before_user_message():
     The FM3 fix inserts a synthetic assistant close so the structure is always:
     [assistant(tool_calls), synthetic_tool_results, synthetic_assistant_close, user_message]
     """
-    provider = OpenAIProvider(api_key="test-key")
+    provider = OpenAIProvider(api_key="test-key", config={"use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)

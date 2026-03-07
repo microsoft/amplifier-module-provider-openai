@@ -151,6 +151,13 @@ class OpenAIProvider:
         # predictable.  Set to True to advertise the full context window.
         self.enable_long_context = self.config.get("enable_long_context", False)
 
+        # Streaming flag — when True (default), uses client.responses.stream() with
+        # chunked HTTP transport to prevent timeouts on large context requests.
+        # This is NOT progressive token streaming to the user; it collects the complete
+        # response before returning, matching what the Anthropic provider does.
+        # Set to False to use the blocking create() path (useful for tests / compat).
+        self.use_streaming = self.config.get("use_streaming", True)
+
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
             max_retries=int(self.config.get("max_retries", 5)),
@@ -932,10 +939,19 @@ class OpenAIProvider:
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             try:
-                return await asyncio.wait_for(
-                    self.client.responses.create(**params),
-                    timeout=effective_timeout,
-                )
+                if self.use_streaming:
+                    # Streaming path — chunked HTTP transport prevents timeouts on
+                    # large context requests.  The complete response is collected before
+                    # returning, so callers see no difference in the return value.
+                    async with asyncio.timeout(effective_timeout):
+                        async with self.client.responses.stream(**params) as stream:
+                            return await stream.get_final_response()
+                else:
+                    # Non-streaming path — preserved for tests and backward compat.
+                    return await asyncio.wait_for(
+                        self.client.responses.create(**params),
+                        timeout=effective_timeout,
+                    )
             except openai.RateLimitError as e:
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:

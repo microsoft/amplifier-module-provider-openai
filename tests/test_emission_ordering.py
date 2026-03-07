@@ -65,6 +65,7 @@ class DummyResponse:
 def _make_provider(**config_overrides) -> OpenAIProvider:
     config = {
         "raw": True,  # Enable raw field in events
+        "use_streaming": False,  # Use blocking path so tests can mock create()
         **config_overrides,
     }
     return OpenAIProvider(api_key="test-key", config=config)
