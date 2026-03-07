@@ -131,6 +131,37 @@ def test_no_include_when_explicit_none_effort_on_default_reasoning_model():
     )
 
 
+def test_reasoning_capable_model_always_gets_include_param():
+    """Regression test for reasoning token loss bug — GPT-5.4 sub-sessions lost
+    reasoning tokens because include param was not sent.
+
+    GPT-5.4 is reasoning-capable (supports_reasoning=True) but has
+    default_reasoning_effort=None. The old include-guard gated on
+    ``default_reasoning_effort is not None``, which evaluated False for GPT-5.4,
+    so include=[reasoning.encrypted_content] was never sent.  This caused 70
+    orphaned reasoning references ("Reasoning IDs in metadata but
+    encrypted_content unavailable") across 4 GPT-5.4 sub-sessions on a real
+    test device.
+
+    The fix: gate on caps.supports_reasoning (the capability flag) rather than
+    default_reasoning_effort, matching the Anthropic provider's pattern of
+    always preserving thinking content for capable models.
+    """
+    provider = _make_provider(default_model="gpt-5.4")  # enable_state defaults to false
+    request = ChatRequest(
+        messages=[Message(role="user", content="Hello")],
+        # No reasoning_effort set — mimics a delegated sub-session with default config
+    )
+    asyncio.run(provider.complete(request))
+
+    kwargs = _get_call_kwargs(provider)
+    assert "include" in kwargs, (
+        "GPT-5.4 reasoning-capable model with no explicit effort must have 'include' parameter "
+        "to prevent silent reasoning token loss (70 occurrences observed on test device)"
+    )
+    assert kwargs["include"] == ["reasoning.encrypted_content"]
+
+
 def test_include_with_reasoning_effort_low_store_false():
     """reasoning_effort='low' with store=false should include encrypted_content."""
     provider = _make_provider()

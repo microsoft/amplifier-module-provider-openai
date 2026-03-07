@@ -772,25 +772,23 @@ class OpenAIProvider:
                 }
             logger.info(f"[PROVIDER] Setting reasoning: {params['reasoning']}")
 
-        # Request encrypted_content only when reasoning will actually produce tokens.
-        # - Explicit non-"none" effort set → reasoning is active → need encrypted_content
-        # - Model reasons by default (default_reasoning_effort is not None) → need encrypted_content
-        # - GPT-5.4+ with no explicit effort (default_reasoning_effort=None) → no reasoning → skip
+        # Request encrypted_content when model supports reasoning (regardless of effort level).
+        # Reasoning-capable models CAN produce reasoning tokens even with effort=none.
+        # Without include=[reasoning.encrypted_content], reasoning token content is lost
+        # when store=false (Amplifier's default), causing orphaned reasoning references.
+        # Exception: explicit effort="none" suppresses include (caller opted out of reasoning).
         if not store_enabled:
             caps = get_capabilities(model_name)
             active_effort: str | None = None
             if "reasoning" in params:
                 r = params["reasoning"]
                 active_effort = r.get("effort") if isinstance(r, dict) else r
-            # Explicit effort (including "none") overrides the model's default.
-            # Only fall back to the model's default when no effort was set at all.
+            # Explicit effort (including "none") overrides the capability-based default.
+            # If the caller explicitly opts out of reasoning, respect that choice.
             if active_effort is not None:
                 model_will_reason = active_effort != "none"
             else:
-                model_will_reason = (
-                    caps.supports_reasoning
-                    and caps.default_reasoning_effort is not None
-                )
+                model_will_reason = caps.supports_reasoning
             if model_will_reason:
                 params["include"] = kwargs.get(
                     "include", ["reasoning.encrypted_content"]

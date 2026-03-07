@@ -180,15 +180,25 @@ def test_reasoning_effort_none_explicit():
     assert "summary" in kwargs["reasoning"]
 
 
-def test_gpt54_without_effort_omits_reasoning():
-    """GPT-5.4 with no explicit reasoning_effort -> no reasoning param sent.
+def test_gpt54_without_effort_still_includes_encrypted_content():
+    """GPT-5.4 with no explicit reasoning_effort -> include=[reasoning.encrypted_content] IS sent.
 
-    GPT-5.4 has default_reasoning_effort=None, meaning it does not reason
-    by default. Unlike older models (gpt-5.2 and below, o-series) which
-    reason by default and get reasoning={summary:'auto'} for observability,
-    GPT-5.4 should only receive reasoning params when explicitly requested.
+    GPT-5.4 is a reasoning-capable model (supports_reasoning=True) that CAN produce
+    reasoning tokens even without explicit effort. Without include=[reasoning.encrypted_content],
+    reasoning token content is lost when store=false (Amplifier's default), causing
+    orphaned reasoning references (70 occurrences observed on test device).
+
+    Regression test: the include-guard incorrectly gated on default_reasoning_effort
+    (None for GPT-5.4), but reasoning-capable models CAN produce tokens even without
+    explicit effort. The guard must use supports_reasoning (the capability flag) instead,
+    matching the Anthropic provider's pattern of always preserving thinking content for
+    capable models.
     """
     provider = _make_provider(default_model="gpt-5.4")
     asyncio.run(provider.complete(_request_with_effort(None)))
     kwargs = _get_call_kwargs(provider)
-    assert "reasoning" not in kwargs
+    assert "include" in kwargs, (
+        "GPT-5.4 is reasoning-capable; include=[reasoning.encrypted_content] must be sent "
+        "even without explicit reasoning_effort, to prevent silent reasoning token loss."
+    )
+    assert kwargs["include"] == ["reasoning.encrypted_content"]
