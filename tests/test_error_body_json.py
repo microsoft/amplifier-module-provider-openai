@@ -27,7 +27,7 @@ from amplifier_module_provider_openai import OpenAIProvider
 
 def _make_provider(**config_overrides) -> OpenAIProvider:
     """Create a provider with retries disabled so errors propagate immediately."""
-    config = {"max_retries": 0, **config_overrides}
+    config = {"max_retries": 0, "use_streaming": False, **config_overrides}
     return OpenAIProvider(api_key="test-key", config=config)
 
 

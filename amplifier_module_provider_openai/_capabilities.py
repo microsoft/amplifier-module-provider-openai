@@ -33,6 +33,9 @@ class ModelCapabilities:
     supports_vision: bool = True
     supports_streaming: bool = True
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
+    long_context_pricing_threshold: int | None = (
+        None  # Input tokens above this = 2x/1.5x pricing
+    )
 
 
 def _detect_family(model_id: str) -> str:
@@ -97,7 +100,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
     """Return capabilities for *model_id*.
 
     Version-gated logic for the gpt-5 family:
-    - 5.4+ (or unknown sub-version): 272K context, reasoning, no explicit effort
+    - 5.4+ (or unknown sub-version): 1.05M context, reasoning, no explicit effort, 272K pricing threshold
     - 5.3: 400K context, reasoning, no explicit effort
     - 5.2 and below: 200K context, reasoning, implicit effort
     """
@@ -146,13 +149,14 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
             # 5.4+ or unparseable version — assume latest
             return ModelCapabilities(
                 family="gpt-5",
-                context_window=272_000,
+                context_window=1_050_000,
                 max_output_tokens=128_000,
                 supports_reasoning=True,
                 default_reasoning_effort=None,
                 supports_vision=True,
                 supports_streaming=True,
                 capability_tags=_GPT5_TAGS,
+                long_context_pricing_threshold=272_000,
             )
 
         if minor == 3:

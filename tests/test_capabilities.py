@@ -38,7 +38,7 @@ class TestGPT54Family:
     def test_gpt_5_4(self):
         caps = get_capabilities("gpt-5.4")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 272_000
+        assert caps.context_window == 1_050_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
         assert caps.default_reasoning_effort is None
@@ -55,7 +55,7 @@ class TestGPT54Family:
     def test_gpt_5_4_pro(self):
         caps = get_capabilities("gpt-5.4-pro")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 272_000
+        assert caps.context_window == 1_050_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
         assert caps.default_reasoning_effort is None
@@ -63,7 +63,7 @@ class TestGPT54Family:
     def test_gpt_5_4_dated_snapshot(self):
         caps = get_capabilities("gpt-5.4-2026-03-05")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 272_000
+        assert caps.context_window == 1_050_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
 
@@ -187,7 +187,7 @@ class TestForwardCompatibility:
         caps = get_capabilities("gpt-5.9-turbo")
         assert caps.family == "gpt-5"
         # Unknown gpt-5 version >= 5.4 assumes latest (5.4+) defaults
-        assert caps.context_window == 272_000
+        assert caps.context_window == 1_050_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
         assert caps.default_reasoning_effort is None
@@ -220,6 +220,32 @@ class TestModelMayReason:
         caps = get_capabilities("gpt-4.1-mini")
         assert caps.family == "unknown"
         assert caps.supports_reasoning is False
+
+
+class TestLongContextPricingThreshold:
+    """Test long_context_pricing_threshold field on ModelCapabilities."""
+
+    def test_gpt54_pricing_threshold(self):
+        assert get_capabilities("gpt-5.4").long_context_pricing_threshold == 272_000
+
+    def test_gpt54_pro_pricing_threshold(self):
+        assert get_capabilities("gpt-5.4-pro").long_context_pricing_threshold == 272_000
+
+    def test_gpt52_no_pricing_threshold(self):
+        assert get_capabilities("gpt-5.2").long_context_pricing_threshold is None
+
+    def test_gpt5_mini_no_pricing_threshold(self):
+        assert get_capabilities("gpt-5-mini").long_context_pricing_threshold is None
+
+    def test_unknown_gpt5_gets_pricing_threshold(self):
+        assert get_capabilities("gpt-5.99").long_context_pricing_threshold == 272_000
+
+    def test_gpt54_context_window_is_1050000(self):
+        assert get_capabilities("gpt-5.4").context_window == 1_050_000
+
+    def test_default_long_context_pricing_threshold_is_none(self):
+        caps = ModelCapabilities(family="test")
+        assert caps.long_context_pricing_threshold is None
 
 
 class TestDetectFamily:
