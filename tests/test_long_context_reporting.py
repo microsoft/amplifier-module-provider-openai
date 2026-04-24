@@ -1,12 +1,16 @@
-"""Tests for enable_long_context config flag and context_window reporting (task-2).
+"""Tests for enable_long_context config flag and context_window reporting.
 
 Verifies that:
-1. Default (no flag) reports 272K context for GPT-5.4 (cost-safe).
-2. enable_long_context=True reports 1,050K for GPT-5.4 (full capability).
+1. For a model with a pricing threshold (gpt-5.4), default config reports the
+   threshold (cost-safe 272K).
+2. enable_long_context=True reports the full 1,050K for gpt-5.4.
 3. Models without a pricing threshold are unaffected by the flag.
 4. list_models() obeys the same reporting logic.
 5. get_info() includes the enable_long_context ConfigField.
 6. enable_long_context defaults to False when not in config.
+
+Note: gpt-5.5 (the current DEFAULT_MODEL) has no pricing threshold, so the
+threshold-vs-full behavior is exercised via an explicit `default_model="gpt-5.4"`.
 """
 
 import asyncio
@@ -70,15 +74,15 @@ class TestEnableLongContextDefault:
 class TestGetInfoContextWindowReporting:
     """get_info() must report context_window based on the flag."""
 
-    def test_default_reports_272k(self):
-        """Provider with default config → get_info() shows context_window=272_000."""
-        provider = _make_provider()
+    def test_gpt_5_4_default_reports_272k(self):
+        """gpt-5.4 with default flag → get_info() shows context_window=272_000."""
+        provider = _make_provider(default_model="gpt-5.4")
         info = provider.get_info()
         assert info.defaults["context_window"] == 272_000
 
-    def test_long_context_enabled_reports_1050k(self):
-        """Provider with enable_long_context=True → get_info() shows context_window=1_050_000."""
-        provider = _make_provider(enable_long_context=True)
+    def test_gpt_5_4_long_context_enabled_reports_1050k(self):
+        """gpt-5.4 with enable_long_context=True → get_info() shows context_window=1_050_000."""
+        provider = _make_provider(default_model="gpt-5.4", enable_long_context=True)
         info = provider.get_info()
         assert info.defaults["context_window"] == 1_050_000
 

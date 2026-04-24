@@ -5,10 +5,10 @@ from amplifier_module_provider_openai import OpenAIProvider
 
 
 class TestDefaultModel:
-    """Verify DEFAULT_MODEL is set to gpt-5.4."""
+    """Verify DEFAULT_MODEL is set to gpt-5.5."""
 
-    def test_default_model_is_gpt_5_4(self):
-        assert DEFAULT_MODEL == "gpt-5.4"
+    def test_default_model_is_gpt_5_5(self):
+        assert DEFAULT_MODEL == "gpt-5.5"
 
 
 class TestDisplayNames:
