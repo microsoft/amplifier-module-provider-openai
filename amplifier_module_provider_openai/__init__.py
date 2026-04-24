@@ -88,6 +88,43 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     return cleanup
 
 
+# gpt-5.5-pro accepts only {medium, high, xhigh} (verified live API 2026-04-24).
+# Catching disallowed values pre-flight gives callers a clear error instead of
+# an opaque API HTTP 400.
+_GPT_5_5_PRO_ALLOWED_EFFORTS = frozenset({"medium", "high", "xhigh"})
+
+
+def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
+    """Reject gpt-5.5-pro requests whose reasoning.effort is not in the allowed set.
+
+    Runs once per request inside _build_params(). No-op for any model that does
+    not start with 'gpt-5.5-pro' (so dated snapshots like
+    'gpt-5.5-pro-2026-04-23' are also covered).
+
+    Raises:
+        kernel_errors.InvalidRequestError: if the resolved effort is set to a
+            value the live API would reject.
+    """
+    if not model_id.startswith("gpt-5.5-pro"):
+        return
+    if reasoning_param is None:
+        return
+    if isinstance(reasoning_param, dict):
+        effort = reasoning_param.get("effort")
+    else:
+        effort = reasoning_param
+    if effort is None or effort in _GPT_5_5_PRO_ALLOWED_EFFORTS:
+        return
+    raise kernel_errors.InvalidRequestError(
+        f"Model {model_id!r} requires reasoning.effort in "
+        f"{{'medium', 'high', 'xhigh'}}; got {effort!r}. "
+        f"gpt-5.5-pro rejects 'minimal', 'none', and 'low' "
+        f"(verified against live API 2026-04-24). "
+        f"Set reasoning.effort to one of the allowed values "
+        f"or omit it to use the model default."
+    )
+
+
 class OpenAIProvider:
     """OpenAI Responses API integration."""
 
@@ -367,6 +404,8 @@ class OpenAIProvider:
         """
         # Known display name mappings
         display_names = {
+            "gpt-5.5": "GPT 5.5",
+            "gpt-5.5-pro": "GPT 5.5 Pro",
             "gpt-5.4": "GPT 5.4",
             "gpt-5.4-pro": "GPT 5.4 Pro",
             "gpt-5.3-codex": "GPT-5.3 codex",
@@ -787,6 +826,7 @@ class OpenAIProvider:
             }
         if reasoning_param is None:
             reasoning_param = self.reasoning
+        _validate_gpt_5_5_pro_effort(model_name, reasoning_param)
         if reasoning_param:
             # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
             if isinstance(reasoning_param, dict):

@@ -145,6 +145,25 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
     if family == "gpt-5":
         major, minor = _parse_gpt5_version(model_id)
 
+        # gpt-5.5 — verified against live API 2026-04-24.
+        # 1M context, ~4x input / 3x output pricing vs 5.4. Reasoning blocks,
+        # rs_* IDs, and encrypted_content carry the same shape as 5.4.
+        # long_context_pricing_threshold is left None: the public pricing page
+        # is not API-derivable, and 5.5's threshold (if any) differs from
+        # 5.4's 272K given the price step. Callers see the full 1M context.
+        if minor == 5:
+            return ModelCapabilities(
+                family="gpt-5",
+                context_window=1_000_000,
+                max_output_tokens=128_000,
+                supports_reasoning=True,
+                default_reasoning_effort=None,
+                supports_vision=True,
+                supports_streaming=True,
+                capability_tags=_GPT5_TAGS,
+                long_context_pricing_threshold=None,
+            )
+
         if minor >= 4 or (major, minor) == (0, 0):
             # 5.4+ or unparseable version — assume latest
             return ModelCapabilities(

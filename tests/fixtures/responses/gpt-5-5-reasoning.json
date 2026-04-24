@@ -1,0 +1,88 @@
+{
+  "background": false,
+  "billing": {
+    "payer": "developer"
+  },
+  "completed_at": 1700000001,
+  "conversation": null,
+  "created_at": 1700000000,
+  "error": null,
+  "frequency_penalty": 0.0,
+  "id": "resp_REDACTED",
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 400,
+  "max_tool_calls": null,
+  "metadata": {},
+  "model": "gpt-5.5-2026-04-23",
+  "moderation": null,
+  "object": "response",
+  "output": [
+    {
+      "content": null,
+      "encrypted_content": null,
+      "id": "rs_0d2b88976232fdc00069ebe28464608190bf2516eccfddedf5",
+      "status": null,
+      "summary": [
+        {
+          "text": "**Simplifying arithmetic reasoning**\n\nI want to make the answer clear and straightforward. That means showing the reasoning behind the arithmetic briefly. It's important to keep things simple so that anyone can follow along. I\u2019m aiming for clarity, but I also want to ensure I don't leave out any vital steps. I just need to focus on delivering the answer in an easy-to-understand way while still being accurate, so let's get to it!",
+          "type": "summary_text"
+        }
+      ],
+      "type": "reasoning"
+    },
+    {
+      "content": [
+        {
+          "annotations": [],
+          "logprobs": [],
+          "text": "13 \u00d7 17 = 13 \u00d7 (10 + 7)\n\n= (13 \u00d7 10) + (13 \u00d7 7)  \n= 130 + 91  \n= 221\n\nSo, **13 \u00d7 17 = 221**.",
+          "type": "output_text"
+        }
+      ],
+      "id": "msg_0d2b88976232fdc00069ebe2889c448190be18e6ba8d5975e4",
+      "phase": "final_answer",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+    }
+  ],
+  "parallel_tool_calls": true,
+  "presence_penalty": 0.0,
+  "previous_response_id": null,
+  "prompt": null,
+  "prompt_cache_key": null,
+  "reasoning": {
+    "effort": "medium",
+    "generate_summary": null,
+    "summary": "detailed"
+  },
+  "safety_identifier": null,
+  "service_tier": "default",
+  "status": "completed",
+  "store": true,
+  "temperature": 1.0,
+  "text": {
+    "format": {
+      "type": "text"
+    },
+    "verbosity": "medium"
+  },
+  "tool_choice": "auto",
+  "tools": [],
+  "top_logprobs": 0,
+  "top_p": 0.98,
+  "truncation": "disabled",
+  "usage": {
+    "input_tokens": 21,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 76,
+    "output_tokens_details": {
+      "reasoning_tokens": 18
+    },
+    "total_tokens": 97
+  },
+  "user": null
+}
