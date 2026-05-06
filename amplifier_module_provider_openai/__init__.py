@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from decimal import Decimal
 from typing import Any
 
 import openai
@@ -52,6 +53,7 @@ from ._constants import NATIVE_TOOL_TYPES
 from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import extract_reasoning_text
 from ._capabilities import get_capabilities
+from ._cost import compute_cost
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,28 @@ class OpenAIChatResponse(ChatResponse):
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """Mount the OpenAI provider."""
     config = config or {}
+
+    # ---------------------------------------------------------------------------
+    # Cost accumulation hook and session.cost contributor
+    # Registered when the coordinator supports hooks, so cost tracking works
+    # as long as the coordinator is fully capable (may be absent in minimal tests).
+    # ---------------------------------------------------------------------------
+    _totals: dict = {'cost_usd': None, 'has_data': False}
+
+    async def _accumulate(event: str, data: dict) -> None:
+        raw = (data.get('usage') or {}).get('cost_usd')
+        if raw is not None:
+            _totals['cost_usd'] = (_totals['cost_usd'] or Decimal('0')) + Decimal(str(raw))
+            _totals['has_data'] = True
+
+    if hasattr(coordinator, 'hooks'):
+        coordinator.hooks.register('llm:response', _accumulate)
+    if hasattr(coordinator, 'register_contributor'):
+        coordinator.register_contributor(
+            'session.cost',
+            'provider-openai',
+            lambda: {'cost_usd': _totals['cost_usd']} if _totals['has_data'] else None,
+        )
 
     # Get API key from config or environment
     api_key = config.get("api_key") or os.environ.get("OPENAI_API_KEY")
@@ -1360,6 +1384,8 @@ class OpenAIProvider:
                     event_usage["output_tokens"] = chat_response.usage.output_tokens
                     if chat_response.usage.cache_read_tokens is not None:
                         event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                    _cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                    event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],
@@ -2307,6 +2333,22 @@ class OpenAIProvider:
             reasoning_tokens=reasoning_tokens,
             cache_read_tokens=cache_read_tokens,
         )
+
+        # M2: Stamp cost_usd onto Usage (zero-transformation passthrough from API fields).
+        # prompt_tokens is the total including cached; cached_tokens is subtracted inside
+        # compute_cost to prevent double-charging.
+        if usage_obj:
+            _prompt_tokens = getattr(usage_obj, "prompt_tokens", usage_counts["input"])
+            _completion_tokens = getattr(usage_obj, "completion_tokens", usage_counts["output"])
+            _cached_tokens = cache_read_tokens or 0
+            cost = compute_cost(
+                getattr(response, "model", ""),
+                prompt_tokens=_prompt_tokens,
+                completion_tokens=_completion_tokens,
+                cached_tokens=_cached_tokens,
+            )
+            if cost is not None:
+                usage = usage.model_copy(update={"cost_usd": cost})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
