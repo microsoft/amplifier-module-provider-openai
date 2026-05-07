@@ -2348,7 +2348,7 @@ class OpenAIProvider:
                 cached_tokens=_cached_tokens,
             )
             if cost is not None:
-                usage = usage.model_copy(update={"cost_usd": cost})
+                usage = usage.model_copy(update={"cost_usd": str(cost)})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
