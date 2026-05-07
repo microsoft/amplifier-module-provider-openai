@@ -77,25 +77,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # Registered when the coordinator supports hooks, so cost tracking works
     # as long as the coordinator is fully capable (may be absent in minimal tests).
     # ---------------------------------------------------------------------------
-    _totals: dict = {"cost_usd": None, "has_data": False}
-
-    async def _accumulate(event: str, data: dict) -> None:
-        if data.get("provider") != "openai":  # ignore events from other providers
-            return
-        raw = (data.get("usage") or {}).get("cost_usd")
-        if raw is not None:
-            _totals["cost_usd"] = (
-                _totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")
-            ) + Decimal(str(raw))
-            _totals["has_data"] = True
-
-    coordinator.hooks.register("llm:response", _accumulate)
-    coordinator.register_contributor(
-        "session.cost",
-        "provider-openai",
-        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
-    )
-
     # Get API key from config or environment
     api_key = config.get("api_key") or os.environ.get("OPENAI_API_KEY")
 
