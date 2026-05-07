@@ -1385,7 +1385,7 @@ class OpenAIProvider:
                     if chat_response.usage.cache_read_tokens is not None:
                         event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
+                    event_usage["cost_usd"] = _cost_usd
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],
@@ -2348,7 +2348,7 @@ class OpenAIProvider:
                 cached_tokens=_cached_tokens,
             )
             if cost is not None:
-                usage = usage.model_copy(update={"cost_usd": str(cost)})
+                usage = usage.model_copy(update={"cost_usd": cost})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
