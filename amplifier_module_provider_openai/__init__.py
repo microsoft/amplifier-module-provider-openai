@@ -72,11 +72,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """Mount the OpenAI provider."""
     config = config or {}
 
-    # ---------------------------------------------------------------------------
-    # Cost accumulation hook and session.cost contributor
-    # Registered when the coordinator supports hooks, so cost tracking works
-    # as long as the coordinator is fully capable (may be absent in minimal tests).
-    # ---------------------------------------------------------------------------
     # Get API key from config or environment
     api_key = config.get("api_key") or os.environ.get("OPENAI_API_KEY")
 
