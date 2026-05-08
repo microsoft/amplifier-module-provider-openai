@@ -2178,7 +2178,17 @@ class OpenAIProvider:
                 # Defensive: strip orphaned reasoning items that have no encrypted_content.
                 # These occur when the model reasoned but include=[reasoning.encrypted_content]
                 # was not requested — the reasoning ID exists but can't be sent back, causing 404s.
-                if metadata and metadata.get(METADATA_REASONING_ITEMS):
+                #
+                # When chaining is active (skip_reasoning_reinsertion=True), the server holds
+                # reasoning state under previous_response_id; we deliberately did not collect
+                # encrypted_content into reasoning_items_to_add. So the "metadata has reasoning
+                # IDs but list is empty" condition is the expected steady state, not an orphan.
+                # Skip the orphan check to avoid spurious warnings and unnecessary clears.
+                if (
+                    not skip_reasoning_reinsertion
+                    and metadata
+                    and metadata.get(METADATA_REASONING_ITEMS)
+                ):
                     has_usable_reasoning = any(
                         isinstance(item, dict)
                         and item.get("type") == "reasoning"
