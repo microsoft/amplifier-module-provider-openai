@@ -9,7 +9,7 @@ import asyncio
 import logging
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_core.message_models import ChatRequest, Message
 
@@ -227,3 +227,66 @@ def test_continuation_inherits_cache_params():
         assert call.kwargs.get("prompt_cache_key") == "session-key"
         assert call.kwargs.get("prompt_cache_retention") == "24h"
         assert call.kwargs.get("safety_identifier") == "user-42"
+
+
+# ---------------------------------------------------------------------------
+# Tests — streaming path
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_path_sends_cache_params():
+    """Streaming code path must include cache hint params in the request.
+
+    The provider has two API entry points: client.responses.create() and
+    client.responses.stream(). Both consume the same params dict upstream of
+    the branch, but that's a structural assumption — this test pins it down.
+    If a future refactor diverges the branches, this test fails.
+    """
+
+    class _StreamContext:
+        """Minimal async context manager wrapping the stream object."""
+
+        def __init__(self, stream):
+            self._stream = stream
+
+        async def __aenter__(self):
+            return self._stream
+
+        async def __aexit__(self, *args):
+            pass
+
+    class _Stream:
+        """Minimal stream stub: returns DummyResponse, exposes empty headers.
+
+        ``_response`` mimics the underlying httpx response accessed by the
+        provider to extract rate-limit headers.  An empty dict is safe.
+        """
+
+        _response = SimpleNamespace(headers={})
+
+        async def get_final_response(self):
+            return DummyResponse()
+
+    provider = _make_provider(
+        use_streaming=True,
+        prompt_cache_key="stream-key",
+        prompt_cache_retention="24h",
+        safety_identifier="stream-user",
+        default_model="gpt-5.4",  # supports both retention values
+    )
+    mock_stream_call = MagicMock(return_value=_StreamContext(_Stream()))
+    provider.client.responses.stream = mock_stream_call
+
+    asyncio.run(provider.complete(_simple_request()))
+
+    assert mock_stream_call.called, "responses.stream() was never called"
+    kwargs = mock_stream_call.call_args.kwargs
+    assert kwargs.get("prompt_cache_key") == "stream-key", (
+        f"prompt_cache_key missing from streaming params: {kwargs}"
+    )
+    assert kwargs.get("prompt_cache_retention") == "24h", (
+        f"prompt_cache_retention missing from streaming params: {kwargs}"
+    )
+    assert kwargs.get("safety_identifier") == "stream-user", (
+        f"safety_identifier missing from streaming params: {kwargs}"
+    )
