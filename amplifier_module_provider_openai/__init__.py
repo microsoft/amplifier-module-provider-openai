@@ -125,6 +125,39 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     )
 
 
+def _drop_unsupported_in_memory_retention(
+    model_id: str, retention: str | None
+) -> str | None:
+    """Return *retention* unless it would be rejected by the model.
+
+    OpenAI's gpt-5.5 family (and any future model with extended-only retention)
+    does NOT support `prompt_cache_retention="in_memory"` — the API returns a
+    400. Rather than pass a value we know will fail, we drop the field and log
+    a warning. The capability flag (set in `_capabilities.py`) is the single
+    source of truth for which models support which retention values.
+
+    Returns None when the value should be dropped. Otherwise returns *retention*
+    unchanged. Models with capability flag True (the default) always pass through.
+
+    Note: We deliberately do NOT validate `retention="24h"` against any
+    model-supported list. That list (`gpt-5.5`, `gpt-5.4`, ..., `gpt-4.1`) is
+    mutable and OpenAI's responsibility to enforce. Our job here is only to
+    block the one combination we KNOW will hard-error.
+    """
+    if retention != "in_memory":
+        return retention
+    caps = get_capabilities(model_id)
+    if caps.supports_in_memory_retention:
+        return retention
+    logger.warning(
+        "[PROVIDER] Dropping prompt_cache_retention='in_memory' for model %r: "
+        "model only supports '24h' retention. Omit the field or pass '24h' "
+        "to silence this warning.",
+        model_id,
+    )
+    return None
+
+
 class OpenAIProvider:
     """OpenAI Responses API integration."""
 
@@ -173,6 +206,35 @@ class OpenAIProvider:
         self.filtered = self.config.get(
             "filtered", True
         )  # Filter to curated model list by default
+
+        # Prompt-caching hint parameters (Responses API top-level fields).
+        # All three default to None = "don't send the field, use OpenAI's
+        # model default". Per-call kwargs override the config default — same
+        # pattern as `truncation`.
+        #
+        # prompt_cache_key: stable per-conversation (or per-tenant+system-prompt)
+        #   identifier. OpenAI shards by hash of first ~256 input tokens; setting
+        #   a stable key keeps subsequent requests routed to the same machine,
+        #   maximizing cache hit rate. Use this instead of the `user` field for
+        #   cache-routing per OpenAI's July 2025 guidance (the `user` field is
+        #   retained on the API but is no longer the recommended cache signal).
+        # prompt_cache_retention: "in_memory" (5–10 min, default for gpt-5.4 and
+        #   below) or "24h" (extended GPU-local KV storage; default for gpt-5.5+).
+        #   Leaving None lets OpenAI pick the model-appropriate default — this
+        #   avoids the gpt-5.5 trap where passing "in_memory" returns 400.
+        # safety_identifier: abuse-tracking signal — the request-side counterpart
+        #   to `prompt_cache_key`. Per-end-user value (not per-deployment), which
+        #   is why it is intentionally NOT exposed via ConfigField; set it via
+        #   per-call kwargs.
+        # Empty strings (e.g. from UI form defaults) are coerced to None so we
+        # don't send empty-string fields to OpenAI.
+        self.prompt_cache_key: str | None = self.config.get("prompt_cache_key") or None
+        self.prompt_cache_retention: str | None = (
+            self.config.get("prompt_cache_retention") or None
+        )
+        self.safety_identifier: str | None = (
+            self.config.get("safety_identifier") or None
+        )
 
         # Deep research / background mode configuration
         self.poll_interval = self.config.get("poll_interval", DEFAULT_POLL_INTERVAL)
@@ -319,6 +381,38 @@ class OpenAIProvider:
                     required=False,
                     default="false",
                 ),
+                ConfigField(
+                    id="prompt_cache_key",
+                    display_name="Prompt cache key",
+                    field_type="text",
+                    prompt=(
+                        "Stable identifier for OpenAI prompt-cache routing "
+                        "(e.g. conversation ID or tenant+system-prompt-version)"
+                    ),
+                    required=False,
+                    default="",
+                ),
+                ConfigField(
+                    id="prompt_cache_retention",
+                    display_name="Prompt cache retention",
+                    field_type="choice",
+                    prompt=(
+                        "Cache retention window. Leave unset to use the model "
+                        "default (recommended)."
+                    ),
+                    choices=["in_memory", "24h"],
+                    required=False,
+                    # default=None (not "") because "" is not a member of
+                    # `choices`; UI renderers that validate `default in choices`
+                    # would reject it. None signals "leave unset" cleanly.
+                    default=None,
+                ),
+                # NOTE: `safety_identifier` is intentionally NOT exposed as a
+                # ConfigField. It is a per-end-user signal, not a per-deployment
+                # one — surfacing it in the UI invites operators to set a single
+                # global value, which defeats its abuse-tracking purpose. The
+                # provider still accepts it via per-call kwargs and (for tests
+                # and unusual deployments) via the config dict.
             ],
         )
 
@@ -894,6 +988,33 @@ class OpenAIProvider:
         if self.truncation:
             params["truncation"] = kwargs.get("truncation", self.truncation)
 
+        # Prompt-caching hint parameters (Responses API top-level fields).
+        # Per-call kwargs override the config default; None / "" means "do not
+        # send". The trailing `or None` mirrors the empty-string coercion in
+        # __init__() so that a caller passing `prompt_cache_key=""` (e.g. from
+        # a UI form) is treated the same as omitting the field.
+        prompt_cache_key = kwargs.get("prompt_cache_key", self.prompt_cache_key) or None
+        if prompt_cache_key is not None:
+            params["prompt_cache_key"] = prompt_cache_key
+
+        prompt_cache_retention = (
+            kwargs.get("prompt_cache_retention", self.prompt_cache_retention) or None
+        )
+        # Drop "in_memory" for models that only support "24h" (gpt-5.5 family).
+        # Other model/retention combinations are sent through as-is — OpenAI's
+        # supported-model list is mutable and not ours to enforce here.
+        prompt_cache_retention = _drop_unsupported_in_memory_retention(
+            model_name, prompt_cache_retention
+        )
+        if prompt_cache_retention is not None:
+            params["prompt_cache_retention"] = prompt_cache_retention
+
+        safety_identifier = (
+            kwargs.get("safety_identifier", self.safety_identifier) or None
+        )
+        if safety_identifier is not None:
+            params["safety_identifier"] = safety_identifier
+
         # Add background mode parameter for long-running requests (deep research)
         if background_mode:
             params["background"] = True
@@ -1308,6 +1429,14 @@ class OpenAIProvider:
                     )
                 if "store" in params:
                     continue_params["store"] = params["store"]
+                if "prompt_cache_key" in params:
+                    continue_params["prompt_cache_key"] = params["prompt_cache_key"]
+                if "prompt_cache_retention" in params:
+                    continue_params["prompt_cache_retention"] = params[
+                        "prompt_cache_retention"
+                    ]
+                if "safety_identifier" in params:
+                    continue_params["safety_identifier"] = params["safety_identifier"]
 
                 # Make continuation call
                 try:
@@ -1359,7 +1488,9 @@ class OpenAIProvider:
                     event_usage["input_tokens"] = chat_response.usage.input_tokens
                     event_usage["output_tokens"] = chat_response.usage.output_tokens
                     if chat_response.usage.cache_read_tokens is not None:
-                        event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                        event_usage["cache_read_tokens"] = (
+                            chat_response.usage.cache_read_tokens
+                        )
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],

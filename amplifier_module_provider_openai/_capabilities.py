@@ -36,6 +36,15 @@ class ModelCapabilities:
     long_context_pricing_threshold: int | None = (
         None  # Input tokens above this = 2x/1.5x pricing
     )
+    supports_in_memory_retention: bool = True
+    """Whether the model accepts `prompt_cache_retention="in_memory"`.
+
+    Per OpenAI docs (Feb 2026), gpt-5.5 and gpt-5.5-pro REJECT "in_memory" — their
+    default and only supported retention is "24h". Setting this False causes the
+    provider to drop the field with a warning rather than send a value the API
+    will reject. Default True preserves existing behavior for all other models
+    (gpt-5.4, gpt-5.2, gpt-5.1*, gpt-5, gpt-5-codex, gpt-4.1, o-series, etc.).
+    """
 
 
 def _detect_family(model_id: str) -> str:
@@ -162,6 +171,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 supports_streaming=True,
                 capability_tags=_GPT5_TAGS,
                 long_context_pricing_threshold=None,
+                supports_in_memory_retention=False,  # 5.5 default is "24h", "in_memory" rejected
             )
 
         if minor >= 4 or (major, minor) == (0, 0):
