@@ -18,7 +18,21 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
 DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
 DEFAULT_TIMEOUT = 600.0  # 10 minutes
-DEFAULT_TRUNCATION = "auto"  # Automatic context management
+# `None` (omit the field) is the cache-friendly default. OpenAI's
+# `truncation="auto"` silently drops oldest messages when context fills,
+# which rewrites the cached prefix and busts prompt caching — listed on
+# OpenAI's caching-troubleshooting checklist as a top cause of low hit
+# rates. With `None`, the API errors loudly on overflow instead of
+# silently degrading. Opt back into the old behavior with
+# `config={"truncation": "auto"}`.
+DEFAULT_TRUNCATION: str | None = None
+
+# Default prompt-cache retention. OpenAI's per-model server-side default
+# is "in_memory" (5–10 min) for gpt-5.4 and below, "24h" for gpt-5.5+.
+# Forcing "24h" everywhere stabilizes cache lifetime across the curated
+# model list. Models that reject "24h" are gated by
+# `ModelCapabilities.supports_24h_retention`.
+DEFAULT_PROMPT_CACHE_RETENTION: str | None = "24h"
 
 # Maximum number of continuation attempts for incomplete responses
 # This prevents infinite loops while being generous enough for legitimate large responses

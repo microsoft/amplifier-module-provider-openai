@@ -98,7 +98,9 @@ def test_event_usage_uses_input_tokens_key():
     payload = hooks.payload_for("llm:response")
     assert payload is not None, "llm:response event must be emitted"
     usage = payload.get("usage", {})
-    assert "input_tokens" in usage, f"Expected 'input_tokens', got keys: {list(usage.keys())}"
+    assert "input_tokens" in usage, (
+        f"Expected 'input_tokens', got keys: {list(usage.keys())}"
+    )
 
 
 def test_event_usage_uses_output_tokens_key():
@@ -111,7 +113,9 @@ def test_event_usage_uses_output_tokens_key():
     payload = hooks.payload_for("llm:response")
     assert payload is not None, "llm:response event must be emitted"
     usage = payload.get("usage", {})
-    assert "output_tokens" in usage, f"Expected 'output_tokens', got keys: {list(usage.keys())}"
+    assert "output_tokens" in usage, (
+        f"Expected 'output_tokens', got keys: {list(usage.keys())}"
+    )
 
 
 def test_event_usage_does_not_have_old_input_key():
@@ -152,7 +156,9 @@ def test_event_usage_includes_cache_read_tokens_when_present():
     payload = hooks.payload_for("llm:response")
     assert payload is not None, "llm:response event must be emitted"
     usage = payload.get("usage", {})
-    assert "cache_read_tokens" in usage, f"Expected 'cache_read_tokens', got: {list(usage.keys())}"
+    assert "cache_read_tokens" in usage, (
+        f"Expected 'cache_read_tokens', got: {list(usage.keys())}"
+    )
     assert usage["cache_read_tokens"] == 800
 
 

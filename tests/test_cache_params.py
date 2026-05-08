@@ -181,8 +181,15 @@ def test_prompt_cache_retention_kwarg_overrides_config():
 
 
 def test_all_three_omitted_by_default():
-    """None of the three cache params appear when not configured."""
-    provider = _make_provider()
+    """All three cache params are absent when explicitly set to None (opt-out path).
+
+    The original semantic — verifying that callers can suppress all three cache hint
+    fields — is preserved by explicitly passing `prompt_cache_retention=None`.
+    Without the explicit None, `prompt_cache_retention` now defaults to "24h" per
+    DEFAULT_PROMPT_CACHE_RETENTION. See test_cache_defaults.py for the new-default
+    tests.
+    """
+    provider = _make_provider(prompt_cache_retention=None)
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     asyncio.run(provider.complete(_simple_request()))
     params = _captured_params(provider)
