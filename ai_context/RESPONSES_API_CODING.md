@@ -13,7 +13,7 @@ A well-formed Responses API request typically includes:
 - `tool_choice` – usually `"auto"`, unless you must force a specific tool.
 - `parallel_tool_calls` – `true` when the model and workflow support concurrent tool invocations.
 - `reasoning` & `include` – opt into reasoning summaries and encrypted traces.
-- `stream`, `store`, `prompt_cache_key` – delivery and caching controls.
+- `stream`, `store`, `prompt_cache_key`, `prompt_cache_retention`, `safety_identifier`, `previous_response_id` – delivery and caching controls.
 
 Example request assembled from `temp.json`, simplified for readability:
 
@@ -88,7 +88,11 @@ Example request assembled from `temp.json`, simplified for readability:
 
 - `stream: true` enables server-sent events so you can react to tool calls and partial text in real time. If you only need the final response, set it to `false`.
 - `store` controls whether the API persists the response for retrieval; some providers (e.g., Azure) require `true`, while OpenAI defaults to `false`.
-- `prompt_cache_key` is an optional identifier you can set to reuse cached context (handy for incremental runs with the same session history).
+- `prompt_cache_key` is an optional identifier you can set to reuse cached context (handy for incremental runs with the same session history). Stable per logical conversation (or per tenant + system-prompt version) is the typical right granularity. ~15 RPM per (prefix, key) pair before requests spill to fresh shards.
+- `prompt_cache_retention` (`"in_memory"` | `"24h"` | omitted) hints at the cache TTL. The provider defaults this to `"24h"` so non-gpt-5.5 models get extended GPU-local KV storage instead of the much-shorter per-model in_memory default. The capability layer (`supports_in_memory_retention`, `supports_24h_retention`) auto-drops values a model would reject.
+- `safety_identifier` is the request-side counterpart to `prompt_cache_key` — a per-end-user abuse-tracking signal. The provider accepts it via per-call kwargs only; it is intentionally not a deployment config field.
+- `previous_response_id` activates server-held reasoning-state chaining. Requires `store: true`. The provider sets both automatically when `enable_response_chaining` resolves to True for a reasoning model, and in that mode does NOT request `reasoning.encrypted_content` or re-insert encrypted reasoning items inline (the server holds reasoning under the chain ID; inlining would bust the cache prefix).
+- `truncation` defaults to omitted (provider-side); explicit `"auto"` will silently rewrite the cached prefix on overflow and is on OpenAI's troubleshooting checklist as a top cause of low cache hit rates.
 
 ### 5. Token Usage and Context Management
 
