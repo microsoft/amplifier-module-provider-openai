@@ -72,6 +72,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """Mount the OpenAI provider."""
     config = config or {}
 
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    def _add_cost(cost) -> None:
+        if cost is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
+            _totals["has_data"] = True
+
     # Get API key from config or environment
     api_key = config.get("api_key") or os.environ.get("OPENAI_API_KEY")
 
@@ -79,8 +86,15 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         logger.warning("No API key found for OpenAI provider")
         return None
 
-    provider = OpenAIProvider(api_key=api_key, config=config, coordinator=coordinator)
+    provider = OpenAIProvider(
+        api_key=api_key, config=config, coordinator=coordinator, add_cost=_add_cost
+    )
     await coordinator.mount("providers", provider, name="openai")
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-openai",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
     logger.info("Mounted OpenAIProvider (Responses API)")
 
     # Return cleanup function
@@ -140,6 +154,7 @@ class OpenAIProvider:
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
         client: AsyncOpenAI | None = None,
+        add_cost=None,
     ):
         """Initialize OpenAI provider with Responses API client.
 
@@ -214,6 +229,7 @@ class OpenAIProvider:
         # Apply patch native mode detection — set during tool conversion
         self._apply_patch_native = False
         self._native_call_ids: set[str] = set()
+        self._add_cost = add_cost or (lambda cost: None)
 
     @property
     def client(self) -> AsyncOpenAI:
@@ -2331,6 +2347,7 @@ class OpenAIProvider:
             )
             if cost is not None:
                 usage = usage.model_copy(update={"cost_usd": cost})
+                self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
