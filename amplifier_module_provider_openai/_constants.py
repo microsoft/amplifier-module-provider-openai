@@ -18,7 +18,21 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
 DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
 DEFAULT_TIMEOUT = 600.0  # 10 minutes
-DEFAULT_TRUNCATION = "auto"  # Automatic context management
+# `None` (omit the field) is the cache-friendly default. OpenAI's
+# `truncation="auto"` silently drops oldest messages when context fills,
+# which rewrites the cached prefix and busts prompt caching — listed on
+# OpenAI's caching-troubleshooting checklist as a top cause of low hit
+# rates. With `None`, the API errors loudly on overflow instead of
+# silently degrading. Opt back into the old behavior with
+# `config={"truncation": "auto"}`.
+DEFAULT_TRUNCATION: str | None = None
+
+# Default prompt-cache retention. OpenAI's per-model server-side default
+# is "in_memory" (5–10 min) for gpt-5.4 and below, "24h" for gpt-5.5+.
+# Forcing "24h" everywhere stabilizes cache lifetime across the curated
+# model list. Models that reject "24h" are gated by
+# `ModelCapabilities.supports_24h_retention`.
+DEFAULT_PROMPT_CACHE_RETENTION: str | None = "24h"
 
 # Maximum number of continuation attempts for incomplete responses
 # This prevents infinite loops while being generous enough for legitimate large responses
@@ -67,5 +81,20 @@ BACKGROUND_POLLING_STATUSES = frozenset(
         BACKGROUND_STATUS_QUEUED,
         BACKGROUND_STATUS_IN_PROGRESS,
         BACKGROUND_STATUS_SEARCHING,
+    }
+)
+
+# Hook event emitted when the server rejects previous_response_id.
+# Caller observability: lets dashboards count chain breaks vs. cache hits.
+RESPONSE_CHAIN_INVALIDATED = "provider:response_chain_invalidated"
+
+# OpenAI error codes that signal "previous_response_id is unknown/expired/foreign-key".
+# Detected against error.body["error"]["code"] (preferred) or, as a fallback,
+# substring match against the raw error message. Keep this set narrow — we do
+# NOT want to swallow generic 4xx errors as "chain invalidations".
+RESPONSE_NOT_FOUND_ERROR_CODES = frozenset(
+    {
+        "response_not_found",
+        "previous_response_not_found",
     }
 )

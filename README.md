@@ -41,20 +41,187 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 module = "provider-openai"
 name = "openai"
 config = {
-    base_url = null,                 # Optional custom endpoint (null = OpenAI default)
+    base_url = null,                       # Optional custom endpoint (null = OpenAI default)
     default_model = "gpt-5.5",
     max_tokens = 4096,
     temperature = 0.7,
-    reasoning = "low",              # Reasoning effort: minimal|low|medium|high
-    reasoning_summary = "detailed",  # Reasoning verbosity: auto|concise|detailed
-    truncation = "auto",            # Automatic context management (default: "auto")
+    reasoning = "low",                     # Reasoning effort: minimal|low|medium|high|xhigh
+    reasoning_summary = "detailed",        # Reasoning verbosity: auto|concise|detailed
+    truncation = null,                     # null omits the field; OpenAI returns an explicit
+                                           # error on context overflow. Opt in to legacy
+                                           # auto-drop with truncation = "auto" (busts cache).
+    prompt_cache_key = "",                 # Stable cache-routing identifier; empty = unset
+    prompt_cache_retention = "24h",        # "24h" | "in_memory" | null (use model default)
+    enable_response_chaining = "auto",     # "auto" | true | false  (reasoning-model chaining)
     enable_state = false,
-    debug = false,      # Enable standard debug events
-    raw_debug = false   # Enable ultra-verbose raw API I/O logging
+    debug = false,                         # Enable standard debug events
+    raw_debug = false                      # Enable ultra-verbose raw API I/O logging
 }
 ```
 
-### Debug Configuration
+> Note: `safety_identifier` is intentionally NOT a deployment config field. It
+> is a per-end-user signal (abuse tracking) and must be set per-call via
+> `kwargs`. See [Prompt Caching](#prompt-caching) below.
+
+## Prompt Caching
+
+The provider exposes OpenAI's prompt-caching hint parameters (`prompt_cache_key`,
+`prompt_cache_retention`, `safety_identifier`) plus an `enable_response_chaining`
+toggle that activates the Responses API's `previous_response_id` mechanism for
+reasoning models.
+
+See also: [OpenAI Cookbook — Prompt Caching 201](https://cookbook.openai.com/examples/prompt_caching_201).
+
+### TL;DR — what the defaults give you
+
+- `prompt_cache_retention = "24h"` — extended GPU-local KV storage on every
+  supported model, instead of OpenAI's per-model `"in_memory"` default
+  (5–10 min) for gpt-5.4 and below.
+- `enable_response_chaining = "auto"` — for reasoning-capable models, the
+  provider sends `store = true` and `previous_response_id` on subsequent
+  turns, and stops re-inserting encrypted reasoning blocks inline. Empirical
+  smoke against gpt-5.5 measured 85% prefix cache hit on turn 2 with chaining
+  on, vs 0% off.
+- `truncation = null` — the field is omitted from requests so the cached
+  prefix is never silently rewritten on context overflow. Opt back into the
+  legacy auto-drop behavior with `truncation = "auto"`.
+
+`prompt_cache_key` is empty by default; setting it is opt-in. `safety_identifier`
+is kwargs-only.
+
+### `prompt_cache_key` — cache-routing identifier
+
+OpenAI shards Responses API traffic across machines by hashing the first ~256
+input tokens. Without a stable key, requests with identical prefixes still hit
+the same shard most of the time, but as soon as anything in the prefix shifts
+(time-of-day stamp, shuffled tools, rewritten system prompt), routing diverges.
+A stable `prompt_cache_key` keeps a logical conversation pinned to one machine
+regardless of small prefix drift, and is the recommended cache signal as of
+OpenAI's July 2025 guidance. (The legacy `user` field still works on the API
+but is no longer the recommended cache signal.)
+
+Granularity guidance:
+
+| Deployment shape                            | Recommended key                                   |
+| ------------------------------------------- | ------------------------------------------------- |
+| Single-user agent loop (typical Amplifier)  | conversation/session ID, e.g. `"conv_abc123"`     |
+| Multi-tenant with shared system prompt      | `f"{tenant_id}:{system_prompt_version}"`          |
+| Low-volume single-session                   | leave unset; prefix-hash routing is sufficient    |
+
+Watch out for the **~15 RPM threshold per (prefix, key) pair**. Past that, OpenAI
+spills overflow requests to fresh machines; high-volume conversations should
+prefer a key that distributes across tenants/sessions rather than one global
+constant.
+
+### `prompt_cache_retention` — TTL hint
+
+| Value         | Meaning                                                                             |
+| ------------- | ----------------------------------------------------------------------------------- |
+| `"24h"`       | Extended GPU-local KV storage. Provider default for all supported models.           |
+| `"in_memory"` | 5–10 min in-process cache. OpenAI's per-model default for gpt-5.4 and below.        |
+| `null`        | Field omitted; OpenAI picks the per-model default.                                  |
+
+The capability layer auto-drops values a model would reject:
+
+- gpt-5.5+ rejects `"in_memory"` — provider drops it with a `[PROVIDER] Dropping
+  prompt_cache_retention='in_memory'` warning.
+- Any future model that rejects `"24h"` (capability flag `supports_24h_retention
+  = False`) gets the field dropped the same way.
+
+You do not need to special-case retention per model; the default `"24h"` is
+safe everywhere.
+
+### `enable_response_chaining` — reasoning-model chaining
+
+Tri-state config (and per-call kwarg). Controls whether the provider uses the
+Responses API's `previous_response_id` mechanism, which is the high-leverage
+caching path for reasoning models:
+
+| Value     | Behavior                                                                                       |
+| --------- | ---------------------------------------------------------------------------------------------- |
+| `"auto"`  | On iff `get_capabilities(model).supports_reasoning` is True. Default. Right answer for most.   |
+| `true`    | Force on regardless of model. Useful for testing or non-reasoning models that still benefit.   |
+| `false`   | Force off. Use for ZDR / regulated-industry deployments that cannot retain server-side state.  |
+
+When chaining is active for a reasoning model, three things happen on each call:
+
+1. `store = true` is set automatically (chaining requires it; this overrides
+   `enable_state` for reasoning models).
+2. `previous_response_id = <id from last assistant.metadata>` is sent on
+   subsequent turns.
+3. Encrypted reasoning items (`include=["reasoning.encrypted_content"]` and
+   re-insertion in `_convert_messages`) are NOT sent — the server holds
+   reasoning state under `previous_response_id`, and inlining encrypted blobs
+   would bust the cache prefix.
+
+For non-reasoning models, or `enable_response_chaining = false`, behavior is
+unchanged: stateless mode with explicit reasoning re-insertion (see
+[Reasoning State Preservation](#reasoning-state-preservation)).
+
+On `previous_response_id` invalidation (HTTP 404 + `response_not_found`), the
+provider retries once without the field and emits a
+`provider:response_chain_invalidated` event.
+
+### `safety_identifier` — kwargs-only
+
+The request-side counterpart to `prompt_cache_key`: an abuse-tracking signal
+that should carry a per-end-user value. Intentionally NOT exposed as a
+deployment `ConfigField` — surfacing it in deployment config invites operators
+to set one global value, which defeats its purpose. Set it via per-call
+`kwargs` only.
+
+### Behavioral change: `truncation` default
+
+The `truncation` default flipped from `"auto"` to `null` (omit the field).
+
+- Before: silently dropped oldest messages on context overflow.
+- After: OpenAI returns an explicit `context_length_exceeded` error.
+
+Reason: `truncation = "auto"` rewrites the cached prefix and is on OpenAI's own
+troubleshooting checklist as a top cause of low cache hit rates. To opt back
+into the legacy auto-drop:
+
+```toml
+config = { truncation = "auto" }
+```
+
+### Recommended configurations
+
+**Single-user agent loop (typical Amplifier session):** defaults are correct.
+For high-volume sessions, optionally pin to a session ID:
+
+```toml
+config = { prompt_cache_key = "session_${SESSION_ID}" }
+```
+
+**Multi-tenant deployment:** key per tenant + system-prompt version to shard
+load while preserving cache stickiness. Use `safety_identifier` per-call for
+abuse tracking:
+
+```toml
+config = { prompt_cache_key = "tenant_42:sysprompt_v7" }
+# In application code, per request:
+# await provider.complete(request, safety_identifier="end_user_abc")
+```
+
+**ZDR / regulated industries:** disable chaining so no server-side state is
+retained for reasoning models:
+
+```toml
+config = { enable_response_chaining = false, enable_state = false }
+```
+
+### Observability
+
+Cache hit rate surfaces as `usage.cache_read_tokens` on responses, and is
+emitted in `llm:response` events as `cache_read_tokens`. Note: OpenAI does NOT
+report a `cache_creation_tokens` metric (unlike Anthropic) — cache writes are
+implicit and not counted separately.
+
+Chain invalidation is observable via the `provider:response_chain_invalidated`
+event.
+
+## Debug Configuration
 
 **Standard Debug** (`debug: true`):
 
@@ -99,16 +266,18 @@ model = "gpt-5.5"
 
 ### Responses API Capabilities
 
-- **Reasoning Control** - Adjust reasoning effort (minimal, low, medium, high)
+- **Reasoning Control** - Adjust reasoning effort (minimal, low, medium, high, xhigh)
 - **Reasoning Summary Verbosity** - Control detail level of reasoning output (auto, concise, detailed)
 - **Extended Thinking Toggle** - Enables high-effort reasoning with automatic token budgeting
 - **Explicit Reasoning Preservation** - Re-inserts reasoning items (with encrypted content) into conversation for robust multi-turn reasoning
-- **Automatic Context Management** - Optional truncation parameter for automatic conversation history management
+- **Prompt Caching Hints** - `prompt_cache_key`, `prompt_cache_retention` (default `"24h"`), and per-call `safety_identifier` wired into the request builder. See [Prompt Caching](#prompt-caching).
+- **Response Chaining for Reasoning Models** - `enable_response_chaining` activates `previous_response_id` for reasoning models, materially improving prefix cache hit rate (default `"auto"`).
+- **Cache-Stable Truncation** - `truncation` defaults to `null` (omitted) so the cached prefix is never silently rewritten on context overflow.
 - **Stateful Conversations** - Optional conversation persistence
 - **Native Tools** - Built-in web search, image generation, code interpreter
 - **Structured Output** - JSON schema-based output formatting
 - **Function Calling** - Custom tool use support
-- **Token Counting** - Usage tracking and management
+- **Token Counting** - Usage tracking and management (including `cache_read_tokens`)
 
 ### Reasoning Summary Levels
 
@@ -259,11 +428,10 @@ response_2 = await provider.complete(request_with_tool_result)
 
 ### Automatic Context Management (Truncation)
 
-The provider supports automatic conversation history management via the `truncation` parameter:
-
-**The Problem**: Long conversations can exceed context limits, requiring manual truncation or compaction.
-
-**The Solution**: OpenAI's `truncation: "auto"` parameter automatically drops older messages when approaching context limits.
+The provider supports OpenAI's optional `truncation` parameter for automatic
+conversation history management. **The default flipped from `"auto"` to `null`
+(omitted)** as of PR #34, because `truncation = "auto"` rewrites the cached
+prefix on overflow and busts prompt caching.
 
 **Configuration**:
 
@@ -271,12 +439,12 @@ The provider supports automatic conversation history management via the `truncat
 providers:
   - module: provider-openai
     config:
-      truncation: "auto"  # Enables automatic context management (default)
+      truncation: null    # Default. Field omitted; OpenAI errors on overflow.
       # OR
-      truncation: null    # Disables automatic truncation (manual control)
+      truncation: "auto"  # Opt in: drop oldest messages on overflow (busts cache).
 ```
 
-**How it works**:
+**How `"auto"` works** (when explicitly opted in):
 
 - OpenAI automatically removes oldest messages when context limit approached
 - FIFO (first-in, first-out) - most recent messages preserved
@@ -285,17 +453,19 @@ providers:
 
 **Trade-offs**:
 
-- ✅ **Simplicity** - No manual context management needed
-- ✅ **Reliability** - Never hits context limit errors
-- ❌ **Control** - Can't specify which messages to drop
-- ❌ **Predictability** - Drop timing depends on token counts
+- `null` (default): explicit `context_length_exceeded` error on overflow,
+  but the cached prefix is preserved across turns.
+- `"auto"`: simplicity and never-hit-the-limit, at the cost of cache hit
+  rate. Listed on OpenAI's troubleshooting checklist as a top cause of
+  low cache utilization.
 
-**When to use**:
+**When to use `"auto"`**:
 
-- **Auto truncation** - For user-facing applications where simplicity matters
-- **Manual control** - For debugging, analysis, or when specific messages must be preserved
+- Legacy behavior compatibility, or workloads where simplicity outweighs
+  cache efficiency. For most users, the new default (`null`) is correct;
+  pair it with explicit context management upstream.
 
-**Default**: `truncation: "auto"` (enabled by default for ease of use)
+See also: [Prompt Caching](#prompt-caching) for the broader cache-stability rationale.
 
 ### Metadata Keys
 

@@ -42,6 +42,7 @@ from ._constants import DEFAULT_MODEL
 from ._constants import DEFAULT_POLL_INTERVAL
 from ._constants import DEFAULT_REASONING_SUMMARY
 from ._constants import DEFAULT_TIMEOUT
+from ._constants import DEFAULT_PROMPT_CACHE_RETENTION
 from ._constants import DEFAULT_TRUNCATION
 from ._constants import DEEP_RESEARCH_MODELS
 from ._constants import MAX_CONTINUATION_ATTEMPTS
@@ -50,6 +51,8 @@ from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 from ._constants import NATIVE_TOOL_TYPES
+from ._constants import RESPONSE_CHAIN_INVALIDATED
+from ._constants import RESPONSE_NOT_FOUND_ERROR_CODES
 from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import extract_reasoning_text
 from ._capabilities import get_capabilities
@@ -141,6 +144,66 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     )
 
 
+def _drop_unsupported_in_memory_retention(
+    model_id: str, retention: str | None
+) -> str | None:
+    """Return *retention* unless it would be rejected by the model.
+
+    OpenAI's gpt-5.5 family (and any future model with extended-only retention)
+    does NOT support `prompt_cache_retention="in_memory"` — the API returns a
+    400. Rather than pass a value we know will fail, we drop the field and log
+    a warning. The capability flag (set in `_capabilities.py`) is the single
+    source of truth for which models support which retention values.
+
+    Returns None when the value should be dropped. Otherwise returns *retention*
+    unchanged. Models with capability flag True (the default) always pass through.
+
+    Note: We deliberately do NOT validate `retention="24h"` against any
+    model-supported list. That list (`gpt-5.5`, `gpt-5.4`, ..., `gpt-4.1`) is
+    mutable and OpenAI's responsibility to enforce. Our job here is only to
+    block the one combination we KNOW will hard-error.
+    """
+    if retention != "in_memory":
+        return retention
+    caps = get_capabilities(model_id)
+    if caps.supports_in_memory_retention:
+        return retention
+    logger.warning(
+        "[PROVIDER] Dropping prompt_cache_retention='in_memory' for model %r: "
+        "model only supports '24h' retention. Omit the field or pass '24h' "
+        "to silence this warning.",
+        model_id,
+    )
+    return None
+
+
+def _drop_unsupported_24h_retention(model_id: str, retention: str | None) -> str | None:
+    """Return *retention* unless `"24h"` would be rejected by the model.
+
+    Mirror of `_drop_unsupported_in_memory_retention`. The capability flag
+    `supports_24h_retention` is True for all current model families
+    (smoke-tested against gpt-4o, gpt-5.x, o-series — all accept "24h"
+    despite not being formally enumerated in the cookbook list). Future
+    families that prove to reject "24h" can flip the flag False on their
+    branch in `_capabilities.py`.
+
+    Returns None when the value should be dropped. Otherwise returns
+    *retention* unchanged.
+    """
+    if retention != "24h":
+        return retention
+    caps = get_capabilities(model_id)
+    if caps.supports_24h_retention:
+        return retention
+    logger.warning(
+        "[PROVIDER] Dropping prompt_cache_retention='24h' for model %r: "
+        "model rejects 24h retention. Omit the field or pass 'in_memory' "
+        "to silence this warning.",
+        model_id,
+    )
+    return None
+
+
 class OpenAIProvider:
     """OpenAI Responses API integration."""
 
@@ -181,15 +244,91 @@ class OpenAIProvider:
         self.reasoning_summary = self.config.get(
             "reasoning_summary", DEFAULT_REASONING_SUMMARY
         )
-        self.truncation = self.config.get(
-            "truncation", DEFAULT_TRUNCATION
-        )  # Automatic context management
+        # `truncation` defaults to None (omit the field) for cache stability.
+        # When the model context fills, OpenAI now returns an explicit error
+        # instead of silently rewriting the prefix. Pass
+        # `config={"truncation": "auto"}` to opt into the legacy auto-drop
+        # behavior.
+        self.truncation = self.config.get("truncation", DEFAULT_TRUNCATION)
         self.enable_state = self.config.get("enable_state", False)
         self.raw = self.config.get("raw", False)  # Include raw payload in events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
         self.filtered = self.config.get(
             "filtered", True
         )  # Filter to curated model list by default
+
+        # Prompt-caching hint parameters (Responses API top-level fields).
+        # All three default to None = "don't send the field, use OpenAI's
+        # model default". Per-call kwargs override the config default — same
+        # pattern as `truncation`.
+        #
+        # prompt_cache_key: stable per-conversation (or per-tenant+system-prompt)
+        #   identifier. OpenAI shards by hash of first ~256 input tokens; setting
+        #   a stable key keeps subsequent requests routed to the same machine,
+        #   maximizing cache hit rate. Use this instead of the `user` field for
+        #   cache-routing per OpenAI's July 2025 guidance (the `user` field is
+        #   retained on the API but is no longer the recommended cache signal).
+        # prompt_cache_retention: "in_memory" (5–10 min) or "24h" (extended
+        #   GPU-local KV storage). Defaults to "24h" so caching is stable
+        #   across all models, including gpt-5.4 and below where OpenAI's
+        #   server-side default is the much-shorter "in_memory". Models that
+        #   reject "24h" (capability flag False) get the field dropped with a
+        #   warning. Models that reject "in_memory" (gpt-5.5+) get the same
+        #   treatment via the existing helper. Pass None explicitly to fall
+        #   back to OpenAI's per-model default.
+        # safety_identifier: abuse-tracking signal — the request-side counterpart
+        #   to `prompt_cache_key`. Per-end-user value (not per-deployment), which
+        #   is why it is intentionally NOT exposed via ConfigField; set it via
+        #   per-call kwargs.
+        # Empty strings (e.g. from UI form defaults) are coerced to None so we
+        # don't send empty-string fields to OpenAI.
+        self.prompt_cache_key: str | None = self.config.get("prompt_cache_key") or None
+        # prompt_cache_retention defaults to "24h" so non-gpt-5.5 models get
+        # extended GPU-local KV storage instead of OpenAI's per-model
+        # in_memory default (5–10 min). Use `dict.get(..., DEFAULT)` so an
+        # explicit `None` in config is preserved as "let OpenAI pick the
+        # model default" rather than overridden. Empty string is coerced to
+        # None to match the established UI-form pattern.
+        _retention = self.config.get(
+            "prompt_cache_retention", DEFAULT_PROMPT_CACHE_RETENTION
+        )
+        self.prompt_cache_retention: str | None = _retention if _retention else None
+        self.safety_identifier: str | None = (
+            self.config.get("safety_identifier") or None
+        )
+
+        # Response chaining for reasoning models — the Responses API's
+        # `previous_response_id` mechanism. Tri-state:
+        #   "auto" (default) — on iff get_capabilities(model).supports_reasoning
+        #   True             — force on regardless of model
+        #   False            — force off (ZDR / privacy / regulated-industry opt-out)
+        #
+        # When active, three things happen on each call to a reasoning model:
+        #   (a) params["store"] = True
+        #   (b) params["previous_response_id"] = <id from last assistant.metadata>
+        #       (when a prior response_id is available; first turn has none)
+        #   (c) `include=["reasoning.encrypted_content"]` is NOT requested,
+        #       and ThinkingBlocks are NOT re-inserted into the input array
+        #       (server holds the reasoning state under previous_response_id;
+        #       sending encrypted blobs inline busts the cache prefix).
+        #
+        # Per OpenAI Cookbook 201 §4.5: Responses API + chaining gives 40–80%
+        # better cache utilization on reasoning workloads vs. stateless mode.
+        #
+        # Interaction with `enable_state`:
+        #   - `enable_state` remains the broad server-state switch (e.g. for
+        #     callers that need response retrieval/inspection regardless of
+        #     reasoning).
+        #   - `enable_response_chaining` is the cache-driven knob for
+        #     reasoning models specifically.
+        #   - When chaining resolves to True, `store=True` is forced (chaining
+        #     requires it). Otherwise `enable_state` decides `store`.
+        raw_chain = self.config.get("enable_response_chaining", "auto")
+        # Coerce: accept "auto" | True | False | None | "" → normalize to "auto"|True|False
+        if raw_chain in (None, "", "auto"):
+            self.enable_response_chaining: str | bool = "auto"
+        else:
+            self.enable_response_chaining = bool(raw_chain)
 
         # Deep research / background mode configuration
         self.poll_interval = self.config.get("poll_interval", DEFAULT_POLL_INTERVAL)
@@ -337,6 +476,52 @@ class OpenAIProvider:
                     required=False,
                     default="false",
                 ),
+                ConfigField(
+                    id="prompt_cache_key",
+                    display_name="Prompt cache key",
+                    field_type="text",
+                    prompt=(
+                        "Stable identifier for OpenAI prompt-cache routing "
+                        "(e.g. conversation ID or tenant+system-prompt-version)"
+                    ),
+                    required=False,
+                    default="",
+                ),
+                ConfigField(
+                    id="prompt_cache_retention",
+                    display_name="Prompt cache retention",
+                    field_type="choice",
+                    prompt=(
+                        "Cache retention window. Leave unset to use the model "
+                        "default (recommended)."
+                    ),
+                    choices=["in_memory", "24h"],
+                    required=False,
+                    # default=None (not "") because "" is not a member of
+                    # `choices`; UI renderers that validate `default in choices`
+                    # would reject it. None signals "leave unset" cleanly.
+                    default=None,
+                ),
+                ConfigField(
+                    id="enable_response_chaining",
+                    display_name="Enable response chaining",
+                    field_type="choice",
+                    prompt=(
+                        "Response chaining for reasoning models via previous_response_id. "
+                        '"auto" (default) enables chaining for reasoning-capable models '
+                        'only. Set to "false" to disable for ZDR / regulated-industry '
+                        "deployments that cannot retain server-side state."
+                    ),
+                    choices=["auto", "true", "false"],
+                    required=False,
+                    default="auto",
+                ),
+                # NOTE: `safety_identifier` is intentionally NOT exposed as a
+                # ConfigField. It is a per-end-user signal, not a per-deployment
+                # one — surfacing it in the UI invites operators to set a single
+                # global value, which defeats its abuse-tracking purpose. The
+                # provider still accepts it via per-call kwargs and (for tests
+                # and unusual deployments) via the config dict.
             ],
         )
 
@@ -705,6 +890,22 @@ class OpenAIProvider:
             return []
         return response.tool_calls
 
+    def _should_chain_responses(self, model_id: str, kwargs: dict[str, Any]) -> bool:
+        """Resolve whether response chaining is active for *this* call.
+
+        Precedence (highest first):
+          1. kwargs["enable_response_chaining"]  (per-call override)
+          2. self.enable_response_chaining       (config)
+          3. "auto" → caps.supports_reasoning
+        """
+        override = kwargs.get("enable_response_chaining", self.enable_response_chaining)
+        if override is True:
+            return True
+        if override is False:
+            return False
+        # "auto"
+        return get_capabilities(model_id).supports_reasoning
+
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
     ) -> ChatResponse:
@@ -756,8 +957,16 @@ class OpenAIProvider:
         for conv_msg in conversation:
             all_messages_for_conversion.append(conv_msg.model_dump())
 
+        # Decide chaining BEFORE message conversion so we can suppress
+        # encrypted-content re-insertion when chain_active is True.
+        model_name = kwargs.get("model", self.default_model)
+        chain_active = self._should_chain_responses(model_name, kwargs)
+
         # Convert to OpenAI Responses API message format
-        input_messages = self._convert_messages(all_messages_for_conversion)
+        input_messages = self._convert_messages(
+            all_messages_for_conversion,
+            skip_reasoning_reinsertion=chain_active,
+        )
         logger.info(
             f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
         )
@@ -783,7 +992,7 @@ class OpenAIProvider:
 
         # Prepare request parameters per Responses API spec
         params = {
-            "model": kwargs.get("model", self.default_model),
+            "model": model_name,
             "input": input_messages,  # Array of message objects, not text string
         }
 
@@ -792,7 +1001,6 @@ class OpenAIProvider:
         background_mode = kwargs.get("background", False)
 
         # Auto-enable background mode for deep research models
-        model_name = kwargs.get("model", self.default_model)
         if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
             ("o3-deep-research", "o4-mini-deep-research")
         ):
@@ -802,22 +1010,39 @@ class OpenAIProvider:
                 f"[PROVIDER] Deep research model detected: {model_name}, background={background_mode}"
             )
 
-        # Determine store parameter early (needed for previous_response_id logic)
-        # Background mode requires store=True
+        # ---- Response chaining resolution (PR-B) -----------------------------
+        # Three knobs interact:
+        #   - background_mode            → forces store=True
+        #   - enable_response_chaining   → for reasoning models, forces store=True
+        #                                  AND attaches previous_response_id
+        #   - enable_state (legacy)      → broad server-state opt-in
+        # Per-call kwargs override config for both.
+        # (chain_active was already resolved above before _convert_messages)
+
         store_enabled = kwargs.get("store", self.enable_state)
         if background_mode:
-            store_enabled = True  # Background mode requires store=True
+            store_enabled = True
             logger.info("[PROVIDER] Background mode enabled, forcing store=True")
+        if chain_active:
+            store_enabled = True  # chaining requires server-side state
         params["store"] = store_enabled
 
-        # Add previous_response_id ONLY if store is enabled (server-side state)
-        # With store=False, we rely on explicit reasoning re-insertion instead
-        if previous_response_id and store_enabled:
+        # Attach previous_response_id when:
+        #   - we found one in the last assistant's metadata, AND
+        #   - either chaining is active for this model, OR
+        #     legacy enable_state is on (preserves existing behavior).
+        # Track on params for downstream invalidation-retry logic.
+        if previous_response_id and (chain_active or store_enabled):
             params["previous_response_id"] = previous_response_id
-            logger.debug("[PROVIDER] Using previous_response_id (store=True)")
-        elif previous_response_id and not store_enabled:
             logger.debug(
-                "[PROVIDER] Skipping previous_response_id (store=False). "
+                "[PROVIDER] Using previous_response_id=%s (chain_active=%s, store=%s)",
+                previous_response_id,
+                chain_active,
+                store_enabled,
+            )
+        elif previous_response_id:
+            logger.debug(
+                "[PROVIDER] Skipping previous_response_id (chain_active=False, store=False). "
                 "Relying on explicit reasoning re-insertion from metadata/content."
             )
 
@@ -866,7 +1091,13 @@ class OpenAIProvider:
         # Without include=[reasoning.encrypted_content], reasoning token content is lost
         # when store=false (Amplifier's default), causing orphaned reasoning references.
         # Exception: explicit effort="none" suppresses include (caller opted out of reasoning).
-        if not store_enabled:
+        #
+        # When chaining is active, server holds reasoning state under
+        # previous_response_id. Re-inserting encrypted_content inline would
+        # (a) be redundant and (b) actively hurt the cache prefix because the
+        # ciphertext changes per call. So skip encrypted-content include when
+        # chaining is on; only request it on stateless/non-reasoning paths.
+        if not store_enabled and not chain_active:
             caps = get_capabilities(model_name)
             active_effort: str | None = None
             if "reasoning" in params:
@@ -883,7 +1114,7 @@ class OpenAIProvider:
                     "include", ["reasoning.encrypted_content"]
                 )
                 logger.debug(
-                    "[PROVIDER] Requesting encrypted_content (store=False, model will reason: %s, effort=%s)",
+                    "[PROVIDER] Requesting encrypted_content (stateless path, model will reason: %s, effort=%s)",
                     model_name,
                     active_effort or caps.default_reasoning_effort,
                 )
@@ -908,9 +1139,43 @@ class OpenAIProvider:
             if max_tool_calls := kwargs.get("max_tool_calls"):
                 params["max_tool_calls"] = max_tool_calls
 
-        # Add truncation parameter for automatic context management
-        if self.truncation:
-            params["truncation"] = kwargs.get("truncation", self.truncation)
+        # Truncation parameter — default None (omit) for cache-prefix
+        # stability; per-call kwarg overrides the config default.
+        truncation = kwargs.get("truncation", self.truncation)
+        if truncation:
+            params["truncation"] = truncation
+
+        # Prompt-caching hint parameters (Responses API top-level fields).
+        # Per-call kwargs override the config default; None / "" means "do not
+        # send". The trailing `or None` mirrors the empty-string coercion in
+        # __init__() so that a caller passing `prompt_cache_key=""` (e.g. from
+        # a UI form) is treated the same as omitting the field.
+        prompt_cache_key = kwargs.get("prompt_cache_key", self.prompt_cache_key) or None
+        if prompt_cache_key is not None:
+            params["prompt_cache_key"] = prompt_cache_key
+
+        prompt_cache_retention = (
+            kwargs.get("prompt_cache_retention", self.prompt_cache_retention) or None
+        )
+        # Drop retention values the model is known to reject. Each helper is
+        # a no-op unless its target value is set AND the capability flag is
+        # False. Today only `supports_in_memory_retention=False` (gpt-5.5)
+        # actually fires; `supports_24h_retention=False` is reserved for
+        # future families that prove to reject "24h".
+        prompt_cache_retention = _drop_unsupported_in_memory_retention(
+            model_name, prompt_cache_retention
+        )
+        prompt_cache_retention = _drop_unsupported_24h_retention(
+            model_name, prompt_cache_retention
+        )
+        if prompt_cache_retention is not None:
+            params["prompt_cache_retention"] = prompt_cache_retention
+
+        safety_identifier = (
+            kwargs.get("safety_identifier", self.safety_identifier) or None
+        )
+        if safety_identifier is not None:
+            params["safety_identifier"] = safety_identifier
 
         # Add background mode parameter for long-running requests (deep research)
         if background_mode:
@@ -1121,6 +1386,46 @@ class OpenAIProvider:
                         status_code=403,
                     ) from e
                 if status == 404:
+                    # Specific case: previous_response_id is unknown/expired.
+                    # Retry once without the field (graceful chain rebuild).
+                    err_code = None
+                    if isinstance(body, dict):
+                        err_code = (body.get("error") or {}).get("code")
+                    raw_msg_404 = str(e).lower()
+                    is_chain_invalidation = (
+                        err_code in RESPONSE_NOT_FOUND_ERROR_CODES
+                        or "previous_response_id" in raw_msg_404
+                    )
+                    if is_chain_invalidation and "previous_response_id" in params:
+                        invalidated_id = params.pop("previous_response_id")
+                        logger.warning(
+                            "[PROVIDER] previous_response_id=%s invalidated by server "
+                            "(code=%s). Retrying without chain.",
+                            invalidated_id,
+                            err_code,
+                        )
+                        if self.coordinator and hasattr(self.coordinator, "hooks"):
+                            await self.coordinator.hooks.emit(
+                                RESPONSE_CHAIN_INVALIDATED,
+                                {
+                                    "provider": self.name,
+                                    "model": params.get("model"),
+                                    "invalidated_id": invalidated_id,
+                                    "error_code": err_code,
+                                },
+                            )
+                        # Recurse once. Do NOT loop indefinitely: by removing
+                        # the field, the next call cannot hit this branch again.
+                        # NOTE: when chain_active was True we also suppressed
+                        # encrypted-content re-insertion in _convert_messages.
+                        # That decision is locked into input_messages already;
+                        # the retry uses the same input. The server will treat
+                        # this as a fresh prefix — equivalent to today's
+                        # stateless reasoning behavior. Reasoning state for
+                        # *this* turn is lost; next turn re-chains via the
+                        # response_id we get from this retry.
+                        return await _do_complete()
+                    # Fall through to existing 404 handling
                     raise kernel_errors.NotFoundError(
                         error_msg,
                         provider=self.name,
@@ -1324,8 +1629,21 @@ class OpenAIProvider:
                     continue_params["parallel_tool_calls"] = params.get(
                         "parallel_tool_calls", True
                     )
+                # Note: continue_params intentionally does NOT inherit
+                # previous_response_id. The incomplete-continuation path uses
+                # _build_continuation_input() to carry context forward
+                # explicitly. Mixing previous_response_id with a rebuilt input
+                # array would double-count tokens.
                 if "store" in params:
                     continue_params["store"] = params["store"]
+                if "prompt_cache_key" in params:
+                    continue_params["prompt_cache_key"] = params["prompt_cache_key"]
+                if "prompt_cache_retention" in params:
+                    continue_params["prompt_cache_retention"] = params[
+                        "prompt_cache_retention"
+                    ]
+                if "safety_identifier" in params:
+                    continue_params["safety_identifier"] = params["safety_identifier"]
 
                 # Make continuation call
                 try:
@@ -1497,7 +1815,12 @@ class OpenAIProvider:
 
         return info
 
-    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _convert_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        skip_reasoning_reinsertion: bool = False,
+    ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
         Handles:
@@ -1740,7 +2063,16 @@ class OpenAIProvider:
                                             if thinking_text
                                             else []
                                         )
-                                        reasoning_items_to_add.append(reasoning_item)
+                                        if skip_reasoning_reinsertion:
+                                            # Chaining is active: server holds reasoning state under
+                                            # previous_response_id. Don't re-emit encrypted_content
+                                            # (would bust the cache prefix) and don't emit bare rs_*
+                                            # IDs (server already knows them).
+                                            pass
+                                        else:
+                                            reasoning_items_to_add.append(
+                                                reasoning_item
+                                            )
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
                             if block.type == "text":
@@ -1850,7 +2182,14 @@ class OpenAIProvider:
                                         else []
                                     )
 
-                                    reasoning_items_to_add.append(reasoning_item)
+                                    if skip_reasoning_reinsertion:
+                                        # Chaining is active: server holds reasoning state under
+                                        # previous_response_id. Don't re-emit encrypted_content
+                                        # (would bust the cache prefix) and don't emit bare rs_*
+                                        # IDs (server already knows them).
+                                        pass
+                                    else:
+                                        reasoning_items_to_add.append(reasoning_item)
 
                 # Handle simple string content
                 elif isinstance(content, str) and content:
@@ -1859,7 +2198,17 @@ class OpenAIProvider:
                 # Defensive: strip orphaned reasoning items that have no encrypted_content.
                 # These occur when the model reasoned but include=[reasoning.encrypted_content]
                 # was not requested — the reasoning ID exists but can't be sent back, causing 404s.
-                if metadata and metadata.get(METADATA_REASONING_ITEMS):
+                #
+                # When chaining is active (skip_reasoning_reinsertion=True), the server holds
+                # reasoning state under previous_response_id; we deliberately did not collect
+                # encrypted_content into reasoning_items_to_add. So the "metadata has reasoning
+                # IDs but list is empty" condition is the expected steady state, not an orphan.
+                # Skip the orphan check to avoid spurious warnings and unnecessary clears.
+                if (
+                    not skip_reasoning_reinsertion
+                    and metadata
+                    and metadata.get(METADATA_REASONING_ITEMS)
+                ):
                     has_usable_reasoning = any(
                         isinstance(item, dict)
                         and item.get("type") == "reasoning"

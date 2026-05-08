@@ -18,22 +18,34 @@ class TestGPT55Family:
         assert caps.supports_streaming is True
         # Pricing-derived; no public API source.
         assert caps.long_context_pricing_threshold is None
+        # gpt-5.5 default retention is "24h"; "in_memory" returns 400 from the API.
+        # This flag is the single source of truth for the in_memory drop in
+        # _drop_unsupported_in_memory_retention(); pin it so a future capability
+        # edit can't silently revert the suppression.
+        assert caps.supports_in_memory_retention is False
+        # gpt-5.5 accepts "24h" (its native default); pin True so the 24h-drop
+        # helper never fires on this model.
+        assert caps.supports_24h_retention is True
 
     def test_gpt_5_5_pro(self):
         caps = get_capabilities("gpt-5.5-pro")
         assert caps.family == "gpt-5"
         assert caps.context_window == 1_000_000
         assert caps.supports_reasoning is True
+        assert caps.supports_in_memory_retention is False
+        assert caps.supports_24h_retention is True
 
     def test_gpt_5_5_dated_snapshot(self):
         caps = get_capabilities("gpt-5.5-2026-04-23")
         assert caps.family == "gpt-5"
         assert caps.context_window == 1_000_000
+        assert caps.supports_24h_retention is True
 
     def test_gpt_5_5_pro_dated_snapshot(self):
         caps = get_capabilities("gpt-5.5-pro-2026-04-23")
         assert caps.family == "gpt-5"
         assert caps.context_window == 1_000_000
+        assert caps.supports_24h_retention is True
 
 
 class TestRegressionGPT54:
@@ -44,6 +56,11 @@ class TestRegressionGPT54:
         assert caps.family == "gpt-5"
         assert caps.context_window == 1_050_000
         assert caps.long_context_pricing_threshold == 272_000
+        # gpt-5.4 supports both retention modes; pin the True side of the
+        # supports_in_memory_retention flag for symmetry with gpt-5.5.
+        assert caps.supports_in_memory_retention is True
+        # gpt-5.4 accepts "24h"; the default "24h" must not be dropped for it.
+        assert caps.supports_24h_retention is True
 
     def test_gpt_5_3_unchanged(self):
         caps = get_capabilities("gpt-5.3-codex")
@@ -54,3 +71,11 @@ class TestRegressionGPT54:
         caps = get_capabilities("gpt-5.9-turbo")
         assert caps.family == "gpt-5"
         assert caps.context_window == 1_050_000
+
+
+class TestSupports24hRetentionDefault:
+    def test_unknown_model_supports_24h_default_true(self):
+        """Permissive default: unknown models advertise 24h support so newly
+        released models keep the cache-friendly default until proven otherwise."""
+        caps = get_capabilities("gpt-X-future")
+        assert caps.supports_24h_retention is True
