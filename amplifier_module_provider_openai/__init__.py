@@ -215,15 +215,17 @@ class OpenAIProvider:
         # prompt_cache_key: stable per-conversation (or per-tenant+system-prompt)
         #   identifier. OpenAI shards by hash of first ~256 input tokens; setting
         #   a stable key keeps subsequent requests routed to the same machine,
-        #   maximizing cache hit rate. Replaces the deprecated `user` field's
-        #   cache-routing role.
+        #   maximizing cache hit rate. Use this instead of the `user` field for
+        #   cache-routing per OpenAI's July 2025 guidance (the `user` field is
+        #   retained on the API but is no longer the recommended cache signal).
         # prompt_cache_retention: "in_memory" (5–10 min, default for gpt-5.4 and
         #   below) or "24h" (extended GPU-local KV storage; default for gpt-5.5+).
         #   Leaving None lets OpenAI pick the model-appropriate default — this
         #   avoids the gpt-5.5 trap where passing "in_memory" returns 400.
-        # safety_identifier: abuse-tracking signal; the other half of the
-        #   deprecated `user` field. Unrelated to caching but ships in the same
-        #   migration.
+        # safety_identifier: abuse-tracking signal — the request-side counterpart
+        #   to `prompt_cache_key`. Per-end-user value (not per-deployment), which
+        #   is why it is intentionally NOT exposed via ConfigField; set it via
+        #   per-call kwargs.
         # Empty strings (e.g. from UI form defaults) are coerced to None so we
         # don't send empty-string fields to OpenAI.
         self.prompt_cache_key: str | None = self.config.get("prompt_cache_key") or None
@@ -405,17 +407,12 @@ class OpenAIProvider:
                     # would reject it. None signals "leave unset" cleanly.
                     default=None,
                 ),
-                ConfigField(
-                    id="safety_identifier",
-                    display_name="Safety identifier",
-                    field_type="text",
-                    prompt=(
-                        "Opaque end-user identifier for OpenAI abuse tracking "
-                        "(replaces deprecated `user` field)"
-                    ),
-                    required=False,
-                    default="",
-                ),
+                # NOTE: `safety_identifier` is intentionally NOT exposed as a
+                # ConfigField. It is a per-end-user signal, not a per-deployment
+                # one — surfacing it in the UI invites operators to set a single
+                # global value, which defeats its abuse-tracking purpose. The
+                # provider still accepts it via per-call kwargs and (for tests
+                # and unusual deployments) via the config dict.
             ],
         )
 
