@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from decimal import Decimal
 from typing import Any
 
 import openai
@@ -55,6 +56,7 @@ from ._constants import RESPONSE_NOT_FOUND_ERROR_CODES
 from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import extract_reasoning_text
 from ._capabilities import get_capabilities
+from ._cost import compute_cost
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """Mount the OpenAI provider."""
     config = config or {}
 
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    def _add_cost(cost) -> None:
+        if cost is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
+            _totals["has_data"] = True
+
     # Get API key from config or environment
     api_key = config.get("api_key") or os.environ.get("OPENAI_API_KEY")
 
@@ -80,8 +89,15 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         logger.warning("No API key found for OpenAI provider")
         return None
 
-    provider = OpenAIProvider(api_key=api_key, config=config, coordinator=coordinator)
+    provider = OpenAIProvider(
+        api_key=api_key, config=config, coordinator=coordinator, add_cost=_add_cost
+    )
     await coordinator.mount("providers", provider, name="openai")
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-openai",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
     logger.info("Mounted OpenAIProvider (Responses API)")
 
     # Return cleanup function
@@ -201,6 +217,7 @@ class OpenAIProvider:
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
         client: AsyncOpenAI | None = None,
+        add_cost=None,
     ):
         """Initialize OpenAI provider with Responses API client.
 
@@ -351,6 +368,7 @@ class OpenAIProvider:
         # Apply patch native mode detection — set during tool conversion
         self._apply_patch_native = False
         self._native_call_ids: set[str] = set()
+        self._add_cost = add_cost or (lambda cost: None)
 
     @property
     def client(self) -> AsyncOpenAI:
@@ -1680,6 +1698,8 @@ class OpenAIProvider:
                         event_usage["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
+                    _cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                    event_usage["cost_usd"] = _cost_usd
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],
@@ -2658,6 +2678,25 @@ class OpenAIProvider:
             reasoning_tokens=reasoning_tokens,
             cache_read_tokens=cache_read_tokens,
         )
+
+        # M2: Stamp cost_usd onto Usage (zero-transformation passthrough from API fields).
+        # prompt_tokens is the total including cached; cached_tokens is subtracted inside
+        # compute_cost to prevent double-charging.
+        if usage_obj:
+            _prompt_tokens = getattr(usage_obj, "prompt_tokens", usage_counts["input"])
+            _completion_tokens = getattr(
+                usage_obj, "completion_tokens", usage_counts["output"]
+            )
+            _cached_tokens = cache_read_tokens or 0
+            cost = compute_cost(
+                getattr(response, "model", ""),
+                prompt_tokens=_prompt_tokens,
+                completion_tokens=_completion_tokens,
+                cached_tokens=_cached_tokens,
+            )
+            if cost is not None:
+                usage = usage.model_copy(update={"cost_usd": cost})
+                self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
