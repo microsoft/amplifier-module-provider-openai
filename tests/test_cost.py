@@ -129,3 +129,41 @@ def test_gpt_55_pro_no_cache_discount():
     """gpt-5.5-pro: cached_tokens=1M → $0 (no cache discount)."""
     result = compute_cost("gpt-5.5-pro", cached_tokens=1_000_000)
     assert result == Decimal("0"), f"Expected Decimal('0'), got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# (k) o3-deep-research pricing: $10/$40/$5.00  (corrected from $2/$8/$0.50)
+# ---------------------------------------------------------------------------
+def test_o3_deep_research_input_cost():
+    """o3-deep-research: 1M fresh input -> $10.00."""
+    result = compute_cost("o3-deep-research", prompt_tokens=1_000_000)
+    assert result == Decimal("10.00"), f"Expected Decimal('10.00'), got {result!r}"
+
+
+def test_o3_deep_research_output_cost():
+    """o3-deep-research: 1M output -> $40.00."""
+    result = compute_cost("o3-deep-research", completion_tokens=1_000_000)
+    assert result == Decimal("40.00"), f"Expected Decimal('40.00'), got {result!r}"
+
+
+def test_o3_deep_research_cache_read_cost():
+    """o3-deep-research: 1M cached -> $5.00 (50% of $10 input, matching o3 pattern)."""
+    result = compute_cost("o3-deep-research", cached_tokens=1_000_000)
+    assert result == Decimal("5.00"), f"Expected Decimal('5.00'), got {result!r}"
+
+
+def test_o3_deep_research_dated_alias():
+    """o3-deep-research-2025-06-26: same rates as o3-deep-research."""
+    assert compute_cost("o3-deep-research-2025-06-26", prompt_tokens=1_000_000) == Decimal("10.00")
+    assert compute_cost("o3-deep-research-2025-06-26", completion_tokens=1_000_000) == Decimal("40.00")
+    assert compute_cost("o3-deep-research-2025-06-26", cached_tokens=1_000_000) == Decimal("5.00")
+
+
+# ---------------------------------------------------------------------------
+# (l) o4-mini-deep-research stays at $2/$8/$0.275  (correct, unchanged)
+# ---------------------------------------------------------------------------
+def test_o4_mini_deep_research_unchanged():
+    """o4-mini-deep-research must remain at $2/$8/$0.275 -- NOT changed by this fix."""
+    assert compute_cost("o4-mini-deep-research", prompt_tokens=1_000_000) == Decimal("2.00")
+    assert compute_cost("o4-mini-deep-research", completion_tokens=1_000_000) == Decimal("8.00")
+    assert compute_cost("o4-mini-deep-research", cached_tokens=1_000_000) == Decimal("0.275")

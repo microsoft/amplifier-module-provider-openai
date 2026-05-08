@@ -81,17 +81,17 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.00"),
     },
     # ------------------------------------------------------------------
-    # o3 Deep Research  ($2.00 / $8.00, cache_read $0.50)
+    # o3 Deep Research  ($10.00 / $40.00, cache_read $5.00)
     # ------------------------------------------------------------------
     "o3-deep-research": {
-        "input_per_m": Decimal("2.00"),
-        "output_per_m": Decimal("8.00"),
-        "cache_read_per_m": Decimal("0.50"),
+        "input_per_m": Decimal("10.00"),
+        "output_per_m": Decimal("40.00"),
+        "cache_read_per_m": Decimal("5.00"),
     },
     "o3-deep-research-2025-06-26": {
-        "input_per_m": Decimal("2.00"),
-        "output_per_m": Decimal("8.00"),
-        "cache_read_per_m": Decimal("0.50"),
+        "input_per_m": Decimal("10.00"),
+        "output_per_m": Decimal("40.00"),
+        "cache_read_per_m": Decimal("5.00"),
     },
     # ------------------------------------------------------------------
     # o4-mini Deep Research  ($2.00 / $8.00, cache_read $0.275)
