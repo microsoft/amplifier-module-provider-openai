@@ -258,3 +258,43 @@ def test_no_auto_reasoning_for_non_reasoning_model():
         "Non-reasoning model (gpt-4.1-mini) should NOT have reasoning param, "
         f"but got reasoning={kwargs.get('reasoning')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 7 (PR-B regression): encrypted_content include is suppressed when chaining
+# ---------------------------------------------------------------------------
+
+
+def test_encrypted_content_suppressed_under_chaining():
+    """When chaining is active, encrypted_content include is NOT sent.
+
+    Regression for PR-B: the two mechanisms (chaining via previous_response_id
+    and inline encrypted_content) were previously belt-and-suspenders for
+    enable_state=True; PR-B drops encrypted_content because it busts the
+    cache prefix.
+
+    Chaining is "auto" by default and resolves to True for gpt-5.5
+    (supports_reasoning=True). So with default config on a reasoning model,
+    include=[reasoning.encrypted_content] must be absent from the API params.
+    """
+    provider = _make_provider(default_model="gpt-5.5")
+    provider.client.responses.create = AsyncMock(
+        return_value=_make_response_with_reasoning(
+            encrypted_content="enc",
+            reasoning_id="rs_test_chaining",
+            summary=None,
+        )
+    )
+
+    request = ChatRequest(
+        messages=[Message(role="user", content="Hello")],
+    )
+    asyncio.run(provider.complete(request))
+
+    kwargs = _get_call_kwargs(provider)
+    include = kwargs.get("include", [])
+    assert "reasoning.encrypted_content" not in include, (
+        "With chaining active (auto + reasoning model), "
+        "include=reasoning.encrypted_content must NOT be sent. "
+        f"Got include={include}"
+    )

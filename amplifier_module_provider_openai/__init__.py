@@ -50,6 +50,8 @@ from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 from ._constants import NATIVE_TOOL_TYPES
+from ._constants import RESPONSE_CHAIN_INVALIDATED
+from ._constants import RESPONSE_NOT_FOUND_ERROR_CODES
 from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import extract_reasoning_text
 from ._capabilities import get_capabilities
@@ -278,6 +280,39 @@ class OpenAIProvider:
             self.config.get("safety_identifier") or None
         )
 
+        # Response chaining for reasoning models — the Responses API's
+        # `previous_response_id` mechanism. Tri-state:
+        #   "auto" (default) — on iff get_capabilities(model).supports_reasoning
+        #   True             — force on regardless of model
+        #   False            — force off (ZDR / privacy / regulated-industry opt-out)
+        #
+        # When active, three things happen on each call to a reasoning model:
+        #   (a) params["store"] = True
+        #   (b) params["previous_response_id"] = <id from last assistant.metadata>
+        #       (when a prior response_id is available; first turn has none)
+        #   (c) `include=["reasoning.encrypted_content"]` is NOT requested,
+        #       and ThinkingBlocks are NOT re-inserted into the input array
+        #       (server holds the reasoning state under previous_response_id;
+        #       sending encrypted blobs inline busts the cache prefix).
+        #
+        # Per OpenAI Cookbook 201 §4.5: Responses API + chaining gives 40–80%
+        # better cache utilization on reasoning workloads vs. stateless mode.
+        #
+        # Interaction with `enable_state`:
+        #   - `enable_state` remains the broad server-state switch (e.g. for
+        #     callers that need response retrieval/inspection regardless of
+        #     reasoning).
+        #   - `enable_response_chaining` is the cache-driven knob for
+        #     reasoning models specifically.
+        #   - When chaining resolves to True, `store=True` is forced (chaining
+        #     requires it). Otherwise `enable_state` decides `store`.
+        raw_chain = self.config.get("enable_response_chaining", "auto")
+        # Coerce: accept "auto" | True | False | None | "" → normalize to "auto"|True|False
+        if raw_chain in (None, "", "auto"):
+            self.enable_response_chaining: str | bool = "auto"
+        else:
+            self.enable_response_chaining = bool(raw_chain)
+
         # Deep research / background mode configuration
         self.poll_interval = self.config.get("poll_interval", DEFAULT_POLL_INTERVAL)
         self.background_timeout = self.config.get(
@@ -448,6 +483,20 @@ class OpenAIProvider:
                     # `choices`; UI renderers that validate `default in choices`
                     # would reject it. None signals "leave unset" cleanly.
                     default=None,
+                ),
+                ConfigField(
+                    id="enable_response_chaining",
+                    display_name="Enable response chaining",
+                    field_type="choice",
+                    prompt=(
+                        "Response chaining for reasoning models via previous_response_id. "
+                        '"auto" (default) enables chaining for reasoning-capable models '
+                        'only. Set to "false" to disable for ZDR / regulated-industry '
+                        "deployments that cannot retain server-side state."
+                    ),
+                    choices=["auto", "true", "false"],
+                    required=False,
+                    default="auto",
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
                 # ConfigField. It is a per-end-user signal, not a per-deployment
@@ -823,6 +872,22 @@ class OpenAIProvider:
             return []
         return response.tool_calls
 
+    def _should_chain_responses(self, model_id: str, kwargs: dict[str, Any]) -> bool:
+        """Resolve whether response chaining is active for *this* call.
+
+        Precedence (highest first):
+          1. kwargs["enable_response_chaining"]  (per-call override)
+          2. self.enable_response_chaining       (config)
+          3. "auto" → caps.supports_reasoning
+        """
+        override = kwargs.get("enable_response_chaining", self.enable_response_chaining)
+        if override is True:
+            return True
+        if override is False:
+            return False
+        # "auto"
+        return get_capabilities(model_id).supports_reasoning
+
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
     ) -> ChatResponse:
@@ -874,8 +939,16 @@ class OpenAIProvider:
         for conv_msg in conversation:
             all_messages_for_conversion.append(conv_msg.model_dump())
 
+        # Decide chaining BEFORE message conversion so we can suppress
+        # encrypted-content re-insertion when chain_active is True.
+        model_name = kwargs.get("model", self.default_model)
+        chain_active = self._should_chain_responses(model_name, kwargs)
+
         # Convert to OpenAI Responses API message format
-        input_messages = self._convert_messages(all_messages_for_conversion)
+        input_messages = self._convert_messages(
+            all_messages_for_conversion,
+            skip_reasoning_reinsertion=chain_active,
+        )
         logger.info(
             f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
         )
@@ -901,7 +974,7 @@ class OpenAIProvider:
 
         # Prepare request parameters per Responses API spec
         params = {
-            "model": kwargs.get("model", self.default_model),
+            "model": model_name,
             "input": input_messages,  # Array of message objects, not text string
         }
 
@@ -910,7 +983,6 @@ class OpenAIProvider:
         background_mode = kwargs.get("background", False)
 
         # Auto-enable background mode for deep research models
-        model_name = kwargs.get("model", self.default_model)
         if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
             ("o3-deep-research", "o4-mini-deep-research")
         ):
@@ -920,22 +992,39 @@ class OpenAIProvider:
                 f"[PROVIDER] Deep research model detected: {model_name}, background={background_mode}"
             )
 
-        # Determine store parameter early (needed for previous_response_id logic)
-        # Background mode requires store=True
+        # ---- Response chaining resolution (PR-B) -----------------------------
+        # Three knobs interact:
+        #   - background_mode            → forces store=True
+        #   - enable_response_chaining   → for reasoning models, forces store=True
+        #                                  AND attaches previous_response_id
+        #   - enable_state (legacy)      → broad server-state opt-in
+        # Per-call kwargs override config for both.
+        # (chain_active was already resolved above before _convert_messages)
+
         store_enabled = kwargs.get("store", self.enable_state)
         if background_mode:
-            store_enabled = True  # Background mode requires store=True
+            store_enabled = True
             logger.info("[PROVIDER] Background mode enabled, forcing store=True")
+        if chain_active:
+            store_enabled = True  # chaining requires server-side state
         params["store"] = store_enabled
 
-        # Add previous_response_id ONLY if store is enabled (server-side state)
-        # With store=False, we rely on explicit reasoning re-insertion instead
-        if previous_response_id and store_enabled:
+        # Attach previous_response_id when:
+        #   - we found one in the last assistant's metadata, AND
+        #   - either chaining is active for this model, OR
+        #     legacy enable_state is on (preserves existing behavior).
+        # Track on params for downstream invalidation-retry logic.
+        if previous_response_id and (chain_active or store_enabled):
             params["previous_response_id"] = previous_response_id
-            logger.debug("[PROVIDER] Using previous_response_id (store=True)")
-        elif previous_response_id and not store_enabled:
             logger.debug(
-                "[PROVIDER] Skipping previous_response_id (store=False). "
+                "[PROVIDER] Using previous_response_id=%s (chain_active=%s, store=%s)",
+                previous_response_id,
+                chain_active,
+                store_enabled,
+            )
+        elif previous_response_id:
+            logger.debug(
+                "[PROVIDER] Skipping previous_response_id (chain_active=False, store=False). "
                 "Relying on explicit reasoning re-insertion from metadata/content."
             )
 
@@ -984,7 +1073,13 @@ class OpenAIProvider:
         # Without include=[reasoning.encrypted_content], reasoning token content is lost
         # when store=false (Amplifier's default), causing orphaned reasoning references.
         # Exception: explicit effort="none" suppresses include (caller opted out of reasoning).
-        if not store_enabled:
+        #
+        # When chaining is active, server holds reasoning state under
+        # previous_response_id. Re-inserting encrypted_content inline would
+        # (a) be redundant and (b) actively hurt the cache prefix because the
+        # ciphertext changes per call. So skip encrypted-content include when
+        # chaining is on; only request it on stateless/non-reasoning paths.
+        if not store_enabled and not chain_active:
             caps = get_capabilities(model_name)
             active_effort: str | None = None
             if "reasoning" in params:
@@ -1001,7 +1096,7 @@ class OpenAIProvider:
                     "include", ["reasoning.encrypted_content"]
                 )
                 logger.debug(
-                    "[PROVIDER] Requesting encrypted_content (store=False, model will reason: %s, effort=%s)",
+                    "[PROVIDER] Requesting encrypted_content (stateless path, model will reason: %s, effort=%s)",
                     model_name,
                     active_effort or caps.default_reasoning_effort,
                 )
@@ -1273,6 +1368,46 @@ class OpenAIProvider:
                         status_code=403,
                     ) from e
                 if status == 404:
+                    # Specific case: previous_response_id is unknown/expired.
+                    # Retry once without the field (graceful chain rebuild).
+                    err_code = None
+                    if isinstance(body, dict):
+                        err_code = (body.get("error") or {}).get("code")
+                    raw_msg_404 = str(e).lower()
+                    is_chain_invalidation = (
+                        err_code in RESPONSE_NOT_FOUND_ERROR_CODES
+                        or "previous_response_id" in raw_msg_404
+                    )
+                    if is_chain_invalidation and "previous_response_id" in params:
+                        invalidated_id = params.pop("previous_response_id")
+                        logger.warning(
+                            "[PROVIDER] previous_response_id=%s invalidated by server "
+                            "(code=%s). Retrying without chain.",
+                            invalidated_id,
+                            err_code,
+                        )
+                        if self.coordinator and hasattr(self.coordinator, "hooks"):
+                            await self.coordinator.hooks.emit(
+                                RESPONSE_CHAIN_INVALIDATED,
+                                {
+                                    "provider": self.name,
+                                    "model": params.get("model"),
+                                    "invalidated_id": invalidated_id,
+                                    "error_code": err_code,
+                                },
+                            )
+                        # Recurse once. Do NOT loop indefinitely: by removing
+                        # the field, the next call cannot hit this branch again.
+                        # NOTE: when chain_active was True we also suppressed
+                        # encrypted-content re-insertion in _convert_messages.
+                        # That decision is locked into input_messages already;
+                        # the retry uses the same input. The server will treat
+                        # this as a fresh prefix — equivalent to today's
+                        # stateless reasoning behavior. Reasoning state for
+                        # *this* turn is lost; next turn re-chains via the
+                        # response_id we get from this retry.
+                        return await _do_complete()
+                    # Fall through to existing 404 handling
                     raise kernel_errors.NotFoundError(
                         error_msg,
                         provider=self.name,
@@ -1476,6 +1611,11 @@ class OpenAIProvider:
                     continue_params["parallel_tool_calls"] = params.get(
                         "parallel_tool_calls", True
                     )
+                # Note: continue_params intentionally does NOT inherit
+                # previous_response_id. The incomplete-continuation path uses
+                # _build_continuation_input() to carry context forward
+                # explicitly. Mixing previous_response_id with a rebuilt input
+                # array would double-count tokens.
                 if "store" in params:
                     continue_params["store"] = params["store"]
                 if "prompt_cache_key" in params:
@@ -1655,7 +1795,12 @@ class OpenAIProvider:
 
         return info
 
-    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _convert_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        skip_reasoning_reinsertion: bool = False,
+    ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
         Handles:
@@ -1898,7 +2043,16 @@ class OpenAIProvider:
                                             if thinking_text
                                             else []
                                         )
-                                        reasoning_items_to_add.append(reasoning_item)
+                                        if skip_reasoning_reinsertion:
+                                            # Chaining is active: server holds reasoning state under
+                                            # previous_response_id. Don't re-emit encrypted_content
+                                            # (would bust the cache prefix) and don't emit bare rs_*
+                                            # IDs (server already knows them).
+                                            pass
+                                        else:
+                                            reasoning_items_to_add.append(
+                                                reasoning_item
+                                            )
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
                             if block.type == "text":
@@ -2008,7 +2162,14 @@ class OpenAIProvider:
                                         else []
                                     )
 
-                                    reasoning_items_to_add.append(reasoning_item)
+                                    if skip_reasoning_reinsertion:
+                                        # Chaining is active: server holds reasoning state under
+                                        # previous_response_id. Don't re-emit encrypted_content
+                                        # (would bust the cache prefix) and don't emit bare rs_*
+                                        # IDs (server already knows them).
+                                        pass
+                                    else:
+                                        reasoning_items_to_add.append(reasoning_item)
 
                 # Handle simple string content
                 elif isinstance(content, str) and content:

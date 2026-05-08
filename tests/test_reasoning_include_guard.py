@@ -74,8 +74,14 @@ def test_no_include_for_non_reasoning_model():
 
 
 def test_include_sent_when_reasoning_active_store_false():
-    """When reasoning IS active and store=false, include parameter SHOULD be sent."""
-    provider = _make_provider()  # store defaults to false
+    """Stateless path: when reasoning IS active and chaining is off, include IS sent.
+
+    PR-B note: with default config, reasoning models now use chaining (auto mode),
+    which suppresses encrypted_content include. This test validates the stateless
+    fallback with enable_response_chaining=False.
+    """
+    # Disable chaining to exercise the stateless reasoning path
+    provider = _make_provider(enable_response_chaining=False)
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
         reasoning_effort="high",  # Reasoning IS active
@@ -84,14 +90,14 @@ def test_include_sent_when_reasoning_active_store_false():
 
     kwargs = _get_call_kwargs(provider)
     assert "include" in kwargs, (
-        "Reasoning request with store=false should have 'include' parameter"
+        "Stateless reasoning path (chaining=False) should have 'include' parameter"
     )
     assert kwargs["include"] == ["reasoning.encrypted_content"]
 
 
 def test_no_include_when_store_true():
     """When store=true, include parameter should NOT be sent (not needed)."""
-    provider = _make_provider(enable_state=True)
+    provider = _make_provider(enable_state=True, enable_response_chaining=False)
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
         reasoning_effort="high",  # Reasoning active, but store=true
@@ -146,8 +152,13 @@ def test_reasoning_capable_model_always_gets_include_param():
     The fix: gate on caps.supports_reasoning (the capability flag) rather than
     default_reasoning_effort, matching the Anthropic provider's pattern of
     always preserving thinking content for capable models.
+
+    PR-B note: gpt-5.4 now defaults to chaining mode (auto, supports_reasoning=True),
+    which suppresses encrypted_content include. This test validates the stateless
+    fallback path (enable_response_chaining=False).
     """
-    provider = _make_provider(default_model="gpt-5.4")  # enable_state defaults to false
+    # Disable chaining to exercise the stateless reasoning path
+    provider = _make_provider(default_model="gpt-5.4", enable_response_chaining=False)
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
         # No reasoning_effort set — mimics a delegated sub-session with default config
@@ -156,15 +167,21 @@ def test_reasoning_capable_model_always_gets_include_param():
 
     kwargs = _get_call_kwargs(provider)
     assert "include" in kwargs, (
-        "GPT-5.4 reasoning-capable model with no explicit effort must have 'include' parameter "
-        "to prevent silent reasoning token loss (70 occurrences observed on test device)"
+        "GPT-5.4 stateless path (chaining=False): include=[reasoning.encrypted_content] "
+        "must be sent to prevent silent reasoning token loss "
+        "(70 occurrences observed on test device)"
     )
     assert kwargs["include"] == ["reasoning.encrypted_content"]
 
 
 def test_include_with_reasoning_effort_low_store_false():
-    """reasoning_effort='low' with store=false should include encrypted_content."""
-    provider = _make_provider()
+    """Stateless path: reasoning_effort='low' with chaining=off should include encrypted_content.
+
+    PR-B note: with default config, reasoning models use chaining (auto mode),
+    which suppresses encrypted_content. This test validates the stateless fallback.
+    """
+    # Disable chaining to exercise the stateless reasoning path
+    provider = _make_provider(enable_response_chaining=False)
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
         reasoning_effort="low",
@@ -173,6 +190,6 @@ def test_include_with_reasoning_effort_low_store_false():
 
     kwargs = _get_call_kwargs(provider)
     assert "include" in kwargs, (
-        "reasoning_effort='low' with store=false should have 'include'"
+        "Stateless path (chaining=False): reasoning_effort='low' should have 'include'"
     )
     assert kwargs["include"] == ["reasoning.encrypted_content"]

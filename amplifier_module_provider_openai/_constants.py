@@ -83,3 +83,18 @@ BACKGROUND_POLLING_STATUSES = frozenset(
         BACKGROUND_STATUS_SEARCHING,
     }
 )
+
+# Hook event emitted when the server rejects previous_response_id.
+# Caller observability: lets dashboards count chain breaks vs. cache hits.
+RESPONSE_CHAIN_INVALIDATED = "provider:response_chain_invalidated"
+
+# OpenAI error codes that signal "previous_response_id is unknown/expired/foreign-key".
+# Detected against error.body["error"]["code"] (preferred) or, as a fallback,
+# substring match against the raw error message. Keep this set narrow — we do
+# NOT want to swallow generic 4xx errors as "chain invalidations".
+RESPONSE_NOT_FOUND_ERROR_CODES = frozenset(
+    {
+        "response_not_found",
+        "previous_response_not_found",
+    }
+)

@@ -181,12 +181,17 @@ def test_reasoning_effort_none_explicit():
 
 
 def test_gpt54_without_effort_still_includes_encrypted_content():
-    """GPT-5.4 with no explicit reasoning_effort -> include=[reasoning.encrypted_content] IS sent.
+    """GPT-5.4 stateless path (chaining off) -> include=[reasoning.encrypted_content] IS sent.
 
     GPT-5.4 is a reasoning-capable model (supports_reasoning=True) that CAN produce
     reasoning tokens even without explicit effort. Without include=[reasoning.encrypted_content],
     reasoning token content is lost when store=false (Amplifier's default), causing
     orphaned reasoning references (70 occurrences observed on test device).
+
+    PR-B note: gpt-5.4 now defaults to response chaining (auto mode, supports_reasoning=True),
+    which suppresses encrypted_content include in favour of server-side state. This test
+    validates the stateless fallback path, exercised when enable_response_chaining=False
+    (ZDR opt-out / regulated-industry deployments).
 
     Regression test: the include-guard incorrectly gated on default_reasoning_effort
     (None for GPT-5.4), but reasoning-capable models CAN produce tokens even without
@@ -194,11 +199,12 @@ def test_gpt54_without_effort_still_includes_encrypted_content():
     matching the Anthropic provider's pattern of always preserving thinking content for
     capable models.
     """
-    provider = _make_provider(default_model="gpt-5.4")
+    # Disable chaining to exercise the stateless reasoning path (ZDR opt-out / pre-PR-B baseline)
+    provider = _make_provider(default_model="gpt-5.4", enable_response_chaining=False)
     asyncio.run(provider.complete(_request_with_effort(None)))
     kwargs = _get_call_kwargs(provider)
     assert "include" in kwargs, (
-        "GPT-5.4 is reasoning-capable; include=[reasoning.encrypted_content] must be sent "
-        "even without explicit reasoning_effort, to prevent silent reasoning token loss."
+        "GPT-5.4 stateless path (chaining=False): include=[reasoning.encrypted_content] must be "
+        "sent even without explicit reasoning_effort, to prevent silent reasoning token loss."
     )
     assert kwargs["include"] == ["reasoning.encrypted_content"]

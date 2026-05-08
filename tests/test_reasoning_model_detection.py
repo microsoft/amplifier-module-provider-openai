@@ -57,10 +57,16 @@ def _get_call_kwargs(provider: OpenAIProvider) -> dict:
 
 
 def test_include_guard_fires_for_implicit_reasoning_model():
-    """Model gpt-5.2-codex with no explicit reasoning_effort and store=false
-    should still get include=[reasoning.encrypted_content] because it may
-    reason by default."""
-    provider = _make_provider(default_model="gpt-5.2-codex")  # store defaults to false
+    """Stateless path: gpt-5.2-codex with no explicit reasoning_effort and chaining=off
+    should still get include=[reasoning.encrypted_content] because it may reason by default.
+
+    PR-B note: reasoning-capable models now default to chaining mode (auto), which suppresses
+    encrypted_content include. This test validates the stateless fallback (chaining=False).
+    """
+    # Disable chaining to exercise the stateless reasoning path
+    provider = _make_provider(
+        default_model="gpt-5.2-codex", enable_response_chaining=False
+    )
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
         reasoning_effort=None,  # No explicit reasoning
@@ -69,16 +75,21 @@ def test_include_guard_fires_for_implicit_reasoning_model():
 
     kwargs = _get_call_kwargs(provider)
     assert "include" in kwargs, (
-        "Implicit reasoning model (gpt-5.2-codex) with store=false should have "
-        f"'include' parameter, but it was missing. kwargs keys: {list(kwargs.keys())}"
+        "Stateless path (chaining=False): implicit reasoning model (gpt-5.2-codex) "
+        f"should have 'include' parameter. kwargs keys: {list(kwargs.keys())}"
     )
     assert kwargs["include"] == ["reasoning.encrypted_content"]
 
 
 def test_include_guard_fires_for_o_series_model():
-    """Model o4-mini with no explicit reasoning_effort and store=false
-    should still get include=[reasoning.encrypted_content]."""
-    provider = _make_provider(default_model="o4-mini")  # store defaults to false
+    """Stateless path: o4-mini with no explicit reasoning_effort and chaining=off
+    should still get include=[reasoning.encrypted_content].
+
+    PR-B note: reasoning-capable models now default to chaining mode (auto), which suppresses
+    encrypted_content include. This test validates the stateless fallback (chaining=False).
+    """
+    # Disable chaining to exercise the stateless reasoning path
+    provider = _make_provider(default_model="o4-mini", enable_response_chaining=False)
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
         reasoning_effort=None,
@@ -87,7 +98,7 @@ def test_include_guard_fires_for_o_series_model():
 
     kwargs = _get_call_kwargs(provider)
     assert "include" in kwargs, (
-        "o-series model (o4-mini) with store=false should have 'include' parameter"
+        "Stateless path (chaining=False): o-series model (o4-mini) should have 'include' parameter"
     )
     assert kwargs["include"] == ["reasoning.encrypted_content"]
 
