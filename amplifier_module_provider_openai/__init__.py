@@ -41,6 +41,7 @@ from ._constants import DEFAULT_MODEL
 from ._constants import DEFAULT_POLL_INTERVAL
 from ._constants import DEFAULT_REASONING_SUMMARY
 from ._constants import DEFAULT_TIMEOUT
+from ._constants import DEFAULT_PROMPT_CACHE_RETENTION
 from ._constants import DEFAULT_TRUNCATION
 from ._constants import DEEP_RESEARCH_MODELS
 from ._constants import MAX_CONTINUATION_ATTEMPTS
@@ -158,6 +159,33 @@ def _drop_unsupported_in_memory_retention(
     return None
 
 
+def _drop_unsupported_24h_retention(model_id: str, retention: str | None) -> str | None:
+    """Return *retention* unless `"24h"` would be rejected by the model.
+
+    Mirror of `_drop_unsupported_in_memory_retention`. The capability flag
+    `supports_24h_retention` is True for all current model families
+    (smoke-tested against gpt-4o, gpt-5.x, o-series — all accept "24h"
+    despite not being formally enumerated in the cookbook list). Future
+    families that prove to reject "24h" can flip the flag False on their
+    branch in `_capabilities.py`.
+
+    Returns None when the value should be dropped. Otherwise returns
+    *retention* unchanged.
+    """
+    if retention != "24h":
+        return retention
+    caps = get_capabilities(model_id)
+    if caps.supports_24h_retention:
+        return retention
+    logger.warning(
+        "[PROVIDER] Dropping prompt_cache_retention='24h' for model %r: "
+        "model rejects 24h retention. Omit the field or pass 'in_memory' "
+        "to silence this warning.",
+        model_id,
+    )
+    return None
+
+
 class OpenAIProvider:
     """OpenAI Responses API integration."""
 
@@ -197,9 +225,12 @@ class OpenAIProvider:
         self.reasoning_summary = self.config.get(
             "reasoning_summary", DEFAULT_REASONING_SUMMARY
         )
-        self.truncation = self.config.get(
-            "truncation", DEFAULT_TRUNCATION
-        )  # Automatic context management
+        # `truncation` defaults to None (omit the field) for cache stability.
+        # When the model context fills, OpenAI now returns an explicit error
+        # instead of silently rewriting the prefix. Pass
+        # `config={"truncation": "auto"}` to opt into the legacy auto-drop
+        # behavior.
+        self.truncation = self.config.get("truncation", DEFAULT_TRUNCATION)
         self.enable_state = self.config.get("enable_state", False)
         self.raw = self.config.get("raw", False)  # Include raw payload in events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
@@ -218,10 +249,14 @@ class OpenAIProvider:
         #   maximizing cache hit rate. Use this instead of the `user` field for
         #   cache-routing per OpenAI's July 2025 guidance (the `user` field is
         #   retained on the API but is no longer the recommended cache signal).
-        # prompt_cache_retention: "in_memory" (5–10 min, default for gpt-5.4 and
-        #   below) or "24h" (extended GPU-local KV storage; default for gpt-5.5+).
-        #   Leaving None lets OpenAI pick the model-appropriate default — this
-        #   avoids the gpt-5.5 trap where passing "in_memory" returns 400.
+        # prompt_cache_retention: "in_memory" (5–10 min) or "24h" (extended
+        #   GPU-local KV storage). Defaults to "24h" so caching is stable
+        #   across all models, including gpt-5.4 and below where OpenAI's
+        #   server-side default is the much-shorter "in_memory". Models that
+        #   reject "24h" (capability flag False) get the field dropped with a
+        #   warning. Models that reject "in_memory" (gpt-5.5+) get the same
+        #   treatment via the existing helper. Pass None explicitly to fall
+        #   back to OpenAI's per-model default.
         # safety_identifier: abuse-tracking signal — the request-side counterpart
         #   to `prompt_cache_key`. Per-end-user value (not per-deployment), which
         #   is why it is intentionally NOT exposed via ConfigField; set it via
@@ -229,9 +264,16 @@ class OpenAIProvider:
         # Empty strings (e.g. from UI form defaults) are coerced to None so we
         # don't send empty-string fields to OpenAI.
         self.prompt_cache_key: str | None = self.config.get("prompt_cache_key") or None
-        self.prompt_cache_retention: str | None = (
-            self.config.get("prompt_cache_retention") or None
+        # prompt_cache_retention defaults to "24h" so non-gpt-5.5 models get
+        # extended GPU-local KV storage instead of OpenAI's per-model
+        # in_memory default (5–10 min). Use `dict.get(..., DEFAULT)` so an
+        # explicit `None` in config is preserved as "let OpenAI pick the
+        # model default" rather than overridden. Empty string is coerced to
+        # None to match the established UI-form pattern.
+        _retention = self.config.get(
+            "prompt_cache_retention", DEFAULT_PROMPT_CACHE_RETENTION
         )
+        self.prompt_cache_retention: str | None = _retention if _retention else None
         self.safety_identifier: str | None = (
             self.config.get("safety_identifier") or None
         )
@@ -984,9 +1026,11 @@ class OpenAIProvider:
             if max_tool_calls := kwargs.get("max_tool_calls"):
                 params["max_tool_calls"] = max_tool_calls
 
-        # Add truncation parameter for automatic context management
-        if self.truncation:
-            params["truncation"] = kwargs.get("truncation", self.truncation)
+        # Truncation parameter — default None (omit) for cache-prefix
+        # stability; per-call kwarg overrides the config default.
+        truncation = kwargs.get("truncation", self.truncation)
+        if truncation:
+            params["truncation"] = truncation
 
         # Prompt-caching hint parameters (Responses API top-level fields).
         # Per-call kwargs override the config default; None / "" means "do not
@@ -1000,10 +1044,15 @@ class OpenAIProvider:
         prompt_cache_retention = (
             kwargs.get("prompt_cache_retention", self.prompt_cache_retention) or None
         )
-        # Drop "in_memory" for models that only support "24h" (gpt-5.5 family).
-        # Other model/retention combinations are sent through as-is — OpenAI's
-        # supported-model list is mutable and not ours to enforce here.
+        # Drop retention values the model is known to reject. Each helper is
+        # a no-op unless its target value is set AND the capability flag is
+        # False. Today only `supports_in_memory_retention=False` (gpt-5.5)
+        # actually fires; `supports_24h_retention=False` is reserved for
+        # future families that prove to reject "24h".
         prompt_cache_retention = _drop_unsupported_in_memory_retention(
+            model_name, prompt_cache_retention
+        )
+        prompt_cache_retention = _drop_unsupported_24h_retention(
             model_name, prompt_cache_retention
         )
         if prompt_cache_retention is not None:
