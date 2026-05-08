@@ -57,7 +57,10 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.50"),
     },
     # ------------------------------------------------------------------
-    # GPT 5.5 Pro  ($30.00 / $180.00, no cache discount)
+    # GPT 5.5 Pro  ($30.00 / $180.00)
+    # Pro models do not support prompt caching — API never returns
+    # cached tokens.  cache_read_per_m is 0.00 (dead rate, never applied).
+    # Source: https://developers.openai.com/api/docs/models/gpt-5.5-pro
     # ------------------------------------------------------------------
     "gpt-5.5-pro": {
         "input_per_m": Decimal("30.00"),
@@ -73,7 +76,10 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.25"),
     },
     # ------------------------------------------------------------------
-    # GPT 5.4 Pro  ($30.00 / $180.00, no cache discount)
+    # GPT 5.4 Pro  ($30.00 / $180.00)
+    # Pro models do not support prompt caching — API never returns
+    # cached tokens.  cache_read_per_m is 0.00 (dead rate, never applied).
+    # Source: https://developers.openai.com/api/docs/models/gpt-5.4-pro
     # ------------------------------------------------------------------
     "gpt-5.4-pro": {
         "input_per_m": Decimal("30.00"),
