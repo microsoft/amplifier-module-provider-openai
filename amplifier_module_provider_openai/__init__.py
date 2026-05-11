@@ -96,7 +96,15 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_contributor(
         "session.cost",
         "provider-openai",
-        lambda: {"cost_usd": str(_totals["cost_usd"]) if _totals["cost_usd"] is not None else None} if _totals["has_data"] else None,
+        lambda: (
+            {
+                "cost_usd": str(_totals["cost_usd"])
+                if _totals["cost_usd"] is not None
+                else None
+            }
+            if _totals["has_data"]
+            else None
+        ),
     )
     logger.info("Mounted OpenAIProvider (Responses API)")
 
@@ -611,6 +619,8 @@ class OpenAIProvider:
             "gpt-5.5-pro": "GPT 5.5 Pro",
             "gpt-5.4": "GPT 5.4",
             "gpt-5.4-pro": "GPT 5.4 Pro",
+            "gpt-5.4-mini": "GPT 5.4 mini",
+            "gpt-5.4-nano": "GPT 5.4 nano",
             "gpt-5.3-codex": "GPT-5.3 codex",
             "gpt-5.2": "GPT 5.2",
             "gpt-5.2-pro": "GPT 5.2 Pro",
@@ -1699,7 +1709,9 @@ class OpenAIProvider:
                             chat_response.usage.cache_read_tokens
                         )
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
+                    event_usage["cost_usd"] = (
+                        str(_cost_usd) if _cost_usd is not None else None
+                    )
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],
