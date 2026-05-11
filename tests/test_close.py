@@ -68,6 +68,9 @@ class TestMountCleanupBugFix:
             async def mount(self, category, instance, name=None):
                 self.mounted.append((category, instance, name))
 
+            def register_contributor(self, *args, **kwargs):  # noqa: ARG002
+                pass
+
         coordinator = FakeCoordinator()
 
         with patch.dict("os.environ", {"OPENAI_API_KEY": "fake-key-for-test"}):
