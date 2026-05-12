@@ -17,7 +17,7 @@ from decimal import Decimal
 
 import pytest
 
-from amplifier_module_provider_openai._cost import compute_cost
+from amplifier_module_provider_openai._cost import _RATES, _find_rates, compute_cost
 
 
 # ---------------------------------------------------------------------------
@@ -154,9 +154,15 @@ def test_o3_deep_research_cache_read_cost():
 
 def test_o3_deep_research_dated_alias():
     """o3-deep-research-2025-06-26: same rates as o3-deep-research."""
-    assert compute_cost("o3-deep-research-2025-06-26", prompt_tokens=1_000_000) == Decimal("10.00")
-    assert compute_cost("o3-deep-research-2025-06-26", completion_tokens=1_000_000) == Decimal("40.00")
-    assert compute_cost("o3-deep-research-2025-06-26", cached_tokens=1_000_000) == Decimal("5.00")
+    assert compute_cost(
+        "o3-deep-research-2025-06-26", prompt_tokens=1_000_000
+    ) == Decimal("10.00")
+    assert compute_cost(
+        "o3-deep-research-2025-06-26", completion_tokens=1_000_000
+    ) == Decimal("40.00")
+    assert compute_cost(
+        "o3-deep-research-2025-06-26", cached_tokens=1_000_000
+    ) == Decimal("5.00")
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +170,126 @@ def test_o3_deep_research_dated_alias():
 # ---------------------------------------------------------------------------
 def test_o4_mini_deep_research_unchanged():
     """o4-mini-deep-research must remain at $2/$8/$0.275 -- NOT changed by this fix."""
-    assert compute_cost("o4-mini-deep-research", prompt_tokens=1_000_000) == Decimal("2.00")
-    assert compute_cost("o4-mini-deep-research", completion_tokens=1_000_000) == Decimal("8.00")
-    assert compute_cost("o4-mini-deep-research", cached_tokens=1_000_000) == Decimal("0.275")
+    assert compute_cost("o4-mini-deep-research", prompt_tokens=1_000_000) == Decimal(
+        "2.00"
+    )
+    assert compute_cost(
+        "o4-mini-deep-research", completion_tokens=1_000_000
+    ) == Decimal("8.00")
+    assert compute_cost("o4-mini-deep-research", cached_tokens=1_000_000) == Decimal(
+        "0.275"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (p) _find_rates: snapshot fallback — API echoes snapshot ID, not alias
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "snapshot,expected_input,expected_output,expected_cache",
+    [
+        ("gpt-5.5-2026-04-23", Decimal("5.00"), Decimal("30.00"), Decimal("0.50")),
+        (
+            "gpt-5.5-pro-2026-04-23",
+            Decimal("30.00"),
+            Decimal("180.00"),
+            Decimal("0.00"),
+        ),
+        ("gpt-5.4-2026-03-05", Decimal("2.50"), Decimal("15.00"), Decimal("0.25")),
+        (
+            "gpt-5.4-pro-2026-03-05",
+            Decimal("30.00"),
+            Decimal("180.00"),
+            Decimal("0.00"),
+        ),
+        (
+            "o3-deep-research-2025-06-26",
+            Decimal("10.00"),
+            Decimal("40.00"),
+            Decimal("5.00"),
+        ),
+        (
+            "o4-mini-deep-research-2025-06-26",
+            Decimal("2.00"),
+            Decimal("8.00"),
+            Decimal("0.275"),
+        ),
+    ],
+)
+def test_dated_snapshot_resolves_via_fallback(
+    snapshot, expected_input, expected_output, expected_cache
+):
+    """Dated snapshots (what the API echoes back) resolve to the family alias rates."""
+    assert _find_rates(snapshot) is not None, f"{snapshot} should resolve via fallback"
+    assert compute_cost(snapshot, prompt_tokens=1_000_000) == expected_input
+    assert compute_cost(snapshot, completion_tokens=1_000_000) == expected_output
+    assert compute_cost(snapshot, cached_tokens=1_000_000) == expected_cache
+
+
+def test_unknown_family_snapshot_returns_none():
+    """A snapshot whose family alias is not in _RATES must return None, not $0."""
+    assert _find_rates("gpt-6-2026-08-01") is None
+    assert compute_cost("gpt-6-2026-08-01", prompt_tokens=1_000_000) is None
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    ["", "not-a-model", "gpt-5.5-", "gpt-5.5-2026", "gpt-5.5-2026-04", "gpt-5.5-2026-04-23-preview"],
+)
+def test_non_snapshot_garbage_returns_none(garbage):
+    """Strings that don't match the YYYY-MM-DD suffix pattern return None."""
+    assert _find_rates(garbage) is None
+
+
+def test_exact_match_wins_over_family_fallback():
+    """An explicit dated entry in _RATES overrides the family alias (exact-match-wins)."""
+    sentinel = {
+        "input_per_m": Decimal("999.00"),
+        "output_per_m": Decimal("999.00"),
+        "cache_read_per_m": Decimal("999.00"),
+    }
+    _RATES["gpt-5.5-2099-01-01"] = sentinel
+    try:
+        assert _find_rates("gpt-5.5-2099-01-01") is sentinel
+        assert compute_cost("gpt-5.5-2099-01-01", prompt_tokens=1_000_000) == Decimal(
+            "999.00"
+        )
+    finally:
+        del _RATES["gpt-5.5-2099-01-01"]
+
+
+# ---------------------------------------------------------------------------
+# (m) Dated snapshot aliases — API returns snapshot ID, not alias
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "snapshot,input_cost,output_cost,cache_cost",
+    [
+        ("gpt-5.5-2026-04-23", Decimal("5.00"), Decimal("30.00"), Decimal("0.50")),
+        (
+            "gpt-5.5-pro-2026-04-23",
+            Decimal("30.00"),
+            Decimal("180.00"),
+            Decimal("0.00"),
+        ),
+        ("gpt-5.4-2026-03-05", Decimal("2.50"), Decimal("15.00"), Decimal("0.25")),
+        (
+            "gpt-5.4-pro-2026-03-05",
+            Decimal("30.00"),
+            Decimal("180.00"),
+            Decimal("0.00"),
+        ),
+    ],
+)
+def test_dated_snapshot_matches_alias_pricing(
+    snapshot, input_cost, output_cost, cache_cost
+):
+    """Dated snapshot IDs (what the API echoes back) must resolve to the same rates as alias."""
+    assert compute_cost(snapshot, prompt_tokens=1_000_000) == input_cost, (
+        f"{snapshot} input"
+    )
+    assert compute_cost(snapshot, completion_tokens=1_000_000) == output_cost, (
+        f"{snapshot} output"
+    )
+    assert compute_cost(snapshot, cached_tokens=1_000_000) == cache_cost, (
+        f"{snapshot} cache"
+    )
+
