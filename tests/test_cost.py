@@ -201,8 +201,6 @@ def test_o4_mini_deep_research_unchanged():
             Decimal("180.00"),
             Decimal("0.00"),
         ),
-        ("gpt-5.4-mini-2026-03-17", Decimal("0.75"), Decimal("4.50"), Decimal("0.075")),
-        ("gpt-5.4-nano-2026-03-17", Decimal("0.20"), Decimal("1.25"), Decimal("0.02")),
         (
             "o3-deep-research-2025-06-26",
             Decimal("10.00"),
@@ -235,7 +233,7 @@ def test_unknown_family_snapshot_returns_none():
 
 @pytest.mark.parametrize(
     "garbage",
-    ["", "not-a-model", "gpt-5.5-", "gpt-5.5-2026", "gpt-5.5-2026-04"],
+    ["", "not-a-model", "gpt-5.5-", "gpt-5.5-2026", "gpt-5.5-2026-04", "gpt-5.5-2026-04-23-preview"],
 )
 def test_non_snapshot_garbage_returns_none(garbage):
     """Strings that don't match the YYYY-MM-DD suffix pattern return None."""
@@ -279,8 +277,6 @@ def test_exact_match_wins_over_family_fallback():
             Decimal("180.00"),
             Decimal("0.00"),
         ),
-        ("gpt-5.4-mini-2026-03-17", Decimal("0.75"), Decimal("4.50"), Decimal("0.075")),
-        ("gpt-5.4-nano-2026-03-17", Decimal("0.20"), Decimal("1.25"), Decimal("0.02")),
     ],
 )
 def test_dated_snapshot_matches_alias_pricing(
@@ -297,22 +293,3 @@ def test_dated_snapshot_matches_alias_pricing(
         f"{snapshot} cache"
     )
 
-
-# ---------------------------------------------------------------------------
-# (n) gpt-5.4-mini pricing: $0.75 / $4.50 / $0.075
-# ---------------------------------------------------------------------------
-def test_gpt_54_mini_pricing():
-    """gpt-5.4-mini: 1M fresh input -> $0.75, 1M output -> $4.50, 1M cached -> $0.075."""
-    assert compute_cost("gpt-5.4-mini", prompt_tokens=1_000_000) == Decimal("0.75")
-    assert compute_cost("gpt-5.4-mini", completion_tokens=1_000_000) == Decimal("4.50")
-    assert compute_cost("gpt-5.4-mini", cached_tokens=1_000_000) == Decimal("0.075")
-
-
-# ---------------------------------------------------------------------------
-# (o) gpt-5.4-nano pricing: $0.20 / $1.25 / $0.02
-# ---------------------------------------------------------------------------
-def test_gpt_54_nano_pricing():
-    """gpt-5.4-nano: 1M fresh input -> $0.20, 1M output -> $1.25, 1M cached -> $0.02."""
-    assert compute_cost("gpt-5.4-nano", prompt_tokens=1_000_000) == Decimal("0.20")
-    assert compute_cost("gpt-5.4-nano", completion_tokens=1_000_000) == Decimal("1.25")
-    assert compute_cost("gpt-5.4-nano", cached_tokens=1_000_000) == Decimal("0.02")

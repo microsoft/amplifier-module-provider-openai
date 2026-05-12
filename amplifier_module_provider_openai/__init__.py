@@ -619,8 +619,6 @@ class OpenAIProvider:
             "gpt-5.5-pro": "GPT 5.5 Pro",
             "gpt-5.4": "GPT 5.4",
             "gpt-5.4-pro": "GPT 5.4 Pro",
-            "gpt-5.4-mini": "GPT 5.4 mini",
-            "gpt-5.4-nano": "GPT 5.4 nano",
             "gpt-5.3-codex": "GPT-5.3 codex",
             "gpt-5.2": "GPT 5.2",
             "gpt-5.2-pro": "GPT 5.2 Pro",
