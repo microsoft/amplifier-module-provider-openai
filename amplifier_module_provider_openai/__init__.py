@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections import defaultdict
 from decimal import Decimal
 from typing import Any
@@ -1318,25 +1319,141 @@ class OpenAIProvider:
         # Using a list-of-one so the nonlocal assignment works across retries.
         captured_rate_limit_info: dict[str, Any] = {}
 
+        # Per-request streaming override (does NOT mutate self.use_streaming).
+        # Callers like session-namer pass metadata={"stream": False} to force
+        # the blocking create() path and suppress llm:stream_* events.
+        _meta = getattr(request, "metadata", None)
+        _use_streaming = self.use_streaming
+        if isinstance(_meta, dict) and _meta.get("stream") is False:
+            _use_streaming = False
+
+        # Background mode (deep-research polling) does not produce token events;
+        # disable the stream-event loop for that path.
+        supports_streaming = not background_mode
+
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info
             try:
-                if self.use_streaming:
+                if _use_streaming:
                     # Streaming path — chunked HTTP transport prevents timeouts on
-                    # large context requests.  The complete response is collected before
-                    # returning, so callers see no difference in the return value.
-                    async with asyncio.timeout(effective_timeout):
-                        async with self.client.responses.stream(**params) as stream:
-                            response = await stream.get_final_response()
-                            # Extract rate limit headers from the underlying HTTP response.
-                            # The OpenAI SDK stores it as stream._response (httpx.Response).
-                            raw_http = getattr(stream, "_response", None)
-                            headers = getattr(raw_http, "headers", None)
-                            captured_rate_limit_info = self._extract_rate_limit_headers(
-                                headers
+                    # large context requests. The event loop emits contract events
+                    # (llm:stream_*); get_final_response() collects the complete
+                    # response afterwards so callers see no difference in return value.
+                    request_id = str(uuid.uuid4())
+                    seq: dict[int, int] = {}          # block_index → next seq number
+                    block_types: dict[int, str] = {}  # block_index → contract type
+                    partial_emitted = False
+                    hooks_available = bool(
+                        self.coordinator and hasattr(self.coordinator, "hooks")
+                    )
+                    # Emit events only when coordinator is present AND this is not
+                    # a background-mode (deep-research) polling call.
+                    emit_stream_events = hooks_available and supports_streaming
+
+                    try:
+                        async with asyncio.timeout(effective_timeout):
+                            async with self.client.responses.stream(**params) as stream:
+                                if emit_stream_events:
+                                    async for event in stream:
+                                        et = event.type
+
+                                        if et == "response.output_item.added":
+                                            idx = event.output_index
+                                            item_type = getattr(event.item, "type", None)
+                                            block_type = {
+                                                "message": "text",
+                                                "reasoning": "thinking",
+                                                "function_call": "tool_use",
+                                            }.get(item_type, "text")
+                                            block_types[idx] = block_type
+                                            seq[idx] = 0
+                                            payload: dict[str, Any] = {
+                                                "request_id": request_id,
+                                                "block_index": idx,
+                                                "block_type": block_type,
+                                            }
+                                            if block_type == "tool_use":
+                                                name = getattr(event.item, "name", None)
+                                                if name:
+                                                    payload["name"] = name
+                                            await self.coordinator.hooks.emit(
+                                                "llm:stream_block_start", payload
+                                            )
+
+                                        elif et == "response.output_text.delta":
+                                            text = event.delta
+                                            if text:
+                                                idx = event.output_index
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_delta",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "block_type": block_types.get(idx, "text"),
+                                                        "sequence": seq.get(idx, 0),
+                                                        "text": text,
+                                                    },
+                                                )
+                                                seq[idx] = seq.get(idx, 0) + 1
+                                                partial_emitted = True
+
+                                        elif et in (
+                                            "response.reasoning_summary_text.delta",
+                                            "response.reasoning_text.delta",
+                                        ):
+                                            text = event.delta
+                                            if text:
+                                                idx = event.output_index
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_delta",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "block_type": block_types.get(idx, "thinking"),
+                                                        "sequence": seq.get(idx, 0),
+                                                        "text": text,
+                                                    },
+                                                )
+                                                seq[idx] = seq.get(idx, 0) + 1
+                                                partial_emitted = True
+
+                                        elif et == "response.output_item.done":
+                                            idx = event.output_index
+                                            if idx in block_types:
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_end",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "block_type": block_types[idx],
+                                                    },
+                                                )
+
+                                response = await stream.get_final_response()
+                                # Extract rate limit headers from the underlying HTTP response.
+                                # The OpenAI SDK stores it as stream._response (httpx.Response).
+                                raw_http = getattr(stream, "_response", None)
+                                headers = getattr(raw_http, "headers", None)
+                                captured_rate_limit_info = (
+                                    self._extract_rate_limit_headers(headers)
+                                )
+                                return response
+                    except Exception as e:
+                        # If a partial stream was already emitted, signal abort to
+                        # consumers before re-raising for normal error translation.
+                        if partial_emitted and hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_aborted",
+                                {
+                                    "request_id": request_id,
+                                    "error": {
+                                        "type": type(e).__name__,
+                                        "msg": str(e),
+                                    },
+                                },
                             )
-                            return response
+                        raise
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
                     return await asyncio.wait_for(
