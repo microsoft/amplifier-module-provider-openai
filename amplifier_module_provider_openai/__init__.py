@@ -1390,6 +1390,7 @@ class OpenAIProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
+                                                        "block_type": block_types.get(idx, "text"),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -1405,10 +1406,11 @@ class OpenAIProvider:
                                             if text:
                                                 idx = event.output_index
                                                 await self.coordinator.hooks.emit(
-                                                    "llm:stream_thinking_delta",
+                                                    "llm:stream_block_delta",
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
+                                                        "block_type": block_types.get(idx, "thinking"),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },

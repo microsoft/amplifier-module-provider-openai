@@ -426,6 +426,7 @@ def test_stream_text_block_events_in_order():
     assert name1 == "llm:stream_block_delta"
     assert p1["request_id"] == request_id
     assert p1["block_index"] == 0
+    assert p1["block_type"] == "text"
     assert p1["sequence"] == 0
     assert p1["text"] == "Hello, world!"
 
@@ -481,12 +482,12 @@ def test_stream_delta_sequence_is_per_block():
 
 
 # ---------------------------------------------------------------------------
-# 11. Thinking (reasoning) block emits llm:stream_thinking_delta
+# 11. Thinking (reasoning) block emits llm:stream_block_delta with block_type:"thinking"
 # ---------------------------------------------------------------------------
 
 
 def test_stream_thinking_block():
-    """A reasoning output block emits thinking_delta, not block_delta."""
+    """A reasoning output block emits block_delta with block_type='thinking' (not a separate event)."""
     provider = OpenAIProvider(
         api_key="test-key",
         config={"use_streaming": True, "max_retries": 0},
@@ -525,7 +526,7 @@ def test_stream_thinking_block():
     names = [n for n, _ in stream_events]
     assert names == [
         "llm:stream_block_start",
-        "llm:stream_thinking_delta",
+        "llm:stream_block_delta",
         "llm:stream_block_end",
     ], f"Got: {names}"
 
@@ -536,6 +537,7 @@ def test_stream_thinking_block():
     assert delta_p["text"] == "I am thinking..."
     assert delta_p["sequence"] == 0
     assert delta_p["request_id"] == start_p["request_id"]
+    assert delta_p["block_type"] == "thinking"
 
     _, end_p = stream_events[2]
     assert end_p["block_type"] == "thinking"
@@ -784,3 +786,4 @@ def test_stream_empty_delta_not_emitted():
     ]
     assert len(deltas) == 1, "Only the non-empty delta should be emitted"
     assert deltas[0]["text"] == "real"
+    assert deltas[0]["block_type"] == "text"
