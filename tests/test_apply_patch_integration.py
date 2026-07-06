@@ -99,6 +99,350 @@ class TestConvertToolsFromRequest:
         assert result[0]["name"] == "read_file"
 
 
+class TestConvertToolsFromRequestModelGating:
+    """Model-aware gating for native apply_patch.
+
+    Regression coverage for the bug where the native ``{"type": "apply_patch"}``
+    tool shape was sent to gpt-5-mini (which does not support it), causing:
+    "Tool 'apply_patch' is not supported with gpt-5-mini".
+
+    The gate must check BOTH the session-wide apply_patch.engine capability
+    AND the specific model's ModelCapabilities.supports_native_apply_patch.
+    """
+
+    def test_native_apply_patch_falls_back_for_unsupported_model(self) -> None:
+        """gpt-5-mini does not support native apply_patch — must fall back
+        to the function-tool shape instead of erroring against the API."""
+        provider = _make_provider(default_model="gpt-5-mini")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "gpt-5-mini")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 0
+        func_tools = [t for t in result if t.get("type") == "function"]
+        assert len(func_tools) == 1
+        assert func_tools[0]["name"] == "apply_patch"
+
+    def test_native_apply_patch_sent_for_supporting_model(self) -> None:
+        """gpt-5.1 is confirmed to support native apply_patch — the native
+        shape must still be sent for models known to support it."""
+        provider = _make_provider(default_model="gpt-5.1")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "gpt-5.1")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 1
+        assert native_tools[0] == {"type": "apply_patch"}
+
+    def test_gpt_5_4_still_gets_native_shape(self) -> None:
+        """gpt-5.4 (confirmed supported) is unaffected by the model gate."""
+        provider = _make_provider(default_model="gpt-5.4")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "gpt-5.4")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 1
+
+    def test_falls_back_to_default_model_when_model_name_omitted(self) -> None:
+        """When callers don't pass model_name explicitly, the provider's
+        configured default_model is used to resolve capabilities."""
+        provider = _make_provider(default_model="gpt-5-mini")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec])
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 0
+        func_tools = [t for t in result if t.get("type") == "function"]
+        assert len(func_tools) == 1
+
+    # --- Default-True-with-named-exclusions regression coverage ---
+    #
+    # Empirical basis: live calls to the Responses API disproved a naive
+    # "exclude all -mini/-nano" rule. The dividing line is VERSION, not SIZE:
+    # every gpt-5.1+ variant supports native apply_patch (mini/nano included),
+    # while the original gpt-5.0 generation (bare gpt-5, gpt-5-mini, gpt-5-nano,
+    # gpt-5-codex, gpt-5-pro, gpt-5-chat-latest) does not. Per explicit product
+    # direction, the philosophy is now DEFAULT TRUE / exclude only proven
+    # failures: "-chat-latest" aliases are NOT excluded as a blanket class
+    # anymore — only the single alias proven to fail (gpt-5.1-chat-latest) is
+    # a named exception. gpt-5.3-chat-latest, previously a known false
+    # negative, now correctly resolves True.
+
+    def test_gpt_5_4_mini_supports_native_apply_patch(self) -> None:
+        """gpt-5.4-mini is confirmed supported despite being a 'mini' size —
+        the version-gated rule (minor >= 1) overrides model size."""
+        provider = _make_provider(default_model="gpt-5.4-mini")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "gpt-5.4-mini")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 1
+
+    def test_gpt_5_4_nano_supports_native_apply_patch(self) -> None:
+        """gpt-5.4-nano is confirmed supported — 'nano' size is also not an
+        exclusion signal once minor >= 1."""
+        provider = _make_provider(default_model="gpt-5.4-nano")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "gpt-5.4-nano")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 1
+
+    def test_gpt_5_nano_bare_does_not_support_native_apply_patch(self) -> None:
+        """gpt-5-nano (gpt-5.0 generation, minor==0) is confirmed NOT supported."""
+        provider = _make_provider(default_model="gpt-5-nano")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "gpt-5-nano")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 0
+        func_tools = [t for t in result if t.get("type") == "function"]
+        assert len(func_tools) == 1
+
+    def test_gpt_5_codex_bare_does_not_support_native_apply_patch(self) -> None:
+        """gpt-5-codex (gpt-5.0 generation) is confirmed NOT supported."""
+        provider = _make_provider(default_model="gpt-5-codex")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "gpt-5-codex")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 0
+        func_tools = [t for t in result if t.get("type") == "function"]
+        assert len(func_tools) == 1
+
+    def test_gpt_5_1_codex_max_supports_native_apply_patch(self) -> None:
+        """gpt-5.1-codex-max is confirmed supported (minor==1)."""
+        provider = _make_provider(default_model="gpt-5.1-codex-max")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "gpt-5.1-codex-max")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 1
+
+    def test_gpt_5_1_chat_latest_does_not_support_native_apply_patch(self) -> None:
+        """gpt-5.1-chat-latest is confirmed NOT supported despite minor==1 —
+        the blanket "-chat-latest" exclusion overrides the version rule."""
+        provider = _make_provider(default_model="gpt-5.1-chat-latest")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request(
+            [tool_spec], "gpt-5.1-chat-latest"
+        )
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 0
+        func_tools = [t for t in result if t.get("type") == "function"]
+        assert len(func_tools) == 1
+
+    def test_o3_mini_does_not_support_native_apply_patch(self) -> None:
+        """o3-mini (o-series) is confirmed NOT supported."""
+        provider = _make_provider(default_model="o3-mini")
+        provider._apply_patch_native = True
+
+        tool_spec = _make_apply_patch_tool_spec()
+        result = provider._convert_tools_from_request([tool_spec], "o3-mini")
+
+        native_tools = [t for t in result if t.get("type") == "apply_patch"]
+        assert len(native_tools) == 0
+        func_tools = [t for t in result if t.get("type") == "function"]
+        assert len(func_tools) == 1
+
+
+# --- Direct unit tests on get_capabilities() version-gated apply_patch rule ---
+
+
+class TestGetCapabilitiesApplyPatchDefaultTrueRule:
+    """Direct tests on `_capabilities.get_capabilities()` — not routed through
+    the provider's tool-conversion wrapper. Covers the DEFAULT-TRUE-WITH-
+    NAMED-EXCLUSIONS rule (superseding the earlier version-gated-only rule),
+    empirically derived from live Responses API calls (2026-07).
+
+    Philosophy: default to True (assume support); only exclude models/
+    families we have direct empirical proof reject the native tool. This
+    means the gpt-5.0 generation, o-series, deep-research, gpt-5.1-chat-latest
+    (named exception), and gpt-4.x (named prefix carve-out) are the ONLY
+    exclusions — everything else, including future/unrecognized model ids,
+    defaults True.
+    """
+
+    def test_gpt_5_4_mini_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5.4-mini").supports_native_apply_patch is True
+
+    def test_gpt_5_4_nano_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5.4-nano").supports_native_apply_patch is True
+
+    def test_gpt_5_mini_bare_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5-mini").supports_native_apply_patch is False
+
+    def test_gpt_5_nano_bare_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5-nano").supports_native_apply_patch is False
+
+    def test_gpt_5_codex_bare_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5-codex").supports_native_apply_patch is False
+
+    def test_gpt_5_pro_bare_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5-pro").supports_native_apply_patch is False
+
+    def test_gpt_5_bare_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5").supports_native_apply_patch is False
+
+    def test_gpt_5_1_codex_max_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5.1-codex-max").supports_native_apply_patch is True
+
+    def test_gpt_5_1_codex_mini_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert (
+            get_capabilities("gpt-5.1-codex-mini").supports_native_apply_patch is True
+        )
+
+    def test_gpt_5_1_chat_latest_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert (
+            get_capabilities("gpt-5.1-chat-latest").supports_native_apply_patch is False
+        )
+
+    def test_gpt_5_3_chat_latest_supported_no_longer_excluded(self) -> None:
+        """Accuracy improvement over the old rule: gpt-5.3-chat-latest is
+        empirically SUPPORTED. The old blanket "-chat-latest" exclusion
+        produced a false negative here; the new default-True-with-named-
+        exclusions rule correctly resolves this to True since it is not the
+        one named exception (gpt-5.1-chat-latest)."""
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert (
+            get_capabilities("gpt-5.3-chat-latest").supports_native_apply_patch is True
+        )
+
+    def test_gpt_5_chat_latest_bare_not_supported(self) -> None:
+        """gpt-5-chat-latest (gpt-5.0 generation, minor==0) is confirmed
+        NOT supported — covered by the minor==0 rule, not the named
+        gpt-5.1-chat-latest exception."""
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert (
+            get_capabilities("gpt-5-chat-latest").supports_native_apply_patch is False
+        )
+
+    def test_gpt_5_5_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-5.5").supports_native_apply_patch is True
+
+    def test_o3_mini_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("o3-mini").supports_native_apply_patch is False
+
+    def test_o4_mini_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("o4-mini").supports_native_apply_patch is False
+
+    def test_deep_research_not_supported(self) -> None:
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("o3-deep-research").supports_native_apply_patch is False
+
+    # --- gpt-4.x carve-out: confirmed NOT supported, must not silently ---
+    # --- flip True when the "unknown" bucket's default changes to True. ---
+
+    def test_gpt_4_1_not_supported(self) -> None:
+        """gpt-4.1 is confirmed NOT supported — the gpt-4.x carve-out must
+        override the new "unknown family defaults True" behavior."""
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-4.1").supports_native_apply_patch is False
+
+    def test_gpt_4o_not_supported(self) -> None:
+        """gpt-4o is confirmed NOT supported — same carve-out as gpt-4.1."""
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-4o").supports_native_apply_patch is False
+
+    def test_gpt_4_1_mini_not_supported(self) -> None:
+        """gpt-4.1-mini is confirmed NOT supported."""
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-4.1-mini").supports_native_apply_patch is False
+
+    def test_gpt_4o_mini_not_supported(self) -> None:
+        """gpt-4o-mini is confirmed NOT supported."""
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        assert get_capabilities("gpt-4o-mini").supports_native_apply_patch is False
+
+    def test_gpt_4_x_family_stays_unknown(self) -> None:
+        """The gpt-4.x carve-out must be a narrow model_id override, NOT a
+        new family branch — family stays "unknown" so every other capability
+        default (context_window, reasoning, etc.) is untouched."""
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        caps = get_capabilities("gpt-4.1")
+        assert caps.family == "unknown"
+        assert caps.supports_native_apply_patch is False
+        # Other fields must match the plain "unknown" bucket defaults.
+        assert caps.context_window == 200_000
+        assert caps.max_output_tokens == 128_000
+        assert caps.supports_reasoning is False
+
+    # --- "unknown" bucket now defaults True (loud-failure-accepted trade-off) ---
+
+    def test_novel_unrecognized_model_defaults_true(self) -> None:
+        """A genuinely novel/untested model id (not matching any known
+        family or the gpt-4.x prefix) now defaults True — the accepted
+        trade-off per explicit product direction: default-optimistic, find
+        out via a loud API rejection if a future model doesn't support it."""
+        from amplifier_module_provider_openai._capabilities import get_capabilities
+
+        caps = get_capabilities("gpt-6-hypothetical")
+        assert caps.family == "unknown"
+        assert caps.supports_native_apply_patch is True
+
+    def test_default_dataclass_supports_native_apply_patch_is_true(self) -> None:
+        """The bare dataclass default (no family-specific override at all)
+        is True — the new baseline philosophy."""
+        from amplifier_module_provider_openai._capabilities import ModelCapabilities
+
+        assert ModelCapabilities(family="test").supports_native_apply_patch is True
+
+
 # --- Test _convert_to_chat_response (apply_patch_call parsing) ---
 
 
@@ -119,11 +463,14 @@ class TestConvertResponseApplyPatchCall:
         mock_block.operation = mock_operation
 
         mock_response = MagicMock()
+        mock_response.model = "gpt-5.5"
         mock_response.output = [mock_block]
         mock_response.usage = MagicMock()
         mock_response.usage.input_tokens = 100
         mock_response.usage.output_tokens = 50
         mock_response.usage.total_tokens = 150
+        mock_response.usage.prompt_tokens = 100
+        mock_response.usage.completion_tokens = 50
         mock_response.usage.output_tokens_details = None
         mock_response.usage.input_tokens_details = None
         mock_response.id = "resp_123"
@@ -158,11 +505,14 @@ class TestConvertResponseApplyPatchCall:
         mock_block.operation = mock_operation
 
         mock_response = MagicMock()
+        mock_response.model = "gpt-5.5"
         mock_response.output = [mock_block]
         mock_response.usage = MagicMock()
         mock_response.usage.input_tokens = 10
         mock_response.usage.output_tokens = 5
         mock_response.usage.total_tokens = 15
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
         mock_response.usage.output_tokens_details = None
         mock_response.usage.input_tokens_details = None
         mock_response.id = "resp_456"
@@ -591,11 +941,14 @@ class TestApplyPatchCallHistoryReplay:
         mock_block.arguments = '{"path": "src/main.py"}'
 
         mock_response = MagicMock()
+        mock_response.model = "gpt-5.5"
         mock_response.output = [mock_block]
         mock_response.usage = MagicMock()
         mock_response.usage.input_tokens = 10
         mock_response.usage.output_tokens = 5
         mock_response.usage.total_tokens = 15
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
         mock_response.usage.output_tokens_details = None
         mock_response.usage.input_tokens_details = None
         mock_response.id = "resp_bugA"
