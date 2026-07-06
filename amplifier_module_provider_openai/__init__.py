@@ -1186,7 +1186,9 @@ class OpenAIProvider:
             tools_list.extend(native_tools)
 
         if tools_list:
-            params["tools"] = self._convert_tools_from_request(tools_list)
+            params["tools"] = self._convert_tools_from_request(
+                tools_list, model_name
+            )
             # Add tool-related parameters per Responses API spec
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
             params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
@@ -2534,7 +2536,9 @@ class OpenAIProvider:
 
         return openai_messages
 
-    def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
+    def _convert_tools_from_request(
+        self, tools: list, model_name: str | None = None
+    ) -> list[dict[str, Any]]:
         """Convert ToolSpec objects from ChatRequest to OpenAI format.
 
         Handles both user-defined function tools and native OpenAI-hosted tools
@@ -2546,11 +2550,17 @@ class OpenAIProvider:
 
         Args:
             tools: List of ToolSpec objects or native tool dicts
+            model_name: Model actually being used for this request. Required to
+                decide whether the native `{"type": "apply_patch"}` tool shape is
+                safe to send (not every model supports it — see
+                ModelCapabilities.supports_native_apply_patch). Falls back to
+                self.default_model when omitted (e.g. existing call sites/tests).
 
         Returns:
             List of OpenAI-formatted tool definitions
         """
         openai_tools = []
+        resolved_model = model_name or self.default_model
 
         # Lazy detection of native apply_patch engine via coordinator capability.
         # Once detected, the flag persists — no repeated lookups.
@@ -2571,10 +2581,21 @@ class OpenAIProvider:
 
             # Handle ToolSpec objects (user-defined function tools)
             if hasattr(tool, "name"):
-                # Special handling for apply_patch with native engine
+                # Special handling for apply_patch with native engine — but only
+                # for models confirmed to support OpenAI's native apply_patch tool
+                # type. Sending {"type": "apply_patch"} to an unsupported model
+                # (e.g. gpt-5-mini) causes the API to reject the request outright:
+                # "Tool 'apply_patch' is not supported with gpt-5-mini". Fall back
+                # to the already-supported function-tool shape in that case.
                 if tool.name == "apply_patch" and self._apply_patch_native:
-                    openai_tools.append({"type": "apply_patch"})
-                    continue
+                    if get_capabilities(resolved_model).supports_native_apply_patch:
+                        openai_tools.append({"type": "apply_patch"})
+                        continue
+                    logger.info(
+                        "[PROVIDER] Model %s does not support native apply_patch; "
+                        "falling back to function-tool mode for this request.",
+                        resolved_model,
+                    )
 
                 openai_tools.append(
                     {
