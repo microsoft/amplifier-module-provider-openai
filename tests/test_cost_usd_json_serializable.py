@@ -244,13 +244,34 @@ def test_llm_response_event_cost_usd_round_trips_through_json():
 # ---------------------------------------------------------------------------
 
 
-def test_usage_model_stores_decimal_internally():
-    """result.usage.cost_usd must be Decimal, not str.
+def test_usage_model_direct_access_is_decimal_but_model_dump_is_str():
+    """result.usage.cost_usd is Decimal via direct attribute access, but
+    model_dump() always stringifies it — even in plain (non-JSON) mode.
 
-    Brian's fix keeps Decimal *inside* the system for arithmetic precision and
-    converts to str only at the emission boundary.  This test documents and
-    guards that contract: changing _convert_to_chat_response to store str(cost)
-    instead of cost would break this test.
+    Brian's fix keeps Decimal *inside* the system for arithmetic precision;
+    direct attribute access on the Usage instance bypasses serialization and
+    returns the raw Decimal untouched.
+
+    However, `amplifier_core.message_models.Usage.cost_usd` carries:
+
+        @field_serializer("cost_usd", when_used="always")
+        def serialize_cost_usd(self, v): return str(v) if v is not None else None
+
+    `when_used="always"` means the serializer fires on *every* model_dump()
+    call, not just `mode="json"`. This is deliberate (amplifier-core commit
+    91fa469, "fix: Decimal JSON serialization for Usage.cost_usd — required
+    for M2 cost stamping (#73)") so that Decimal can never leak out through a
+    plain `model_dump()` anywhere in the system, not only at explicit JSON
+    boundaries. amplifier-core's own test suite asserts this exact contract
+    (`tests/test_cost_usd_serialization.py::test_model_dump_returns_string`).
+
+    So: direct attribute access → Decimal (arithmetic-safe).
+        model_dump() (plain or JSON mode) → str (JSON-safe), always.
+
+    NOTE: the identical stale assertion (expecting model_dump() to preserve
+    Decimal) was also found in microsoft/amplifier-module-provider-anthropic's
+    test suite and fails there for the same reason. Out of scope for this fix,
+    but flagged for awareness — that repo's test needs the same correction.
     """
     provider = _make_provider()
     fake_coordinator = FakeCoordinator()
@@ -274,8 +295,11 @@ def test_usage_model_stores_decimal_internally():
         f"emission boundary only. Got {internal_cost!r}"
     )
 
-    # model_dump() also returns Decimal — Pydantic preserves the type
+    # model_dump() always stringifies cost_usd via Usage's field_serializer
+    # (when_used="always"), even in plain non-JSON mode — this is intentional
+    # so a plain model_dump() can never leak a JSON-unsafe Decimal.
     dumped_cost = result.usage.model_dump().get("cost_usd")
-    assert isinstance(dumped_cost, Decimal), (
-        f"model_dump()['cost_usd'] must be Decimal, got {type(dumped_cost).__name__!r}"
+    assert isinstance(dumped_cost, str), (
+        f"model_dump()['cost_usd'] must be str (the field_serializer runs with "
+        f"when_used='always'), got {type(dumped_cost).__name__!r}: {dumped_cost!r}"
     )
