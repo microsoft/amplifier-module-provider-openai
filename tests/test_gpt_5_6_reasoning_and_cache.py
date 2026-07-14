@@ -151,3 +151,27 @@ def test_prompt_cache_options_kwarg_overrides_config():
         provider.complete(_simple_request(), prompt_cache_options={"mode": "explicit"})
     )
     assert _captured_params(provider)["prompt_cache_options"] == {"mode": "explicit"}
+
+
+def test_prompt_cache_options_forwarded_on_continuation():
+    """prompt_cache_options must survive an incomplete->continuation sequence.
+
+    Mirrors test_cache_params.test_continuation_inherits_cache_params: if the
+    continuation-forwarding block ever drops the field, this catches it (the
+    continuation call would otherwise land on a different cache policy).
+    """
+    provider = _make_provider(
+        default_model="gpt-5.6-sol", prompt_cache_options={"mode": "explicit"}
+    )
+    incomplete_resp = SimpleNamespace(
+        status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
+    )
+    provider.client.responses.create = AsyncMock(
+        side_effect=[incomplete_resp, DummyResponse()]
+    )
+    asyncio.run(provider.complete(_simple_request()))
+
+    calls = provider.client.responses.create.call_args_list
+    assert len(calls) == 2
+    for call in calls:
+        assert call.kwargs.get("prompt_cache_options") == {"mode": "explicit"}

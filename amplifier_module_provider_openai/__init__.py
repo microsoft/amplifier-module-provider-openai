@@ -1947,6 +1947,10 @@ class OpenAIProvider:
                     ]
                 if "safety_identifier" in params:
                     continue_params["safety_identifier"] = params["safety_identifier"]
+                if "prompt_cache_options" in params:
+                    continue_params["prompt_cache_options"] = params[
+                        "prompt_cache_options"
+                    ]
 
                 # Make continuation call
                 try:
