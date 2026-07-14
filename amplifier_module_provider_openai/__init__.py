@@ -190,6 +190,53 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     )
 
 
+# reasoning.mode selects the reasoning strategy. Verified live against gpt-5.6-sol
+# 2026-07-14: mode in {"standard", "pro"} ("pro" = deeper internal reasoning, one
+# final answer). Only forwarded when the caller sets it; models that do not support
+# a mode (pre-5.6) reject it loudly at the API, which is the desired fail-loud.
+_REASONING_MODE_ALLOWED = frozenset({"standard", "pro"})
+
+
+def _validate_reasoning_mode(reasoning_param: Any) -> None:
+    """Reject a reasoning.mode value the API would not accept.
+
+    Validates the value (not model support) when present -- a clear pre-flight
+    error instead of an opaque HTTP 400. No-op unless reasoning_param is a dict
+    carrying a non-None 'mode'.
+    """
+    if not isinstance(reasoning_param, dict):
+        return
+    mode = reasoning_param.get("mode")
+    if mode is None or mode in _REASONING_MODE_ALLOWED:
+        return
+    raise kernel_errors.InvalidRequestError(
+        f"reasoning.mode must be one of {{'standard', 'pro'}}; got {mode!r}. "
+        f"'pro' requires a GPT-5.6 model (verified against live API 2026-07-14)."
+    )
+
+
+# prompt_cache_options.mode is a stable enum; ttl currently accepts only "30m" but
+# is left to the API to validate (it is the more volatile field). Verified live
+# against gpt-5.6-sol 2026-07-14. Note: prompt_cache_options COEXISTS with
+# prompt_cache_retention -- it does not replace it.
+_PROMPT_CACHE_OPTIONS_MODES = frozenset({"implicit", "explicit"})
+
+
+def _validate_prompt_cache_options(options: Any) -> None:
+    """Validate the prompt_cache_options object shape/mode enum pre-flight."""
+    if not isinstance(options, dict):
+        raise kernel_errors.InvalidRequestError(
+            f"prompt_cache_options must be an object with 'mode'/'ttl'; "
+            f"got {type(options).__name__}."
+        )
+    mode = options.get("mode")
+    if mode is not None and mode not in _PROMPT_CACHE_OPTIONS_MODES:
+        raise kernel_errors.InvalidRequestError(
+            f"prompt_cache_options.mode must be one of "
+            f"{{'implicit', 'explicit'}}; got {mode!r}."
+        )
+
+
 def _drop_unsupported_in_memory_retention(
     model_id: str, retention: str | None
 ) -> str | None:
@@ -339,6 +386,12 @@ class OpenAIProvider:
             "prompt_cache_retention", DEFAULT_PROMPT_CACHE_RETENTION
         )
         self.prompt_cache_retention: str | None = _retention if _retention else None
+        # prompt_cache_options (GPT-5.6): explicit prompt-cache control that COEXISTS
+        # with prompt_cache_retention. Shape {"mode": "implicit"|"explicit", "ttl":
+        # "30m"}; default None = do not send. Verified live 2026-07-14.
+        self.prompt_cache_options: dict | None = (
+            self.config.get("prompt_cache_options") or None
+        )
         self.safety_identifier: str | None = (
             self.config.get("safety_identifier") or None
         )
@@ -519,7 +572,7 @@ class OpenAIProvider:
                     display_name="Reasoning Effort",
                     field_type="choice",
                     prompt="Select reasoning effort level",
-                    choices=["none", "low", "medium", "high", "xhigh"],
+                    choices=["none", "low", "medium", "high", "xhigh", "max"],
                     default="none",
                     required=False,
                     requires_model=True,  # Shown after model selection
@@ -1126,6 +1179,7 @@ class OpenAIProvider:
         if reasoning_param is None:
             reasoning_param = self.reasoning
         _validate_gpt_5_5_pro_effort(model_name, reasoning_param)
+        _validate_reasoning_mode(reasoning_param)
         if reasoning_param:
             # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
             if isinstance(reasoning_param, dict):
@@ -1134,6 +1188,12 @@ class OpenAIProvider:
                     "effort": reasoning_param.get("effort", "medium"),
                     "summary": reasoning_param.get("summary", self.reasoning_summary),
                 }
+                # reasoning.mode: "pro" (GPT-5.6) enables extended internal reasoning.
+                # Only forwarded when the caller sets it, so pre-5.6 models are
+                # unaffected; verified live 2026-07-14 (mode in {standard, pro}).
+                _reasoning_mode = reasoning_param.get("mode")
+                if _reasoning_mode is not None:
+                    params["reasoning"]["mode"] = _reasoning_mode
             else:
                 # String format: use as effort level with default summary
                 params["reasoning"] = {
@@ -1186,9 +1246,7 @@ class OpenAIProvider:
             tools_list.extend(native_tools)
 
         if tools_list:
-            params["tools"] = self._convert_tools_from_request(
-                tools_list, model_name
-            )
+            params["tools"] = self._convert_tools_from_request(tools_list, model_name)
             # Add tool-related parameters per Responses API spec
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
             params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
@@ -1228,6 +1286,17 @@ class OpenAIProvider:
         )
         if prompt_cache_retention is not None:
             params["prompt_cache_retention"] = prompt_cache_retention
+
+        # prompt_cache_options (GPT-5.6): explicit prompt-cache control that COEXISTS
+        # with prompt_cache_retention (verified live 2026-07-14 -- both are echoed
+        # together; it is NOT a replacement). Forwarded verbatim after a mode-enum
+        # pre-flight check; the API validates ttl (currently only "30m").
+        prompt_cache_options = (
+            kwargs.get("prompt_cache_options", self.prompt_cache_options) or None
+        )
+        if prompt_cache_options is not None:
+            _validate_prompt_cache_options(prompt_cache_options)
+            params["prompt_cache_options"] = prompt_cache_options
 
         safety_identifier = (
             kwargs.get("safety_identifier", self.safety_identifier) or None
@@ -1343,7 +1412,7 @@ class OpenAIProvider:
                     # (llm:stream_*); get_final_response() collects the complete
                     # response afterwards so callers see no difference in return value.
                     request_id = str(uuid.uuid4())
-                    seq: dict[int, int] = {}          # block_index → next seq number
+                    seq: dict[int, int] = {}  # block_index → next seq number
                     block_types: dict[int, str] = {}  # block_index → contract type
                     partial_emitted = False
                     hooks_available = bool(
@@ -1362,7 +1431,9 @@ class OpenAIProvider:
 
                                         if et == "response.output_item.added":
                                             idx = event.output_index
-                                            item_type = getattr(event.item, "type", None)
+                                            item_type = getattr(
+                                                event.item, "type", None
+                                            )
                                             block_type = {
                                                 "message": "text",
                                                 "reasoning": "thinking",
@@ -1392,7 +1463,9 @@ class OpenAIProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
-                                                        "block_type": block_types.get(idx, "text"),
+                                                        "block_type": block_types.get(
+                                                            idx, "text"
+                                                        ),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -1412,7 +1485,9 @@ class OpenAIProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
-                                                        "block_type": block_types.get(idx, "thinking"),
+                                                        "block_type": block_types.get(
+                                                            idx, "thinking"
+                                                        ),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -1872,6 +1947,10 @@ class OpenAIProvider:
                     ]
                 if "safety_identifier" in params:
                     continue_params["safety_identifier"] = params["safety_identifier"]
+                if "prompt_cache_options" in params:
+                    continue_params["prompt_cache_options"] = params[
+                        "prompt_cache_options"
+                    ]
 
                 # Make continuation call
                 try:
@@ -2913,12 +2992,17 @@ class OpenAIProvider:
             if details and hasattr(details, "reasoning_tokens"):
                 reasoning_tokens = details.reasoning_tokens
 
-        # Extract cache_read_tokens from input_tokens_details
+        # Extract cache_read_tokens (and, for GPT-5.6, cache_write_tokens) from
+        # input_tokens_details. Field verified live on gpt-5.6-sol (2026-07-14):
+        # usage.input_tokens_details.{cached_tokens, cache_write_tokens}.
         cache_read_tokens = None
+        cache_write_tokens = None
         if usage_obj and hasattr(usage_obj, "input_tokens_details"):
             details = usage_obj.input_tokens_details
             if details and hasattr(details, "cached_tokens"):
                 cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
+            if details and hasattr(details, "cache_write_tokens"):
+                cache_write_tokens = details.cache_write_tokens  # GPT-5.6+; 0 valid
 
         usage = Usage(
             input_tokens=usage_counts["input"],
@@ -2926,22 +3010,25 @@ class OpenAIProvider:
             total_tokens=usage_counts["total"],
             reasoning_tokens=reasoning_tokens,
             cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
 
         # M2: Stamp cost_usd onto Usage (zero-transformation passthrough from API fields).
-        # prompt_tokens is the total including cached; cached_tokens is subtracted inside
-        # compute_cost to prevent double-charging.
+        # prompt_tokens is the total including cached AND cache-write; both are subtracted
+        # inside compute_cost to prevent double-charging.
         if usage_obj:
             _prompt_tokens = getattr(usage_obj, "prompt_tokens", usage_counts["input"])
             _completion_tokens = getattr(
                 usage_obj, "completion_tokens", usage_counts["output"]
             )
             _cached_tokens = cache_read_tokens or 0
+            _cache_write_tokens = cache_write_tokens or 0
             cost = compute_cost(
                 getattr(response, "model", ""),
                 prompt_tokens=_prompt_tokens,
                 completion_tokens=_completion_tokens,
                 cached_tokens=_cached_tokens,
+                cache_write_tokens=_cache_write_tokens,
             )
             if cost is not None:
                 usage = usage.model_copy(update={"cost_usd": cost})

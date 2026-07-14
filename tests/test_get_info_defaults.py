@@ -23,15 +23,15 @@ class TestGetInfoUsesCapabilities:
     """get_info() must derive defaults from ModelCapabilities."""
 
     def test_default_model_reports_full_context(self):
-        """With the default model (gpt-5.5), get_info() reports the full 1M
-        context window because gpt-5.5 has no published pricing threshold.
+        """With the default model (gpt-5.6-sol), get_info() reports the full
+        1.05M context window because gpt-5.6 has no modelled pricing threshold.
         """
         provider = _make_provider()
         info = provider.get_info()
         caps = get_capabilities(DEFAULT_MODEL)
         assert caps.long_context_pricing_threshold is None
         assert info.defaults["context_window"] == caps.context_window
-        assert info.defaults["context_window"] == 1_000_000
+        assert info.defaults["context_window"] == 1_050_000
 
     def test_default_model_max_output_tokens_matches_capabilities(self):
         """max_output_tokens in get_info() must match the default model's
@@ -41,18 +41,18 @@ class TestGetInfoUsesCapabilities:
         caps = get_capabilities(DEFAULT_MODEL)
         assert info.defaults["max_output_tokens"] == caps.max_output_tokens
 
-    def test_default_model_id_is_gpt_5_5(self):
+    def test_default_model_id_is_gpt_5_6_sol(self):
         provider = _make_provider()
         info = provider.get_info()
-        assert info.defaults["model"] == "gpt-5.5"
+        assert info.defaults["model"] == "gpt-5.6-sol"
 
-    def test_enable_long_context_noop_for_gpt_5_5(self):
-        """gpt-5.5 has no pricing threshold, so enable_long_context is a no-op
-        for the context_window reported by get_info()."""
+    def test_enable_long_context_noop_for_gpt_5_6(self):
+        """gpt-5.6-sol has no modelled pricing threshold, so enable_long_context
+        is a no-op for the context_window reported by get_info()."""
         provider = _make_provider(enable_long_context=True)
         info = provider.get_info()
-        assert info.defaults["context_window"] == 1_000_000
-        assert info.defaults["model"] == "gpt-5.5"
+        assert info.defaults["context_window"] == 1_050_000
+        assert info.defaults["model"] == "gpt-5.6-sol"
 
     def test_uses_self_default_model_not_hardcoded(self):
         """get_info() must use self.default_model, not a hardcoded string."""

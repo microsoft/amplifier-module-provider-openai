@@ -9,8 +9,8 @@ Verifies that:
 5. get_info() includes the enable_long_context ConfigField.
 6. enable_long_context defaults to False when not in config.
 
-Note: gpt-5.5 (the current DEFAULT_MODEL) has no pricing threshold, so the
-threshold-vs-full behavior is exercised via an explicit `default_model="gpt-5.4"`.
+Note: gpt-5.6-sol (the current DEFAULT_MODEL) has no modelled pricing threshold,
+so the threshold-vs-full behavior is exercised via an explicit `default_model="gpt-5.4"`.
 """
 
 import asyncio
