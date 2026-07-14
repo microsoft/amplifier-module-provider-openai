@@ -22,8 +22,14 @@ Usage
 Notes
 -----
 - O-series: completion_tokens already includes reasoning_tokens (no extra handling needed).
-- No cache write cost for OpenAI (unlike Anthropic).
-- cached_tokens subtraction happens INSIDE compute_cost to prevent call-site double-charging.
+- Cache-write cost: most OpenAI models have none (writes are free, reads discounted).
+  GPT-5.6 (Sol/Terra/Luna) is the exception -- it bills cache-WRITE tokens at 1.25x the
+  input rate and reports them as usage.input_tokens_details.cache_write_tokens (Responses API)
+  / usage.prompt_tokens_details.cache_write_tokens (Chat Completions). Rate entries that omit
+  "cache_write_per_m" bill any write tokens as ordinary input (correct for pre-5.6 models,
+  which never emit the field). Verified against live gpt-5.6-sol usage on 2026-07-14.
+- cached_tokens / cache_write_tokens subtraction happens INSIDE compute_cost to prevent
+  call-site double-charging.
 - Snapshot aliasing: the Responses API echoes back a dated snapshot id in response.model
   (e.g. "gpt-5.5-2026-04-23") rather than the alias ("gpt-5.5"). _find_rates() strips the
   YYYY-MM-DD suffix and falls back to the family alias automatically — no duplicate entries
@@ -49,6 +55,9 @@ _SNAPSHOT_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 #   "input_per_m":       Decimal,  # fresh input tokens, per 1M
 #   "output_per_m":      Decimal,  # output/completion tokens, per 1M
 #   "cache_read_per_m":  Decimal,  # cached input tokens, per 1M (0.00 = no discount)
+#   "cache_write_per_m": Decimal,  # OPTIONAL. cache-WRITE tokens, per 1M (GPT-5.6 only).
+#                                  # Omit for models with no distinct write price -- write
+#                                  # tokens are then billed as ordinary input.
 # }
 #
 # Rates are in USD.
@@ -58,6 +67,33 @@ _SNAPSHOT_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 # TODO: gpt-5.3-codex, gpt-5.2, gpt-5.2-pro, gpt-5.1, gpt-5.1-codex, gpt-5-mini
 #       not yet on pricing page; these models return None until rates are added.
 _RATES: dict[str, dict[str, Decimal]] = {
+    # ------------------------------------------------------------------
+    # GPT 5.6 family: Sol / Terra / Luna  (GA 2026-07-09)
+    # Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M (short-context, Standard tier).
+    # cache_read = 0.1x input; cache_write = 1.25x input (GPT-5.6 bills writes).
+    # Field verified live: usage.input_tokens_details.cache_write_tokens (Responses API).
+    # Alias "gpt-5.6" -> API echoes "gpt-5.6-sol" in response.model, so keying the
+    # canonical tier ids is sufficient; no bare-alias entry required for cost.
+    # NOTE: short/long-context price split (~2x) NOT modelled here yet -- see issue #335.
+    # ------------------------------------------------------------------
+    "gpt-5.6-sol": {
+        "input_per_m": Decimal("5.00"),
+        "output_per_m": Decimal("30.00"),
+        "cache_read_per_m": Decimal("0.50"),
+        "cache_write_per_m": Decimal("6.25"),
+    },
+    "gpt-5.6-terra": {
+        "input_per_m": Decimal("2.50"),
+        "output_per_m": Decimal("15.00"),
+        "cache_read_per_m": Decimal("0.25"),
+        "cache_write_per_m": Decimal("3.125"),
+    },
+    "gpt-5.6-luna": {
+        "input_per_m": Decimal("1.00"),
+        "output_per_m": Decimal("6.00"),
+        "cache_read_per_m": Decimal("0.10"),
+        "cache_write_per_m": Decimal("1.25"),
+    },
     # ------------------------------------------------------------------
     # GPT 5.5 (DEFAULT)  ($5.00 / $30.00, cache_read $0.50)
     # ------------------------------------------------------------------
@@ -143,33 +179,50 @@ def compute_cost(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> Decimal | None:
     """Compute the cost of an OpenAI API call in USD.
 
     Args:
         model: The model ID (e.g. 'gpt-5.4') or dated snapshot id
             (e.g. 'gpt-5.4-2026-03-05') as returned by the Responses API.
-        prompt_tokens: Total prompt tokens (TOTAL, includes cached).
-            This is response.usage.prompt_tokens.
+        prompt_tokens: Total prompt tokens (TOTAL, includes cached AND cache-write).
+            This is response.usage.prompt_tokens (Chat) / usage.input_tokens (Responses).
         completion_tokens: Completion tokens used.
-        cached_tokens: Number of prompt tokens served from cache.
-            This is response.usage.prompt_tokens_details.cached_tokens.
+        cached_tokens: Number of prompt tokens served from cache (billed at
+            cache_read_per_m). usage.{prompt,input}_tokens_details.cached_tokens.
+        cache_write_tokens: Number of prompt tokens written to cache this call.
+            GPT-5.6 only; billed at cache_write_per_m (1.25x input) when the model
+            has that rate. usage.{prompt,input}_tokens_details.cache_write_tokens.
+            Models without a cache_write_per_m rate never emit this field and bill
+            it as ordinary input.
 
     Returns:
         Decimal cost in USD, or None if the model is not in the pricing table.
 
     Note:
-        cached_tokens subtraction happens inside this function to prevent
-        call-site double-charging.  Callers pass the raw API fields directly.
+        cached_tokens / cache_write_tokens subtraction happens inside this function
+        to prevent call-site double-charging. Callers pass the raw API fields directly.
     """
     rates = _find_rates(model)
     if rates is None:
         return None
-    # Subtract cached from total INSIDE the function to prevent call-site double-charging.
-    # Clamp to 0: if caller passes only cached_tokens without matching prompt_tokens,
-    # fresh_input should not go negative.
-    fresh_input = max(0, prompt_tokens - cached_tokens)
+
+    cache_write_rate = rates.get("cache_write_per_m")
+    if cache_write_rate is None:
+        # Model has no distinct cache-write price: any write tokens are ordinary
+        # input (pre-5.6 models never emit the field, so this is also the historical
+        # path, byte-for-byte unchanged).
+        fresh_input = max(0, prompt_tokens - cached_tokens)
+        write_cost = Decimal(0)
+    else:
+        # GPT-5.6: cache-write tokens are a re-rated subset of prompt_tokens
+        # (billed at 1.25x input INSTEAD of the input rate, not on top of it).
+        fresh_input = max(0, prompt_tokens - cached_tokens - cache_write_tokens)
+        write_cost = Decimal(cache_write_tokens) * cache_write_rate / _PER_M
+
     cost = Decimal(fresh_input) * rates["input_per_m"] / _PER_M
+    cost += write_cost
     cost += Decimal(completion_tokens) * rates["output_per_m"] / _PER_M
     if cached_tokens:
         cost += Decimal(cached_tokens) * rates["cache_read_per_m"] / _PER_M

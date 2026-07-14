@@ -1186,9 +1186,7 @@ class OpenAIProvider:
             tools_list.extend(native_tools)
 
         if tools_list:
-            params["tools"] = self._convert_tools_from_request(
-                tools_list, model_name
-            )
+            params["tools"] = self._convert_tools_from_request(tools_list, model_name)
             # Add tool-related parameters per Responses API spec
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
             params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
@@ -1343,7 +1341,7 @@ class OpenAIProvider:
                     # (llm:stream_*); get_final_response() collects the complete
                     # response afterwards so callers see no difference in return value.
                     request_id = str(uuid.uuid4())
-                    seq: dict[int, int] = {}          # block_index → next seq number
+                    seq: dict[int, int] = {}  # block_index → next seq number
                     block_types: dict[int, str] = {}  # block_index → contract type
                     partial_emitted = False
                     hooks_available = bool(
@@ -1362,7 +1360,9 @@ class OpenAIProvider:
 
                                         if et == "response.output_item.added":
                                             idx = event.output_index
-                                            item_type = getattr(event.item, "type", None)
+                                            item_type = getattr(
+                                                event.item, "type", None
+                                            )
                                             block_type = {
                                                 "message": "text",
                                                 "reasoning": "thinking",
@@ -1392,7 +1392,9 @@ class OpenAIProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
-                                                        "block_type": block_types.get(idx, "text"),
+                                                        "block_type": block_types.get(
+                                                            idx, "text"
+                                                        ),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -1412,7 +1414,9 @@ class OpenAIProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
-                                                        "block_type": block_types.get(idx, "thinking"),
+                                                        "block_type": block_types.get(
+                                                            idx, "thinking"
+                                                        ),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -2913,12 +2917,17 @@ class OpenAIProvider:
             if details and hasattr(details, "reasoning_tokens"):
                 reasoning_tokens = details.reasoning_tokens
 
-        # Extract cache_read_tokens from input_tokens_details
+        # Extract cache_read_tokens (and, for GPT-5.6, cache_write_tokens) from
+        # input_tokens_details. Field verified live on gpt-5.6-sol (2026-07-14):
+        # usage.input_tokens_details.{cached_tokens, cache_write_tokens}.
         cache_read_tokens = None
+        cache_write_tokens = None
         if usage_obj and hasattr(usage_obj, "input_tokens_details"):
             details = usage_obj.input_tokens_details
             if details and hasattr(details, "cached_tokens"):
                 cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
+            if details and hasattr(details, "cache_write_tokens"):
+                cache_write_tokens = details.cache_write_tokens  # GPT-5.6+; 0 valid
 
         usage = Usage(
             input_tokens=usage_counts["input"],
@@ -2929,19 +2938,21 @@ class OpenAIProvider:
         )
 
         # M2: Stamp cost_usd onto Usage (zero-transformation passthrough from API fields).
-        # prompt_tokens is the total including cached; cached_tokens is subtracted inside
-        # compute_cost to prevent double-charging.
+        # prompt_tokens is the total including cached AND cache-write; both are subtracted
+        # inside compute_cost to prevent double-charging.
         if usage_obj:
             _prompt_tokens = getattr(usage_obj, "prompt_tokens", usage_counts["input"])
             _completion_tokens = getattr(
                 usage_obj, "completion_tokens", usage_counts["output"]
             )
             _cached_tokens = cache_read_tokens or 0
+            _cache_write_tokens = cache_write_tokens or 0
             cost = compute_cost(
                 getattr(response, "model", ""),
                 prompt_tokens=_prompt_tokens,
                 completion_tokens=_completion_tokens,
                 cached_tokens=_cached_tokens,
+                cache_write_tokens=_cache_write_tokens,
             )
             if cost is not None:
                 usage = usage.model_copy(update={"cost_usd": cost})

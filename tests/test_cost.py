@@ -233,7 +233,14 @@ def test_unknown_family_snapshot_returns_none():
 
 @pytest.mark.parametrize(
     "garbage",
-    ["", "not-a-model", "gpt-5.5-", "gpt-5.5-2026", "gpt-5.5-2026-04", "gpt-5.5-2026-04-23-preview"],
+    [
+        "",
+        "not-a-model",
+        "gpt-5.5-",
+        "gpt-5.5-2026",
+        "gpt-5.5-2026-04",
+        "gpt-5.5-2026-04-23-preview",
+    ],
 )
 def test_non_snapshot_garbage_returns_none(garbage):
     """Strings that don't match the YYYY-MM-DD suffix pattern return None."""
@@ -293,3 +300,115 @@ def test_dated_snapshot_matches_alias_pricing(
         f"{snapshot} cache"
     )
 
+
+# ---------------------------------------------------------------------------
+# (q) GPT-5.6 (Sol / Terra / Luna): base pricing + cache-WRITE billing (1.25x)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "model,inp,out,cread,cwrite",
+    [
+        (
+            "gpt-5.6-sol",
+            Decimal("5.00"),
+            Decimal("30.00"),
+            Decimal("0.50"),
+            Decimal("6.25"),
+        ),
+        (
+            "gpt-5.6-terra",
+            Decimal("2.50"),
+            Decimal("15.00"),
+            Decimal("0.25"),
+            Decimal("3.125"),
+        ),
+        (
+            "gpt-5.6-luna",
+            Decimal("1.00"),
+            Decimal("6.00"),
+            Decimal("0.10"),
+            Decimal("1.25"),
+        ),
+    ],
+)
+def test_gpt_56_family_rates(model, inp, out, cread, cwrite):
+    """Each GPT-5.6 tier prices input/output/cache-read/cache-write at 1M tokens each."""
+    assert compute_cost(model, prompt_tokens=1_000_000) == inp
+    assert compute_cost(model, completion_tokens=1_000_000) == out
+    assert compute_cost(model, cached_tokens=1_000_000) == cread
+    # cache-write: 1M written tokens (prompt_tokens must include them) -> write rate only.
+    assert (
+        compute_cost(model, prompt_tokens=1_000_000, cache_write_tokens=1_000_000)
+        == cwrite
+    )
+
+
+def test_gpt_56_no_triple_charge_mixed_turn():
+    """A turn mixing fresh + cached + written tokens charges each bucket once (Sol).
+
+    fresh = 1000 - 200 cached - 300 written = 500 @ $5/M   = 0.0025
+    write = 300 @ $6.25/M                                  = 0.001875
+    read  = 200 @ $0.50/M                                  = 0.0001
+    out   = 100 @ $30/M                                    = 0.003
+    total                                                  = 0.007475
+    """
+    result = compute_cost(
+        "gpt-5.6-sol",
+        prompt_tokens=1_000,
+        completion_tokens=100,
+        cached_tokens=200,
+        cache_write_tokens=300,
+    )
+    assert result == Decimal("0.007475"), f"got {result!r}"
+
+
+def test_gpt_56_golden_from_real_usage():
+    """Reality-derived golden: exact token counts captured from live gpt-5.6-sol.
+
+    Source: two real Responses-API calls with an identical >1024-token prefix
+    (see projects/gpt-5-6-support/ground-truth/usage-real.json). These are the
+    numbers the API actually returned -- not synthetic.
+
+    WRITE call: input=2655, cache_write=2652, cached=0, output=5
+        fresh=3 @5 + 2652 @6.25 + 5 @30 = 0.000015 + 0.016575 + 0.000150 = 0.016740
+    READ  call: input=2655, cache_write=0, cached=2652, output=5
+        fresh=3 @5 + 2652 @0.50 + 5 @30 = 0.000015 + 0.001326 + 0.000150 = 0.001491
+    """
+    write = compute_cost(
+        "gpt-5.6-sol",
+        prompt_tokens=2655,
+        completion_tokens=5,
+        cached_tokens=0,
+        cache_write_tokens=2652,
+    )
+    read = compute_cost(
+        "gpt-5.6-sol",
+        prompt_tokens=2655,
+        completion_tokens=5,
+        cached_tokens=2652,
+        cache_write_tokens=0,
+    )
+    assert write == Decimal("0.016740"), f"WRITE got {write!r}"
+    assert read == Decimal("0.001491"), f"READ got {read!r}"
+    # The write turn MUST cost more than billing those tokens as plain input --
+    # this is the 1.25x premium, and guards against silent regression to $5 input.
+    plain_input = compute_cost(
+        "gpt-5.6-sol", prompt_tokens=2655, completion_tokens=5, cached_tokens=0
+    )
+    assert write is not None and plain_input is not None
+    assert write > plain_input
+
+
+def test_gpt_56_alias_snapshot_resolves():
+    """A dated gpt-5.6-sol snapshot resolves to the tier rates via the fallback."""
+    assert compute_cost("gpt-5.6-sol-2026-07-09", prompt_tokens=1_000_000) == Decimal(
+        "5.00"
+    )
+
+
+def test_cache_write_ignored_for_models_without_write_rate():
+    """Pre-5.6 models have no cache_write_per_m: any cache_write_tokens are billed
+    as ordinary input (historical path unchanged, no crash)."""
+    # gpt-5.5 has no cache_write rate; passing cache_write_tokens must not error and
+    # bills the full prompt as input (fresh = prompt - cached, write ignored).
+    result = compute_cost("gpt-5.5", prompt_tokens=1_000, cache_write_tokens=300)
+    assert result == Decimal("1000") * Decimal("5") / Decimal("1000000")
