@@ -29,8 +29,9 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 
 ## Supported Models
 
-- `gpt-5.5` - GPT-5 optimized for code (default)
-- `gpt-5.5` - Latest GPT-5 model
+- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. 1.05M context, adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`.
+- `gpt-5.5` - Latest GPT-5 model (default)
+- `gpt-5.4` - Balanced GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5
 - `gpt-5-nano` - Smallest GPT-5 variant
 
@@ -45,13 +46,19 @@ config = {
     default_model = "gpt-5.5",
     max_tokens = 4096,
     temperature = 0.7,
-    reasoning = "low",                     # Reasoning effort: minimal|low|medium|high|xhigh
+    reasoning = "low",                     # Reasoning effort: none|low|medium|high|xhigh|max
+                                           # (set is model-specific; gpt-5.6 adds "max",
+                                           # rejects "minimal"). Pass a dict to also set
+                                           # reasoning.mode: {effort="high", mode="pro"}.
     reasoning_summary = "detailed",        # Reasoning verbosity: auto|concise|detailed
     truncation = null,                     # null omits the field; OpenAI returns an explicit
                                            # error on context overflow. Opt in to legacy
                                            # auto-drop with truncation = "auto" (busts cache).
     prompt_cache_key = "",                 # Stable cache-routing identifier; empty = unset
     prompt_cache_retention = "24h",        # "24h" | "in_memory" | null (use model default)
+                                           # gpt-5.6 rejects "in_memory" (auto-dropped to 24h).
+    prompt_cache_options = null,           # GPT-5.6 explicit cache control, COEXISTS with
+                                           # retention: {mode="explicit", ttl="30m"}. null = unset.
     enable_response_chaining = "auto",     # "auto" | true | false  (reasoning-model chaining)
     enable_state = false,
     debug = false,                         # Enable standard debug events

@@ -268,6 +268,30 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 supports_native_apply_patch=supports_apply_patch,
             )
 
+        # gpt-5.6 (Sol / Terra / Luna) -- GA 2026-07-09, verified against live API
+        # 2026-07-14. 1.05M context / 128K output across all three tiers; the tiers
+        # differ in price/latency (see _cost.py), not context or capability, so they
+        # share one descriptor. in_memory retention is REJECTED by the API
+        # ("compatible only with 24h extended prompt caching"), so
+        # supports_in_memory_retention=False routes callers to 24h via the existing
+        # _drop_unsupported_in_memory_retention gate. The short/long-context price
+        # split (~2x) is a pricing concern (see _cost.py / issue #335), not a
+        # capability field, so it is not modelled here.
+        if minor == 6:
+            return ModelCapabilities(
+                family="gpt-5",
+                context_window=1_050_000,
+                max_output_tokens=128_000,
+                supports_reasoning=True,
+                default_reasoning_effort=None,
+                supports_vision=True,
+                supports_streaming=True,
+                capability_tags=_GPT5_TAGS,
+                long_context_pricing_threshold=None,
+                supports_in_memory_retention=False,
+                supports_native_apply_patch=supports_apply_patch,
+            )
+
         if minor >= 4 or (major, minor) == (0, 0):
             # 5.4+ or unparseable version — assume latest
             return ModelCapabilities(

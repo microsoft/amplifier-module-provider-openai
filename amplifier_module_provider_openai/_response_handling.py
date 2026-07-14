@@ -276,12 +276,17 @@ def convert_response_with_accumulated_output(
         if details and hasattr(details, "reasoning_tokens"):
             reasoning_tokens = details.reasoning_tokens
 
-    # Extract cache_read_tokens from input_tokens_details
+    # Extract cache_read_tokens (and, for GPT-5.6, cache_write_tokens) from
+    # input_tokens_details. Field verified live on gpt-5.6-sol (2026-07-14):
+    # usage.input_tokens_details.{cached_tokens, cache_write_tokens}.
     cache_read_tokens = None
+    cache_write_tokens = None
     if usage_obj and hasattr(usage_obj, "input_tokens_details"):
         details = usage_obj.input_tokens_details
         if details and hasattr(details, "cached_tokens"):
             cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
+        if details and hasattr(details, "cache_write_tokens"):
+            cache_write_tokens = details.cache_write_tokens  # GPT-5.6+; 0 valid
 
     usage = Usage(
         input_tokens=usage_counts["input"],
@@ -289,6 +294,7 @@ def convert_response_with_accumulated_output(
         total_tokens=usage_counts["total"],
         reasoning_tokens=reasoning_tokens,
         cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
     )
 
     # Build metadata with provider-specific state
