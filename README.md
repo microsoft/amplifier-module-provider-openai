@@ -29,8 +29,8 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 
 ## Supported Models
 
-- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. 1.05M context, adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`.
-- `gpt-5.5` - Latest GPT-5 model (default)
+- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** 1.05M context, adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
+- `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5
 - `gpt-5-nano` - Smallest GPT-5 variant
@@ -43,7 +43,7 @@ module = "provider-openai"
 name = "openai"
 config = {
     base_url = null,                       # Optional custom endpoint (null = OpenAI default)
-    default_model = "gpt-5.5",
+    default_model = "gpt-5.6-sol",
     max_tokens = 4096,
     temperature = 0.7,
     reasoning = "low",                     # Reasoning effort: none|low|medium|high|xhigh|max
@@ -251,7 +251,7 @@ providers:
     config:
       debug: true # Enable debug events
       raw_debug: true # Enable raw API I/O capture
-      default_model: gpt-5.5
+      default_model: gpt-5.6-sol
 ```
 
 ## Environment Variables

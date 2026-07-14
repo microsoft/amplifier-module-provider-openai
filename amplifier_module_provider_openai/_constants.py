@@ -13,7 +13,11 @@ METADATA_REASONING_ITEMS = "openai:reasoning_items"
 METADATA_CONTINUATION_COUNT = "openai:continuation_count"
 
 # Default configuration values
-DEFAULT_MODEL = "gpt-5.5"
+# gpt-5.6-sol (the GPT-5.6 flagship; alias "gpt-5.6" also resolves to it) is the
+# default: same input/output pricing as gpt-5.5 ($5/$30) with the newer model's
+# capabilities. Note gpt-5.6 bills cache-WRITE tokens at 1.25x input (automatic on
+# prompts >1024 tokens) and rejects "in_memory" retention (auto-dropped to 24h).
+DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
 DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
