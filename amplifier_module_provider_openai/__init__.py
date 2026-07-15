@@ -1346,6 +1346,13 @@ class OpenAIProvider:
                     seq: dict[int, int] = {}          # block_index → next seq number
                     block_types: dict[int, str] = {}  # block_index → contract type
                     partial_emitted = False
+                    # Terminal response captured off the stream events. The SDK's
+                    # get_final_response() only accepts a `response.completed` event,
+                    # so a legitimate non-completed terminal (`response.incomplete`
+                    # from max_output_tokens / content filtering) makes it raise
+                    # "Didn't receive a `response.completed` event". We capture the
+                    # response here so we can recover it. See amplifier-support#339.
+                    final_response = None
                     hooks_available = bool(
                         self.coordinator and hasattr(self.coordinator, "hooks")
                     )
@@ -1359,6 +1366,20 @@ class OpenAIProvider:
                                 if emit_stream_events:
                                     async for event in stream:
                                         et = event.type
+
+                                        # Capture the terminal response as we stream so a
+                                        # non-`completed` terminal (`response.incomplete`)
+                                        # can be recovered below. This runs on the
+                                        # event-emitting path (the standard streaming
+                                        # case); `response.failed` is deliberately not
+                                        # captured so genuine failures still raise.
+                                        if et in (
+                                            "response.completed",
+                                            "response.incomplete",
+                                        ):
+                                            final_response = getattr(
+                                                event, "response", None
+                                            )
 
                                         if et == "response.output_item.added":
                                             idx = event.output_index
@@ -1432,7 +1453,32 @@ class OpenAIProvider:
                                                     },
                                                 )
 
-                                response = await stream.get_final_response()
+                                try:
+                                    response = await stream.get_final_response()
+                                except RuntimeError as e:
+                                    # The SDK raises this when the stream ends without a
+                                    # `response.completed` event — e.g. a `response.incomplete`
+                                    # terminal from hitting max_output_tokens or content
+                                    # filtering. Recover the response we captured off the
+                                    # terminal event instead of failing the whole request.
+                                    # See amplifier-support#339.
+                                    if (
+                                        "response.completed" not in str(e)
+                                        or final_response is None
+                                    ):
+                                        raise
+                                    response = final_response
+                                    logger.warning(
+                                        "[PROVIDER] %s recovered a non-`completed` "
+                                        "streaming response (status=%s, model=%s): "
+                                        "returning the partial response instead of "
+                                        "failing. This usually means max_output_tokens "
+                                        "was hit or content filtering stopped "
+                                        "generation. See amplifier-support#339.",
+                                        self.api_label,
+                                        getattr(final_response, "status", "unknown"),
+                                        params.get("model", "unknown"),
+                                    )
                                 # Extract rate limit headers from the underlying HTTP response.
                                 # The OpenAI SDK stores it as stream._response (httpx.Response).
                                 raw_http = getattr(stream, "_response", None)

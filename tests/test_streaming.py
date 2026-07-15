@@ -787,3 +787,120 @@ def test_stream_empty_delta_not_emitted():
     assert len(deltas) == 1, "Only the non-empty delta should be emitted"
     assert deltas[0]["text"] == "real"
     assert deltas[0]["block_type"] == "text"
+
+
+# ---------------------------------------------------------------------------
+# 18. Stream ends on response.incomplete -> recover captured response (#339)
+# ---------------------------------------------------------------------------
+
+
+class IncompleteEventStream(FakeEventStream):
+    """Stream whose get_final_response() raises exactly like the real OpenAI SDK
+    does when the stream ends WITHOUT a ``response.completed`` event -- e.g. it
+    ended on a ``response.incomplete`` terminal (hit max_output_tokens, or content
+    filtering stopped generation). Regression harness for amplifier-support#339.
+    """
+
+    async def get_final_response(self):
+        raise RuntimeError("Didn't receive a `response.completed` event.")
+
+
+def test_stream_incomplete_event_recovers_response():
+    """A stream ending on ``response.incomplete`` recovers the exact response
+    captured off the terminal event instead of failing. Regression for
+    amplifier-support#339.
+    """
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"use_streaming": True, "max_retries": 0},
+    )
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    recovered = DummyResponse()
+    events = [
+        _make_event(
+            "response.output_item.added",
+            output_index=0,
+            item=_make_item(type="message"),
+        ),
+        _make_event("response.output_text.delta", output_index=0, delta="partial"),
+        # Terminal event is `incomplete`, NOT `completed` -- it carries the response.
+        _make_event("response.incomplete", response=recovered),
+    ]
+    stream = IncompleteEventStream(events)
+    provider.client.responses.stream = MagicMock(return_value=MockStreamContext(stream))
+
+    # Spy on the conversion step to prove the RECOVERED response is exactly what
+    # flows through. get_final_response() raises here, so a non-None result can
+    # only come from the terminal-event recovery path.
+    spy = MagicMock(side_effect=provider._convert_to_chat_response)
+    provider._convert_to_chat_response = spy
+
+    result = asyncio.run(provider.complete(_simple_request()))
+
+    assert result is not None
+    spy.assert_called_once()
+    assert spy.call_args.args[0] is recovered, (
+        "the recovered incomplete response must be the one converted and returned"
+    )
+
+    # Recovery is not an abort: llm:stream_aborted must NOT fire.
+    aborted = [
+        name for name, _ in fake_coordinator.hooks.events if name == "llm:stream_aborted"
+    ]
+    assert aborted == [], f"recovery must not emit stream_aborted, got {aborted}"
+
+
+def test_stream_no_terminal_capture_still_raises():
+    """When the stream raises the no-completed error and NO terminal response was
+    captured, the provider still surfaces an LLMError (no silent swallow)."""
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"use_streaming": True, "max_retries": 0},
+    )
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    # No response.completed / response.incomplete event -> nothing captured.
+    events = [
+        _make_event(
+            "response.output_item.added",
+            output_index=0,
+            item=_make_item(type="message"),
+        ),
+        _make_event("response.output_text.delta", output_index=0, delta="partial"),
+    ]
+    stream = IncompleteEventStream(events)
+    provider.client.responses.stream = MagicMock(return_value=MockStreamContext(stream))
+
+    with pytest.raises(kernel_errors.LLMError):
+        asyncio.run(provider.complete(_simple_request()))
+
+
+def test_stream_failed_terminal_is_not_recovered():
+    """A ``response.failed`` terminal must NOT be recovered (only completed and
+    incomplete are captured); it still surfaces an LLMError. Guards the
+    capture-set exclusion so genuine failures are never silently swallowed."""
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"use_streaming": True, "max_retries": 0},
+    )
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    events = [
+        _make_event(
+            "response.output_item.added",
+            output_index=0,
+            item=_make_item(type="message"),
+        ),
+        _make_event("response.output_text.delta", output_index=0, delta="partial"),
+        # A `failed` terminal carries a response but must NOT be captured/recovered.
+        _make_event("response.failed", response=DummyResponse()),
+    ]
+    stream = IncompleteEventStream(events)
+    provider.client.responses.stream = MagicMock(return_value=MockStreamContext(stream))
+
+    with pytest.raises(kernel_errors.LLMError):
+        asyncio.run(provider.complete(_simple_request()))
