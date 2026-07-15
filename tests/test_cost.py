@@ -305,7 +305,7 @@ def test_dated_snapshot_matches_alias_pricing(
 # (q) GPT-5.6 (Sol / Terra / Luna): base pricing + cache-WRITE billing (1.25x)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "model,inp,out,cread,cwrite",
+    "model,inp,out,cread,cwrite,l_inp,l_out,l_cread,l_cwrite",
     [
         (
             "gpt-5.6-sol",
@@ -313,6 +313,10 @@ def test_dated_snapshot_matches_alias_pricing(
             Decimal("30.00"),
             Decimal("0.50"),
             Decimal("6.25"),
+            Decimal("10.00"),
+            Decimal("45.00"),
+            Decimal("1.00"),
+            Decimal("12.50"),
         ),
         (
             "gpt-5.6-terra",
@@ -320,6 +324,10 @@ def test_dated_snapshot_matches_alias_pricing(
             Decimal("15.00"),
             Decimal("0.25"),
             Decimal("3.125"),
+            Decimal("5.00"),
+            Decimal("22.50"),
+            Decimal("0.50"),
+            Decimal("6.25"),
         ),
         (
             "gpt-5.6-luna",
@@ -327,18 +335,51 @@ def test_dated_snapshot_matches_alias_pricing(
             Decimal("6.00"),
             Decimal("0.10"),
             Decimal("1.25"),
+            Decimal("2.00"),
+            Decimal("9.00"),
+            Decimal("0.20"),
+            Decimal("2.50"),
         ),
     ],
 )
-def test_gpt_56_family_rates(model, inp, out, cread, cwrite):
-    """Each GPT-5.6 tier prices input/output/cache-read/cache-write at 1M tokens each."""
-    assert compute_cost(model, prompt_tokens=1_000_000) == inp
+def test_gpt_56_family_rates(
+    model, inp, out, cread, cwrite, l_inp, l_out, l_cread, l_cwrite
+):
+    """Each GPT-5.6 tier prices the four token classes at its SHORT rate for
+    requests with input <=272K, and re-rates the WHOLE request at its LONG rate
+    when input exceeds the 272K threshold (see _LONG_RATES / compute_cost).
+
+    Short-context assertions use a 200K count (<=272K, so no re-rate) scaled from
+    the per-1M rate; long-context assertions use counts >272K to trigger the split.
+    """
+    _M = Decimal(1_000_000)
+
+    # --- short context: input at/below the 272K threshold keeps the standard rate ---
+    assert compute_cost(model, prompt_tokens=200_000) == Decimal(200_000) * inp / _M
+    # output / cache-read carry 0 prompt tokens -> below threshold -> short rate.
     assert compute_cost(model, completion_tokens=1_000_000) == out
     assert compute_cost(model, cached_tokens=1_000_000) == cread
-    # cache-write: 1M written tokens (prompt_tokens must include them) -> write rate only.
+    assert (
+        compute_cost(model, prompt_tokens=200_000, cache_write_tokens=200_000)
+        == Decimal(200_000) * cwrite / _M
+    )
+
+    # --- long context: input above 272K re-rates the entire request ---
+    # 1M fresh input -> long input rate.
+    assert compute_cost(model, prompt_tokens=1_000_000) == l_inp
+    # 300K fresh input (>272K, so long) + 1M output at the long output rate.
+    assert (
+        compute_cost(model, prompt_tokens=300_000, completion_tokens=1_000_000)
+        == Decimal(300_000) * l_inp / _M + l_out
+    )
+    # 1M all-cached input (>272K) -> long cache-read rate on the whole request.
+    assert (
+        compute_cost(model, prompt_tokens=1_000_000, cached_tokens=1_000_000) == l_cread
+    )
+    # 1M all cache-write input (>272K) -> long cache-write rate.
     assert (
         compute_cost(model, prompt_tokens=1_000_000, cache_write_tokens=1_000_000)
-        == cwrite
+        == l_cwrite
     )
 
 
@@ -399,10 +440,31 @@ def test_gpt_56_golden_from_real_usage():
 
 
 def test_gpt_56_alias_snapshot_resolves():
-    """A dated gpt-5.6-sol snapshot resolves to the tier rates via the fallback."""
-    assert compute_cost("gpt-5.6-sol-2026-07-09", prompt_tokens=1_000_000) == Decimal(
-        "5.00"
+    """A dated gpt-5.6-sol snapshot resolves to the tier rates via the fallback --
+    through BOTH the short table (_RATES) and the long table (_LONG_RATES)."""
+    # short context: 200K input (<=272K) -> sol short input $5/M -> $1.00.
+    assert compute_cost("gpt-5.6-sol-2026-07-09", prompt_tokens=200_000) == Decimal(
+        "1.00"
     )
+    # long context: 1M input (>272K) -> snapshot must also resolve through _LONG_RATES
+    # to sol's long input rate $10/M -> $10.00.
+    assert compute_cost("gpt-5.6-sol-2026-07-09", prompt_tokens=1_000_000) == Decimal(
+        "10.00"
+    )
+
+
+def test_long_context_rerate_requires_both_gates():
+    """Long-context re-rating fires only when the model has BOTH a threshold AND
+    modelled long rates. The two gates are independent:
+
+    - gpt-5.4: has a 272K threshold but NO _LONG_RATES entry -> never re-rates,
+      keeps its single short rate even at 1M input.
+    - gpt-5.5: threshold is None -> never re-rates regardless of input size.
+    """
+    # gpt-5.4 short input $2.50/M applies even at 1M input (no long rates modelled).
+    assert compute_cost("gpt-5.4", prompt_tokens=1_000_000) == Decimal("2.50")
+    # gpt-5.5 short input $5.00/M applies even at 1M input (threshold is None).
+    assert compute_cost("gpt-5.5", prompt_tokens=1_000_000) == Decimal("5.00")
 
 
 def test_cache_write_ignored_for_models_without_write_rate():

@@ -41,11 +41,26 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
+from ._capabilities import get_capabilities
+
 # ---------------------------------------------------------------------------
 # Internal constants
 # ---------------------------------------------------------------------------
 
 _PER_M = Decimal("1_000_000")
+
+# Long-context re-rating threshold. A request whose INPUT (prompt) token count
+# exceeds the model's `long_context_pricing_threshold` bills the ENTIRE request --
+# input, output, cached, AND cache-write tokens -- at the long-context rates in
+# _LONG_RATES (whole-request re-rating, not marginal-on-the-overage). Boundary is
+# strict: a request exactly AT the threshold is still short-context (OpenAI prices
+# "<=272K" short, ">272K" long). Measured on input tokens only; output tokens do
+# not count toward the threshold.
+#
+# The threshold is NOT redefined here -- it is read per-model from the single
+# source of truth, ModelCapabilities.long_context_pricing_threshold in
+# _capabilities.py (272_000 for gpt-5.6; None for models with no split, which
+# therefore never re-rate). Source, verification date, and rationale live there.
 
 # Matches OpenAI dated-snapshot suffix: "<family>-YYYY-MM-DD".
 # Used by _find_rates() to fall back from a snapshot id to the family alias.
@@ -74,7 +89,9 @@ _RATES: dict[str, dict[str, Decimal]] = {
     # Field verified live: usage.input_tokens_details.cache_write_tokens (Responses API).
     # Alias "gpt-5.6" -> API echoes "gpt-5.6-sol" in response.model, so keying the
     # canonical tier ids is sufficient; no bare-alias entry required for cost.
-    # NOTE: short/long-context price split (~2x) NOT modelled here yet -- see issue #335.
+    # The rates below are SHORT-context (<=272K input tokens). Requests whose input
+    # exceeds the model's ModelCapabilities.long_context_pricing_threshold re-rate the
+    # whole request at _LONG_RATES (see compute_cost).
     # ------------------------------------------------------------------
     "gpt-5.6-sol": {
         "input_per_m": Decimal("5.00"),
@@ -151,26 +168,66 @@ _RATES: dict[str, dict[str, Decimal]] = {
 }
 
 
-def _find_rates(model: str) -> dict[str, Decimal] | None:
+# _LONG_RATES: GPT-5.6 long-context rates, applied to the WHOLE request when input
+# tokens exceed the model's ModelCapabilities.long_context_pricing_threshold (272K
+# for gpt-5.6). Same four keys as _RATES entries.
+# Relative to short-context: input / cached / cache-write are 2x, output is 1.5x.
+# Absolute rates read directly off the pricing page (not derived from multipliers):
+#   sol   input $10.00  cached $1.00  cache-write $12.50  output $45.00
+#   terra input  $5.00  cached $0.50  cache-write  $6.25  output $22.50
+#   luna  input  $2.00  cached $0.20  cache-write  $2.50  output  $9.00
+# Source: https://developers.openai.com/api/docs/pricing (verified 2026-07-15).
+_LONG_RATES: dict[str, dict[str, Decimal]] = {
+    "gpt-5.6-sol": {
+        "input_per_m": Decimal("10.00"),
+        "output_per_m": Decimal("45.00"),
+        "cache_read_per_m": Decimal("1.00"),
+        "cache_write_per_m": Decimal("12.50"),
+    },
+    "gpt-5.6-terra": {
+        "input_per_m": Decimal("5.00"),
+        "output_per_m": Decimal("22.50"),
+        "cache_read_per_m": Decimal("0.50"),
+        "cache_write_per_m": Decimal("6.25"),
+    },
+    "gpt-5.6-luna": {
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("9.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("2.50"),
+    },
+}
+
+
+def _find_rates(
+    model: str, table: dict[str, dict[str, Decimal]] | None = None
+) -> dict[str, Decimal] | None:
     """Look up pricing rates, falling back from snapshot id to family alias.
 
     The OpenAI Responses API echoes back the dated snapshot id in response.model
     (e.g. 'gpt-5.5-2026-04-23'), not the alias the caller configured ('gpt-5.5').
     We do a two-level lookup:
 
-      1. Exact match — lets an individual snapshot be listed explicitly in _RATES
+      1. Exact match — lets an individual snapshot be listed explicitly in the table
          if OpenAI ever re-prices it differently from the family.
       2. Strip the YYYY-MM-DD suffix and retry against the family alias.
 
+    Args:
+        model: model id or dated snapshot id.
+        table: rate table to search. Defaults to _RATES (short-context). Pass
+            _LONG_RATES to resolve long-context rates for the same model.
+
     Returns None (not a fabricated $0.00) when neither resolves.
     """
-    rates = _RATES.get(model)
+    if table is None:
+        table = _RATES
+    rates = table.get(model)
     if rates is not None:
         return rates
     m = _SNAPSHOT_RE.match(model)
     if m is None:
         return None
-    return _RATES.get(m.group("base"))
+    return table.get(m.group("base"))
 
 
 def compute_cost(
@@ -207,6 +264,21 @@ def compute_cost(
     rates = _find_rates(model)
     if rates is None:
         return None
+
+    # Long-context re-rating: when input tokens exceed the model's long-context
+    # pricing threshold, the ENTIRE request (input, output, cached, cache-write)
+    # bills at the long-context rates. Two independent gates:
+    #   1. threshold -- read per-model from the single source of truth,
+    #      ModelCapabilities.long_context_pricing_threshold (272_000 for gpt-5.6,
+    #      None for models with no documented split, which therefore never re-rate).
+    #   2. _LONG_RATES -- only GPT-5.6 tiers have long rates modelled, so a model
+    #      with a threshold but no long rates (e.g. gpt-5.4) keeps its single
+    #      short-context rate set unchanged.
+    threshold = get_capabilities(model).long_context_pricing_threshold
+    if threshold is not None and prompt_tokens > threshold:
+        long_rates = _find_rates(model, _LONG_RATES)
+        if long_rates is not None:
+            rates = long_rates
 
     cache_write_rate = rates.get("cache_write_per_m")
     if cache_write_rate is None:
