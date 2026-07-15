@@ -57,6 +57,15 @@ class ModelCapabilities:
     a warning rather than send a value the API will reject.
     """
 
+    allowed_reasoning_efforts: frozenset[str] | None = None
+    """Set of reasoning.effort values the model accepts, or None to skip validation.
+
+    None (default) = do not pre-flight-validate effort for this model (permissive;
+    the API remains the backstop). Populated only where the accepted set is known
+    and differs from the wizard's offered choices, so a bad combo (e.g. gpt-5.5 +
+    'max') fails clearly BEFORE the network call instead of as an opaque 400.
+    """
+
     supports_native_apply_patch: bool = True
     """Whether the model accepts OpenAI's native `{"type": "apply_patch"}` tool.
 
@@ -247,16 +256,17 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
         # gpt-5.4-mini and gpt-5.4-nano are both confirmed supported.
         supports_apply_patch = minor >= 1 and model_id != "gpt-5.1-chat-latest"
 
-        # gpt-5.5 — verified against live API 2026-04-24.
-        # 1M context, ~4x input / 3x output pricing vs 5.4. Reasoning blocks,
+        # gpt-5.5 — verified against live API 2026-04-24; context window
+        # corrected 2026-07-14 (model page: 1,050,000, not 1,000,000).
+        # 1.05M context, ~4x input / 3x output pricing vs 5.4. Reasoning blocks,
         # rs_* IDs, and encrypted_content carry the same shape as 5.4.
         # long_context_pricing_threshold is left None: the public pricing page
         # is not API-derivable, and 5.5's threshold (if any) differs from
-        # 5.4's 272K given the price step. Callers see the full 1M context.
+        # 5.4's 272K given the price step. Callers see the full 1.05M context.
         if minor == 5:
             return ModelCapabilities(
                 family="gpt-5",
-                context_window=1_000_000,
+                context_window=1_050_000,
                 max_output_tokens=128_000,
                 supports_reasoning=True,
                 default_reasoning_effort=None,
@@ -265,6 +275,10 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 capability_tags=_GPT5_TAGS,
                 long_context_pricing_threshold=None,
                 supports_in_memory_retention=False,  # 5.5 default is "24h", "in_memory" rejected
+                # 5.5 accepts none/low/medium/high/xhigh; NO 'max' (5.6-only), NO 'minimal'.
+                allowed_reasoning_efforts=frozenset(
+                    {"none", "low", "medium", "high", "xhigh"}
+                ),
                 supports_native_apply_patch=supports_apply_patch,
             )
 
@@ -289,6 +303,10 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 capability_tags=_GPT5_TAGS,
                 long_context_pricing_threshold=None,
                 supports_in_memory_retention=False,
+                # 5.6 adds 'max' (5.6-only); still NO 'minimal'.
+                allowed_reasoning_efforts=frozenset(
+                    {"none", "low", "medium", "high", "xhigh", "max"}
+                ),
                 supports_native_apply_patch=supports_apply_patch,
             )
 

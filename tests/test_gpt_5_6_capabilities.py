@@ -50,7 +50,7 @@ class TestRegressionAfterGPT56:
 
     def test_gpt_5_5_unchanged(self):
         caps = get_capabilities("gpt-5.5")
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
         assert caps.supports_in_memory_retention is False
 
     def test_gpt_5_4_unchanged(self):
@@ -66,3 +66,24 @@ class TestRegressionAfterGPT56:
         assert caps.context_window == 1_050_000
         # 5.7 is not gpt-5.6, so it keeps the permissive in_memory default (True).
         assert caps.supports_in_memory_retention is True
+
+
+class TestAllowedReasoningEfforts:
+    """Gap D: allowed_reasoning_efforts is capability-gated only for 5.5/5.6."""
+
+    def test_gpt_5_5_allowed_efforts(self):
+        caps = get_capabilities("gpt-5.5")
+        assert caps.allowed_reasoning_efforts == frozenset(
+            {"none", "low", "medium", "high", "xhigh"}
+        )
+
+    def test_gpt_5_6_allowed_efforts(self):
+        caps = get_capabilities("gpt-5.6-sol")
+        assert caps.allowed_reasoning_efforts == frozenset(
+            {"none", "low", "medium", "high", "xhigh", "max"}
+        )
+        assert "minimal" not in caps.allowed_reasoning_efforts
+
+    def test_gpt_5_4_efforts_permissive(self):
+        """Regression guard: gating is opt-in per model, not a blanket default."""
+        assert get_capabilities("gpt-5.4").allowed_reasoning_efforts is None

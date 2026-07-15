@@ -10,7 +10,7 @@ class TestGPT55Family:
     def test_gpt_5_5(self):
         caps = get_capabilities("gpt-5.5")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
         assert caps.default_reasoning_effort is None
@@ -30,7 +30,7 @@ class TestGPT55Family:
     def test_gpt_5_5_pro(self):
         caps = get_capabilities("gpt-5.5-pro")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
         assert caps.supports_reasoning is True
         assert caps.supports_in_memory_retention is False
         assert caps.supports_24h_retention is True
@@ -38,13 +38,13 @@ class TestGPT55Family:
     def test_gpt_5_5_dated_snapshot(self):
         caps = get_capabilities("gpt-5.5-2026-04-23")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
         assert caps.supports_24h_retention is True
 
     def test_gpt_5_5_pro_dated_snapshot(self):
         caps = get_capabilities("gpt-5.5-pro-2026-04-23")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
         assert caps.supports_24h_retention is True
 
 
