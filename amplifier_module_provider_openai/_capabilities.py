@@ -268,26 +268,38 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 supports_native_apply_patch=supports_apply_patch,
             )
 
-        # gpt-5.6 (Sol / Terra / Luna) -- GA 2026-07-09, verified against live API
-        # 2026-07-14. 1.05M context / 128K output across all three tiers; the tiers
-        # differ in price/latency (see _cost.py), not context or capability, so they
-        # share one descriptor. in_memory retention is REJECTED by the API
-        # ("compatible only with 24h extended prompt caching"), so
-        # supports_in_memory_retention=False routes callers to 24h via the existing
-        # _drop_unsupported_in_memory_retention gate. The short/long-context price
-        # split (~2x) is a pricing concern (see _cost.py / issue #335), not a
-        # capability field, so it is not modelled here.
+        # gpt-5.6 (Sol / Terra / Luna) -- GA 2026-07-09.
+        #
+        # context_window=900_000 is EMPIRICALLY MEASURED, not the marketing number.
+        # OpenAI advertises ~1.05M, but a live binary-search probe of gpt-5.6-sol
+        # (2026-07-14) found the real hard ceiling is ~908K-928K: a 907,812-token
+        # input succeeds, 928,125 returns HTTP 400 context_length_exceeded. The
+        # nominal 1.05M is NOT deliverable -- reporting it caused real
+        # context_length_exceeded crashes on long sessions. 900_000 sits safely
+        # below the measured success point (headroom for output tokens). All three
+        # tiers share this ceiling (they differ in price/latency, see _cost.py).
+        #
+        # in_memory retention is REJECTED by the API ("compatible only with 24h
+        # extended prompt caching"), so supports_in_memory_retention=False routes
+        # callers to 24h via the existing _drop_unsupported_in_memory_retention gate.
+        #
+        # long_context_pricing_threshold=272_000 (mirrors gpt-5.4): gpt-5.6 has a
+        # documented short/long-context price split (~2x) at this boundary. get_info()
+        # reports the THRESHOLD as the default context_window, so unpinned sessions
+        # compact against the standard-priced 272K window and don't silently incur 2x
+        # billing. Callers who need the full measured 900K opt in via
+        # enable_long_context=True (accepting the ~2x price) -- identical to gpt-5.4.
         if minor == 6:
             return ModelCapabilities(
                 family="gpt-5",
-                context_window=1_050_000,
+                context_window=900_000,
                 max_output_tokens=128_000,
                 supports_reasoning=True,
                 default_reasoning_effort=None,
                 supports_vision=True,
                 supports_streaming=True,
                 capability_tags=_GPT5_TAGS,
-                long_context_pricing_threshold=None,
+                long_context_pricing_threshold=272_000,
                 supports_in_memory_retention=False,
                 supports_native_apply_patch=supports_apply_patch,
             )
