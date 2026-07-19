@@ -432,6 +432,54 @@ def test_response_not_found_triggers_retry_without_chain():
     assert result is not None
 
 
+def test_response_not_found_retry_restores_full_history():
+    """404 invalidation retry must resend the FULL history, not just the delta.
+
+    Issue #321: when chaining is active the first request trims ``input`` to the
+    post-chain delta because ``previous_response_id`` carries the prior turns as
+    server-side state. When the server rejects that id (expired/unknown), the
+    server holds NO prior context, so the retry must restore the full converted
+    history. Retrying with only the delta would silently drop the entire prior
+    conversation -- the exact regression this guards against.
+    """
+    provider = _make_provider(default_model="gpt-5.5")  # auto -> chain_active=True
+    provider.client.responses.create = AsyncMock(
+        side_effect=[_make_not_found_error("response_not_found"), DummyResponse()]
+    )
+
+    # Request: user "Hi" -> assistant "Hello!" (chained id) -> user "Follow-up".
+    # The pre-chain user turn "Hi" is what a delta-only retry would drop.
+    request = _request_with_prior_response_id("resp_abc")
+    result = asyncio.run(provider.complete(request))
+
+    calls = _all_calls(provider)
+    assert len(calls) == 2, (
+        f"Expected exactly 2 API calls (invalidation retry), got {len(calls)}"
+    )
+
+    # First (chained) call: chain attached, input trimmed to the delta only.
+    chained_input = str(calls[0].get("input", []))
+    assert calls[0].get("previous_response_id") == "resp_abc"
+    assert "Follow-up" in chained_input, (
+        f"Chained call should carry the post-chain delta; got input={chained_input}"
+    )
+    assert "Hi" not in chained_input, (
+        f"Chained call input should be trimmed to the delta (no pre-chain 'Hi'); "
+        f"got input={chained_input}"
+    )
+
+    # Retry call: chain dropped AND full history restored (delta + prior turns).
+    retry_input = str(calls[1].get("input", []))
+    assert "previous_response_id" not in calls[1], (
+        f"Retry must NOT carry previous_response_id; got {calls[1].get('previous_response_id')}"
+    )
+    assert "Hi" in retry_input and "Follow-up" in retry_input, (
+        f"Retry must restore FULL history (pre-chain 'Hi' + delta 'Follow-up'), "
+        f"not just the delta; got input={retry_input}"
+    )
+    assert result is not None
+
+
 def test_response_chain_invalidated_event_emitted():
     """The retry path emits provider:response_chain_invalidated."""
     coordinator = FakeCoordinator()
