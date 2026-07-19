@@ -1149,6 +1149,38 @@ class OpenAIProvider:
                 chain_active,
                 store_enabled,
             )
+            # Issue #321: previous_response_id already carries the full prior
+            # request+response as server-side state. Re-sending the entire local
+            # conversation in `input` double-counts every prior token server-side.
+            # Send ONLY the delta: developer context for this turn plus the
+            # conversation messages added AFTER the chained assistant turn.
+            chain_idx = None
+            for i in range(len(conversation) - 1, -1, -1):
+                cm = conversation[i]
+                cm_dict = cm.model_dump() if hasattr(cm, "model_dump") else cm
+                if (
+                    getattr(cm, "role", None) == "assistant"
+                    and isinstance(cm_dict, dict)
+                    and cm_dict.get("metadata")
+                    and cm_dict["metadata"].get(METADATA_RESPONSE_ID)
+                    == previous_response_id
+                ):
+                    chain_idx = i
+                    break
+            if chain_idx is not None:
+                delta_for_conversion = [dev.model_dump() for dev in developer_msgs] + [
+                    cm.model_dump() for cm in conversation[chain_idx + 1 :]
+                ]
+                params["input"] = self._convert_messages(
+                    delta_for_conversion,
+                    skip_reasoning_reinsertion=chain_active,
+                )
+                logger.info(
+                    "[PROVIDER] Response chaining active: trimmed input to delta "
+                    "(%d local messages -> %d API messages after previous_response_id)",
+                    len(delta_for_conversion),
+                    len(params["input"]),
+                )
         elif previous_response_id:
             logger.debug(
                 "[PROVIDER] Skipping previous_response_id (chain_active=False, store=False). "
