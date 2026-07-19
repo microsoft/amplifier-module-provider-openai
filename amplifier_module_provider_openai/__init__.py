@@ -1725,6 +1725,14 @@ class OpenAIProvider:
                     )
                     if is_chain_invalidation and "previous_response_id" in params:
                         invalidated_id = params.pop("previous_response_id")
+                        # Issue #321: when chaining was active we trimmed
+                        # params["input"] down to the post-chain delta. With the
+                        # chain now invalidated the server holds no prior context,
+                        # so restore the full converted history. OpenAI's
+                        # documented recovery is previous_response_id=null + full
+                        # input; retrying with only the delta would silently drop
+                        # the entire prior conversation.
+                        params["input"] = input_messages
                         logger.warning(
                             "[PROVIDER] previous_response_id=%s invalidated by server "
                             "(code=%s). Retrying without chain.",
