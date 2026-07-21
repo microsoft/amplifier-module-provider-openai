@@ -28,6 +28,7 @@ from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.events import PROVIDER_RETRY
+from amplifier_core.models import HookResult
 from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
@@ -131,6 +132,39 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         api_key=api_key, config=config, coordinator=coordinator, add_cost=_add_cost
     )
     await coordinator.mount("providers", provider, name="openai")
+
+    # Issue #321: break the OpenAI Responses API response chain whenever the
+    # context is compacted, so the provider stops rebuilding the pre-compaction
+    # server-side context via previous_response_id (which drives unbounded
+    # input-token growth -> context_length_exceeded). The default context
+    # module emits the literal "context:compaction"; other context managers use
+    # the kernel's "context:pre_compact"/"context:post_compact". Subscribe to
+    # all three so the fix survives a swapped context module.
+    async def _on_compaction(event: str, data: dict[str, Any]) -> HookResult:
+        provider._reset_chain_on_next_request = True
+        logger.info(
+            "[PROVIDER] Compaction event '%s' received; breaking OpenAI "
+            "response chain on next request (Issue #321).",
+            event,
+        )
+        return HookResult()
+
+    if hasattr(coordinator, "hooks") and coordinator.hooks is not None:
+        for _compaction_event in (
+            "context:compaction",
+            "context:pre_compact",
+            "context:post_compact",
+        ):
+            try:
+                coordinator.hooks.on(_compaction_event, _on_compaction)
+            except Exception as sub_err:  # pragma: no cover - defensive
+                logger.warning(
+                    "[PROVIDER] Could not subscribe to '%s' for Issue #321 "
+                    "chain reset: %s",
+                    _compaction_event,
+                    sub_err,
+                )
+
     coordinator.register_contributor(
         "session.cost",
         "provider-openai",
@@ -321,6 +355,17 @@ class OpenAIProvider:
         self._client: AsyncOpenAI | None = client  # Lazy init if None
         self.config = config or {}
         self.coordinator = coordinator
+
+        # Issue #321: one-shot flag set by the compaction hook handlers
+        # registered in mount(). When the context manager compacts (or a
+        # swapped context module fires its pre/post-compaction event), the
+        # local transcript shrinks but the most recent assistant message may
+        # still carry a pre-compaction openai:response_id. Chaining from it via
+        # previous_response_id makes OpenAI rebuild the full pre-compaction
+        # server-side context, so input tokens climb without bound until
+        # context_length_exceeded. This flag tells the next request to break
+        # the chain so it restarts from the compacted view.
+        self._reset_chain_on_next_request = False
 
         # Configuration with sensible defaults (from _constants.py - single source of truth)
         self.base_url = self.config.get(
@@ -1099,6 +1144,23 @@ class OpenAIProvider:
                             )
                             break
 
+        # Issue #321: if a compaction fired since the last request, break the
+        # chain now. The stored previous_response_id points at the pre-compaction
+        # server-side context; chaining from it would rebuild the un-compacted
+        # transcript server-side and grow input tokens without bound. Dropping it
+        # forces a fresh prefix built from the compacted local transcript (which
+        # is still sent in full via `input`). One-shot: consume and clear so
+        # subsequent turns chain normally from the new post-compaction response.
+        if self._reset_chain_on_next_request:
+            if previous_response_id is not None:
+                logger.info(
+                    "[PROVIDER] Breaking response chain after compaction "
+                    "(dropping previous_response_id=%s) - Issue #321.",
+                    previous_response_id,
+                )
+                previous_response_id = None
+            self._reset_chain_on_next_request = False
+
         # Prepare request parameters per Responses API spec
         params = {
             "model": model_name,
@@ -1669,6 +1731,43 @@ class OpenAIProvider:
                     or "too many tokens" in raw_msg
                     or "maximum context" in raw_msg
                 ):
+                    # Issue #321: an overflow while a response chain is active
+                    # almost always means previous_response_id is holding a
+                    # large pre-compaction server-side context. Break the chain
+                    # once and retry with the full (compacted) local transcript
+                    # so the request is bounded by the local view. This is the
+                    # self-heal that also covers the resume path, where a fresh
+                    # process re-lifts a stale on-disk openai:response_id before
+                    # any compaction event has fired.
+                    if "previous_response_id" in params:
+                        overflow_id = params.pop("previous_response_id")
+                        # Chain is gone -> the server holds no prior context, so
+                        # restore the full converted history (mirrors the 404
+                        # invalidation path). Retrying with only the delta would
+                        # silently drop the entire prior conversation.
+                        params["input"] = input_messages
+                        logger.warning(
+                            "[PROVIDER] context_length_exceeded with active "
+                            "response chain (previous_response_id=%s). Breaking "
+                            "chain and retrying with full compacted input "
+                            "(Issue #321).",
+                            overflow_id,
+                        )
+                        if self.coordinator and hasattr(self.coordinator, "hooks"):
+                            await self.coordinator.hooks.emit(
+                                RESPONSE_CHAIN_INVALIDATED,
+                                {
+                                    "provider": self.name,
+                                    "model": params.get("model"),
+                                    "invalidated_id": overflow_id,
+                                    "error_code": "context_length_exceeded",
+                                },
+                            )
+                        # Retry once. previous_response_id is gone, so a second
+                        # overflow cannot re-enter this branch — it falls through
+                        # to ContextLengthError, which the context manager
+                        # handles via its normal compaction path.
+                        return await _do_complete()
                     raise kernel_errors.ContextLengthError(
                         error_msg,
                         provider=self.name,
