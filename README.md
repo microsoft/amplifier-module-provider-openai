@@ -591,7 +591,16 @@ messages = [
 
 Both emissions carry `provider`, `repair_count`, and `repairs` (a list of `{tool_call_id, tool_name}`). `repair_count` counts synthesized results only and always equals `len(repairs)`.
 
-The `chain_pairing` site adds `dropped_count` alongside the chain-specific diagnostics (`expected_call_ids`, `provided_call_ids`, `synthesized_for`, `dropped_item_id_outputs`). Dropping an unpairable output is a separate action from synthesizing a missing one, so a turn may legitimately report `repair_count: 0` with `dropped_count: 1` — the provider dropped an output that could pair with nothing server-side while every genuine call was already correctly paired.
+The `chain_pairing` site adds `dropped_count` and `kept_count` alongside the chain-specific diagnostics (`expected_call_ids`, `provided_call_ids`, `synthesized_for`, `dropped_item_id_outputs`, `kept_item_id_outputs`). Dropping an unpairable output is a separate action from synthesizing a missing one, so a turn may legitimately report `repair_count: 0` with `dropped_count: 1` — the provider dropped an output that could pair with nothing server-side while every genuine call was already correctly paired.
+
+An `fc_`-keyed (Responses-API item id) output has **two** possible outcomes, and each is counted separately:
+
+| Field | Outcome |
+|-------|---------|
+| `dropped_count` / `dropped_item_id_outputs` | The `fc_` id matches no chained call. It can pair with nothing server-side, so it is discarded and the orphaned call gets a synthesized error result. |
+| `kept_count` / `kept_item_id_outputs` | The `fc_` id matches the chained turn's local tool-call record — both were keyed from the same `ToolCallBlock.id`. The real tool output is **kept**: dropping it would destroy the payload while the orphan repair re-synthesized an error under that same unpairable id, which is strictly worse. |
+
+Total `fc_` keying anomalies observed on a turn is therefore `dropped_count + kept_count`, not `dropped_count` alone.
 
 **Philosophy**: This is **graceful degradation** following kernel philosophy - errors in other modules (context management) don't crash the provider or kill the user's session.
 

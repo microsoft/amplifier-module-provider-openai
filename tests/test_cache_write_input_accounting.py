@@ -40,8 +40,10 @@ from unittest.mock import AsyncMock
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_openai import OpenAIProvider
+from amplifier_core.message_models import Usage
 from amplifier_module_provider_openai._response_handling import (
     convert_response_with_accumulated_output,
+    merge_discarded_usage,
 )
 
 # ---------------------------------------------------------------------------
@@ -435,3 +437,99 @@ def test_pre_5_6_model_without_cache_write_field_still_reconstructs():
     assert "cache_write_tokens" not in usage
     assert usage["input_tokens"] == 1_000
     assert _consumer_total_input(usage) == 1_000
+
+
+# ---------------------------------------------------------------------------
+# 5. Truncation-retry path (merge_discarded_usage)
+#
+# The truncation-retry policy discards an attempt and folds its BILLED usage
+# into the report. That fold happens AFTER the final response has already been
+# normalized, so it must normalize each discarded attempt the same way -- the
+# raw vendor input_tokens contains cache_write as a subset. Adding it raw
+# reintroduces exactly the double-count this module exists to prevent, but
+# only on turns that truncated AND wrote cache (invisible to fixtures whose
+# cache_write is 0).
+# ---------------------------------------------------------------------------
+
+
+def _usage_stub(
+    *, input_tokens: int, output_tokens: int, cached: int, cache_write: int
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        input_tokens_details=SimpleNamespace(
+            cached_tokens=cached, cache_write_tokens=cache_write
+        ),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+    )
+
+
+def test_merge_discarded_usage_preserves_the_consumer_formula():
+    """Gross input must reconstruct as input_tokens + cache_write_tokens after
+    a discarded attempt is folded in -- the same invariant asserted for the
+    non-truncated paths above."""
+    # Discarded attempt: raw 10,000 gross, of which 4,000 was a cache WRITE.
+    discarded = _usage_stub(
+        input_tokens=10_000, output_tokens=500, cached=0, cache_write=4_000
+    )
+    # Final kept attempt: raw 10,000 gross, all cache READ, no write.
+    final = Usage(
+        input_tokens=10_000,  # already normalized (cache_write = 0 here)
+        output_tokens=800,
+        total_tokens=10_800,
+        cache_read_tokens=9_500,
+        cache_write_tokens=0,
+        reasoning_tokens=400,
+    )
+
+    merged = merge_discarded_usage(final, [discarded])
+
+    true_gross = 10_000 + 10_000  # raw discarded + raw final
+    assert merged.input_tokens + (merged.cache_write_tokens or 0) == true_gross, (
+        "discarded attempt's raw input was folded in without subtracting its "
+        "cache_write, so the consumer formula double-counts the write"
+    )
+    assert merged.input_tokens == 16_000  # 10,000 + (10,000 - 4,000)
+    assert merged.cache_write_tokens == 4_000
+    assert merged.output_tokens == 1_300
+    assert merged.total_tokens == merged.input_tokens + merged.output_tokens
+
+
+def test_merge_discarded_usage_without_cache_write_is_a_plain_sum():
+    """Pre-5.6 models never write cache: normalization must be a no-op there,
+    not an off-by-something."""
+    discarded = SimpleNamespace(
+        input_tokens=1_000,
+        output_tokens=50,
+        input_tokens_details=SimpleNamespace(cached_tokens=400),
+        output_tokens_details=None,
+    )
+    final = Usage(
+        input_tokens=2_000, output_tokens=100, total_tokens=2_100, cache_read_tokens=900
+    )
+
+    merged = merge_discarded_usage(final, [discarded])
+
+    assert merged.input_tokens == 3_000
+    assert merged.output_tokens == 150
+    assert merged.cache_read_tokens == 1_300
+    assert merged.cache_write_tokens is None
+
+
+def test_merge_discarded_usage_multiple_attempts_each_normalized():
+    """Every discarded attempt is normalized, not just the first."""
+    a = _usage_stub(input_tokens=5_000, output_tokens=10, cached=0, cache_write=2_000)
+    b = _usage_stub(input_tokens=6_000, output_tokens=20, cached=0, cache_write=3_000)
+    final = Usage(
+        input_tokens=1_000,
+        output_tokens=30,
+        total_tokens=1_030,
+        cache_write_tokens=0,
+    )
+
+    merged = merge_discarded_usage(final, [a, b])
+
+    true_gross = 1_000 + 5_000 + 6_000
+    assert merged.input_tokens + (merged.cache_write_tokens or 0) == true_gross
+    assert merged.cache_write_tokens == 5_000

@@ -59,6 +59,7 @@ from ._constants import NATIVE_TOOL_TYPES
 from ._constants import RESPONSE_CHAIN_INVALIDATED
 from ._constants import RESPONSE_NOT_FOUND_ERROR_CODES
 from ._response_handling import FunctionCallTruncationError
+from ._response_handling import merge_discarded_usage
 from ._response_handling import convert_response_with_accumulated_output
 from ._response_handling import describe_incomplete_function_calls
 from ._response_handling import extract_reasoning_text
@@ -1280,11 +1281,23 @@ class OpenAIProvider:
         assistant message's tool_calls):
         1. every chained tool call id must have a matching output — an
            error output is synthesized for any orphan;
-        2. any fc_-prefixed function_call_output id (a Responses-API ITEM
-           id, not a call id) is a bug upstream: it can pair with nothing
-           server-side, so it is dropped with a loud warning — observed
-           live killing a session even for a COMPLETED, successfully
-           executed tool call.
+        2. an fc_-prefixed function_call_output id (a Responses-API ITEM
+           id, not a call id) indicates an upstream keying bug. Both
+           branches see the SAME keyspace (expected ids and output
+           call_ids both originate from ToolCallBlock.id), so two
+           sub-cases exist:
+           - the fc_ id MATCHES a chained call id: the local record of
+             the turn is keyed by the same fc_ id (legacy pre-P4
+             history). Dropping the real output and synthesizing an
+             error keyed by the same id would destroy the payload while
+             changing nothing on the wire — so the REAL output is KEPT,
+             with a loud warning;
+           - the fc_ id matches NO chained call id: it can pair with
+             nothing, so it is dropped with a loud warning — observed
+             live killing a session even for a COMPLETED, successfully
+             executed tool call.
+           Native result envelopes are never subject to this drop (see
+           the scoping note at the check itself).
         """
         expected_ids: list[str] = []
         # call_id -> tool name, for the canonical repair event's `repairs`
@@ -1311,6 +1324,7 @@ class OpenAIProvider:
 
         provided_ids: set[str] = set()
         anomalous_items: list[dict[str, Any]] = []
+        kept_anomalous_ids: list[str] = []
         kept: list[dict[str, Any]] = []
         for item in delta_input:
             item_type = item.get("type") if isinstance(item, dict) else None
@@ -1321,6 +1335,27 @@ class OpenAIProvider:
                 # and dropping a native output would destroy a real, otherwise
                 # unrecoverable tool result.
                 if item_type == "function_call_output" and call_id.startswith("fc_"):
+                    if call_id in expected_ids:
+                        # The chained turn's LOCAL record is keyed by the same
+                        # fc_ id — the pairing is internally consistent, just
+                        # mis-keyed upstream. Dropping this output would
+                        # destroy the real tool result only for the orphan
+                        # branch to synthesize an error output under the SAME
+                        # unpairable id: strictly worse. Keep the real output.
+                        kept_anomalous_ids.append(call_id)
+                        logger.warning(
+                            "[PROVIDER] Chain pairing: function_call_output %s "
+                            "is keyed by an ITEM id (fc_), but the chained "
+                            "turn's local tool-call record uses the same id — "
+                            "keeping the REAL output (len %d) rather than "
+                            "destroying it. This indicates an upstream "
+                            "dispatch-keying bug (likely pre-P4 history).",
+                            call_id,
+                            len(str(item.get("output") or "")),
+                        )
+                        provided_ids.add(call_id)
+                        kept.append(item)
+                        continue
                     anomalous_items.append(item)
                     logger.warning(
                         "[PROVIDER] Chain pairing: dropping function_call_output "
@@ -1356,7 +1391,7 @@ class OpenAIProvider:
             )
 
         if (
-            (missing_ids or anomalous_items)
+            (missing_ids or anomalous_items or kept_anomalous_ids)
             and self.coordinator
             and hasattr(self.coordinator, "hooks")
         ):
@@ -1413,12 +1448,21 @@ class OpenAIProvider:
                     ],
                     "repair_site": "chain_pairing",
                     "dropped_count": len(anomalous_items),
+                    # An fc_-keyed output is now one of TWO outcomes, not one:
+                    # dropped (pairs with nothing) or KEPT (its id matches the
+                    # chained turn's local record). dropped_count alone would
+                    # therefore under-report fc_ keying anomalies — the very
+                    # signal this event was fixed to surface — because every
+                    # kept output would vanish from the counts. Total fc_
+                    # anomalies on a turn = dropped_count + kept_count.
+                    "kept_count": len(kept_anomalous_ids),
                     "expected_call_ids": expected_ids,
                     "provided_call_ids": sorted(provided_ids),
                     "synthesized_for": missing_ids,
                     "dropped_item_id_outputs": [
                         str(i.get("call_id")) for i in anomalous_items
                     ],
+                    "kept_item_id_outputs": kept_anomalous_ids,
                 },
             )
         return kept
@@ -2794,6 +2838,10 @@ class OpenAIProvider:
             final_response = response
             continuation_count = 0
             truncation_retry_done = False
+            # Usage objects from attempts whose output was discarded (the
+            # truncation-retry policy). Discarded attempts are still BILLED —
+            # their usage must be folded into the reported totals.
+            discarded_usages: list[Any] = []
 
             while (
                 hasattr(final_response, "status")
@@ -2842,6 +2890,11 @@ class OpenAIProvider:
                                 },
                             )
                         params["max_output_tokens"] = cap_tokens
+                        # The truncated attempt's output is discarded, but its
+                        # tokens (full input pass + up to the previous budget
+                        # of output, including reasoning) were BILLED. Track
+                        # its usage so the final report includes it.
+                        discarded_usages.append(getattr(final_response, "usage", None))
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
                             self._create_response(params),
@@ -2996,6 +3049,53 @@ class OpenAIProvider:
             else:
                 # Use existing conversion for normal (non-continued) responses
                 chat_response = self._convert_to_chat_response(response)
+
+            # Fold the usage of discarded truncation attempts into the report.
+            # The discarded attempt burned a full input pass plus up to the
+            # previous output budget (including reasoning tokens) — all billed;
+            # without this the final report covers only the kept response.
+            if discarded_usages and chat_response.usage is not None:
+                chat_response.usage = merge_discarded_usage(
+                    chat_response.usage, discarded_usages
+                )
+                extra_cost = None
+                for _discarded in discarded_usages:
+                    if _discarded is None:
+                        continue
+                    # NOTE: this deliberately feeds compute_cost the RAW vendor
+                    # `input_tokens` (which still contains cache_write), NOT the
+                    # contract-normalized value merge_discarded_usage() adds to
+                    # Usage.input_tokens — compute_cost subtracts cached and
+                    # cache_write internally and expects the raw combined total.
+                    # Same asymmetry, same reason, as the kept response's cost
+                    # path above.
+                    _input_details = getattr(_discarded, "input_tokens_details", None)
+                    _cost = compute_cost(
+                        params["model"],
+                        prompt_tokens=getattr(_discarded, "input_tokens", 0) or 0,
+                        completion_tokens=getattr(_discarded, "output_tokens", 0) or 0,
+                        cached_tokens=(getattr(_input_details, "cached_tokens", 0) or 0)
+                        if _input_details
+                        else 0,
+                        cache_write_tokens=(
+                            getattr(_input_details, "cache_write_tokens", 0) or 0
+                        )
+                        if _input_details
+                        else 0,
+                    )
+                    if _cost is not None:
+                        extra_cost = (extra_cost or Decimal("0")) + _cost
+                if extra_cost is not None:
+                    chat_response.usage = chat_response.usage.model_copy(
+                        update={
+                            "cost_usd": (
+                                getattr(chat_response.usage, "cost_usd", None)
+                                or Decimal("0")
+                            )
+                            + extra_cost
+                        }
+                    )
+                    self._add_cost(extra_cost)
 
             # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3962,8 +4062,9 @@ class OpenAIProvider:
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
-                    # P4: call_id-keyed; raises FunctionCallTruncationError on
-                    # incomplete/unparseable calls instead of surfacing {}.
+                    # P4: call_id-keyed; raises FunctionCallTruncationError
+                    # on incomplete calls; completed-but-unparseable arguments
+                    # coerce to {} loudly (survivable model failure).
                     tool_id, tool_name, tool_input = parse_function_call_block(block)
                     content_blocks.append(
                         ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
@@ -4083,8 +4184,9 @@ class OpenAIProvider:
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
-                    # P4: call_id-keyed; raises FunctionCallTruncationError on
-                    # incomplete/unparseable calls instead of surfacing {}.
+                    # P4: call_id-keyed; raises FunctionCallTruncationError
+                    # on incomplete calls; completed-but-unparseable arguments
+                    # coerce to {} loudly (survivable model failure).
                     tool_id, tool_name, tool_input = parse_function_call_block(block)
                     content_blocks.append(
                         ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)

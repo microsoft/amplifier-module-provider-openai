@@ -8,11 +8,15 @@ item ids (`fc_…`) instead of call ids (`call_…`) — unpairable outputs, the
 a 400 killed the session.
 
 Invariants asserted here (non-negotiable):
-- no `{}`-argument call ever surfaces from a truncated/unparseable function_call
+- no `{}`-argument call ever surfaces from a TRUNCATED (status "incomplete")
+  function_call — truncation fails loud (FunctionCallTruncationError)
+- a NON-incomplete call with unparseable JSON arguments is a survivable model
+  failure, NOT truncation: it coerces to {} with a loud warning so the
+  tool-error feedback loop can drive recovery (raising killed sessions on
+  COMPLETED responses — the error is non-retryable and caught nowhere)
 - surfaced tool-call ids are call_-keyed (call_id preferred over item id)
-- incomplete-after-budget fails loud (FunctionCallTruncationError), never silent
 - the continuation policy retries once with the budget raised to the model cap
-  before failing
+  before failing, and the discarded attempt's BILLED usage is still reported
 - default output budget comes from the model's capability table, not a fixed 4096
 """
 
@@ -67,6 +71,7 @@ def _make_response(
     output: list | None = None,
     incomplete_reason: str | None = None,
     max_output_tokens: int | None = 4096,
+    usage: dict | None = None,
 ) -> Response:
     payload = _base_payload()
     payload["status"] = status
@@ -76,6 +81,8 @@ def _make_response(
     )
     if output is not None:
         payload["output"] = output
+    if usage is not None:
+        payload["usage"] = usage
     return Response.model_validate(payload)
 
 
@@ -114,11 +121,21 @@ def test_parse_incomplete_status_raises_never_surfaces_empty_args():
         parse_function_call_block(_function_call_item(status="incomplete"))
 
 
-def test_parse_unparseable_arguments_raises():
-    with pytest.raises(FunctionCallTruncationError):
-        parse_function_call_block(
+def test_parse_unparseable_arguments_on_completed_call_coerces_loudly(caplog):
+    """Malformed-but-completed arguments are a known model failure mode, not
+    truncation. Raising here killed the session (the error is non-retryable
+    and caught nowhere); coercing to {} lets the tool-error feedback loop
+    drive model recovery."""
+    with caplog.at_level("WARNING"):
+        tool_id, name, args = parse_function_call_block(
             _function_call_item(status="completed", arguments=TRUNCATED_ARGS)
         )
+    assert args == {}
+    assert tool_id == "call_Ohhub2jBM8HU07mYExW9jDvD"
+    assert name == "write_file"
+    assert any("unparseable JSON arguments" in r.message for r in caplog.records), (
+        "the coercion must be loud"
+    )
 
 
 def test_parse_empty_arguments_is_a_legitimate_no_arg_call():
@@ -186,6 +203,62 @@ def test_accumulated_conversion_valid_calls_are_call_id_keyed():
 
 
 # ---------------------------------------------------------------------------
+# Completed responses with malformed arguments must SURVIVE (regression:
+# raising here killed sessions — the error is non-retryable, caught nowhere,
+# and the truncation retry loop never runs for status="completed")
+# ---------------------------------------------------------------------------
+
+
+def test_completed_response_with_unparseable_arguments_survives_complete():
+    """A status='completed' response carrying malformed JSON args is a known
+    model failure mode, not truncation. It never enters the truncation retry
+    loop (gated on status=='incomplete'), so raising ends the session. The
+    call must surface with {} arguments so the tool-error feedback loop can
+    drive recovery."""
+    provider = _make_provider()
+    captured: list[dict] = []
+    response = _make_response(
+        status="completed",
+        output=[
+            _function_call_item(
+                status="completed",
+                arguments='{"path": "/tmp/x", "content": "unterminated',
+            )
+        ],
+    )
+    provider.client.responses.create = _sequential_mock(  # pyright: ignore[reportAttributeAccessIssue]
+        [response], captured
+    )
+
+    request = ChatRequest(messages=[Message(role="user", content="go")])
+    result = asyncio.run(provider.complete(request))  # must NOT raise
+
+    assert len(captured) == 1, "completed response: no retry loop involvement"
+    assert result.tool_calls is not None
+    assert result.tool_calls[0].id == "call_Ohhub2jBM8HU07mYExW9jDvD"
+    assert result.tool_calls[0].arguments == {}
+
+
+def test_incomplete_response_with_unparseable_arguments_still_fails_loud():
+    """The survivable path above must NOT weaken the truncation contract:
+    an INCOMPLETE response with unparseable args still retries then fails
+    loud (covered in depth by the continuation-policy tests below)."""
+    provider = _make_provider({"max_tokens": 4096})
+    captured: list[dict] = []
+    truncated = _make_response(
+        status="incomplete",
+        output=[_function_call_item(status="in_progress")],
+        incomplete_reason="max_output_tokens",
+    )
+    provider.client.responses.create = _sequential_mock(  # pyright: ignore[reportAttributeAccessIssue]
+        [truncated, truncated], captured
+    )
+    request = ChatRequest(messages=[Message(role="user", content="write the file")])
+    with pytest.raises(FunctionCallTruncationError):
+        asyncio.run(provider.complete(request))
+
+
+# ---------------------------------------------------------------------------
 # Continuation policy (retry-at-cap, then loud failure)
 # ---------------------------------------------------------------------------
 
@@ -221,6 +294,46 @@ def test_truncated_call_retries_once_with_budget_raised_to_model_cap():
     assert result.tool_calls is not None
     assert result.tool_calls[0].id.startswith("call_")
     assert result.tool_calls[0].arguments["content"] == "done"
+
+
+def test_truncation_retry_reports_discarded_attempt_usage():
+    """The discarded truncated attempt is BILLED (full input pass + up to the
+    previous budget of output, including reasoning tokens). Its usage must be
+    folded into the reported totals, not silently dropped with its output."""
+    provider = _make_provider({"max_tokens": 4096})
+    captured: list[dict] = []
+    truncated = _make_response(
+        status="incomplete",
+        output=[_function_call_item()],
+        incomplete_reason="max_output_tokens",
+    )
+    recovered = _make_response(
+        status="completed",
+        output=[
+            _function_call_item(
+                status="completed",
+                arguments='{"file_path": "/workspace/DISCREPANCIES.md", "content": "done"}',
+            )
+        ],
+    )
+    provider.client.responses.create = _sequential_mock(  # pyright: ignore[reportAttributeAccessIssue]
+        [truncated, recovered], captured
+    )
+
+    request = ChatRequest(messages=[Message(role="user", content="write the file")])
+    result = asyncio.run(provider.complete(request))
+
+    assert len(captured) == 2, "sanity: one discarded attempt + one retry"
+    # Both responses share the fixture usage (input=14, output=6): the report
+    # must cover BOTH attempts, not just the kept retry.
+    t_usage, r_usage = truncated.usage, recovered.usage
+    assert t_usage is not None and r_usage is not None
+    assert result.usage is not None
+    assert result.usage.input_tokens == t_usage.input_tokens + r_usage.input_tokens
+    assert result.usage.output_tokens == t_usage.output_tokens + r_usage.output_tokens
+    assert result.usage.total_tokens == (
+        result.usage.input_tokens + result.usage.output_tokens
+    )
 
 
 def test_truncated_call_at_cap_fails_loud_no_empty_arg_calls():
@@ -349,3 +462,61 @@ def test_paired_function_call_gets_no_synthetic_output():
     wire = provider._convert_messages(messages)
     outputs = [i for i in wire if i.get("type") == "function_call_output"]
     assert len(outputs) == 1, "no duplicate/synthetic output for a paired call"
+
+
+def test_truncation_retry_discarded_usage_does_not_double_count_cache_write():
+    """Composed end-to-end: a truncated attempt that WROTE cache, then a retry.
+
+    Usage.input_tokens is normalized to the kernel contract (cache_write
+    subtracted out) so consumers reconstruct gross as
+    `input_tokens + cache_write_tokens`. Folding the discarded attempt in
+    must preserve that: adding its RAW input (which already contains the
+    write) inflates the reported gross by exactly the discarded cache_write.
+    Fixtures carry cache_write=0, so only a non-zero write catches this.
+    """
+    provider = _make_provider({"max_tokens": 4096})
+    captured: list[dict] = []
+    truncated = _make_response(
+        status="incomplete",
+        output=[_function_call_item()],
+        incomplete_reason="max_output_tokens",
+        usage={
+            "input_tokens": 10_000,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 4_000},
+            "output_tokens": 500,
+            "output_tokens_details": {"reasoning_tokens": 300},
+            "total_tokens": 10_500,
+        },
+    )
+    recovered = _make_response(
+        status="completed",
+        output=[
+            _function_call_item(
+                status="completed",
+                arguments='{"file_path": "/workspace/DISCREPANCIES.md", "content": "done"}',
+            )
+        ],
+        usage={
+            "input_tokens": 10_000,
+            "input_tokens_details": {"cached_tokens": 9_500, "cache_write_tokens": 0},
+            "output_tokens": 800,
+            "output_tokens_details": {"reasoning_tokens": 400},
+            "total_tokens": 10_800,
+        },
+    )
+    provider.client.responses.create = _sequential_mock(  # pyright: ignore[reportAttributeAccessIssue]
+        [truncated, recovered], captured
+    )
+
+    request = ChatRequest(messages=[Message(role="user", content="write the file")])
+    result = asyncio.run(provider.complete(request))
+
+    assert len(captured) == 2, "sanity: one discarded attempt + one retry"
+    assert result.usage is not None
+    true_gross = 10_000 + 10_000  # raw vendor totals of both billed attempts
+    reported_gross = result.usage.input_tokens + (result.usage.cache_write_tokens or 0)
+    assert reported_gross == true_gross, (
+        "the discarded attempt's cache_write was counted twice: once inside its "
+        "raw input_tokens and again via cache_write_tokens"
+    )
+    assert result.usage.output_tokens == 1_300
