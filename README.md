@@ -50,10 +50,14 @@ config = {
                                            # old fixed 4096 default silently truncated large
                                            # tool calls mid-arguments.
     temperature = 0.7,
-    reasoning = "low",                     # Reasoning effort: none|low|medium|high|xhigh|max
-                                           # (set is model-specific; gpt-5.6 adds "max",
-                                           # rejects "minimal"). Pass a dict to also set
-                                           # reasoning.mode: {effort="high", mode="pro"}.
+    reasoning_effort = "low",              # CANONICAL effort key: none|minimal|low|medium|
+                                           # high|xhigh|max (set is model-specific; gpt-5.6
+                                           # adds "max", rejects "minimal"). Validated at
+                                           # mount. "none"/unset sends no reasoning param.
+    reasoning = null,                      # LEGACY alias, still works. Use when you need the
+                                           # dict form to also set reasoning.mode:
+                                           # {effort="high", mode="pro"}. If both are set,
+                                           # reasoning_effort wins and a warning is logged.
     reasoning_summary = "detailed",        # Reasoning verbosity: auto|concise|detailed
     truncation = null,                     # null omits the field; OpenAI returns an explicit
                                            # error on context overflow. Opt in to legacy
@@ -73,6 +77,45 @@ config = {
 > Note: `safety_identifier` is intentionally NOT a deployment config field. It
 > is a per-end-user signal (abuse tracking) and must be set per-call via
 > `kwargs`. See [Prompt Caching](#prompt-caching) below.
+
+### Reasoning Effort
+
+The `reasoning_effort` config key (canonical — it matches the kernel's portable
+`request.reasoning_effort` field) sets a session-level default reasoning effort
+applied to **every** request, so you can opt into stronger reasoning once
+instead of supplying it per-request. The legacy `reasoning` key remains a
+working alias; when both are set, `reasoning_effort` wins (a warning is logged).
+
+```yaml
+providers:
+  - module: provider-openai
+    config:
+      default_model: gpt-5.6-sol
+      reasoning_effort: xhigh  # legacy alias: reasoning
+```
+
+Precedence (highest wins):
+
+1. `kwargs["reasoning"]` — the full dict form, per call
+2. `kwargs["reasoning_effort"]` — effort string, per call
+3. `request.reasoning_effort` — the kernel's portable per-request field
+4. `config["reasoning_effort"]` — canonical session default (this key)
+5. `config["reasoning"]` — legacy session default
+6. Nothing sent — the model's own default applies
+
+Notes:
+
+- **`"none"` and unset both send no reasoning parameter.** `"none"` is the
+  provisioning default and means "use the provider/model default behavior" —
+  it deliberately does not emit `reasoning={"effort": "none"}`.
+- **Values are validated at mount**, not at request time. An unrecognized
+  effort, or one the default model rejects (`gpt-5.5-pro` accepts only
+  `medium`, `high`, `xhigh`), raises immediately instead of surfacing as an
+  HTTP 400 mid-session.
+- **Non-reasoning models are skipped with a warning**, not an error — the
+  config is ignored rather than producing an API failure.
+- Use the legacy `reasoning` key when you need the dict form to also set
+  `reasoning.mode`, e.g. `{effort = "high", mode = "pro"}`.
 
 ## Prompt Caching
 
