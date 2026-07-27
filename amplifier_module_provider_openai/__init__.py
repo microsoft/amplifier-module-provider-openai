@@ -888,6 +888,106 @@ class OpenAIProvider:
 
         return continuation_input
 
+    async def _enforce_chain_output_pairing(
+        self,
+        delta_input: list[dict[str, Any]],
+        chained_msg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Chain-aware pairing invariant for the response-chaining delta path.
+
+        When a request chains via previous_response_id, the function_call
+        items live SERVER-SIDE in the chained response; the delta input
+        carries only the outputs. The server requires every call in the
+        chained response to have a function_call_output in this input,
+        paired BY call_id — an unpaired call is a non-retryable 400
+        ("No tool output found for function call ...") that kills the
+        session. The generic wire backstop in _convert_messages cannot
+        protect this case (no function_call items in the input to check).
+
+        Enforced here, against the LOCAL record of the chained turn (the
+        assistant message's tool_calls):
+        1. every chained tool call id must have a matching output — an
+           error output is synthesized for any orphan;
+        2. any fc_-prefixed output id (a Responses-API ITEM id, not a
+           call id) is a bug upstream: it can pair with nothing
+           server-side, so it is dropped with a loud warning — observed
+           live killing a session even for a COMPLETED, successfully
+           executed tool call.
+        """
+        expected_ids: list[str] = []
+        for tc in chained_msg.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                tc_id = tc.get("id") or tc.get("tool_call_id")
+                if tc_id:
+                    expected_ids.append(str(tc_id))
+        content = chained_msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_call":
+                    b_id = block.get("id")
+                    if b_id and str(b_id) not in expected_ids:
+                        expected_ids.append(str(b_id))
+
+        provided_ids: set[str] = set()
+        anomalous_items: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
+        for item in delta_input:
+            if isinstance(item, dict) and item.get("type") == "function_call_output":
+                call_id = str(item.get("call_id") or "")
+                if call_id.startswith("fc_"):
+                    anomalous_items.append(item)
+                    logger.warning(
+                        "[PROVIDER] Chain pairing: dropping function_call_output "
+                        "keyed by ITEM id %s (output len %d) — fc_ ids cannot "
+                        "pair with any server-side call; this indicates an "
+                        "upstream dispatch-keying bug.",
+                        call_id,
+                        len(str(item.get("output") or "")),
+                    )
+                    continue
+                provided_ids.add(call_id)
+            kept.append(item)
+
+        missing_ids = [cid for cid in expected_ids if cid not in provided_ids]
+        for cid in missing_ids:
+            logger.warning(
+                "[PROVIDER] Chain pairing: synthesizing error output for "
+                "orphaned chained call %s (expected=%s, provided=%s).",
+                cid,
+                expected_ids,
+                sorted(provided_ids),
+            )
+            kept.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": cid,
+                    "output": (
+                        "[error] Tool execution result missing for this call "
+                        "(chained-turn pairing repair). The result was lost or "
+                        "mis-keyed; re-issue the tool call if still needed."
+                    ),
+                }
+            )
+
+        if (
+            (missing_ids or anomalous_items)
+            and self.coordinator
+            and hasattr(self.coordinator, "hooks")
+        ):
+            await self.coordinator.hooks.emit(
+                "provider:chain_pairing_repaired",
+                {
+                    "provider": self.name,
+                    "expected_call_ids": expected_ids,
+                    "provided_call_ids": sorted(provided_ids),
+                    "synthesized_for": missing_ids,
+                    "dropped_item_id_outputs": [
+                        str(i.get("call_id")) for i in anomalous_items
+                    ],
+                },
+            )
+        return kept
+
     def _find_missing_tool_results(
         self, messages: list
     ) -> list[tuple[int, str, str, dict]]:
@@ -1244,6 +1344,27 @@ class OpenAIProvider:
                 params["input"] = self._convert_messages(
                     delta_for_conversion,
                     skip_reasoning_reinsertion=chain_active,
+                )
+                # Pathway #2 (chain-aware pairing invariant): the server-side
+                # response referenced by previous_response_id carries the
+                # function_call items; the delta input carries only outputs.
+                # The generic wire backstop in _convert_messages cannot see
+                # server-side calls, so enforce here: every tool call issued
+                # by the assistant turn being chained from MUST have a
+                # function_call_output paired BY call_id in this delta, or
+                # the API 400s ("No tool output found for function call ...")
+                # and kills the session. Observed live: a COMPLETED,
+                # successfully-executed tool call still 400'd because its
+                # output was keyed by the fc_ item id instead of call_id.
+                chained_msg = conversation[chain_idx]
+                chained_dict = (
+                    chained_msg.model_dump()
+                    if hasattr(chained_msg, "model_dump")
+                    else chained_msg
+                )
+                params["input"] = await self._enforce_chain_output_pairing(
+                    params["input"],
+                    chained_dict if isinstance(chained_dict, dict) else {},
                 )
                 logger.info(
                     "[PROVIDER] Response chaining active: trimmed input to delta "
