@@ -180,6 +180,202 @@ def test_reasoning_effort_none_explicit():
     assert "summary" in kwargs["reasoning"]
 
 
+# ---------------------------------------------------------------------------
+# Canonical `reasoning_effort` config key (portable kernel key)
+# ---------------------------------------------------------------------------
+
+
+def test_config_reasoning_effort_honored_on_normal_path():
+    """Canonical config reasoning_effort='high' -> reasoning={'effort': 'high'}
+    on the NORMAL request path (no extended_thinking kwarg needed)."""
+    provider = _make_provider(reasoning_effort="high")
+    asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
+    assert kwargs["reasoning"]["effort"] == "high"
+    assert "summary" in kwargs["reasoning"]
+
+
+def test_config_reasoning_effort_none_stays_inert():
+    """reasoning_effort='none' (the provisioned ConfigField default) must NOT
+    start injecting a reasoning param — absence keeps today's behavior."""
+    provider = _make_provider(reasoning_effort="none")
+    asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    # Default model (gpt-5.6-sol) has default_reasoning_effort=None, so no
+    # reasoning param is auto-injected either.
+    assert "reasoning" not in kwargs
+
+
+def test_config_reasoning_effort_absent_unchanged():
+    """No effort-family config at all -> no reasoning param (existing behavior)."""
+    provider = _make_provider()
+    asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" not in kwargs
+
+
+def test_request_effort_overrides_config_reasoning_effort():
+    """request.reasoning_effort='low' beats config reasoning_effort='high'."""
+    provider = _make_provider(reasoning_effort="high")
+    asyncio.run(provider.complete(_request_with_effort("low")))
+
+    kwargs = _get_call_kwargs(provider)
+    assert kwargs["reasoning"]["effort"] == "low"
+
+
+def test_kwargs_reasoning_effort_honored_on_normal_path():
+    """Per-call kwargs['reasoning_effort'] works WITHOUT extended_thinking."""
+    provider = _make_provider()
+    asyncio.run(provider.complete(_request_with_effort(None), reasoning_effort="xhigh"))
+
+    kwargs = _get_call_kwargs(provider)
+    assert kwargs["reasoning"]["effort"] == "xhigh"
+
+
+def test_config_reasoning_effort_wins_over_legacy_reasoning(caplog):
+    """Both config keys set -> canonical reasoning_effort wins, with a warning."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        provider = _make_provider(reasoning_effort="high", reasoning="low")
+    asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    assert kwargs["reasoning"]["effort"] == "high"
+    assert any(
+        "reasoning_effort" in r.message and "wins" in r.message for r in caplog.records
+    )
+
+
+def test_legacy_reasoning_config_still_works_alone():
+    """config reasoning='low' alone keeps working (legacy alias, unchanged)."""
+    provider = _make_provider(reasoning="low")
+    asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    assert kwargs["reasoning"]["effort"] == "low"
+
+
+def test_config_reasoning_effort_capability_gated_no_op(caplog):
+    """Non-reasoning model + config reasoning_effort -> loud no-op, no param."""
+    import logging
+
+    provider = _make_provider(
+        default_model="gpt-4.1-mini",  # supports_reasoning=False
+        reasoning_effort="high",
+    )
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" not in kwargs
+    assert any(
+        "reasoning_effort" in r.message and "does not support reasoning" in r.message
+        for r in caplog.records
+    )
+
+
+def test_config_reasoning_effort_composes_with_capability_max_tokens():
+    """Combined P5 + canonical-effort behavior in ONE request: with no
+    max_tokens config, the output budget derives from the model's capability
+    limit (P5, PR #54) AND config reasoning_effort injects the reasoning
+    param — the two are orthogonal and must both land in the same params.
+    """
+    from amplifier_module_provider_openai._capabilities import get_capabilities
+
+    provider = _make_provider(reasoning_effort="high")  # no max_tokens config
+    asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    # P5: capability-derived output budget (gpt-5.6-sol default model)
+    expected_max = get_capabilities(provider.default_model).max_output_tokens
+    assert kwargs["max_output_tokens"] == expected_max
+    # Canonical effort key honored on the same request
+    assert kwargs["reasoning"]["effort"] == "high"
+    assert "summary" in kwargs["reasoning"]
+
+
+def test_config_reasoning_effort_normalized():
+    """Mixed case / whitespace values are normalized ('  High ' -> 'high')."""
+    provider = _make_provider(reasoning_effort="  High ")
+    asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    assert kwargs["reasoning"]["effort"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# Mount-time validation of config reasoning_effort
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_config_reasoning_effort_fails_loud_at_mount():
+    """Unknown value ('ultra') raises at provider construction (mount time),
+    not as an API 400 mid-session."""
+    import pytest
+
+    with pytest.raises(ValueError, match="reasoning_effort.*ultra"):
+        OpenAIProvider(api_key="test-key", config={"reasoning_effort": "ultra"})
+
+
+def test_gpt_5_5_pro_disallowed_config_effort_fails_at_mount():
+    """gpt-5.5-pro accepts only {medium, high, xhigh}; 'low' fails at mount."""
+    import pytest
+
+    with pytest.raises(ValueError, match="gpt-5.5-pro"):
+        OpenAIProvider(
+            api_key="test-key",
+            config={"default_model": "gpt-5.5-pro", "reasoning_effort": "low"},
+        )
+
+
+def test_gpt_5_5_pro_allowed_config_effort_mounts():
+    """gpt-5.5-pro + reasoning_effort='high' constructs fine."""
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"default_model": "gpt-5.5-pro", "reasoning_effort": "high"},
+    )
+    assert provider.reasoning_effort == "high"
+
+
+# ---------------------------------------------------------------------------
+# Inert effort-family key warning
+# ---------------------------------------------------------------------------
+
+
+def test_unconsumed_effort_key_warns_at_init(caplog):
+    """config 'effort' (Anthropic-style alias) is inert here -> loud warning."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        provider = _make_provider(effort="high")
+
+    assert any(
+        "'effort'" in r.message and "not consumed" in r.message for r in caplog.records
+    )
+
+    # And it must stay inert: no reasoning param is injected by it.
+    asyncio.run(provider.complete(_request_with_effort(None)))
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" not in kwargs
+
+
+def test_no_effort_warnings_for_clean_config(caplog):
+    """A config without effort-family keys emits no effort warnings."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _make_provider()
+
+    assert not any(
+        "not consumed" in r.message or "canonical" in r.message for r in caplog.records
+    )
+
+
 def test_gpt54_without_effort_still_includes_encrypted_content():
     """GPT-5.4 stateless path (chaining off) -> include=[reasoning.encrypted_content] IS sent.
 
