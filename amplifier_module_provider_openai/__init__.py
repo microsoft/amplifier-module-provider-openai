@@ -55,8 +55,11 @@ from ._constants import METADATA_STATUS
 from ._constants import NATIVE_TOOL_TYPES
 from ._constants import RESPONSE_CHAIN_INVALIDATED
 from ._constants import RESPONSE_NOT_FOUND_ERROR_CODES
+from ._response_handling import FunctionCallTruncationError
 from ._response_handling import convert_response_with_accumulated_output
+from ._response_handling import describe_incomplete_function_calls
 from ._response_handling import extract_reasoning_text
+from ._response_handling import parse_function_call_block
 from ._capabilities import get_capabilities
 from ._cost import compute_cost
 
@@ -372,7 +375,12 @@ class OpenAIProvider:
             "base_url", None
         )  # Optional custom endpoint (None = OpenAI default)
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
-        self.max_tokens = self.config.get("max_tokens", DEFAULT_MAX_TOKENS)
+        # P5: no fixed 4096 default. None = derive per request from the
+        # model's capability max_output_tokens (mirrors provider-anthropic,
+        # which defaults to its capability table). An explicit config value
+        # still wins. DEFAULT_MAX_TOKENS survives only as the documented
+        # fallback when capability data is absent (see _resolve_max_tokens).
+        self.max_tokens = self.config.get("max_tokens")
         self.temperature = self.config.get(
             "temperature", None
         )  # None = not sent (some models don't support it)
@@ -880,6 +888,106 @@ class OpenAIProvider:
 
         return continuation_input
 
+    async def _enforce_chain_output_pairing(
+        self,
+        delta_input: list[dict[str, Any]],
+        chained_msg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Chain-aware pairing invariant for the response-chaining delta path.
+
+        When a request chains via previous_response_id, the function_call
+        items live SERVER-SIDE in the chained response; the delta input
+        carries only the outputs. The server requires every call in the
+        chained response to have a function_call_output in this input,
+        paired BY call_id — an unpaired call is a non-retryable 400
+        ("No tool output found for function call ...") that kills the
+        session. The generic wire backstop in _convert_messages cannot
+        protect this case (no function_call items in the input to check).
+
+        Enforced here, against the LOCAL record of the chained turn (the
+        assistant message's tool_calls):
+        1. every chained tool call id must have a matching output — an
+           error output is synthesized for any orphan;
+        2. any fc_-prefixed output id (a Responses-API ITEM id, not a
+           call id) is a bug upstream: it can pair with nothing
+           server-side, so it is dropped with a loud warning — observed
+           live killing a session even for a COMPLETED, successfully
+           executed tool call.
+        """
+        expected_ids: list[str] = []
+        for tc in chained_msg.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                tc_id = tc.get("id") or tc.get("tool_call_id")
+                if tc_id:
+                    expected_ids.append(str(tc_id))
+        content = chained_msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_call":
+                    b_id = block.get("id")
+                    if b_id and str(b_id) not in expected_ids:
+                        expected_ids.append(str(b_id))
+
+        provided_ids: set[str] = set()
+        anomalous_items: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
+        for item in delta_input:
+            if isinstance(item, dict) and item.get("type") == "function_call_output":
+                call_id = str(item.get("call_id") or "")
+                if call_id.startswith("fc_"):
+                    anomalous_items.append(item)
+                    logger.warning(
+                        "[PROVIDER] Chain pairing: dropping function_call_output "
+                        "keyed by ITEM id %s (output len %d) — fc_ ids cannot "
+                        "pair with any server-side call; this indicates an "
+                        "upstream dispatch-keying bug.",
+                        call_id,
+                        len(str(item.get("output") or "")),
+                    )
+                    continue
+                provided_ids.add(call_id)
+            kept.append(item)
+
+        missing_ids = [cid for cid in expected_ids if cid not in provided_ids]
+        for cid in missing_ids:
+            logger.warning(
+                "[PROVIDER] Chain pairing: synthesizing error output for "
+                "orphaned chained call %s (expected=%s, provided=%s).",
+                cid,
+                expected_ids,
+                sorted(provided_ids),
+            )
+            kept.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": cid,
+                    "output": (
+                        "[error] Tool execution result missing for this call "
+                        "(chained-turn pairing repair). The result was lost or "
+                        "mis-keyed; re-issue the tool call if still needed."
+                    ),
+                }
+            )
+
+        if (
+            (missing_ids or anomalous_items)
+            and self.coordinator
+            and hasattr(self.coordinator, "hooks")
+        ):
+            await self.coordinator.hooks.emit(
+                "provider:chain_pairing_repaired",
+                {
+                    "provider": self.name,
+                    "expected_call_ids": expected_ids,
+                    "provided_call_ids": sorted(provided_ids),
+                    "synthesized_for": missing_ids,
+                    "dropped_item_id_outputs": [
+                        str(i.get("call_id")) for i in anomalous_items
+                    ],
+                },
+            )
+        return kept
+
     def _find_missing_tool_results(
         self, messages: list
     ) -> list[tuple[int, str, str, dict]]:
@@ -1237,6 +1345,27 @@ class OpenAIProvider:
                     delta_for_conversion,
                     skip_reasoning_reinsertion=chain_active,
                 )
+                # Pathway #2 (chain-aware pairing invariant): the server-side
+                # response referenced by previous_response_id carries the
+                # function_call items; the delta input carries only outputs.
+                # The generic wire backstop in _convert_messages cannot see
+                # server-side calls, so enforce here: every tool call issued
+                # by the assistant turn being chained from MUST have a
+                # function_call_output paired BY call_id in this delta, or
+                # the API 400s ("No tool output found for function call ...")
+                # and kills the session. Observed live: a COMPLETED,
+                # successfully-executed tool call still 400'd because its
+                # output was keyed by the fc_ item id instead of call_id.
+                chained_msg = conversation[chain_idx]
+                chained_dict = (
+                    chained_msg.model_dump()
+                    if hasattr(chained_msg, "model_dump")
+                    else chained_msg
+                )
+                params["input"] = await self._enforce_chain_output_pairing(
+                    params["input"],
+                    chained_dict if isinstance(chained_dict, dict) else {},
+                )
                 logger.info(
                     "[PROVIDER] Response chaining active: trimmed input to delta "
                     "(%d local messages -> %d API messages after previous_response_id)",
@@ -1254,7 +1383,19 @@ class OpenAIProvider:
 
         if request.max_output_tokens:
             params["max_output_tokens"] = request.max_output_tokens
-        elif max_tokens := kwargs.get("max_tokens", self.max_tokens):
+        else:
+            # P5: default the output budget to the MODEL's capability limit
+            # instead of a fixed 4096 (mirrors provider-anthropic). A 4096
+            # cap silently truncated large tool calls (a >4K-token write_file
+            # can never complete) while the Anthropic provider ran at its
+            # model cap — both a live session-killer (P4 trigger) and a
+            # cross-provider parity confound. Explicit request/kwargs/config
+            # values still win; DEFAULT_MAX_TOKENS is only the fallback when
+            # capability data is absent.
+            max_tokens = kwargs.get("max_tokens", self.max_tokens)
+            if max_tokens is None:
+                caps = get_capabilities(params["model"])
+                max_tokens = caps.max_output_tokens or DEFAULT_MAX_TOKENS
             params["max_output_tokens"] = max_tokens
 
         if request.temperature is not None:
@@ -2052,12 +2193,88 @@ class OpenAIProvider:
             )
             final_response = response
             continuation_count = 0
+            truncation_retry_done = False
 
             while (
                 hasattr(final_response, "status")
                 and final_response.status == "incomplete"
                 and continuation_count < MAX_CONTINUATION_ATTEMPTS
             ):
+                # P4: a response that ended INSIDE a function_call cannot be
+                # resumed by continuation — arguments are not resumable, so
+                # each continuation restarts and truncates again (observed
+                # live: 5 fruitless continuations, then `{}`-argument calls
+                # that 400'd the session). Policy: discard the truncated
+                # output and RETRY the original request once with the output
+                # budget raised to the model's capability cap. If we are
+                # already at the cap (or the retry also truncates), fail
+                # loud with a structured error naming the truncation.
+                incomplete_calls = describe_incomplete_function_calls(
+                    list(getattr(final_response, "output", []) or [])
+                )
+                if incomplete_calls:
+                    caps = get_capabilities(params["model"])
+                    cap_tokens = caps.max_output_tokens or DEFAULT_MAX_TOKENS
+                    current_budget = params.get("max_output_tokens") or 0
+                    call_desc = ", ".join(
+                        f"{c['name']}(call_id={c['call_id'] or c['item_id']}, {c['reason']})"
+                        for c in incomplete_calls
+                    )
+                    if not truncation_retry_done and current_budget < cap_tokens:
+                        truncation_retry_done = True
+                        logger.warning(
+                            "[PROVIDER] Response truncated mid-function_call (%s). "
+                            "Discarding truncated output and retrying with "
+                            "max_output_tokens raised %s -> %s (model cap).",
+                            call_desc,
+                            current_budget,
+                            cap_tokens,
+                        )
+                        if self.coordinator and hasattr(self.coordinator, "hooks"):
+                            await self.coordinator.hooks.emit(
+                                "provider:truncated_function_call_retry",
+                                {
+                                    "provider": self.name,
+                                    "model": params["model"],
+                                    "incomplete_calls": incomplete_calls,
+                                    "previous_max_output_tokens": current_budget,
+                                    "retry_max_output_tokens": cap_tokens,
+                                },
+                            )
+                        params["max_output_tokens"] = cap_tokens
+                        retry_start = time.time()
+                        final_response = await asyncio.wait_for(
+                            self.client.responses.create(**params),
+                            timeout=self.timeout,
+                        )
+                        elapsed_ms += int((time.time() - retry_start) * 1000)
+                        # Nothing was executed from the truncated attempt;
+                        # replace the accumulated output wholesale.
+                        accumulated_output = (
+                            list(final_response.output)
+                            if hasattr(final_response, "output")
+                            else []
+                        )
+                        continue
+                    raise FunctionCallTruncationError(
+                        f"Response truncated mid-function_call and cannot be "
+                        f"recovered: {call_desc}. Output budget "
+                        f"{current_budget} tokens"
+                        + (
+                            " (already at the model's max_output_tokens cap"
+                            + (
+                                "; a raised-budget retry was already attempted"
+                                if truncation_retry_done
+                                else ""
+                            )
+                            + ")"
+                        )
+                        + ". The tool call's arguments exceeded the budget; "
+                        "refusing to surface a truncated call as executable.",
+                        provider=self.name,
+                        model=params["model"],
+                    )
+
                 continuation_count += 1
 
                 # Extract incomplete reason for logging
@@ -2798,7 +3015,47 @@ class OpenAIProvider:
                 logger.warning(f"Unknown message role: {role}")
                 i += 1
 
-        return openai_messages
+        # P4 wire-path invariant: every function_call item replayed into the
+        # input MUST have a function_call_output paired by call_id, or the
+        # API rejects the whole request (400 "No tool output found for
+        # function call <call_id>") and kills the session. The message-level
+        # repair (_find_missing_tool_results) is the primary net; this is the
+        # last-resort backstop at the wire format itself — if an orphan
+        # slipped through, synthesize an error output rather than letting the
+        # request 400.
+        output_call_ids = {
+            item.get("call_id")
+            for item in openai_messages
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+        }
+        repaired: list[dict[str, Any]] = []
+        for item in openai_messages:
+            repaired.append(item)
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "function_call"
+                and item.get("call_id")
+                and item["call_id"] not in output_call_ids
+            ):
+                logger.warning(
+                    "[PROVIDER] Orphaned function_call %s (%s) reached the wire "
+                    "path with no paired output; synthesizing an error output "
+                    "to keep the request valid.",
+                    item["call_id"],
+                    item.get("name", "?"),
+                )
+                repaired.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": item["call_id"],
+                        "output": (
+                            "[error] Tool execution result missing (the call was "
+                            "interrupted). Synthesized to preserve conversation "
+                            "validity — re-issue the tool call if still needed."
+                        ),
+                    }
+                )
+        return repaired
 
     def _convert_tools_from_request(
         self, tools: list, model_name: str | None = None
@@ -2994,23 +3251,9 @@ class OpenAIProvider:
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
-                    tool_id = getattr(block, "call_id", "") or getattr(block, "id", "")
-                    tool_name = getattr(block, "name", "")
-                    tool_input = getattr(block, "input", None)
-                    if tool_input is None and hasattr(block, "arguments"):
-                        tool_input = block.arguments
-                    if isinstance(tool_input, str):
-                        try:
-                            tool_input = json.loads(tool_input)
-                        except json.JSONDecodeError:
-                            logger.debug(
-                                "Failed to decode tool call arguments: %s", tool_input
-                            )
-                    if tool_input is None:
-                        tool_input = {}
-                    # Ensure tool_input is dict after json.loads or default
-                    if not isinstance(tool_input, dict):
-                        tool_input = {}
+                    # P4: call_id-keyed; raises FunctionCallTruncationError on
+                    # incomplete/unparseable calls instead of surfacing {}.
+                    tool_id, tool_name, tool_input = parse_function_call_block(block)
                     content_blocks.append(
                         ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
                     )
@@ -3115,23 +3358,9 @@ class OpenAIProvider:
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
-                    tool_id = block.get("call_id") or block.get("id", "")
-                    tool_name = block.get("name", "")
-                    tool_input = block.get("input")
-                    if tool_input is None:
-                        tool_input = block.get("arguments", {})
-                    if isinstance(tool_input, str):
-                        try:
-                            tool_input = json.loads(tool_input)
-                        except json.JSONDecodeError:
-                            logger.debug(
-                                "Failed to decode tool call arguments: %s", tool_input
-                            )
-                    if tool_input is None:
-                        tool_input = {}
-                    # Ensure tool_input is dict after json.loads or default
-                    if not isinstance(tool_input, dict):
-                        tool_input = {}
+                    # P4: call_id-keyed; raises FunctionCallTruncationError on
+                    # incomplete/unparseable calls instead of surfacing {}.
+                    tool_id, tool_name, tool_input = parse_function_call_block(block)
                     content_blocks.append(
                         ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
                     )

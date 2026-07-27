@@ -44,7 +44,11 @@ name = "openai"
 config = {
     base_url = null,                       # Optional custom endpoint (null = OpenAI default)
     default_model = "gpt-5.6-sol",
-    max_tokens = 4096,
+    max_tokens = null,                     # Output-token budget. null (default) = the model
+                                           # capability's max_output_tokens (e.g. 128K for
+                                           # gpt-5.x); set a number to cap explicitly. The
+                                           # old fixed 4096 default silently truncated large
+                                           # tool calls mid-arguments.
     temperature = 0.7,
     reasoning = "low",                     # Reasoning effort: none|low|medium|high|xhigh|max
                                            # (set is model-specific; gpt-5.6 adds "max",
