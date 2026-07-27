@@ -227,6 +227,60 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     )
 
 
+# Full vocabulary of reasoning.effort values any curated model accepts.
+# "minimal".."xhigh" per OpenAI docs; "max" added by gpt-5.6 (see README).
+# Used for mount-time validation of the canonical `reasoning_effort` config
+# key: a value outside this set can never succeed at request time, so it
+# fails loud at mount instead of 400ing mid-session.
+_KNOWN_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
+
+def _resolve_config_reasoning_effort(value: Any, model_id: str) -> str | None:
+    """Validate/normalize the canonical `reasoning_effort` config key at mount.
+
+    Returns the normalized effort string, or None when the key should not
+    inject a reasoning param:
+      - value is None / "" (key absent or blank)
+      - value is "none" — the provisioned ConfigField default, meaning "use
+        the provider/model default behavior". This deliberately does NOT emit
+        reasoning={"effort": "none"}: absence must not start injecting a
+        value (OpenAI's own default-medium guidance), and existing installs
+        carry reasoning_effort="none" from the provisioning UI.
+
+    Raises:
+        ValueError: when the value is not a recognized effort, or when the
+            default model's accepted set is known and excludes it
+            (gpt-5.5-pro accepts only {medium, high, xhigh}). Failing here
+            surfaces at mount — loud and immediate — instead of as an API
+            HTTP 400 mid-session.
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized or normalized == "none":
+        return None
+    if normalized not in _KNOWN_REASONING_EFFORTS:
+        raise ValueError(
+            f"Invalid config 'reasoning_effort'={value!r} for provider-openai. "
+            f"Valid values: {', '.join(sorted(_KNOWN_REASONING_EFFORTS))}. "
+            f"Fix the provider config (settings.yaml / bundle config block)."
+        )
+    # Per-model accepted sets, where known. gpt-5.5-pro is the only model
+    # with a verified restricted set today (live API 2026-04-24).
+    if model_id.startswith("gpt-5.5-pro") and (
+        normalized not in _GPT_5_5_PRO_ALLOWED_EFFORTS
+    ):
+        raise ValueError(
+            f"Config 'reasoning_effort'={value!r} is not accepted by model "
+            f"{model_id!r}: gpt-5.5-pro requires one of "
+            f"{sorted(_GPT_5_5_PRO_ALLOWED_EFFORTS)} "
+            f"(verified against live API 2026-04-24)."
+        )
+    return normalized
+
+
 # reasoning.mode selects the reasoning strategy. Verified live against gpt-5.6-sol
 # 2026-07-14: mode in {"standard", "pro"} ("pro" = deeper internal reasoning, one
 # final answer). Only forwarded when the caller sets it; models that do not support
@@ -387,6 +441,32 @@ class OpenAIProvider:
         self.reasoning = self.config.get(
             "reasoning", None
         )  # None = not sent (none|low|medium|high|xhigh)
+        # Canonical effort config key: "reasoning_effort" (matches the
+        # kernel's portable request.reasoning_effort field). Validated at
+        # mount — unknown values raise here instead of 400ing mid-session.
+        # Normalized to None when absent/blank/"none" (the provisioned
+        # ConfigField default) so absence never injects a reasoning param.
+        self.reasoning_effort = _resolve_config_reasoning_effort(
+            self.config.get("reasoning_effort"), self.default_model
+        )
+        if self.reasoning_effort is not None and self.reasoning is not None:
+            logger.warning(
+                "[PROVIDER] Both 'reasoning_effort' and 'reasoning' are set "
+                "in config; 'reasoning_effort'=%r (canonical) wins and "
+                "'reasoning'=%r is ignored.",
+                self.reasoning_effort,
+                self.reasoning,
+            )
+        # Loudness guard against silently-inert config: warn about
+        # effort-family keys this provider does NOT consume.
+        for _inert_key in ("effort",):
+            if _inert_key in self.config:
+                logger.warning(
+                    "[PROVIDER] Config key '%s' is not consumed by "
+                    "provider-openai and has no effect. Accepted effort keys: "
+                    "'reasoning_effort' (canonical), 'reasoning' (legacy).",
+                    _inert_key,
+                )
         self.reasoning_summary = self.config.get(
             "reasoning_summary", DEFAULT_REASONING_SUMMARY
         )
@@ -1404,13 +1484,33 @@ class OpenAIProvider:
             params["temperature"] = temperature
 
         # Phase 2: Reasoning parameter precedence chain
-        # kwargs["reasoning"] > request.reasoning_effort > config default > None
+        # kwargs["reasoning"] > kwargs["reasoning_effort"] > request.reasoning_effort
+        #   > config "reasoning_effort" (canonical) > config "reasoning" (legacy) > None
         reasoning_param = kwargs.get("reasoning", getattr(request, "reasoning", None))
-        if reasoning_param is None and request.reasoning_effort:
-            reasoning_param = {
-                "effort": request.reasoning_effort,
-                "summary": self.reasoning_summary,
-            }
+        if reasoning_param is None:
+            effort_hint = kwargs.get("reasoning_effort") or request.reasoning_effort
+            if effort_hint:
+                reasoning_param = {
+                    "effort": effort_hint,
+                    "summary": self.reasoning_summary,
+                }
+        if reasoning_param is None and self.reasoning_effort is not None:
+            # Canonical config key (validated/normalized at mount; "none" and
+            # absence resolve to None so this path never fires for them).
+            # Capability-gated: a model that can't reason gets a loud no-op
+            # instead of a mid-session API 400.
+            if get_capabilities(model_name).supports_reasoning:
+                reasoning_param = {
+                    "effort": self.reasoning_effort,
+                    "summary": self.reasoning_summary,
+                }
+            else:
+                logger.warning(
+                    "[PROVIDER] Ignoring config 'reasoning_effort'=%r: "
+                    "model %s does not support reasoning.",
+                    self.reasoning_effort,
+                    model_name,
+                )
         if reasoning_param is None:
             reasoning_param = self.reasoning
         _validate_gpt_5_5_pro_effort(model_name, reasoning_param)
