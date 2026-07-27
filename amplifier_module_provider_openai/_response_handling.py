@@ -14,6 +14,7 @@ from typing import Any
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
+from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import TextBlock
 from amplifier_core.message_models import ThinkingBlock
 from amplifier_core.message_models import ToolCall
@@ -27,6 +28,129 @@ from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 
 logger = logging.getLogger(__name__)
+
+
+class FunctionCallTruncationError(kernel_errors.LLMError):
+    """A function_call was truncated (max_output_tokens mid-arguments) and cannot be executed.
+
+    Raised instead of surfacing the call with empty/garbage arguments. A
+    truncated function_call cannot be resumed by the Responses API
+    continuation mechanism — each continuation restarts and truncates again
+    (observed live: 5 fruitless continuations, then stitched `{}`-argument
+    calls keyed by item id that 400'd the session). Failing loud here is the
+    contract: no `{}`-argument calls, no item-id-keyed dispatch, no silent
+    degradation.
+    """
+
+    def __init__(
+        self, message: str, *, provider: str | None = None, model: str | None = None
+    ) -> None:
+        super().__init__(message, provider=provider, model=model, retryable=False)
+
+
+def _function_call_fields(block: Any) -> tuple[str | None, str | None, str, Any, Any]:
+    """Extract (call_id, item_id, name, arguments, status) from SDK object or dict."""
+    if isinstance(block, dict):
+        call_id = block.get("call_id")
+        item_id = block.get("id")
+        name = block.get("name", "")
+        arguments = block.get("input")
+        if arguments is None:
+            arguments = block.get("arguments")
+        status = block.get("status")
+    else:
+        call_id = getattr(block, "call_id", None)
+        item_id = getattr(block, "id", None)
+        name = getattr(block, "name", "")
+        arguments = getattr(block, "input", None)
+        if arguments is None:
+            arguments = getattr(block, "arguments", None)
+        status = getattr(block, "status", None)
+    return call_id, item_id, name, arguments, status
+
+
+def describe_incomplete_function_calls(output_items: list[Any]) -> list[dict[str, Any]]:
+    """Non-raising detection of function_call items that must never be executed.
+
+    A call is unexecutable when its status is "incomplete" (truncated by
+    max_output_tokens) or its arguments are a non-empty string that does not
+    parse as JSON (the truncation artifact). Returns one summary dict per
+    offending item so the caller can decide retry-vs-fail.
+    """
+    problems: list[dict[str, Any]] = []
+    for block in output_items:
+        block_type = (
+            block.get("type")
+            if isinstance(block, dict)
+            else getattr(block, "type", None)
+        )
+        if block_type not in {"tool_call", "function_call"}:
+            continue
+        call_id, item_id, name, arguments, status = _function_call_fields(block)
+        reason = None
+        if status == "incomplete":
+            reason = "status_incomplete"
+        elif isinstance(arguments, str) and arguments.strip():
+            try:
+                json.loads(arguments)
+            except json.JSONDecodeError:
+                reason = "arguments_unparseable"
+        if reason:
+            problems.append(
+                {
+                    "reason": reason,
+                    "call_id": call_id,
+                    "item_id": item_id,
+                    "name": name,
+                    "arguments_len": len(arguments)
+                    if isinstance(arguments, str)
+                    else None,
+                }
+            )
+    return problems
+
+
+def parse_function_call_block(block: Any) -> tuple[str, str, dict[str, Any]]:
+    """Parse a function_call output item into (tool_id, tool_name, arguments).
+
+    Invariants (the P4 contract):
+    - tool_id is the pairing key: `call_id` PREFERRED over the item `id`.
+      Tool outputs must pair by call_id (`call_…`); dispatching by the
+      Responses-API item id (`fc_…`) makes outputs unpairable and 400s the
+      next request.
+    - An incomplete (truncated) call, or one whose non-empty arguments do
+      not parse as JSON, raises FunctionCallTruncationError — it is NEVER
+      surfaced as an executable call with `{}` arguments.
+    - An empty/absent arguments payload is a legitimate no-argument call.
+    """
+    call_id, item_id, name, arguments, status = _function_call_fields(block)
+
+    if status == "incomplete":
+        raise FunctionCallTruncationError(
+            f"function_call '{name}' (call_id={call_id or item_id}) has status "
+            "'incomplete' — its arguments were truncated by max_output_tokens "
+            "and it cannot be executed"
+        )
+
+    tool_input: Any = arguments
+    if isinstance(tool_input, str):
+        if not tool_input.strip():
+            tool_input = {}
+        else:
+            try:
+                tool_input = json.loads(tool_input)
+            except json.JSONDecodeError as exc:
+                raise FunctionCallTruncationError(
+                    f"function_call '{name}' (call_id={call_id or item_id}) carries "
+                    f"unparseable JSON arguments ({len(arguments)} chars) — a "
+                    "truncation artifact; refusing to surface it with empty arguments"
+                ) from exc
+    if tool_input is None:
+        tool_input = {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    return call_id or item_id or "", name, tool_input
 
 
 def extract_reasoning_text(reasoning_summary: Any) -> str | None:
@@ -152,23 +276,10 @@ def convert_response_with_accumulated_output(
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
-                tool_id = getattr(block, "id", "") or getattr(block, "call_id", "")
-                tool_name = getattr(block, "name", "")
-                tool_input = getattr(block, "input", None)
-                if tool_input is None and hasattr(block, "arguments"):
-                    tool_input = block.arguments
-                if isinstance(tool_input, str):
-                    try:
-                        tool_input = json.loads(tool_input)
-                    except json.JSONDecodeError:
-                        logger.debug(
-                            "Failed to decode tool call arguments: %s", tool_input
-                        )
-                if tool_input is None:
-                    tool_input = {}
-                # Ensure tool_input is dict after json.loads or default
-                if not isinstance(tool_input, dict):
-                    tool_input = {}
+                # P4: call_id-keyed, and NEVER surfaces an incomplete/
+                # truncated call — parse_function_call_block raises
+                # FunctionCallTruncationError instead of coercing to {}.
+                tool_id, tool_name, tool_input = parse_function_call_block(block)
                 content_blocks.append(
                     ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
                 )
@@ -230,23 +341,9 @@ def convert_response_with_accumulated_output(
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
-                tool_id = block.get("id") or block.get("call_id", "")
-                tool_name = block.get("name", "")
-                tool_input = block.get("input")
-                if tool_input is None:
-                    tool_input = block.get("arguments", {})
-                if isinstance(tool_input, str):
-                    try:
-                        tool_input = json.loads(tool_input)
-                    except json.JSONDecodeError:
-                        logger.debug(
-                            "Failed to decode tool call arguments: %s", tool_input
-                        )
-                if tool_input is None:
-                    tool_input = {}
-                # Ensure tool_input is dict after json.loads or default
-                if not isinstance(tool_input, dict):
-                    tool_input = {}
+                # P4: call_id-keyed, and NEVER surfaces an incomplete/
+                # truncated call (see SDK-object branch above).
+                tool_id, tool_name, tool_input = parse_function_call_block(block)
                 content_blocks.append(
                     ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
                 )
