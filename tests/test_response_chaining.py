@@ -435,8 +435,8 @@ def test_response_not_found_triggers_retry_without_chain():
 def test_response_not_found_retry_restores_full_history():
     """404 invalidation retry must resend the FULL history, not just the delta.
 
-    Issue #321: when chaining is active the first request trims ``input`` to the
-    post-chain delta because ``previous_response_id`` carries the prior turns as
+    When chaining is active the first request trims ``input`` to the post-chain
+    delta because ``previous_response_id`` carries the prior turns as
     server-side state. When the server rejects that id (expired/unknown), the
     server holds NO prior context, so the retry must restore the full converted
     history. Retrying with only the delta would silently drop the entire prior

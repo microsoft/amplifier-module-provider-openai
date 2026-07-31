@@ -1,4 +1,4 @@
-"""Issue #321: the OpenAI provider must stop rebuilding the pre-compaction
+"""The OpenAI provider must stop rebuilding the pre-compaction
 server-side context via previous_response_id after the local context is
 compacted (or on a context_length_exceeded overflow).
 
@@ -322,7 +322,7 @@ def test_generic_bad_request_not_treated_as_overflow():
     )
 
     # A generic 400 is translated to InvalidRequestError (not ContextLengthError)
-    # and, crucially, must NOT trigger the Issue #321 chain-break retry.
+    # and, crucially, must NOT trigger the chain-break retry.
     with pytest.raises(kernel_errors.InvalidRequestError):
         asyncio.run(provider.complete(_request_with_prior_response_id()))
 
