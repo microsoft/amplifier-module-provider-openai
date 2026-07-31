@@ -312,6 +312,41 @@ def _validate_reasoning_mode(reasoning_param: Any) -> None:
 # prompt_cache_retention -- it does not replace it.
 _PROMPT_CACHE_OPTIONS_MODES = frozenset({"implicit", "explicit"})
 
+_CONTEXT_OVERFLOW_ERROR_CODES = frozenset({"context_length_exceeded"})
+
+# Substring fallbacks. Kept for older Chat Completions wording and for
+# errors that arrive without a machine-readable code. "exceeds the context
+# window" is the current Responses API phrasing, which none of the legacy
+# markers matched.
+_CONTEXT_OVERFLOW_MESSAGE_MARKERS = (
+    "context length",
+    "too many tokens",
+    "maximum context",
+    "exceeds the context window",
+)
+
+
+def _extract_error_fields(body: object) -> tuple[str | None, str | None]:
+    """Return (code, type) from an OpenAI error body, tolerating shapes."""
+    if not isinstance(body, dict):
+        return None, None
+    err = body.get("error")
+    if isinstance(err, dict):
+        return err.get("code"), err.get("type")
+    return body.get("code"), body.get("type")
+
+
+def _is_context_overflow(err_code: str | None, raw_msg: str) -> bool:
+    """True when an OpenAI error denotes context-window overflow.
+
+    Code first -- stable, and mirrors the existing 404 chain-invalidation
+    precedent in this file (``err_code in RESPONSE_NOT_FOUND_ERROR_CODES``).
+    Message substrings are a fallback only.
+    """
+    if err_code is not None and err_code in _CONTEXT_OVERFLOW_ERROR_CODES:
+        return True
+    return any(m in raw_msg for m in _CONTEXT_OVERFLOW_MESSAGE_MARKERS)
+
 
 def _validate_prompt_cache_options(options: Any) -> None:
     """Validate the prompt_cache_options object shape/mode enum pre-flight."""
@@ -1740,6 +1775,59 @@ class OpenAIProvider:
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info
+
+            async def _handle_context_overflow(e: Exception, error_msg: str):
+                """Issue #321 self-heal + ContextLengthError. Shared by the 400
+                path and the streaming APIError path, which surface the same
+                condition."""
+                # Issue #321: an overflow while a response chain is active
+                # almost always means previous_response_id is holding a
+                # large pre-compaction server-side context. Break the chain
+                # once and retry with the full (compacted) local transcript
+                # so the request is bounded by the local view. This is the
+                # self-heal that also covers the resume path, where a fresh
+                # process re-lifts a stale on-disk openai:response_id before
+                # any compaction event has fired.
+                if "previous_response_id" in params:
+                    overflow_id = params.pop("previous_response_id")
+                    # Chain is gone -> the server holds no prior context, so
+                    # restore the full converted history (mirrors the 404
+                    # invalidation path). Retrying with only the delta would
+                    # silently drop the entire prior conversation.
+                    params["input"] = input_messages
+                    logger.warning(
+                        "[PROVIDER] context_length_exceeded with active "
+                        "response chain (previous_response_id=%s). Breaking "
+                        "chain and retrying with full compacted input "
+                        "(Issue #321).",
+                        overflow_id,
+                    )
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            RESPONSE_CHAIN_INVALIDATED,
+                            {
+                                "provider": self.name,
+                                "model": params.get("model"),
+                                "invalidated_id": overflow_id,
+                                "error_code": "context_length_exceeded",
+                            },
+                        )
+                    # Retry once. previous_response_id is gone, so a second
+                    # overflow cannot re-enter this branch — it falls through
+                    # to the ContextLengthError below, which is non-retryable
+                    # and so fails fast instead of burning max_retries on a
+                    # request that cannot succeed. Nothing in the ecosystem
+                    # currently consumes ContextLengthError: compaction is
+                    # driven by the context manager's own token threshold at
+                    # request-build time, not by provider errors. Raising the
+                    # typed error does not trigger recovery.
+                    return await _do_complete()
+                raise kernel_errors.ContextLengthError(
+                    error_msg,
+                    provider=self.name,
+                    status_code=400,
+                ) from e
+
             try:
                 if _use_streaming:
                     # Streaming path — chunked HTTP transport prevents timeouts on
@@ -1967,53 +2055,9 @@ class OpenAIProvider:
                 raw_msg = str(e).lower()
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
-                if (
-                    "context length" in raw_msg
-                    or "too many tokens" in raw_msg
-                    or "maximum context" in raw_msg
-                ):
-                    # Issue #321: an overflow while a response chain is active
-                    # almost always means previous_response_id is holding a
-                    # large pre-compaction server-side context. Break the chain
-                    # once and retry with the full (compacted) local transcript
-                    # so the request is bounded by the local view. This is the
-                    # self-heal that also covers the resume path, where a fresh
-                    # process re-lifts a stale on-disk openai:response_id before
-                    # any compaction event has fired.
-                    if "previous_response_id" in params:
-                        overflow_id = params.pop("previous_response_id")
-                        # Chain is gone -> the server holds no prior context, so
-                        # restore the full converted history (mirrors the 404
-                        # invalidation path). Retrying with only the delta would
-                        # silently drop the entire prior conversation.
-                        params["input"] = input_messages
-                        logger.warning(
-                            "[PROVIDER] context_length_exceeded with active "
-                            "response chain (previous_response_id=%s). Breaking "
-                            "chain and retrying with full compacted input "
-                            "(Issue #321).",
-                            overflow_id,
-                        )
-                        if self.coordinator and hasattr(self.coordinator, "hooks"):
-                            await self.coordinator.hooks.emit(
-                                RESPONSE_CHAIN_INVALIDATED,
-                                {
-                                    "provider": self.name,
-                                    "model": params.get("model"),
-                                    "invalidated_id": overflow_id,
-                                    "error_code": "context_length_exceeded",
-                                },
-                            )
-                        # Retry once. previous_response_id is gone, so a second
-                        # overflow cannot re-enter this branch — it falls through
-                        # to ContextLengthError, which the context manager
-                        # handles via its normal compaction path.
-                        return await _do_complete()
-                    raise kernel_errors.ContextLengthError(
-                        error_msg,
-                        provider=self.name,
-                        status_code=400,
-                    ) from e
+                err_code, _ = _extract_error_fields(body)
+                if _is_context_overflow(err_code, raw_msg):
+                    return await _handle_context_overflow(e, error_msg)
                 elif (
                     "content filter" in raw_msg
                     or "safety" in raw_msg
@@ -2127,6 +2171,53 @@ class OpenAIProvider:
                 ) from e
             except kernel_errors.LLMError:
                 raise  # Already translated, don't double-wrap
+            except openai.APIError as e:
+                # Streaming failures never reach the typed branches above. OpenAI
+                # returns HTTP 200, opens the SSE stream, then delivers the failure as
+                # an SSE "error" event; the SDK re-raises it as a bare openai.APIError,
+                # which is the PARENT of APIStatusError and carries no status_code.
+                # Before this branch existed such errors fell through to the generic
+                # `except Exception` handler, which hardcodes retryable=True -- so a
+                # deterministic 400 (context overflow, invalid params) was retried
+                # max_retries times before surfacing.
+                if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
+                    # Transport-level failures are genuinely transient.
+                    raise kernel_errors.LLMError(
+                        str(e) or f"{type(e).__name__}: (no message)",
+                        provider=self.name,
+                        retryable=True,
+                    ) from e
+                body = getattr(e, "body", None)
+                error_msg = (
+                    json.dumps(body)
+                    if body is not None
+                    else (str(e) or f"{type(e).__name__}: (no message)")
+                )
+                err_code, err_type = _extract_error_fields(body)
+                raw_msg = str(e).lower()
+                if _is_context_overflow(err_code, raw_msg):
+                    return await _handle_context_overflow(e, error_msg)
+                if err_type == "invalid_request_error":
+                    # Deterministic client error surfaced mid-stream -- retrying
+                    # replays the identical request and fails identically.
+                    #
+                    # `type` is the only safe discriminator here. Do NOT widen this
+                    # to "any error carrying a `code`": the codes documented for this
+                    # API (openai.types.responses.ResponseError) are led by
+                    # "server_error" and "rate_limit_exceeded", which are precisely
+                    # the transient failures retries exist for. Classifying on the
+                    # presence of a code would make them permanent.
+                    raise kernel_errors.InvalidRequestError(
+                        error_msg,
+                        provider=self.name,
+                        status_code=400,
+                    ) from e
+                # Unclassifiable -- preserve the prior conservative default.
+                raise kernel_errors.LLMError(
+                    error_msg,
+                    provider=self.name,
+                    retryable=True,
+                ) from e
             except Exception as e:
                 body = getattr(e, "body", None)
                 if body is not None:
