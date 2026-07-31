@@ -1,4 +1,5 @@
-"""Deterministic, zero-network regression test for issue #321.
+"""Deterministic, zero-network regression test for double-counted tokens
+when response-chaining is active.
 
 Bug (before fix): when response-chaining is active, the OpenAI provider built
 an outbound request that carried BOTH the full local `input` message array
@@ -7,9 +8,9 @@ time. Because previous_response_id already tells the server to load the full
 prior request+response as server-side state, re-sending the whole local
 history double-counts every prior token server-side.
 
-Fix (issue #321): when previous_response_id is attached, `input` is trimmed to
-the DELTA only -- the messages added after the chained assistant turn. The
-prior history lives in server-side state referenced by previous_response_id.
+Fix: when previous_response_id is attached, `input` is trimmed to the DELTA
+only -- the messages added after the chained assistant turn. The prior history
+lives in server-side state referenced by previous_response_id.
 
 This test asserts the FIXED behavior:
   - previous_response_id is still attached (chaining still works), AND
@@ -21,8 +22,7 @@ possible -- the mock captures kwargs and returns a canned, in-memory
 DummyResponse synchronously.
 
 Run with:
-    cd /Users/salil/Development/msft/gh-issues-support/amplifier-issue-321/provider-openai
-    uv run pytest tests/test_issue_321_double_context_proof.py -s -v
+    uv run pytest tests/test_chain_delta_input.py -s -v
 """
 
 import asyncio
@@ -86,7 +86,7 @@ def _flatten_input_text(input_items: list[Any]) -> str:
 
 
 def test_chaining_trims_input_to_delta_when_previous_response_id_attached():
-    """REGRESSION (issue #321): chain_active=True => outbound params attach
+    """REGRESSION: chain_active=True => outbound params attach
     previous_response_id AND send only the delta in `input` (the new user turn),
     NOT the full prior history that is already covered server-side.
     """
@@ -127,7 +127,7 @@ def test_chaining_trims_input_to_delta_when_previous_response_id_attached():
         f"{captured.get('previous_response_id')!r}"
     )
 
-    # --- The core issue #321 fix assertions -------------------------------
+    # --- The core delta-input fix assertions -----------------------------
     assert "input" in captured, f"params missing 'input': {sorted(captured.keys())}"
     assert isinstance(captured["input"], list)
 
@@ -139,11 +139,11 @@ def test_chaining_trims_input_to_delta_when_previous_response_id_attached():
     )
     # The already-chained prior turns MUST NOT be re-sent (that was the bug).
     assert "capital of france" not in flat, (
-        "BUG #321 present: prior user turn re-sent in input despite "
+        "BUG present: prior user turn re-sent in input despite "
         f"previous_response_id being attached. input={captured['input']}"
     )
     assert "paris" not in flat, (
-        "BUG #321 present: prior assistant turn re-sent in input despite "
+        "BUG present: prior assistant turn re-sent in input despite "
         f"previous_response_id being attached. input={captured['input']}"
     )
     # Delta is exactly the one new user turn (no developer messages in this case).
@@ -153,7 +153,7 @@ def test_chaining_trims_input_to_delta_when_previous_response_id_attached():
     )
 
     # --- Evidence printout -------------------------------------------------
-    print("\n=== ISSUE #321 FIX EVIDENCE ===")
+    print("\n=== DELTA INPUT FIX EVIDENCE ===")
     print("params['previous_response_id']:", captured["previous_response_id"])
     print("len(params['input']) (delta):", len(captured["input"]))
     print("input contains 'population' (delta present):", "population" in flat)
