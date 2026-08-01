@@ -306,6 +306,59 @@ def _validate_reasoning_mode(reasoning_param: Any) -> None:
     )
 
 
+# reasoning.context (GPT-5.6 "persisted reasoning") selects how much prior
+# reasoning is re-rendered: "auto" (default) | "current_turn" | "all_turns".
+# "current_turn" trims rendered context on long agent loops -- the documented
+# mitigation for context_length_exceeded. Value-validated pre-flight; model
+# support is fail-loud at the API (pre-5.6 rejects it), same stance as `mode`.
+_REASONING_CONTEXT_ALLOWED = frozenset({"auto", "current_turn", "all_turns"})
+
+
+def _validate_reasoning_context(reasoning_param: Any) -> None:
+    """Reject a reasoning.context value the API would not accept."""
+    if not isinstance(reasoning_param, dict):
+        return
+    context = reasoning_param.get("context")
+    if context is None or context in _REASONING_CONTEXT_ALLOWED:
+        return
+    raise kernel_errors.InvalidRequestError(
+        f"reasoning.context must be one of "
+        f"{{'auto', 'current_turn', 'all_turns'}}; got {context!r}. "
+        f"Persisted reasoning requires a GPT-5.6 model."
+    )
+
+
+# reasoning.effort values the API accepts, gated per-model via
+# ModelCapabilities.allowed_reasoning_efforts (Gap D). "max" is GPT-5.6-only;
+# "minimal" is unsupported on GPT-5.5/5.6. Composes (AND) with
+# _validate_gpt_5_5_pro_effort -- both must pass for gpt-5.5-pro.
+def _validate_reasoning_effort(model_id: str, reasoning_param: Any) -> None:
+    """Reject a reasoning.effort the *model* does not accept (capability-driven).
+
+    No-op when the model's capabilities set `allowed_reasoning_efforts=None`
+    (the permissive default for every family except gpt-5.5 / gpt-5.6). Composes
+    with `_validate_gpt_5_5_pro_effort`: both must pass. Catches the gpt-5.5 +
+    'max' regression (max is 5.6-only) with a clear pre-flight error.
+    """
+    caps = get_capabilities(model_id)
+    allowed = caps.allowed_reasoning_efforts
+    if allowed is None:
+        return
+    if reasoning_param is None:
+        return
+    if isinstance(reasoning_param, dict):
+        effort = reasoning_param.get("effort")
+    else:
+        effort = reasoning_param
+    if effort is None or effort in allowed:
+        return
+    raise kernel_errors.InvalidRequestError(
+        f"Model {model_id!r} does not accept reasoning.effort={effort!r}; "
+        f"allowed values: {sorted(allowed)}. "
+        f"('max' is GPT-5.6-only; 'minimal' is unsupported on GPT-5.5/5.6.)"
+    )
+
+
 # prompt_cache_options.mode is a stable enum; ttl currently accepts only "30m" but
 # is left to the API to validate (it is the more volatile field). Verified live
 # against gpt-5.6-sol 2026-07-14. Note: prompt_cache_options COEXISTS with
@@ -360,6 +413,35 @@ def _validate_prompt_cache_options(options: Any) -> None:
         raise kernel_errors.InvalidRequestError(
             f"prompt_cache_options.mode must be one of "
             f"{{'implicit', 'explicit'}}; got {mode!r}."
+        )
+
+
+def _validate_context_management(cm: Any) -> None:
+    """Pre-flight type check for context_management (must be a list of directives).
+
+    A shape-only check (mirrors the isinstance guard in
+    `_validate_prompt_cache_options`); the API validates the contents of each
+    directive (e.g. `{"type": "compaction", "compact_threshold": N}`).
+    """
+    if not isinstance(cm, list):
+        raise kernel_errors.InvalidRequestError(
+            f"context_management must be a list of directives; got {type(cm).__name__}."
+        )
+
+
+# text.verbosity (GPT-5.6): controls response length/detail. Opt-in; fail-loud
+# on models that reject it (pre-5.6).
+_TEXT_VERBOSITY_ALLOWED = frozenset({"low", "medium", "high"})
+
+
+def _validate_text_verbosity(verbosity: Any) -> None:
+    """Reject a text.verbosity value the API would not accept (no-op when None)."""
+    if verbosity is None:
+        return
+    if verbosity not in _TEXT_VERBOSITY_ALLOWED:
+        raise kernel_errors.InvalidRequestError(
+            f"text_verbosity must be one of {{'low', 'medium', 'high'}}; "
+            f"got {verbosity!r}."
         )
 
 
@@ -421,6 +503,33 @@ def _drop_unsupported_24h_retention(model_id: str, retention: str | None) -> str
         model_id,
     )
     return None
+
+
+def _estimate_input_tokens(input_messages: list) -> int:
+    """Rough chars/4 token estimate over the serialized input. Heuristic only --
+    never authoritative, never used to block. Cheap (no tokenizer dependency)."""
+    try:
+        approx_chars = len(json.dumps(input_messages, default=str))
+    except (TypeError, ValueError):
+        approx_chars = sum(len(str(m)) for m in input_messages)
+    return approx_chars // 4
+
+
+def _warn_if_input_exceeds_window(model_id: str, input_messages: list) -> None:
+    """Log a WARNING (never raise) when the estimated input exceeds the model's
+    real context window. Advisory diagnosis for context_length_exceeded."""
+    caps = get_capabilities(model_id)
+    estimated = _estimate_input_tokens(input_messages)
+    if estimated > caps.context_window:
+        logger.warning(
+            "[PROVIDER] Estimated input ~%d tokens exceeds %s context window "
+            "(%d). The API may return context_length_exceeded. Consider "
+            "context_management compaction, reasoning.context='current_turn', "
+            "or a smaller input.",
+            estimated,
+            model_id,
+            caps.context_window,
+        )
 
 
 class OpenAIProvider:
@@ -560,9 +669,18 @@ class OpenAIProvider:
         self.prompt_cache_options: dict | None = (
             self.config.get("prompt_cache_options") or None
         )
+        # context_management (GPT-5.6): server-side compaction directive, e.g.
+        # [{"type": "compaction", "compact_threshold": 200_000}]. Opt-in; None =
+        # do not send. Passed through verbatim (the API validates the shape).
+        self.context_management: list | None = (
+            self.config.get("context_management") or None
+        )
         self.safety_identifier: str | None = (
             self.config.get("safety_identifier") or None
         )
+        # text.verbosity (GPT-5.6): "low" | "medium" | "high". Wrapped into the
+        # Responses API `text` object at request time. None = do not send.
+        self.text_verbosity: str | None = self.config.get("text_verbosity") or None
 
         # Response chaining for reasoning models — the Responses API's
         # `previous_response_id` mechanism. Tri-state:
@@ -752,6 +870,15 @@ class OpenAIProvider:
                     prompt="Enable long context (>272K tokens, 2x input / 1.5x output pricing)",
                     required=False,
                     default="false",
+                ),
+                ConfigField(
+                    id="text_verbosity",
+                    display_name="Text verbosity",
+                    field_type="choice",
+                    prompt="Response verbosity (GPT-5.6). Leave unset for model default.",
+                    choices=["low", "medium", "high"],
+                    required=False,
+                    default=None,
                 ),
                 ConfigField(
                     id="prompt_cache_key",
@@ -1552,6 +1679,8 @@ class OpenAIProvider:
             reasoning_param = self.reasoning
         _validate_gpt_5_5_pro_effort(model_name, reasoning_param)
         _validate_reasoning_mode(reasoning_param)
+        _validate_reasoning_context(reasoning_param)
+        _validate_reasoning_effort(model_name, reasoning_param)
         if reasoning_param:
             # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
             if isinstance(reasoning_param, dict):
@@ -1566,6 +1695,10 @@ class OpenAIProvider:
                 _reasoning_mode = reasoning_param.get("mode")
                 if _reasoning_mode is not None:
                     params["reasoning"]["mode"] = _reasoning_mode
+                # reasoning.context (GPT-5.6): persisted-reasoning strategy.
+                _reasoning_context = reasoning_param.get("context")
+                if _reasoning_context is not None:
+                    params["reasoning"]["context"] = _reasoning_context
             else:
                 # String format: use as effort level with default summary
                 params["reasoning"] = {
@@ -1670,11 +1803,34 @@ class OpenAIProvider:
             _validate_prompt_cache_options(prompt_cache_options)
             params["prompt_cache_options"] = prompt_cache_options
 
+        # context_management (GPT-5.6): server-side compaction directive.
+        # Opt-in; None = do not send. Passed through verbatim after a shape-only
+        # pre-flight check -- the API validates directive contents.
+        context_management = (
+            kwargs.get("context_management", self.context_management) or None
+        )
+        if context_management is not None:
+            _validate_context_management(context_management)
+            params["context_management"] = context_management
+
         safety_identifier = (
             kwargs.get("safety_identifier", self.safety_identifier) or None
         )
         if safety_identifier is not None:
             params["safety_identifier"] = safety_identifier
+
+        # text.verbosity (GPT-5.6): opt-in response-length control. Guard against
+        # clobbering any pre-existing `text` object (there is none today, but be
+        # defensive -- mirrors the safety_identifier passthrough pattern).
+        text_verbosity = kwargs.get("text_verbosity", self.text_verbosity) or None
+        if text_verbosity is not None:
+            _validate_text_verbosity(text_verbosity)
+            params.setdefault("text", {})["verbosity"] = text_verbosity
+
+        # Advisory-only: estimate input size against the model's context window
+        # and log a warning if it's likely to overflow. Never blocks -- heuristic
+        # diagnosis for context_length_exceeded (Error 2).
+        _warn_if_input_exceeds_window(model_name, input_messages)
 
         # Add background mode parameter for long-running requests (deep research)
         if background_mode:
@@ -2549,6 +2705,10 @@ class OpenAIProvider:
                     continue_params["prompt_cache_options"] = params[
                         "prompt_cache_options"
                     ]
+                if "context_management" in params:
+                    continue_params["context_management"] = params["context_management"]
+                if "text" in params:
+                    continue_params["text"] = params["text"]
 
                 # Make continuation call
                 try:
