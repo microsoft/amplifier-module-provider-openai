@@ -120,6 +120,51 @@ class ModelCapabilities:
     exception).
     """
 
+    supports_native_computer_use: bool = False
+    """Whether the model accepts OpenAI's native `{"type": "computer"}` tool.
+
+    THE INVERSE DISTRIBUTION from `supports_native_apply_patch` \u2014 same
+    version-gating machinery (`_detect_family` / `_parse_gpt5_version`),
+    opposite default, because the live evidence points the opposite way.
+
+    Live-API evidence (2026-08-03, bare `{"type": "computer"}` tool \u2014 no
+    `display_width`/`display_height`/`environment` sub-fields; the GA
+    `computer` tool takes no config on declaration \u2014 declared against
+    `https://api.openai.com/v1/responses` with `max_output_tokens=16`):
+
+    | Result | Models (live-probed) |
+    |---|---|
+    | SUPPORTED | gpt-5.4, gpt-5.4-mini, gpt-5.4-pro |
+    | SUPPORTED | gpt-5.5, gpt-5.5-pro |
+    | SUPPORTED | gpt-5.6 |
+    | NOT supported | gpt-5.4-nano (proves size, not just version, gates this) |
+    | NOT supported | gpt-5 (bare), gpt-5.1, gpt-5.2, gpt-5.3, gpt-5.3-chat-latest |
+    | NOT supported | gpt-5-mini (bare, gpt-5.0 generation) |
+    | NOT supported | gpt-4o, gpt-4.1 |
+    | NOT supported | o-series: o1, o3-mini |
+
+    Rule: SUPPORTED only when `minor >= 4` AND the model_id is not a
+    "-nano" tier. The "-nano" exclusion is a model_id substring check
+    (not an enumerated list) so it generalizes to future nano releases
+    the same way `_detect_family`/`_parse_gpt5_version` generalize version
+    bumps \u2014 proven for gpt-5.4-nano, extended by pattern rather than by
+    adding a name every release.
+
+    Default False for the dataclass and for every other family/branch
+    (o-series, deep-research, gpt-4.x, gpt-5-mini, gpt-5 through 5.3) \u2014
+    inherited, not named one by one, because the majority result here is
+    False (the OPPOSITE distribution from apply_patch's majority-True
+    result). Sending `computer` to an unsupported model fails loud and
+    immediately (`Tool 'computer' is not supported with <model>`, HTTP
+    400) \u2014 same fail-closed-at-the-API-boundary property apply_patch
+    accepts \u2014 but a narrow default avoids exercising that failure path
+    for the common case, where the common case is "does not support it."
+
+    This flag governs ONLY whether the model accepts the native wire tool
+    type. It carries no opinion on geometry, coordinate mapping, or action
+    decoding \u2014 those are downstream/consumer concerns.
+    """
+
 
 def _detect_family(model_id: str) -> str:
     """Classify *model_id* into a capability family.
@@ -247,6 +292,16 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
         # gpt-5.4-mini and gpt-5.4-nano are both confirmed supported.
         supports_apply_patch = minor >= 1 and model_id != "gpt-5.1-chat-latest"
 
+        # Native `computer` tool support — empirical, live-API basis, 2026-08-03.
+        # See ModelCapabilities.supports_native_computer_use docstring for the
+        # full evidence table. Rule (inverse distribution from apply_patch):
+        # minor >= 4 AND not a "-nano" tier. Confirmed live: gpt-5.4,
+        # gpt-5.4-mini, gpt-5.4-pro, gpt-5.5, gpt-5.5-pro, gpt-5.6 all SUPPORTED;
+        # gpt-5.4-nano confirmed NOT supported despite minor == 4 — size, not
+        # just version, gates this tool (unlike apply_patch, where mini/nano
+        # made no difference once minor >= 1).
+        supports_computer_use = minor >= 4 and "-nano" not in model_id
+
         # gpt-5.5 — verified against live API 2026-04-24.
         # 1M context, ~4x input / 3x output pricing vs 5.4. Reasoning blocks,
         # rs_* IDs, and encrypted_content carry the same shape as 5.4.
@@ -266,6 +321,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 long_context_pricing_threshold=None,
                 supports_in_memory_retention=False,  # 5.5 default is "24h", "in_memory" rejected
                 supports_native_apply_patch=supports_apply_patch,
+                supports_native_computer_use=supports_computer_use,
             )
 
         # gpt-5.6 (Sol / Terra / Luna) -- GA 2026-07-09.
@@ -302,6 +358,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 long_context_pricing_threshold=272_000,
                 supports_in_memory_retention=False,
                 supports_native_apply_patch=supports_apply_patch,
+                supports_native_computer_use=supports_computer_use,
             )
 
         if minor >= 4 or (major, minor) == (0, 0):
@@ -317,6 +374,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 capability_tags=_GPT5_TAGS,
                 long_context_pricing_threshold=272_000,
                 supports_native_apply_patch=supports_apply_patch,
+                supports_native_computer_use=supports_computer_use,
             )
 
         if minor == 3:
