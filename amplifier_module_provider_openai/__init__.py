@@ -9,6 +9,7 @@ __all__ = ["mount", "OpenAIProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -19,6 +20,8 @@ from decimal import Decimal
 from typing import Any
 
 import openai
+from pydantic import ValidationError
+
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
@@ -423,6 +426,156 @@ def _drop_unsupported_24h_retention(model_id: str, retention: str | None) -> str
     return None
 
 
+def _computer_action_to_dict(action: Any) -> dict[str, Any]:
+    """Normalize one `computer_call` action entry to a plain dict.
+
+    Actions arrive either as plain dicts (dict-format response replay) or as
+    SDK objects (openai-python pydantic models on the live parsed-response
+    path). Handle both without depending on a specific action class, since
+    the action union has many variants (click, move, keypress, scroll,
+    drag, type, wait, screenshot, ...).
+    """
+    if isinstance(action, dict):
+        return action
+    if hasattr(action, "model_dump"):
+        return action.model_dump()
+    if hasattr(action, "__dict__"):
+        return {k: v for k, v in vars(action).items() if not k.startswith("_")}
+    return {"value": action}
+
+
+def _extract_computer_actions(block: Any) -> list[dict[str, Any]]:
+    """Extract the actions batch from a `computer_call` response item.
+
+    Live Responses API traffic (captured against gpt-5.6) returns a
+    **batched** `actions` array on `computer_call` items, not a singular
+    `action` field -- confirmed via `openai-turn0.json`/`openai-turn1.json`
+    fixtures, each `{"...", "actions": [...], "call_id": "..."}`. Support a
+    singular `action` field defensively too, in case an older/different
+    wire shape is ever encountered, rather than silently dropping the call.
+    """
+    if isinstance(block, dict):
+        actions = block.get("actions")
+        if actions is None:
+            single = block.get("action")
+            actions = [single] if single is not None else []
+    else:
+        actions = getattr(block, "actions", None)
+        if actions is None:
+            single = getattr(block, "action", None)
+            actions = [single] if single is not None else []
+    return [_computer_action_to_dict(a) for a in actions]
+
+
+def _extract_computer_screenshot_data_url(tool_content: Any) -> str:
+    """Build the `image_url` data URI OpenAI's `computer_call_output` expects.
+
+    Accepts either:
+    - a plain base64 PNG string (already-encoded image data), or
+    - a list of content blocks containing an `ImageBlock`-shaped dict
+      (`{"type": "image", "source": {"type": "base64", "media_type", "data"}}`),
+      mirroring the existing `role == "user"` image conversion (`input_image`,
+      above).
+
+    Raises ValueError if neither shape is present. A `computer_call_output`
+    with no image is not a valid response to a `computer_call` -- per the
+    "fail loud, never silently degrade" requirement, this must surface as an
+    error rather than be sent as a malformed/empty request.
+    """
+    if isinstance(tool_content, str) and tool_content:
+        return f"data:image/png;base64,{tool_content}"
+
+    if isinstance(tool_content, list):
+        for block in tool_content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64" and source.get("data"):
+                    media_type = source.get("media_type", "image/png")
+                    return f"data:{media_type};base64,{source['data']}"
+
+    raise ValueError(
+        "computer_call tool result did not contain image data; expected a "
+        "base64 PNG string or an image content block "
+        f"(got: {type(tool_content).__name__})"
+    )
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await *value* if it's awaitable, otherwise return it as-is.
+
+    `client.responses.with_raw_response.create(**params)`'s return type
+    varies by openai SDK internals: the installed SDK (2.8.1) returns a
+    `LegacyAPIResponse` whose `.parse()` is synchronous (verified live --
+    calling it either returns the parsed model directly or raises
+    `pydantic.ValidationError` immediately, it is never a coroutine). Other
+    SDK versions may return the newer `APIResponse`, whose `.parse()` *is*
+    a coroutine. This normalizes both shapes for `_create_response` and
+    `_read_raw_json_body` without depending on which one is live.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _read_raw_json_body(raw_response: Any) -> Any:
+    """Decode the JSON body of a raw SDK response, sync or async API.
+
+    Prefers a `.json()` method if the response object has one (the newer
+    `APIResponse` shape). The installed SDK's `LegacyAPIResponse` has no
+    `.json()` at all (verified live) -- only a synchronous `.content`
+    (bytes) property, so that's the fallback.
+    """
+    json_method = getattr(raw_response, "json", None)
+    if callable(json_method):
+        return await _maybe_await(json_method())
+    return json.loads(raw_response.content)
+
+
+def _params_declare_computer_tool(params: dict[str, Any]) -> bool:
+    """True if this request's `tools` list declares the native `computer` tool.
+
+    Scopes the raw-JSON fallback in `OpenAIProvider._create_response` to
+    exactly the request shape that can trigger it. Every other request
+    keeps calling `client.responses.create()` directly and unchanged.
+    """
+    tools = params.get("tools") or []
+    return any(isinstance(t, dict) and t.get("type") == "computer" for t in tools)
+
+
+class _RawResponseObject:
+    """Minimal read-only view over a raw Responses-API JSON body.
+
+    Exists only for the fallback path in `OpenAIProvider._create_response`:
+    when the installed openai SDK's typed `Response` model rejects a real
+    `computer_call` payload, callers throughout `_complete_chat_request`
+    and `_convert_to_chat_response` still need `response.output`,
+    `response.usage`, `response.status`, etc. to behave like the SDK's own
+    parsed objects, because that code reads the response via
+    `getattr`/`hasattr`, not `dict.get`.
+
+    Only *nested dict* attributes (`usage`, `incomplete_details`, ...) are
+    wrapped. List-valued attributes (`output`) are left as plain lists of
+    plain dicts on purpose: `_convert_to_chat_response`'s per-block parsing
+    already branches on `hasattr(block, "type")` vs. dict `block.get(...)`
+    for every block type it handles -- this wrapper piggybacks on that
+    existing dual-path convention rather than inventing a new one.
+    """
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = data
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            value = self._data[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        return _RawResponseObject(value) if isinstance(value, dict) else value
+
+    def get(self, key: str, default: Any = None) -> Any:
+        value = self._data.get(key, default)
+        return _RawResponseObject(value) if isinstance(value, dict) else value
+
+
 class OpenAIProvider:
     """OpenAI Responses API integration."""
 
@@ -635,6 +788,12 @@ class OpenAIProvider:
         # Apply patch native mode detection — set during tool conversion
         self._apply_patch_native = False
         self._native_call_ids: set[str] = set()
+        # Maps call_id -> native tool type ("computer", etc.) for call_ids in
+        # _native_call_ids. Only populated for native types that need a
+        # different result envelope than apply_patch's default
+        # (apply_patch_call_output); absence of an entry means "apply_patch",
+        # preserving existing behavior/tests untouched.
+        self._native_call_types: dict[str, str] = {}
         self._add_cost = add_cost or (lambda cost: None)
 
         # Process-wide concurrency gate.
@@ -1282,6 +1441,71 @@ class OpenAIProvider:
             return False
         # "auto"
         return get_capabilities(model_id).supports_reasoning
+
+    async def _create_response(self, params: dict[str, Any]) -> Any:
+        """Call `client.responses.create(**params)`.
+
+        For computer-use requests, parses from the raw JSON body instead of
+        the SDK's typed model.
+
+        Why: OpenAI's GA `computer_call` response omits `pending_safety_checks`
+        entirely. Every openai-python release checked -- 2.8.1 (installed) and
+        2.52.0 (latest) -- declares it a required field with no default on
+        `ResponseComputerToolCall`, so `client.responses.create()`'s automatic
+        parsing raises `pydantic.ValidationError` on a real live response,
+        independent of anything this provider does (see PR #58 for the version
+        evidence). `provider-anthropic` already uses `with_raw_response` on its
+        non-streaming path (for headers); this follows the same precedent to
+        read the body before the SDK's typed model gets a chance to reject it.
+
+        Scoped to requests that declare the `computer` tool via
+        `_params_declare_computer_tool`: every other request keeps calling
+        `client.responses.create()` directly, unchanged, so this fallback
+        cannot mask an unrelated parsing regression.
+
+        `with_raw_response.create()` returns a `LegacyAPIResponse` on the
+        installed SDK (2.8.1) whose `.parse()` is synchronous and has no
+        `.json()` method at all -- verified live, not assumed from the type
+        stubs (which describe the newer async `APIResponse`, not what this
+        SDK version actually returns for this resource). Both `.parse()` and
+        the raw-body read are handled for either shape via `_maybe_await` /
+        `_read_raw_json_body` so this keeps working if the SDK's
+        with_raw_response implementation changes.
+
+        Fails loud: if the raw body itself doesn't parse as the expected
+        shape, a `RuntimeError` is raised with the original `ValidationError`
+        preserved as its cause -- never a silently empty/partial response.
+        """
+        if not _params_declare_computer_tool(params):
+            return await self.client.responses.create(**params)
+
+        raw_response = await self.client.responses.with_raw_response.create(**params)
+        try:
+            return await _maybe_await(raw_response.parse())
+        except ValidationError as e:
+            logger.warning(
+                "[PROVIDER] %s: typed Response model rejected a computer-use "
+                "response (%s). Falling back to the raw JSON body -- see "
+                "PR #58 for the pending_safety_checks SDK defect this works "
+                "around.",
+                self.api_label,
+                e,
+            )
+            try:
+                body = await _read_raw_json_body(raw_response)
+            except (json.JSONDecodeError, AttributeError) as json_error:
+                raise RuntimeError(
+                    "computer-use response fallback failed: the raw JSON "
+                    "body could not be decoded either (typed-parse error: "
+                    f"{e}; json-decode error: {json_error})"
+                ) from json_error
+            if not isinstance(body, dict) or "output" not in body:
+                raise RuntimeError(
+                    "computer-use response fallback failed: raw JSON body "
+                    f"is missing the expected 'output' field (got: "
+                    f"{type(body).__name__})"
+                ) from e
+            return _RawResponseObject(body)
 
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
@@ -2008,7 +2232,7 @@ class OpenAIProvider:
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
                     return await asyncio.wait_for(
-                        self.client.responses.create(**params),
+                        self._create_response(params),
                         timeout=effective_timeout,
                     )
             except openai.RateLimitError as e:
@@ -2440,7 +2664,7 @@ class OpenAIProvider:
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
-                            self.client.responses.create(**params),
+                            self._create_response(params),
                             timeout=self.timeout,
                         )
                         elapsed_ms += int((time.time() - retry_start) * 1000)
@@ -2554,7 +2778,7 @@ class OpenAIProvider:
                 try:
                     continue_start = time.time()
                     final_response = await asyncio.wait_for(
-                        self.client.responses.create(**continue_params),
+                        self._create_response(continue_params),
                         timeout=self.timeout,
                     )
                     continue_elapsed = int((time.time() - continue_start) * 1000)
@@ -2768,8 +2992,28 @@ class OpenAIProvider:
                             if isinstance(tool_content, str)
                             else json.dumps(tool_content)
                         )
+                        # Use computer_call_output (with an image envelope, not
+                        # a stringified blob) for native computer calls. This
+                        # must be checked before the generic native-call branch
+                        # below, since computer call_ids are also present in
+                        # _native_call_ids but need a different result shape.
+                        if self._native_call_types.get(tool_call_id) == "computer":
+                            image_url = _extract_computer_screenshot_data_url(
+                                tool_content
+                            )
+                            openai_messages.append(
+                                {
+                                    "type": "computer_call_output",
+                                    "call_id": tool_call_id,
+                                    "output": {
+                                        "type": "computer_screenshot",
+                                        "image_url": image_url,
+                                        "detail": "original",
+                                    },
+                                }
+                            )
                         # Use apply_patch_call_output for native apply_patch calls
-                        if tool_call_id in self._native_call_ids:
+                        elif tool_call_id in self._native_call_ids:
                             # Determine status: "failed" if content signals error, else "completed"
                             _patch_status = "completed"
                             if (
@@ -2929,6 +3173,24 @@ class OpenAIProvider:
                                                 "status": "completed",
                                             }
                                         )
+                                    elif tc_name == "computer" and isinstance(
+                                        tc_input.get("actions"), list
+                                    ):
+                                        # Detect historical native computer_call by input
+                                        # shape: native calls store {"actions": [...]}
+                                        # (see _extract_computer_actions). Restore as
+                                        # native computer_call so the result is replayed
+                                        # with computer_call_output, not function_call_output.
+                                        self._native_call_ids.add(tc_id)
+                                        self._native_call_types[tc_id] = "computer"
+                                        function_call_items.append(
+                                            {
+                                                "type": "computer_call",
+                                                "call_id": tc_id,
+                                                "actions": tc_input.get("actions", []),
+                                                "status": "completed",
+                                            }
+                                        )
                                     else:
                                         tc_args_str = (
                                             json.dumps(tc_input) if tc_input else "{}"
@@ -3008,7 +3270,26 @@ class OpenAIProvider:
                                         "delete_file",
                                         "rename_file",
                                     }
-                                    if (
+                                    if tc_name == "computer" and isinstance(
+                                        tc_input.get("actions"), list
+                                    ):
+                                        # Detect historical native computer_call by input
+                                        # shape: native calls store {"actions": [...]}
+                                        # (see _extract_computer_actions). Restore as
+                                        # native computer_call so the result is replayed
+                                        # with computer_call_output, not
+                                        # function_call_output.
+                                        self._native_call_ids.add(tc_id)
+                                        self._native_call_types[tc_id] = "computer"
+                                        function_call_items.append(
+                                            {
+                                                "type": "computer_call",
+                                                "call_id": tc_id,
+                                                "actions": tc_input.get("actions", []),
+                                                "status": "completed",
+                                            }
+                                        )
+                                    elif (
                                         tc_name == "apply_patch"
                                         and tc_input.get("type") in _native_op_types
                                     ):
@@ -3298,6 +3579,27 @@ class OpenAIProvider:
 
             # Handle ToolSpec objects (user-defined function tools)
             if hasattr(tool, "name"):
+                # Native `computer` tool carried via ToolSpec extras. ToolSpec
+                # is declared `extra="allow"` (amplifier_core.message_models),
+                # so a tool that exposes `native_tool_spec = {"type": "computer"}`
+                # (see amplifier-module-loop-streaming's native-tool-spec
+                # mechanism) rides a `type="computer"` attribute onto the
+                # resulting ToolSpec instance untouched. Detect it the same
+                # way: an extra attribute, not a hardcoded name check.
+                #
+                # Unlike apply_patch, `computer` must be emitted completely
+                # bare -- no name/description/parameters. Live Responses API
+                # traffic confirms the tool accepts *zero* declaration fields:
+                # `{"type": "computer"}` -> 200; `display_width`,
+                # `display_height`, `environment`, `display_width_px` (any of
+                # them, alone) -> 400 "Unknown parameter". Forwarding
+                # tool.description/tool.parameters here would break the
+                # request outright, so this branch discards them by
+                # construction rather than by omission.
+                if getattr(tool, "type", None) == "computer":
+                    openai_tools.append({"type": "computer"})
+                    continue
+
                 # Special handling for apply_patch with native engine — but only
                 # for models confirmed to support OpenAI's native apply_patch tool
                 # type. Sending {"type": "apply_patch"} to an unsupported model
@@ -3474,6 +3776,20 @@ class OpenAIProvider:
                     # Track for round-trip output format
                     self._native_call_ids.add(call_id)
 
+                elif block_type == "computer_call":
+                    call_id = getattr(block, "call_id", "")
+                    args = {"actions": _extract_computer_actions(block)}
+                    content_blocks.append(
+                        ToolCallBlock(id=call_id, name="computer", input=args)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=call_id, name="computer", arguments=args)
+                    )
+                    # Track for round-trip output format (computer_call_output,
+                    # not apply_patch_call_output -- see _native_call_types).
+                    self._native_call_ids.add(call_id)
+                    self._native_call_types[call_id] = "computer"
+
             else:
                 # Dictionary format
                 block_type = block.get("type")
@@ -3584,6 +3900,18 @@ class OpenAIProvider:
                         ToolCall(id=call_id, name="apply_patch", arguments=args)
                     )
                     self._native_call_ids.add(call_id)
+
+                elif block_type == "computer_call":
+                    call_id = block.get("call_id", "")
+                    args = {"actions": _extract_computer_actions(block)}
+                    content_blocks.append(
+                        ToolCallBlock(id=call_id, name="computer", input=args)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=call_id, name="computer", arguments=args)
+                    )
+                    self._native_call_ids.add(call_id)
+                    self._native_call_types[call_id] = "computer"
 
         # Extract usage counts
         usage_obj = response.usage if hasattr(response, "usage") else None

@@ -50,6 +50,14 @@ DEFAULT_BACKGROUND_TIMEOUT = (
 
 # Native tool types that should be passed through to OpenAI without conversion
 # These are OpenAI-hosted tools, not user-defined function tools
+#
+# `computer` (OpenAI's computer-use tool) is unusual among this set: live
+# Responses API traffic against gpt-5.6 confirms it accepts *zero* declaration
+# fields. `{"type": "computer"}` alone -> 200. Adding any of `display_width`,
+# `display_height`, `environment`, or `display_width_px` -> 400
+# "Unknown parameter" (the opposite of Anthropic's `computer_20251124`, which
+# *requires* `display_width_px`/`display_height_px`). See
+# `_convert_tools_from_request` for where this is enforced.
 NATIVE_TOOL_TYPES = frozenset(
     {
         "web_search_preview",
@@ -58,6 +66,7 @@ NATIVE_TOOL_TYPES = frozenset(
         "file_search",
         "code_interpreter",
         "apply_patch",
+        "computer",
     }
 )
 
