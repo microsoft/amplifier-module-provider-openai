@@ -1,0 +1,14 @@
+{
+  "id": "cu_0383dce93f5d198c006a70120f58d4819aa6e30e8dd255cc42",
+  "type": "computer_call",
+  "status": "completed",
+  "actions": [
+    {
+      "type": "move",
+      "keys": null,
+      "x": 426,
+      "y": 87
+    }
+  ],
+  "call_id": "call_1warEZSWaXDHw1TSSeigeHxv"
+}

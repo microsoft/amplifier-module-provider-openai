@@ -423,6 +423,80 @@ def _drop_unsupported_24h_retention(model_id: str, retention: str | None) -> str
     return None
 
 
+def _computer_action_to_dict(action: Any) -> dict[str, Any]:
+    """Normalize one `computer_call` action entry to a plain dict.
+
+    Actions arrive either as plain dicts (dict-format response replay) or as
+    SDK objects (openai-python pydantic models on the live parsed-response
+    path). Handle both without depending on a specific action class, since
+    the action union has many variants (click, move, keypress, scroll,
+    drag, type, wait, screenshot, ...).
+    """
+    if isinstance(action, dict):
+        return action
+    if hasattr(action, "model_dump"):
+        return action.model_dump()
+    if hasattr(action, "__dict__"):
+        return {k: v for k, v in vars(action).items() if not k.startswith("_")}
+    return {"value": action}
+
+
+def _extract_computer_actions(block: Any) -> list[dict[str, Any]]:
+    """Extract the actions batch from a `computer_call` response item.
+
+    Live Responses API traffic (captured against gpt-5.6) returns a
+    **batched** `actions` array on `computer_call` items, not a singular
+    `action` field -- confirmed via `openai-turn0.json`/`openai-turn1.json`
+    fixtures, each `{"...", "actions": [...], "call_id": "..."}`. Support a
+    singular `action` field defensively too, in case an older/different
+    wire shape is ever encountered, rather than silently dropping the call.
+    """
+    if isinstance(block, dict):
+        actions = block.get("actions")
+        if actions is None:
+            single = block.get("action")
+            actions = [single] if single is not None else []
+    else:
+        actions = getattr(block, "actions", None)
+        if actions is None:
+            single = getattr(block, "action", None)
+            actions = [single] if single is not None else []
+    return [_computer_action_to_dict(a) for a in actions]
+
+
+def _extract_computer_screenshot_data_url(tool_content: Any) -> str:
+    """Build the `image_url` data URI OpenAI's `computer_call_output` expects.
+
+    Accepts either:
+    - a plain base64 PNG string (already-encoded image data), or
+    - a list of content blocks containing an `ImageBlock`-shaped dict
+      (`{"type": "image", "source": {"type": "base64", "media_type", "data"}}`),
+      mirroring the existing `role == "user"` image conversion (`input_image`,
+      above).
+
+    Raises ValueError if neither shape is present. A `computer_call_output`
+    with no image is not a valid response to a `computer_call` -- per the
+    "fail loud, never silently degrade" requirement, this must surface as an
+    error rather than be sent as a malformed/empty request.
+    """
+    if isinstance(tool_content, str) and tool_content:
+        return f"data:image/png;base64,{tool_content}"
+
+    if isinstance(tool_content, list):
+        for block in tool_content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64" and source.get("data"):
+                    media_type = source.get("media_type", "image/png")
+                    return f"data:{media_type};base64,{source['data']}"
+
+    raise ValueError(
+        "computer_call tool result did not contain image data; expected a "
+        "base64 PNG string or an image content block "
+        f"(got: {type(tool_content).__name__})"
+    )
+
+
 class OpenAIProvider:
     """OpenAI Responses API integration."""
 
@@ -635,6 +709,12 @@ class OpenAIProvider:
         # Apply patch native mode detection — set during tool conversion
         self._apply_patch_native = False
         self._native_call_ids: set[str] = set()
+        # Maps call_id -> native tool type ("computer", etc.) for call_ids in
+        # _native_call_ids. Only populated for native types that need a
+        # different result envelope than apply_patch's default
+        # (apply_patch_call_output); absence of an entry means "apply_patch",
+        # preserving existing behavior/tests untouched.
+        self._native_call_types: dict[str, str] = {}
         self._add_cost = add_cost or (lambda cost: None)
 
         # Process-wide concurrency gate.
@@ -2768,8 +2848,28 @@ class OpenAIProvider:
                             if isinstance(tool_content, str)
                             else json.dumps(tool_content)
                         )
+                        # Use computer_call_output (with an image envelope, not
+                        # a stringified blob) for native computer calls. This
+                        # must be checked before the generic native-call branch
+                        # below, since computer call_ids are also present in
+                        # _native_call_ids but need a different result shape.
+                        if self._native_call_types.get(tool_call_id) == "computer":
+                            image_url = _extract_computer_screenshot_data_url(
+                                tool_content
+                            )
+                            openai_messages.append(
+                                {
+                                    "type": "computer_call_output",
+                                    "call_id": tool_call_id,
+                                    "output": {
+                                        "type": "computer_screenshot",
+                                        "image_url": image_url,
+                                        "detail": "original",
+                                    },
+                                }
+                            )
                         # Use apply_patch_call_output for native apply_patch calls
-                        if tool_call_id in self._native_call_ids:
+                        elif tool_call_id in self._native_call_ids:
                             # Determine status: "failed" if content signals error, else "completed"
                             _patch_status = "completed"
                             if (
@@ -2929,6 +3029,24 @@ class OpenAIProvider:
                                                 "status": "completed",
                                             }
                                         )
+                                    elif tc_name == "computer" and isinstance(
+                                        tc_input.get("actions"), list
+                                    ):
+                                        # Detect historical native computer_call by input
+                                        # shape: native calls store {"actions": [...]}
+                                        # (see _extract_computer_actions). Restore as
+                                        # native computer_call so the result is replayed
+                                        # with computer_call_output, not function_call_output.
+                                        self._native_call_ids.add(tc_id)
+                                        self._native_call_types[tc_id] = "computer"
+                                        function_call_items.append(
+                                            {
+                                                "type": "computer_call",
+                                                "call_id": tc_id,
+                                                "actions": tc_input.get("actions", []),
+                                                "status": "completed",
+                                            }
+                                        )
                                     else:
                                         tc_args_str = (
                                             json.dumps(tc_input) if tc_input else "{}"
@@ -3008,7 +3126,26 @@ class OpenAIProvider:
                                         "delete_file",
                                         "rename_file",
                                     }
-                                    if (
+                                    if tc_name == "computer" and isinstance(
+                                        tc_input.get("actions"), list
+                                    ):
+                                        # Detect historical native computer_call by input
+                                        # shape: native calls store {"actions": [...]}
+                                        # (see _extract_computer_actions). Restore as
+                                        # native computer_call so the result is replayed
+                                        # with computer_call_output, not
+                                        # function_call_output.
+                                        self._native_call_ids.add(tc_id)
+                                        self._native_call_types[tc_id] = "computer"
+                                        function_call_items.append(
+                                            {
+                                                "type": "computer_call",
+                                                "call_id": tc_id,
+                                                "actions": tc_input.get("actions", []),
+                                                "status": "completed",
+                                            }
+                                        )
+                                    elif (
                                         tc_name == "apply_patch"
                                         and tc_input.get("type") in _native_op_types
                                     ):
@@ -3298,6 +3435,27 @@ class OpenAIProvider:
 
             # Handle ToolSpec objects (user-defined function tools)
             if hasattr(tool, "name"):
+                # Native `computer` tool carried via ToolSpec extras. ToolSpec
+                # is declared `extra="allow"` (amplifier_core.message_models),
+                # so a tool that exposes `native_tool_spec = {"type": "computer"}`
+                # (see amplifier-module-loop-streaming's native-tool-spec
+                # mechanism) rides a `type="computer"` attribute onto the
+                # resulting ToolSpec instance untouched. Detect it the same
+                # way: an extra attribute, not a hardcoded name check.
+                #
+                # Unlike apply_patch, `computer` must be emitted completely
+                # bare -- no name/description/parameters. Live Responses API
+                # traffic confirms the tool accepts *zero* declaration fields:
+                # `{"type": "computer"}` -> 200; `display_width`,
+                # `display_height`, `environment`, `display_width_px` (any of
+                # them, alone) -> 400 "Unknown parameter". Forwarding
+                # tool.description/tool.parameters here would break the
+                # request outright, so this branch discards them by
+                # construction rather than by omission.
+                if getattr(tool, "type", None) == "computer":
+                    openai_tools.append({"type": "computer"})
+                    continue
+
                 # Special handling for apply_patch with native engine — but only
                 # for models confirmed to support OpenAI's native apply_patch tool
                 # type. Sending {"type": "apply_patch"} to an unsupported model
@@ -3474,6 +3632,20 @@ class OpenAIProvider:
                     # Track for round-trip output format
                     self._native_call_ids.add(call_id)
 
+                elif block_type == "computer_call":
+                    call_id = getattr(block, "call_id", "")
+                    args = {"actions": _extract_computer_actions(block)}
+                    content_blocks.append(
+                        ToolCallBlock(id=call_id, name="computer", input=args)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=call_id, name="computer", arguments=args)
+                    )
+                    # Track for round-trip output format (computer_call_output,
+                    # not apply_patch_call_output -- see _native_call_types).
+                    self._native_call_ids.add(call_id)
+                    self._native_call_types[call_id] = "computer"
+
             else:
                 # Dictionary format
                 block_type = block.get("type")
@@ -3584,6 +3756,18 @@ class OpenAIProvider:
                         ToolCall(id=call_id, name="apply_patch", arguments=args)
                     )
                     self._native_call_ids.add(call_id)
+
+                elif block_type == "computer_call":
+                    call_id = block.get("call_id", "")
+                    args = {"actions": _extract_computer_actions(block)}
+                    content_blocks.append(
+                        ToolCallBlock(id=call_id, name="computer", input=args)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=call_id, name="computer", arguments=args)
+                    )
+                    self._native_call_ids.add(call_id)
+                    self._native_call_types[call_id] = "computer"
 
         # Extract usage counts
         usage_obj = response.usage if hasattr(response, "usage") else None
