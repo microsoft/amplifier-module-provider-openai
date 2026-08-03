@@ -29,6 +29,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._constants import NATIVE_TOOL_TYPES
@@ -163,8 +164,14 @@ class TestWireBodyComputerDeclaration:
     @pytest.mark.asyncio
     async def test_computer_tool_reaches_client_create_call_bare(self) -> None:
         """End-to-end through provider.complete(): capture the exact kwargs
-        passed to client.responses.create(**params) and assert on the
-        serialized "tools" wire value directly.
+        passed to the OpenAI client for a computer-tool request and assert
+        on the serialized "tools" wire value directly.
+
+        A request declaring the `computer` tool routes through
+        client.responses.with_raw_response.create(**params) (see
+        OpenAIProvider._create_response -- the raw-JSON fallback for
+        OpenAI's pending_safety_checks SDK defect), not the plain
+        client.responses.create(**params) a non-computer request uses.
 
         Response-side post-processing (cost computation, rate-limit header
         parsing, ChatResponse construction) is exercised separately and
@@ -205,7 +212,11 @@ class TestWireBodyComputerDeclaration:
             raise _CapturedAndAborted()
 
         fake_client = MagicMock()
-        fake_client.responses.create = AsyncMock(side_effect=fake_create)
+        # Computer-tool requests go through with_raw_response, not create()
+        # directly -- see OpenAIProvider._create_response.
+        fake_client.responses.with_raw_response.create = AsyncMock(
+            side_effect=fake_create
+        )
         provider._client = fake_client
 
         request = ChatRequest(
@@ -653,3 +664,175 @@ class TestComputerCallHistoryReplay:
         assert len(function_call_items) == 1
         assert function_call_items[0]["name"] == "computer"
         assert "call_func_computer" not in provider._native_call_ids
+
+
+# --- Test _create_response: the raw-JSON fallback for OpenAI's SDK defect ---
+#
+# Live GA `computer_call` responses omit `pending_safety_checks` entirely.
+# Every openai-python release checked (2.8.1 installed, 2.52.0 latest)
+# declares it a required field with no default on `ResponseComputerToolCall`,
+# so `client.responses.create()`'s automatic parsing raises a real
+# `pydantic.ValidationError` against a real captured response -- independent
+# of anything this provider does. These tests exercise the SDK's *actual*
+# installed `openai.types.responses.Response` model (no mocking away the
+# boundary that broke) to prove the fallback works against the real defect,
+# not a stand-in for it.
+
+
+def _envelope_for(computer_call_block: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a captured `computer_call` fixture block in a full Responses-API
+    envelope, matching the shape a live `responses.create()` call returns."""
+    return {
+        "id": "resp_test_computer_use",
+        "created_at": 1234567890.0,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": None,
+        "metadata": {},
+        "model": "gpt-5.6-sol",
+        "object": "response",
+        "output": [computer_call_block],
+        "parallel_tool_calls": True,
+        "temperature": 1.0,
+        "tool_choice": "auto",
+        "tools": [{"type": "computer"}],
+        "top_p": 1.0,
+        "status": "completed",
+        "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+    }
+
+
+class _FakeRawAPIResponse:
+    """Stands in for the SDK's `AsyncAPIResponse` (what
+    `client.responses.with_raw_response.create()` returns), but calls the
+    REAL installed `openai.types.responses.Response` model to parse --
+    exercising the actual SDK boundary that the pending_safety_checks
+    defect breaks, not a mock of it."""
+
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    async def parse(self) -> Any:
+        from openai.types.responses import Response
+
+        return Response.model_validate(self._body)
+
+    async def json(self) -> Any:
+        return self._body
+
+
+class TestCreateResponseComputerUseFallback:
+    def test_declares_computer_tool_detection(self) -> None:
+        from amplifier_module_provider_openai import _params_declare_computer_tool
+
+        assert _params_declare_computer_tool({"tools": [{"type": "computer"}]})
+        assert not _params_declare_computer_tool({"tools": [{"type": "function"}]})
+        assert not _params_declare_computer_tool({"tools": []})
+        assert not _params_declare_computer_tool({})
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_typed_model_rejects_live_computer_call_payload(
+        self,
+    ) -> None:
+        """Ground-truth regression guard: proves the SDK defect is real, using
+        the real installed openai SDK types (not a mock). If this test ever
+        starts failing because parsing *succeeds*, the SDK has fixed the
+        upstream bug and the fallback in `_create_response` may be safe to
+        remove."""
+        from openai.types.responses import Response
+
+        block = _load_fixture("openai-turn1.json")
+        envelope = _envelope_for(block)
+
+        with pytest.raises(ValidationError) as exc_info:
+            Response.model_validate(envelope)
+
+        errors = exc_info.value.errors()
+        assert any(
+            "pending_safety_checks" in str(err["loc"]) and err["type"] == "missing"
+            for err in errors
+        ), (
+            "expected the known pending_safety_checks-required-but-missing "
+            f"defect; got errors: {errors!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_raw_json_when_typed_parse_fails(self) -> None:
+        """The actual fix: `_create_response` recovers from the real SDK
+        ValidationError by reading the raw JSON body, and the result is
+        consumable by `_convert_to_chat_response` exactly like a normal
+        parsed response would be."""
+        provider = _make_provider()
+        provider._native_call_ids = set()
+        provider._native_call_types = {}
+
+        block = _load_fixture("openai-turn1.json")
+        envelope = _envelope_for(block)
+
+        fake_client = MagicMock()
+        fake_client.responses.with_raw_response.create = AsyncMock(
+            return_value=_FakeRawAPIResponse(envelope)
+        )
+        provider._client = fake_client
+
+        params = {"model": "gpt-5.6-sol", "tools": [{"type": "computer"}]}
+        response = await provider._create_response(params)
+
+        # Not the typed SDK model -- the raw-JSON wrapper.
+        assert type(response).__name__ == "_RawResponseObject"
+
+        chat_response = provider._convert_to_chat_response(response)
+        assert chat_response.tool_calls is not None
+        assert len(chat_response.tool_calls) == 1
+        call = chat_response.tool_calls[0]
+        assert call.name == "computer"
+        assert call.arguments == {
+            "actions": [{"type": "move", "keys": None, "x": 426, "y": 87}]
+        }
+        assert chat_response.usage is not None
+        assert chat_response.usage.input_tokens == 100
+        assert chat_response.usage.output_tokens == 20
+
+    @pytest.mark.asyncio
+    async def test_non_computer_request_uses_plain_create_unchanged(self) -> None:
+        """Scope guard: a request that does NOT declare the `computer` tool
+        must never touch `with_raw_response` -- only the computer-use path
+        changes behavior."""
+        provider = _make_provider()
+
+        sentinel = MagicMock(name="typed_response")
+        fake_client = MagicMock()
+        fake_client.responses.create = AsyncMock(return_value=sentinel)
+        fake_client.responses.with_raw_response.create = AsyncMock(
+            side_effect=AssertionError(
+                "with_raw_response.create must not be called for a "
+                "non-computer-use request"
+            )
+        )
+        provider._client = fake_client
+
+        params = {"model": "gpt-5.6-sol", "tools": [{"type": "function"}]}
+        result = await provider._create_response(params)
+
+        assert result is sentinel
+        fake_client.responses.create.assert_awaited_once_with(**params)
+        fake_client.responses.with_raw_response.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fails_loud_when_raw_body_missing_output_field(self) -> None:
+        """Fail-loud requirement: if the raw JSON body doesn't even have the
+        shape we expect, raise clearly -- never silently return an empty or
+        partial ChatResponse."""
+        provider = _make_provider()
+
+        malformed_envelope = {"id": "resp_bad", "status": "completed"}  # no "output"
+        fake_client = MagicMock()
+        fake_client.responses.with_raw_response.create = AsyncMock(
+            return_value=_FakeRawAPIResponse(malformed_envelope)
+        )
+        provider._client = fake_client
+
+        params = {"model": "gpt-5.6-sol", "tools": [{"type": "computer"}]}
+
+        with pytest.raises(RuntimeError, match="missing the expected 'output'"):
+            await provider._create_response(params)

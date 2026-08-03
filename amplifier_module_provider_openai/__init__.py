@@ -9,6 +9,7 @@ __all__ = ["mount", "OpenAIProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -19,6 +20,8 @@ from decimal import Decimal
 from typing import Any
 
 import openai
+from pydantic import ValidationError
+
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
@@ -495,6 +498,82 @@ def _extract_computer_screenshot_data_url(tool_content: Any) -> str:
         "base64 PNG string or an image content block "
         f"(got: {type(tool_content).__name__})"
     )
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await *value* if it's awaitable, otherwise return it as-is.
+
+    `client.responses.with_raw_response.create(**params)`'s return type
+    varies by openai SDK internals: the installed SDK (2.8.1) returns a
+    `LegacyAPIResponse` whose `.parse()` is synchronous (verified live --
+    calling it either returns the parsed model directly or raises
+    `pydantic.ValidationError` immediately, it is never a coroutine). Other
+    SDK versions may return the newer `APIResponse`, whose `.parse()` *is*
+    a coroutine. This normalizes both shapes for `_create_response` and
+    `_read_raw_json_body` without depending on which one is live.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _read_raw_json_body(raw_response: Any) -> Any:
+    """Decode the JSON body of a raw SDK response, sync or async API.
+
+    Prefers a `.json()` method if the response object has one (the newer
+    `APIResponse` shape). The installed SDK's `LegacyAPIResponse` has no
+    `.json()` at all (verified live) -- only a synchronous `.content`
+    (bytes) property, so that's the fallback.
+    """
+    json_method = getattr(raw_response, "json", None)
+    if callable(json_method):
+        return await _maybe_await(json_method())
+    return json.loads(raw_response.content)
+
+
+def _params_declare_computer_tool(params: dict[str, Any]) -> bool:
+    """True if this request's `tools` list declares the native `computer` tool.
+
+    Scopes the raw-JSON fallback in `OpenAIProvider._create_response` to
+    exactly the request shape that can trigger it. Every other request
+    keeps calling `client.responses.create()` directly and unchanged.
+    """
+    tools = params.get("tools") or []
+    return any(isinstance(t, dict) and t.get("type") == "computer" for t in tools)
+
+
+class _RawResponseObject:
+    """Minimal read-only view over a raw Responses-API JSON body.
+
+    Exists only for the fallback path in `OpenAIProvider._create_response`:
+    when the installed openai SDK's typed `Response` model rejects a real
+    `computer_call` payload, callers throughout `_complete_chat_request`
+    and `_convert_to_chat_response` still need `response.output`,
+    `response.usage`, `response.status`, etc. to behave like the SDK's own
+    parsed objects, because that code reads the response via
+    `getattr`/`hasattr`, not `dict.get`.
+
+    Only *nested dict* attributes (`usage`, `incomplete_details`, ...) are
+    wrapped. List-valued attributes (`output`) are left as plain lists of
+    plain dicts on purpose: `_convert_to_chat_response`'s per-block parsing
+    already branches on `hasattr(block, "type")` vs. dict `block.get(...)`
+    for every block type it handles -- this wrapper piggybacks on that
+    existing dual-path convention rather than inventing a new one.
+    """
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = data
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            value = self._data[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        return _RawResponseObject(value) if isinstance(value, dict) else value
+
+    def get(self, key: str, default: Any = None) -> Any:
+        value = self._data.get(key, default)
+        return _RawResponseObject(value) if isinstance(value, dict) else value
 
 
 class OpenAIProvider:
@@ -1363,6 +1442,71 @@ class OpenAIProvider:
         # "auto"
         return get_capabilities(model_id).supports_reasoning
 
+    async def _create_response(self, params: dict[str, Any]) -> Any:
+        """Call `client.responses.create(**params)`.
+
+        For computer-use requests, parses from the raw JSON body instead of
+        the SDK's typed model.
+
+        Why: OpenAI's GA `computer_call` response omits `pending_safety_checks`
+        entirely. Every openai-python release checked -- 2.8.1 (installed) and
+        2.52.0 (latest) -- declares it a required field with no default on
+        `ResponseComputerToolCall`, so `client.responses.create()`'s automatic
+        parsing raises `pydantic.ValidationError` on a real live response,
+        independent of anything this provider does (see PR #58 for the version
+        evidence). `provider-anthropic` already uses `with_raw_response` on its
+        non-streaming path (for headers); this follows the same precedent to
+        read the body before the SDK's typed model gets a chance to reject it.
+
+        Scoped to requests that declare the `computer` tool via
+        `_params_declare_computer_tool`: every other request keeps calling
+        `client.responses.create()` directly, unchanged, so this fallback
+        cannot mask an unrelated parsing regression.
+
+        `with_raw_response.create()` returns a `LegacyAPIResponse` on the
+        installed SDK (2.8.1) whose `.parse()` is synchronous and has no
+        `.json()` method at all -- verified live, not assumed from the type
+        stubs (which describe the newer async `APIResponse`, not what this
+        SDK version actually returns for this resource). Both `.parse()` and
+        the raw-body read are handled for either shape via `_maybe_await` /
+        `_read_raw_json_body` so this keeps working if the SDK's
+        with_raw_response implementation changes.
+
+        Fails loud: if the raw body itself doesn't parse as the expected
+        shape, a `RuntimeError` is raised with the original `ValidationError`
+        preserved as its cause -- never a silently empty/partial response.
+        """
+        if not _params_declare_computer_tool(params):
+            return await self.client.responses.create(**params)
+
+        raw_response = await self.client.responses.with_raw_response.create(**params)
+        try:
+            return await _maybe_await(raw_response.parse())
+        except ValidationError as e:
+            logger.warning(
+                "[PROVIDER] %s: typed Response model rejected a computer-use "
+                "response (%s). Falling back to the raw JSON body -- see "
+                "PR #58 for the pending_safety_checks SDK defect this works "
+                "around.",
+                self.api_label,
+                e,
+            )
+            try:
+                body = await _read_raw_json_body(raw_response)
+            except (json.JSONDecodeError, AttributeError) as json_error:
+                raise RuntimeError(
+                    "computer-use response fallback failed: the raw JSON "
+                    "body could not be decoded either (typed-parse error: "
+                    f"{e}; json-decode error: {json_error})"
+                ) from json_error
+            if not isinstance(body, dict) or "output" not in body:
+                raise RuntimeError(
+                    "computer-use response fallback failed: raw JSON body "
+                    f"is missing the expected 'output' field (got: "
+                    f"{type(body).__name__})"
+                ) from e
+            return _RawResponseObject(body)
+
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
     ) -> ChatResponse:
@@ -2088,7 +2232,7 @@ class OpenAIProvider:
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
                     return await asyncio.wait_for(
-                        self.client.responses.create(**params),
+                        self._create_response(params),
                         timeout=effective_timeout,
                     )
             except openai.RateLimitError as e:
@@ -2520,7 +2664,7 @@ class OpenAIProvider:
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
-                            self.client.responses.create(**params),
+                            self._create_response(params),
                             timeout=self.timeout,
                         )
                         elapsed_ms += int((time.time() - retry_start) * 1000)
@@ -2634,7 +2778,7 @@ class OpenAIProvider:
                 try:
                     continue_start = time.time()
                     final_response = await asyncio.wait_for(
-                        self.client.responses.create(**continue_params),
+                        self._create_response(continue_params),
                         timeout=self.timeout,
                     )
                     continue_elapsed = int((time.time() - continue_start) * 1000)
