@@ -138,10 +138,28 @@ class ModelCapabilities:
     | SUPPORTED | gpt-5.5, gpt-5.5-pro |
     | SUPPORTED | gpt-5.6 |
     | NOT supported | gpt-5.4-nano (proves size, not just version, gates this) |
-    | NOT supported | gpt-5 (bare), gpt-5.1, gpt-5.2, gpt-5.3, gpt-5.3-chat-latest |
+    | NOT supported | gpt-5 (bare), gpt-5.1, gpt-5.2, gpt-5.3-chat-latest |
+
+    NOT live-probed (no signal, answered by rule only): `gpt-5.3` returned
+    `model_not_found`, not a tool rejection - it is absent from the table
+    above deliberately. A 404 says nothing about tool support. Same
+    treatment as the deep-research and -nano generalizations noted below.
     | NOT supported | gpt-5-mini (bare, gpt-5.0 generation) |
     | NOT supported | gpt-4o, gpt-4.1 |
     | NOT supported | o-series: o1, o3-mini |
+
+    DEFAULT POLICY (explicit decision, not an implementation convenience):
+    unclassifiable models get False. The probe found computer-use is the
+    EXCEPTION, not the rule - 3 of 11 probed models accept it - so defaulting
+    True would produce frequent loud failures. The accepted cost is the inverse:
+    a genuinely-supporting future model this module cannot yet classify reports
+    False, and its caller simply does not offer the tool - no error, no log.
+    This is why `supports_native_apply_patch` defaults True and this defaults
+    False: opposite calls on opposite evidence, not an inconsistency.
+
+    REQUIREMENT ON CALLERS: treat False as "do not offer a computer tool",
+    never as "fall back to another vendor's tool type". Falling back reproduces
+    the exact downstream defect this field exists to remove.
 
     Rule: SUPPORTED only when `minor >= 4` AND the model_id is not a
     "-nano" tier. The "-nano" exclusion is a model_id substring check
