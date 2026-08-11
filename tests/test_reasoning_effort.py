@@ -376,6 +376,98 @@ def test_no_effort_warnings_for_clean_config(caplog):
     )
 
 
+# ---------------------------------------------------------------------------
+# Capability-gating parity: explicit-request effort_hint vs. ambient config
+# ---------------------------------------------------------------------------
+
+
+def test_request_effort_hint_capability_gated_no_op(caplog):
+    """Non-reasoning model + request.reasoning_effort='high' -> loud no-op,
+    no 'reasoning' param sent (mirrors the ambient config-path gate: this
+    previously bypassed the gate and produced a hard API 400)."""
+    import logging
+
+    provider = _make_provider(default_model="gpt-4o-mini")  # supports_reasoning=False
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(provider.complete(_request_with_effort("high")))
+
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" not in kwargs
+    assert any(
+        "reasoning_effort" in r.message and "does not support reasoning" in r.message
+        for r in caplog.records
+    )
+
+
+def test_kwargs_effort_hint_capability_gated_no_op(caplog):
+    """Non-reasoning model + kwargs['reasoning_effort']='high' -> loud no-op,
+    no 'reasoning' param sent."""
+    import logging
+
+    provider = _make_provider(default_model="gpt-4o-mini")  # supports_reasoning=False
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(
+            provider.complete(_request_with_effort(None), reasoning_effort="high")
+        )
+
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" not in kwargs
+    assert any(
+        "reasoning_effort" in r.message and "does not support reasoning" in r.message
+        for r in caplog.records
+    )
+
+
+def test_explicit_reasoning_dict_escape_hatch_ungated():
+    """An explicit kwargs['reasoning'] dict is a deliberate provider-specific
+    override and must still be forwarded unchanged, even on a non-reasoning
+    model -- it is NOT subject to the capability gate."""
+    provider = _make_provider(default_model="gpt-4o-mini")  # supports_reasoning=False
+    asyncio.run(
+        provider.complete(
+            _request_with_effort(None),
+            reasoning={"effort": "high", "summary": "concise"},
+        )
+    )
+
+    kwargs = _get_call_kwargs(provider)
+    assert kwargs["reasoning"]["effort"] == "high"
+    assert kwargs["reasoning"]["summary"] == "concise"
+
+
+def test_request_effort_hint_reasoning_capable_model_unchanged():
+    """Reasoning-capable model + request.reasoning_effort='high' -> forwarded
+    exactly as before (regression guard: behavior on capable models must be
+    completely unchanged by the new gate)."""
+    provider = _make_provider(default_model="gpt-5")  # supports_reasoning=True
+    asyncio.run(provider.complete(_request_with_effort("high")))
+
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" in kwargs
+    assert kwargs["reasoning"]["effort"] == "high"
+    assert "summary" in kwargs["reasoning"]
+
+
+def test_config_effort_still_capability_gated_no_op_on_gpt_4o_mini(caplog):
+    """Ambient config path regression guard: non-reasoning gpt-4o-mini +
+    config reasoning_effort='high' -> loud no-op, no param (unchanged)."""
+    import logging
+
+    provider = _make_provider(
+        default_model="gpt-4o-mini",  # supports_reasoning=False
+        reasoning_effort="high",
+    )
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(provider.complete(_request_with_effort(None)))
+
+    kwargs = _get_call_kwargs(provider)
+    assert "reasoning" not in kwargs
+    assert any(
+        "reasoning_effort" in r.message and "does not support reasoning" in r.message
+        for r in caplog.records
+    )
+
+
 def test_gpt54_without_effort_still_includes_encrypted_content():
     """GPT-5.4 stateless path (chaining off) -> include=[reasoning.encrypted_content] IS sent.
 

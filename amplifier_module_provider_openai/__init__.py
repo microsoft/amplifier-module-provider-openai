@@ -1747,19 +1747,32 @@ class OpenAIProvider:
         # Phase 2: Reasoning parameter precedence chain
         # kwargs["reasoning"] > kwargs["reasoning_effort"] > request.reasoning_effort
         #   > config "reasoning_effort" (canonical) > config "reasoning" (legacy) > None
+        #
+        # An explicit kwargs["reasoning"]/request.reasoning dict is a deliberate
+        # provider-specific override and is forwarded ungated below -- the caller
+        # owns the consequences. Every other path here builds `reasoning` from a
+        # portable effort field (kwargs["reasoning_effort"], request.reasoning_effort,
+        # or config "reasoning_effort") and is capability-gated: a model that can't
+        # reason gets a loud no-op instead of a mid-session API 400.
         reasoning_param = kwargs.get("reasoning", getattr(request, "reasoning", None))
         if reasoning_param is None:
             effort_hint = kwargs.get("reasoning_effort") or request.reasoning_effort
             if effort_hint:
-                reasoning_param = {
-                    "effort": effort_hint,
-                    "summary": self.reasoning_summary,
-                }
+                if get_capabilities(model_name).supports_reasoning:
+                    reasoning_param = {
+                        "effort": effort_hint,
+                        "summary": self.reasoning_summary,
+                    }
+                else:
+                    logger.warning(
+                        "[PROVIDER] Ignoring 'reasoning_effort'=%r: "
+                        "model %s does not support reasoning.",
+                        effort_hint,
+                        model_name,
+                    )
         if reasoning_param is None and self.reasoning_effort is not None:
             # Canonical config key (validated/normalized at mount; "none" and
             # absence resolve to None so this path never fires for them).
-            # Capability-gated: a model that can't reason gets a loud no-op
-            # instead of a mid-session API 400.
             if get_capabilities(model_name).supports_reasoning:
                 reasoning_param = {
                     "effort": self.reasoning_effort,
