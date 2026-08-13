@@ -356,15 +356,31 @@ def convert_response_with_accumulated_output(
                     )
                 )
 
-    # Extract usage from final response
+    # Extract usage from final response.
+    #
+    # OpenAI's usage.input_tokens (Responses API) is the RAW vendor gross
+    # total: fresh + cache_read + cache_write ALL COMBINED (cache_write is a
+    # SUBSET of it -- see _cost.py's `fresh_input = prompt_tokens - cached
+    # - cache_write` derivation, confirmed against live gpt-5.6-sol usage).
+    # This differs from Anthropic, where cache_write (cache_creation) is
+    # reported as a genuinely DISJOINT bucket on top of input_tokens.
+    #
+    # The kernel Usage contract (amplifier_core CONTRACTS.md) normalizes
+    # input_tokens to "gross total: fresh + cache_read combined, cache_write
+    # NOT included" -- so every consumer can safely compute
+    # `total_input = input_tokens + cache_write_tokens` regardless of
+    # provider. Emitting the raw OpenAI total here (which already contains
+    # cache_write) would let that formula double-count the write tokens.
+    # Subtract cache_write_tokens out of the raw total before it becomes the
+    # public Usage.input_tokens value.
     usage_obj = final_response.usage if hasattr(final_response, "usage") else None
     usage_counts = {"input": 0, "output": 0, "total": 0}
+    _raw_input_tokens = 0
     if usage_obj:
         if hasattr(usage_obj, "input_tokens"):
-            usage_counts["input"] = usage_obj.input_tokens
+            _raw_input_tokens = usage_obj.input_tokens
         if hasattr(usage_obj, "output_tokens"):
             usage_counts["output"] = usage_obj.output_tokens
-        usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
 
     # Phase 2: Extract reasoning_tokens from output_tokens_details
     reasoning_tokens = None
@@ -384,6 +400,13 @@ def convert_response_with_accumulated_output(
             cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
         if details and hasattr(details, "cache_write_tokens"):
             cache_write_tokens = details.cache_write_tokens  # GPT-5.6+; 0 valid
+
+    # Normalize: cache_write is a SUBSET of the raw OpenAI total, so remove it
+    # to get the "fresh + cache_read" gross the kernel contract expects.
+    # max(0, ...) guards against a malformed/unexpected API payload where
+    # cache_write_tokens would otherwise exceed input_tokens.
+    usage_counts["input"] = max(0, _raw_input_tokens - (cache_write_tokens or 0))
+    usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
 
     usage = Usage(
         input_tokens=usage_counts["input"],
