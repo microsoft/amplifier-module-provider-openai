@@ -474,3 +474,31 @@ def test_cache_write_ignored_for_models_without_write_rate():
     # bills the full prompt as input (fresh = prompt - cached, write ignored).
     result = compute_cost("gpt-5.5", prompt_tokens=1_000, cache_write_tokens=300)
     assert result == Decimal("1000") * Decimal("5") / Decimal("1000000")
+
+
+# ---------------------------------------------------------------------------
+# (r) Golden: exact measured numbers from the cache-write input-accounting
+# defect investigation (see test_cache_write_input_accounting.py). This is
+# the INDEPENDENT verification that compute_cost() itself was, and remains,
+# correct -- the input-accounting bug lived only in how the provider mapped
+# raw usage fields onto the public Usage.input_tokens contract, NOT in cost
+# math. compute_cost() must always be fed the RAW vendor total (prompt_tokens
+# = fresh + cache_read + cache_write combined), never the normalized
+# Usage.input_tokens value.
+# ---------------------------------------------------------------------------
+def test_golden_measured_turn_gross_9028_cache_write_9025():
+    """gpt-5.6-sol, short context: input=9028 (raw), cache_write=9025,
+    cached=0, output=7 -> measured cost was $0.05663125.
+
+    fresh = 9028 - 0 - 9025 = 3
+    cost  = 3 @ $5.00/M + 9025 @ $6.25/M + 7 @ $30.00/M
+          = 0.000015 + 0.05640625 + 0.00021 = 0.05663125
+    """
+    result = compute_cost(
+        "gpt-5.6-sol",
+        prompt_tokens=9_028,
+        completion_tokens=7,
+        cached_tokens=0,
+        cache_write_tokens=9_025,
+    )
+    assert result == Decimal("0.05663125"), f"got {result!r}"

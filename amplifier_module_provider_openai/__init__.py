@@ -2840,6 +2840,21 @@ class OpenAIProvider:
                         event_usage["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
+                    # cache_write_tokens is REQUIRED for a consumer to reconstruct
+                    # gross input. Usage.input_tokens is normalized to
+                    # "fresh + cache_read" (cache_write subtracted out -- see
+                    # _convert_to_chat_response), so gross input is only
+                    # recoverable as input_tokens + cache_write_tokens. Omitting
+                    # it here silently understated a cold turn's input to just
+                    # the fresh remainder (measured: a real 45,320-token cache
+                    # write serialized away to nothing, leaving "3"). Emitted
+                    # whenever the provider measured it -- None only for
+                    # pre-5.6 models, which never write cache and for which
+                    # input_tokens is already the full gross.
+                    if chat_response.usage.cache_write_tokens is not None:
+                        event_usage["cache_write_tokens"] = (
+                            chat_response.usage.cache_write_tokens
+                        )
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
                     event_usage["cost_usd"] = (
                         str(_cost_usd) if _cost_usd is not None else None
@@ -3926,15 +3941,37 @@ class OpenAIProvider:
                     self._native_call_ids.add(call_id)
                     self._native_call_types[call_id] = "computer"
 
-        # Extract usage counts
+        # Extract usage counts.
+        #
+        # OpenAI's usage.input_tokens (Responses API) is the RAW vendor gross
+        # total: fresh + cache_read + cache_write ALL COMBINED (cache_write is
+        # a SUBSET of it -- see the `fresh_input = prompt_tokens - cached -
+        # cache_write` derivation in _cost.py, confirmed against live
+        # gpt-5.6-sol usage). This differs from Anthropic, where cache_write
+        # (cache_creation) is a genuinely DISJOINT bucket reported on top of
+        # input_tokens.
+        #
+        # The kernel Usage contract (amplifier_core CONTRACTS.md) normalizes
+        # input_tokens to "gross total: fresh + cache_read combined,
+        # cache_write NOT included" -- every consumer (e.g. the streaming-UI
+        # display) computes `total_input = input_tokens + cache_write_tokens`
+        # assuming that shape. Emitting OpenAI's raw total unmodified (already
+        # containing cache_write) makes that formula double-count the write
+        # tokens (measured: 18,053 displayed vs. a true 9,028 gross input).
+        #
+        # `_raw_input_tokens` is kept SEPARATELY from the normalized
+        # `usage_counts["input"]` because compute_cost() below needs the raw
+        # vendor gross (its own `prompt_tokens` param already subtracts
+        # cached/cache_write internally) -- normalizing input_tokens here must
+        # not also perturb the cost computation.
         usage_obj = response.usage if hasattr(response, "usage") else None
         usage_counts = {"input": 0, "output": 0, "total": 0}
+        _raw_input_tokens = 0
         if usage_obj:
             if hasattr(usage_obj, "input_tokens"):
-                usage_counts["input"] = usage_obj.input_tokens
+                _raw_input_tokens = usage_obj.input_tokens
             if hasattr(usage_obj, "output_tokens"):
                 usage_counts["output"] = usage_obj.output_tokens
-            usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
 
         # Phase 2: Extract reasoning_tokens from output_tokens_details
         reasoning_tokens = None
@@ -3955,6 +3992,13 @@ class OpenAIProvider:
             if details and hasattr(details, "cache_write_tokens"):
                 cache_write_tokens = details.cache_write_tokens  # GPT-5.6+; 0 valid
 
+        # Normalize: cache_write is a SUBSET of the raw OpenAI total, so
+        # remove it to get the "fresh + cache_read" gross the kernel contract
+        # expects. max(0, ...) guards against a malformed/unexpected API
+        # payload where cache_write_tokens would otherwise exceed input_tokens.
+        usage_counts["input"] = max(0, _raw_input_tokens - (cache_write_tokens or 0))
+        usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
+
         usage = Usage(
             input_tokens=usage_counts["input"],
             output_tokens=usage_counts["output"],
@@ -3966,9 +4010,12 @@ class OpenAIProvider:
 
         # M2: Stamp cost_usd onto Usage (zero-transformation passthrough from API fields).
         # prompt_tokens is the total including cached AND cache-write; both are subtracted
-        # inside compute_cost to prevent double-charging.
+        # inside compute_cost to prevent double-charging. NOTE: this deliberately uses
+        # `_raw_input_tokens` (the unnormalized vendor gross), NOT `usage_counts["input"]`
+        # (which has cache_write subtracted out for the public Usage contract above) --
+        # compute_cost's own internal subtraction expects the raw combined total.
         if usage_obj:
-            _prompt_tokens = getattr(usage_obj, "prompt_tokens", usage_counts["input"])
+            _prompt_tokens = getattr(usage_obj, "prompt_tokens", _raw_input_tokens)
             _completion_tokens = getattr(
                 usage_obj, "completion_tokens", usage_counts["output"]
             )
