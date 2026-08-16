@@ -824,7 +824,9 @@ class OpenAIProvider:
         Cloudflare interposes HTML challenge pages (HTTP 403) that look nothing
         like real API errors.  Signals:
 
-        1. The SDK failed to parse the body as JSON (error.body is None).
+        1. The body did not parse as a JSON object/array. (When the SDK
+           cannot parse the body as JSON it stores the RAW TEXT in
+           ``error.body`` -- a str, NOT None; a parsed error is a dict/list.)
         2. The Content-Type is text/html (not application/json).
         3. The raw response text contains Cloudflare markers.
 
@@ -832,8 +834,14 @@ class OpenAIProvider:
         successfully parsed a JSON body, this is a real API error regardless
         of other signals.
         """
-        # If the SDK parsed a JSON body, this is a real API error
-        if getattr(error, "body", None) is not None:
+        # Only a PARSED JSON body (dict/list) means a genuine, structured
+        # API error. When the SDK cannot parse the body as JSON it stores the
+        # RAW TEXT in ``error.body`` -- a str, NOT None -- so a "body is not
+        # None" guard bails on exactly the HTML challenge pages this exists to
+        # catch. Fall through for a str (or absent) body; bail only on parsed
+        # JSON.
+        body = getattr(error, "body", None)
+        if isinstance(body, (dict, list)):
             return False
 
         # Inspect the raw HTTP response for HTML / Cloudflare signals
