@@ -576,6 +576,70 @@ class _RawResponseObject:
         return _RawResponseObject(value) if isinstance(value, dict) else value
 
 
+def _build_assistant_message_item(
+    content_parts: list[dict[str, Any]],
+    message_id: str | None = None,
+    status: str = "completed",
+) -> dict[str, Any]:
+    """Serialize assistant content as a spec-compliant Responses API message item.
+
+    Emits the canonical ``ResponseOutputMessage`` shape used when assistant history
+    is replayed in the Responses API ``input`` array. This is the single form every
+    tested backend accepts -- verified on the wire against the OpenAI Responses API,
+    llama.cpp's llama-server, and vLLM 0.19:
+
+    - ``type: "message"`` is REQUIRED by llama-server: its input-item dispatch keys
+      on the literal ``type`` field, so a role-only item 400s with
+      "Cannot determine type of 'item'".
+    - ``id`` and ``status`` are REQUIRED by vLLM: input items validate against the
+      openai SDK's ``ResponseOutputMessageParam``, which marks both required, so a
+      role-only message raises ``pydantic.ValidationError``.
+    - ``annotations: []`` on each ``output_text`` part mirrors OpenAI's own output
+      items and is accepted by every backend.
+
+    Real OpenAI is permissive and accepts looser forms, but this canonical form is
+    the intersection all backends accept. Ref: OpenAI Responses API -- a "message"
+    is a discriminated Item type alongside function_call / function_call_output /
+    reasoning.
+
+    Args:
+        content_parts: Assistant output parts, each ``{"type": "output_text",
+            "text": ...}``. ``annotations`` is filled in if absent.
+        message_id: Preserved message id when available; a fresh ``msg_<hex>`` is
+            synthesized otherwise (replayed-history ids need only be valid strings,
+            not server-issued references).
+        status: Completion state of the turn being replayed. Defaults to
+            ``"completed"``, correct for finished history. Pass ``"incomplete"``
+            when replaying a turn that was truncated (e.g. hit max_output_tokens)
+            and is being continued -- claiming ``"completed"`` there contradicts
+            the request being made.
+
+    Returns:
+        One Responses API assistant message item.
+    """
+    normalized: list[dict[str, Any]] = []
+    for part in content_parts:
+        if isinstance(part, dict):
+            normalized.append(
+                {
+                    "type": part.get("type", "output_text"),
+                    "text": part.get("text", ""),
+                    "annotations": part.get("annotations", []),
+                }
+            )
+        else:
+            normalized.append(
+                {"type": "output_text", "text": str(part), "annotations": []}
+            )
+    return {
+        "type": "message",
+        "id": message_id or f"msg_{uuid.uuid4().hex}",
+        "role": "assistant",
+        "status": status,
+        "content": normalized,
+    }
+
+
 class OpenAIProvider:
     """OpenAI Responses API integration."""
 
@@ -1162,10 +1226,13 @@ class OpenAIProvider:
                                     {"type": "output_text", "text": text}
                                 )
 
-        # If we extracted any assistant content, add as assistant message
+        # If we extracted any assistant content, add as a spec-compliant message item.
+        # The turn is being continued precisely because it was truncated, so it is
+        # replayed as "incomplete" -- stamping "completed" would assert the opposite
+        # of what this request is asking the model to do.
         if assistant_content:
             continuation_input.append(
-                {"role": "assistant", "content": assistant_content}
+                _build_assistant_message_item(assistant_content, status="incomplete")
             )
 
         return continuation_input
@@ -3433,20 +3500,29 @@ class OpenAIProvider:
                     and metadata
                     and metadata.get(METADATA_REASONING_ITEMS)
                 ):
-                    has_usable_reasoning = any(
-                        isinstance(item, dict)
-                        and item.get("type") == "reasoning"
-                        and item.get("encrypted_content")
+                    # Strip PER-ITEM: a reasoning item without encrypted_content is
+                    # an orphaned reference the API rejects (bare rs_* id -> 404).
+                    # A turn can mix usable and orphaned reasoning items (e.g. one
+                    # thinking block carried encrypted_content, another did not); an
+                    # all-or-nothing check keyed on any() would keep the orphans
+                    # whenever a single sibling was usable, still failing the request.
+                    kept = [
+                        item
                         for item in reasoning_items_to_add
-                    )
-                    if not has_usable_reasoning:
+                        if not (
+                            isinstance(item, dict)
+                            and item.get("type") == "reasoning"
+                            and not item.get("encrypted_content")
+                        )
+                    ]
+                    if len(kept) != len(reasoning_items_to_add):
                         logger.warning(
                             "[PROVIDER] Reasoning IDs in metadata but encrypted_content unavailable. "
-                            "Stripping orphaned reasoning references to prevent API errors. "
-                            "Ensure include=[reasoning.encrypted_content] is requested for store=false."
+                            "Stripping %d orphaned reasoning reference(s) to prevent API errors. "
+                            "Ensure include=[reasoning.encrypted_content] is requested for store=false.",
+                            len(reasoning_items_to_add) - len(kept),
                         )
-                        # Strip orphaned reasoning items that would cause 404 errors
-                        reasoning_items_to_add.clear()
+                        reasoning_items_to_add[:] = kept
 
                 # Add reasoning items as TOP-LEVEL entries (before assistant message)
                 # Per OpenAI Responses API: reasoning items must be top-level, not in message content
@@ -3456,7 +3532,7 @@ class OpenAIProvider:
                 # Only add assistant message if there's content
                 if assistant_content:
                     openai_messages.append(
-                        {"role": "assistant", "content": assistant_content}
+                        _build_assistant_message_item(assistant_content)
                     )
 
                 # Add function_call items as TOP-LEVEL entries (after assistant message)
