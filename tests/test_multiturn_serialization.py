@@ -147,3 +147,116 @@ class TestConvertMessages:
         assert all(
             m.get("type") != "message" for m in result if m.get("role") == "user"
         )
+
+
+class _Block:
+    """Minimal ContentBlock stand-in for the thinking-block serialization path."""
+
+    def __init__(self, **kw: Any) -> None:
+        self.__dict__.update(kw)
+
+
+class TestReasoningOrphanStrip:
+    """Orphaned reasoning items (no encrypted_content) must be stripped PER-ITEM.
+
+    A reasoning item replayed without ``encrypted_content`` is an unpairable
+    reference the Responses API rejects (bare ``rs_*`` id -> 404). A single
+    assistant turn can mix usable and orphaned reasoning items (one thinking
+    block carried ``encrypted_content``, another did not). The strip must drop
+    only the orphans while keeping the usable items -- an all-or-nothing check
+    keyed on ``any()`` kept the orphans whenever a single sibling was usable,
+    still failing the request.
+
+    The strip only runs when the assistant message carries
+    ``METADATA_REASONING_ITEMS`` metadata (the shape a real reasoning response
+    produces); tests set it explicitly to exercise that guarded path.
+    """
+
+    def _provider(self) -> OpenAIProvider:
+        return OpenAIProvider(api_key="test-key")
+
+    def _reasoning(self, result: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            m for m in result if isinstance(m, dict) and m.get("type") == "reasoning"
+        ]
+
+    def test_mixed_turn_drops_orphan_keeps_usable(self) -> None:
+        from amplifier_module_provider_openai._constants import (
+            METADATA_REASONING_ITEMS,
+        )
+
+        provider = self._provider()
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "metadata": {METADATA_REASONING_ITEMS: ["rs_hasenc", "rs_noenc"]},
+                "content": [
+                    _Block(
+                        type="thinking",
+                        thinking="planning A",
+                        content=["ENCRYPTED_AAA", "rs_hasenc"],
+                    ),
+                    _Block(
+                        type="thinking",
+                        thinking="planning B",
+                        content=["", "rs_noenc"],  # NO encrypted_content -> orphan
+                    ),
+                    _Block(type="text", text="Here is my answer."),
+                ],
+            },
+            {"role": "user", "content": "continue"},
+        ]
+        reasoning = self._reasoning(provider._convert_messages(messages))
+        ids = [r.get("id") for r in reasoning]
+        # usable item kept, orphan dropped
+        assert ids == ["rs_hasenc"]
+        assert all(r.get("encrypted_content") for r in reasoning)
+
+    def test_all_orphan_turn_strips_everything(self) -> None:
+        from amplifier_module_provider_openai._constants import (
+            METADATA_REASONING_ITEMS,
+        )
+
+        provider = self._provider()
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "metadata": {METADATA_REASONING_ITEMS: ["rs_orphan"]},
+                "content": [
+                    _Block(
+                        type="thinking",
+                        thinking="p",
+                        content=["", "rs_orphan"],  # NO encrypted_content
+                    ),
+                    _Block(type="text", text="ans"),
+                ],
+            },
+            {"role": "user", "content": "go"},
+        ]
+        reasoning = self._reasoning(provider._convert_messages(messages))
+        assert reasoning == []  # all-or-nothing behavior preserved when all orphaned
+
+    def test_all_usable_turn_keeps_all(self) -> None:
+        from amplifier_module_provider_openai._constants import (
+            METADATA_REASONING_ITEMS,
+        )
+
+        provider = self._provider()
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "metadata": {METADATA_REASONING_ITEMS: ["rs_a", "rs_b"]},
+                "content": [
+                    _Block(type="thinking", thinking="A", content=["ENC_A", "rs_a"]),
+                    _Block(type="thinking", thinking="B", content=["ENC_B", "rs_b"]),
+                    _Block(type="text", text="done"),
+                ],
+            },
+            {"role": "user", "content": "go"},
+        ]
+        reasoning = self._reasoning(provider._convert_messages(messages))
+        assert [r.get("id") for r in reasoning] == ["rs_a", "rs_b"]
+        assert all(r.get("encrypted_content") for r in reasoning)

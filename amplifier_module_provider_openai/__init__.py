@@ -3491,20 +3491,29 @@ class OpenAIProvider:
                     and metadata
                     and metadata.get(METADATA_REASONING_ITEMS)
                 ):
-                    has_usable_reasoning = any(
-                        isinstance(item, dict)
-                        and item.get("type") == "reasoning"
-                        and item.get("encrypted_content")
+                    # Strip PER-ITEM: a reasoning item without encrypted_content is
+                    # an orphaned reference the API rejects (bare rs_* id -> 404).
+                    # A turn can mix usable and orphaned reasoning items (e.g. one
+                    # thinking block carried encrypted_content, another did not); an
+                    # all-or-nothing check keyed on any() would keep the orphans
+                    # whenever a single sibling was usable, still failing the request.
+                    kept = [
+                        item
                         for item in reasoning_items_to_add
-                    )
-                    if not has_usable_reasoning:
+                        if not (
+                            isinstance(item, dict)
+                            and item.get("type") == "reasoning"
+                            and not item.get("encrypted_content")
+                        )
+                    ]
+                    if len(kept) != len(reasoning_items_to_add):
                         logger.warning(
                             "[PROVIDER] Reasoning IDs in metadata but encrypted_content unavailable. "
-                            "Stripping orphaned reasoning references to prevent API errors. "
-                            "Ensure include=[reasoning.encrypted_content] is requested for store=false."
+                            "Stripping %d orphaned reasoning reference(s) to prevent API errors. "
+                            "Ensure include=[reasoning.encrypted_content] is requested for store=false.",
+                            len(reasoning_items_to_add) - len(kept),
                         )
-                        # Strip orphaned reasoning items that would cause 404 errors
-                        reasoning_items_to_add.clear()
+                        reasoning_items_to_add[:] = kept
 
                 # Add reasoning items as TOP-LEVEL entries (before assistant message)
                 # Per OpenAI Responses API: reasoning items must be top-level, not in message content
