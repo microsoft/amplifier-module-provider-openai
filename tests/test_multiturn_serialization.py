@@ -73,6 +73,16 @@ class TestAssistantMessageHelper:
         assert item["type"] == "message"
         assert item["content"] == []
 
+    def test_status_defaults_to_completed(self) -> None:
+        item = _build_assistant_message_item([{"type": "output_text", "text": "x"}])
+        assert item["status"] == "completed"
+
+    def test_status_override_is_honored(self) -> None:
+        item = _build_assistant_message_item(
+            [{"type": "output_text", "text": "x"}], status="incomplete"
+        )
+        assert item["status"] == "incomplete"
+
 
 class TestBuildContinuationInput:
     """_build_continuation_input must emit assistant items in Form 2+."""
@@ -96,7 +106,9 @@ class TestBuildContinuationInput:
         assert len(assistant) == 1
         msg = assistant[0]
         assert msg["type"] == "message"
-        assert msg["status"] == "completed"
+        # The turn is replayed only because it was truncated, so it must be
+        # reported as incomplete -- "completed" would contradict the request.
+        assert msg["status"] == "incomplete"
         assert msg["id"].startswith("msg_")
         assert msg["content"][0] == {
             "type": "output_text",

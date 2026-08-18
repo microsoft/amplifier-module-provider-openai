@@ -579,6 +579,7 @@ class _RawResponseObject:
 def _build_assistant_message_item(
     content_parts: list[dict[str, Any]],
     message_id: str | None = None,
+    status: str = "completed",
 ) -> dict[str, Any]:
     """Serialize assistant content as a spec-compliant Responses API message item.
 
@@ -607,6 +608,11 @@ def _build_assistant_message_item(
         message_id: Preserved message id when available; a fresh ``msg_<hex>`` is
             synthesized otherwise (replayed-history ids need only be valid strings,
             not server-issued references).
+        status: Completion state of the turn being replayed. Defaults to
+            ``"completed"``, correct for finished history. Pass ``"incomplete"``
+            when replaying a turn that was truncated (e.g. hit max_output_tokens)
+            and is being continued -- claiming ``"completed"`` there contradicts
+            the request being made.
 
     Returns:
         One Responses API assistant message item.
@@ -629,7 +635,7 @@ def _build_assistant_message_item(
         "type": "message",
         "id": message_id or f"msg_{uuid.uuid4().hex}",
         "role": "assistant",
-        "status": "completed",
+        "status": status,
         "content": normalized,
     }
 
@@ -1220,10 +1226,13 @@ class OpenAIProvider:
                                     {"type": "output_text", "text": text}
                                 )
 
-        # If we extracted any assistant content, add as a spec-compliant message item
+        # If we extracted any assistant content, add as a spec-compliant message item.
+        # The turn is being continued precisely because it was truncated, so it is
+        # replayed as "incomplete" -- stamping "completed" would assert the opposite
+        # of what this request is asking the model to do.
         if assistant_content:
             continuation_input.append(
-                _build_assistant_message_item(assistant_content)
+                _build_assistant_message_item(assistant_content, status="incomplete")
             )
 
         return continuation_input
