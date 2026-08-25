@@ -328,6 +328,20 @@ _CONTEXT_OVERFLOW_MESSAGE_MARKERS = (
     "exceeds the context window",
 )
 
+# Every input-item envelope that answers a server-side call, paired by call_id.
+# Native tools REQUIRE their own envelope type -- _convert_messages emits
+# apply_patch_call_output for native apply_patch calls and computer_call_output
+# for computer_use calls; a generic function_call_output is not accepted for
+# them. All three are real, valid pairings and must count as "provided" when
+# the chain-pairing invariant is enforced.
+_PAIRED_OUTPUT_ITEM_TYPES = frozenset(
+    {
+        "function_call_output",
+        "apply_patch_call_output",
+        "computer_call_output",
+    }
+)
+
 
 def _extract_error_fields(body: object) -> tuple[str | None, str | None]:
     """Return (code, type) from an OpenAI error body, tolerating shapes."""
@@ -1247,18 +1261,27 @@ class OpenAIProvider:
         When a request chains via previous_response_id, the function_call
         items live SERVER-SIDE in the chained response; the delta input
         carries only the outputs. The server requires every call in the
-        chained response to have a function_call_output in this input,
-        paired BY call_id — an unpaired call is a non-retryable 400
+        chained response to have a paired output in this input, matched
+        BY call_id — an unpaired call is a non-retryable 400
         ("No tool output found for function call ...") that kills the
         session. The generic wire backstop in _convert_messages cannot
         protect this case (no function_call items in the input to check).
+
+        A paired output is any envelope in _PAIRED_OUTPUT_ITEM_TYPES, NOT
+        function_call_output alone: native tools require their own result
+        envelope (apply_patch_call_output, computer_call_output). Counting
+        only function_call_output made every chained apply_patch/computer
+        call look orphaned, so its genuine result was shipped alongside a
+        synthesized "result missing" error for the SAME call_id — two
+        contradictory results for one call, inviting the model to re-run
+        an already-applied patch.
 
         Enforced here, against the LOCAL record of the chained turn (the
         assistant message's tool_calls):
         1. every chained tool call id must have a matching output — an
            error output is synthesized for any orphan;
-        2. any fc_-prefixed output id (a Responses-API ITEM id, not a
-           call id) is a bug upstream: it can pair with nothing
+        2. any fc_-prefixed function_call_output id (a Responses-API ITEM
+           id, not a call id) is a bug upstream: it can pair with nothing
            server-side, so it is dropped with a loud warning — observed
            live killing a session even for a COMPLETED, successfully
            executed tool call.
@@ -1281,9 +1304,14 @@ class OpenAIProvider:
         anomalous_items: list[dict[str, Any]] = []
         kept: list[dict[str, Any]] = []
         for item in delta_input:
-            if isinstance(item, dict) and item.get("type") == "function_call_output":
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if item_type in _PAIRED_OUTPUT_ITEM_TYPES:
                 call_id = str(item.get("call_id") or "")
-                if call_id.startswith("fc_"):
+                # fc_-keyed drop stays scoped to function_call_output: that is
+                # the envelope the upstream dispatch-keying bug was observed on,
+                # and dropping a native output would destroy a real, otherwise
+                # unrecoverable tool result.
+                if item_type == "function_call_output" and call_id.startswith("fc_"):
                     anomalous_items.append(item)
                     logger.warning(
                         "[PROVIDER] Chain pairing: dropping function_call_output "
