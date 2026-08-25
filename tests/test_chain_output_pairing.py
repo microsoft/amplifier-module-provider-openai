@@ -127,6 +127,135 @@ def test_no_chained_calls_and_clean_delta_is_noop():
 
 
 # ---------------------------------------------------------------------------
+# Native result envelopes count as paired
+#
+# apply_patch and computer_use REQUIRE their own output envelope; a generic
+# function_call_output is not accepted for them. Counting only
+# function_call_output made every chained native call look orphaned, so its
+# genuine result was shipped alongside a synthesized "result missing" error
+# for the SAME call_id -- two contradictory results for one call.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_patch_call_output_counts_as_paired():
+    """A successful native apply_patch result must not be called orphaned."""
+    provider = _make_provider()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_patch1", "name": "apply_patch"}],
+    }
+    delta_input = [
+        {
+            "type": "apply_patch_call_output",
+            "call_id": "call_patch1",
+            "output": "M src/thing.py",
+            "status": "completed",
+        }
+    ]
+    result = _run_pairing(provider, [dict(i) for i in delta_input], chained_msg)
+
+    assert not [i for i in result if i.get("type") == "function_call_output"], (
+        "synthesized an error output for an apply_patch call that already had a "
+        "real, successful result -- the model would see two contradictory "
+        "results for one call and may re-apply an applied patch"
+    )
+    assert result == delta_input, "real apply_patch output was altered or dropped"
+
+
+def test_computer_call_output_counts_as_paired():
+    """computer_use has the same native-envelope exposure as apply_patch."""
+    provider = _make_provider()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_cua1", "name": "computer"}],
+    }
+    delta_input = [
+        {
+            "type": "computer_call_output",
+            "call_id": "call_cua1",
+            "output": {"type": "computer_screenshot", "image_url": "data:,"},
+        }
+    ]
+    result = _run_pairing(provider, [dict(i) for i in delta_input], chained_msg)
+
+    assert not [i for i in result if i.get("type") == "function_call_output"]
+    assert result == delta_input
+
+
+def test_mixed_native_and_function_outputs_all_count():
+    """A turn mixing envelope types pairs every call, synthesizing none."""
+    provider = _make_provider()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "call_patch1", "name": "apply_patch"},
+            {"id": "call_bash1", "name": "bash"},
+        ],
+    }
+    delta_input = [
+        {
+            "type": "apply_patch_call_output",
+            "call_id": "call_patch1",
+            "output": "A new.py",
+            "status": "completed",
+        },
+        {"type": "function_call_output", "call_id": "call_bash1", "output": "ok"},
+    ]
+    result = _run_pairing(provider, [dict(i) for i in delta_input], chained_msg)
+
+    assert result == delta_input
+    assert not any("[error]" in str(i.get("output", "")) for i in result)
+
+
+def test_orphaned_native_call_still_repaired():
+    """The safety net still fires when a native result is genuinely absent."""
+    provider = _make_provider()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_patch_missing", "name": "apply_patch"}],
+    }
+    result = _run_pairing(provider, [], chained_msg)
+
+    outputs = [i for i in result if i.get("type") == "function_call_output"]
+    assert len(outputs) == 1
+    assert outputs[0]["call_id"] == "call_patch_missing"
+    assert "[error]" in outputs[0]["output"]
+
+
+def test_fc_keyed_native_output_is_not_dropped():
+    """The fc_ drop stays scoped to function_call_output.
+
+    Dropping a native output would destroy a real, otherwise unrecoverable
+    tool result. An fc_-keyed native envelope is still not a valid pairing,
+    so the orphan repair for the true call_id must still fire.
+    """
+    provider = _make_provider()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_patch2", "name": "apply_patch"}],
+    }
+    delta_input = [
+        {
+            "type": "apply_patch_call_output",
+            "call_id": "fc_abc123",
+            "output": "M src/thing.py",
+            "status": "completed",
+        }
+    ]
+    result = _run_pairing(provider, [dict(i) for i in delta_input], chained_msg)
+
+    assert delta_input[0] in result, "real native output was destroyed"
+    synthesized = [i for i in result if i.get("type") == "function_call_output"]
+    assert len(synthesized) == 1
+    assert synthesized[0]["call_id"] == "call_patch2"
+
+
+# ---------------------------------------------------------------------------
 # Stitched-dispatch regression — trial-3's flavor at the converter level
 # ---------------------------------------------------------------------------
 
