@@ -723,6 +723,107 @@ class TestConvertMessagesApplyPatchOutput:
         assert func_outputs[0]["call_id"] == "call_other"
 
 
+# --- Test the wire-path pairing backstop counts native result envelopes ---
+#
+# _convert_messages ends with a last-resort backstop: any function_call item
+# replayed into the input with no paired output gets a synthesized "[error]
+# result missing" output, so the request cannot 400 on an orphan. That check
+# must recognize the SAME set of result envelopes as
+# _enforce_chain_output_pairing (_PAIRED_OUTPUT_ITEM_TYPES). Counting only
+# function_call_output declares a real, successful native result missing and
+# ships a fabricated error beside it -- two contradictory results for one
+# call_id, inviting the model to re-run an already-applied patch.
+
+
+class TestWirePathPairingCountsNativeOutputs:
+    def test_native_output_satisfies_wire_path_pairing(self) -> None:
+        """A real apply_patch_call_output pairs its call; nothing is synthesized.
+
+        Uses the shape where the assistant turn replays as a function_call
+        (the stored operation type is not one the history-replay shape
+        detector recognizes) while the result still replays as a native
+        apply_patch_call_output, because the call_id is in _native_call_ids.
+        That divergence is what exposes the backstop's blind spot.
+        """
+        provider = _make_provider()
+        provider._native_call_ids = {"call_np1"}
+
+        messages = [
+            {"role": "user", "content": "patch it"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_call",
+                        "id": "call_np1",
+                        "name": "apply_patch",
+                        "input": {"type": "move_file", "path": "a.py", "diff": ""},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_np1",
+                "content": "M a.py",
+                "tool_name": "apply_patch",
+            },
+        ]
+
+        result = provider._convert_messages(messages)
+
+        patch_outputs = [
+            m
+            for m in result
+            if isinstance(m, dict) and m.get("type") == "apply_patch_call_output"
+        ]
+        assert len(patch_outputs) == 1, "the real native result must survive"
+        assert patch_outputs[0]["output"] == "M a.py"
+
+        synthesized = [
+            m
+            for m in result
+            if isinstance(m, dict)
+            and m.get("type") == "function_call_output"
+            and "[error]" in str(m.get("output", ""))
+        ]
+        assert not synthesized, (
+            "synthesized a 'result missing' error for a call that already had a "
+            "real, successful native result -- the model would see two "
+            "contradictory results for one call_id"
+        )
+
+    def test_orphaned_function_call_still_repaired(self) -> None:
+        """The backstop still fires when an output is genuinely absent."""
+        provider = _make_provider()
+
+        messages = [
+            {"role": "user", "content": "read it"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_call",
+                        "id": "call_orphan",
+                        "name": "read_file",
+                        "input": {"path": "a.py"},
+                    }
+                ],
+            },
+        ]
+
+        result = provider._convert_messages(messages)
+
+        synthesized = [
+            m
+            for m in result
+            if isinstance(m, dict)
+            and m.get("type") == "function_call_output"
+            and "[error]" in str(m.get("output", ""))
+        ]
+        assert len(synthesized) == 1
+        assert synthesized[0]["call_id"] == "call_orphan"
+
+
 # --- Test capability-based activation ---
 
 

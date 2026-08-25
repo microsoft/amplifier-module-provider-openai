@@ -3633,17 +3633,26 @@ class OpenAIProvider:
                 i += 1
 
         # P4 wire-path invariant: every function_call item replayed into the
-        # input MUST have a function_call_output paired by call_id, or the
-        # API rejects the whole request (400 "No tool output found for
-        # function call <call_id>") and kills the session. The message-level
-        # repair (_find_missing_tool_results) is the primary net; this is the
+        # input MUST have a paired output by call_id, or the API rejects the
+        # whole request (400 "No tool output found for function call
+        # <call_id>") and kills the session. The message-level repair
+        # (_find_missing_tool_results) is the primary net; this is the
         # last-resort backstop at the wire format itself — if an orphan
         # slipped through, synthesize an error output rather than letting the
         # request 400.
+        #
+        # "Paired" is _PAIRED_OUTPUT_ITEM_TYPES — the same vocabulary
+        # _enforce_chain_output_pairing enforces — NOT function_call_output
+        # alone. A native tool's result is emitted in its own envelope
+        # (apply_patch_call_output / computer_call_output) above, so counting
+        # only function_call_output declares a real, successful native result
+        # missing and appends a fabricated "result missing" error beside it:
+        # two contradictory results for one call_id. Both enforcement sites
+        # answer the same question and must answer it identically.
         output_call_ids = {
             item.get("call_id")
             for item in openai_messages
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
+            if isinstance(item, dict) and item.get("type") in _PAIRED_OUTPUT_ITEM_TYPES
         }
         repaired: list[dict[str, Any]] = []
         for item in openai_messages:
