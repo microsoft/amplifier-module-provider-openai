@@ -22,6 +22,7 @@ Invariants:
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock
 from openai.types.responses import Response
@@ -335,3 +336,198 @@ def test_chain_delta_request_carries_repaired_pairing():
     assert not any(i.startswith("fc_") for i in ids), (
         "fc_-keyed output reached the wire"
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical repair-event name
+#
+# "a tool call's result went missing and the provider patched over it" is an
+# ECOSYSTEM concept, not an OpenAI one. The kernel registers it as
+# provider:tool_sequence_repaired and six providers emit it -- including this
+# one, for the message-level repair. An unregistered name gets no
+# hooks-logging handler, so every emission is silently discarded before it
+# reaches events.jsonl and the repair becomes invisible to every consumer.
+# ---------------------------------------------------------------------------
+
+
+def _make_provider_with_hooks() -> tuple[OpenAIProvider, AsyncMock]:
+    emit = AsyncMock()
+    coordinator = MagicMock()
+    coordinator.hooks.emit = emit
+    coordinator.get_capability = MagicMock(return_value=None)
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"max_retries": 0, "use_streaming": False},
+        coordinator=coordinator,
+    )
+    return provider, emit
+
+
+def test_emitted_repair_event_is_registered_in_the_kernel():
+    """An unregistered event name is dropped before it reaches events.jsonl."""
+    from amplifier_core.events import ALL_EVENTS
+
+    assert "provider:tool_sequence_repaired" in ALL_EVENTS
+    assert "provider:chain_pairing_repaired" not in ALL_EVENTS, (
+        "if this name ever becomes registered, revisit whether the chain "
+        "repair genuinely warrants a second name for one concept"
+    )
+
+
+def test_chain_repair_emits_the_canonical_event():
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_missing1", "tool": "apply_patch"}],
+    }
+    _run_pairing(provider, [], chained_msg)
+
+    assert emit.await_count == 1
+    name, payload = emit.await_args.args[0], emit.await_args.args[1]
+    assert name == "provider:tool_sequence_repaired", (
+        "emitted a name the kernel does not register -- hooks-logging "
+        "attaches no handler and the repair never reaches events.jsonl"
+    )
+    assert payload["provider"] == provider.name
+    assert payload["repair_count"] == 1
+    assert payload["repairs"] == [
+        {"tool_call_id": "call_missing1", "tool_name": "apply_patch"}
+    ]
+    assert payload["repair_site"] == "chain_pairing", (
+        "the two repair sites must stay distinguishable under one event name"
+    )
+    assert payload["repair_count"] == len(payload["repairs"])
+    assert payload["dropped_count"] == 0
+    assert payload["synthesized_for"] == ["call_missing1"]
+
+
+def test_tool_name_read_from_the_canonical_name_key():
+    """The canonical ToolCall shape carries the tool under "name".
+
+    amplifier_core.message_models.ToolCall serializes to "name"; the
+    streaming orchestrator writes "tool" (covered above). Both shapes
+    genuinely reach this code, so both branches of the lookup are exercised.
+    """
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_canonical", "name": "read_file"}],
+    }
+    _run_pairing(provider, [], chained_msg)
+
+    payload = emit.await_args.args[1]
+    assert payload["repairs"] == [
+        {"tool_call_id": "call_canonical", "tool_name": "read_file"}
+    ]
+
+
+def test_tool_name_falls_back_to_unknown_when_the_record_omits_it():
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_noname"}],
+    }
+    _run_pairing(provider, [], chained_msg)
+
+    payload = emit.await_args.args[1]
+    assert payload["repairs"] == [
+        {"tool_call_id": "call_noname", "tool_name": "unknown"}
+    ]
+
+
+def test_no_event_when_nothing_was_repaired():
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_ok", "tool": "bash"}],
+    }
+    delta = [{"type": "function_call_output", "call_id": "call_ok", "output": "ok"}]
+    _run_pairing(provider, delta, chained_msg)
+
+    assert emit.await_count == 0, "a clean turn must stay silent"
+
+
+def test_dropped_only_turn_reports_zero_repairs_and_one_drop():
+    """Dropping is not synthesizing; the payload must say so explicitly.
+
+    Every genuine call is correctly paired here, but a stray fc_-keyed
+    output is dropped. repair_count must stay 0 and equal len(repairs) --
+    the invariant sibling providers hold and cross-provider repair-volume
+    aggregation depends on -- while dropped_count carries the real signal.
+    The emission is deliberately not gated on repair_count > 0: a dropped
+    output is precisely what went unobserved before this change.
+    """
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_x", "tool": "bash"}],
+    }
+    delta = [
+        {"type": "function_call_output", "call_id": "call_x", "output": "ok"},
+        {"type": "function_call_output", "call_id": "fc_stray", "output": "orphan"},
+    ]
+    _run_pairing(provider, delta, chained_msg)
+
+    assert emit.await_count == 1, "a dropped output must still be reported"
+    payload = emit.await_args.args[1]
+    assert payload["repair_count"] == 0
+    assert payload["repairs"] == []
+    assert payload["repair_count"] == len(payload["repairs"]), (
+        "repair_count must always equal len(repairs) — five sibling providers "
+        "hold this invariant and cross-provider aggregation relies on it"
+    )
+    assert payload["dropped_count"] == 1
+    assert payload["dropped_item_id_outputs"] == ["fc_stray"]
+
+
+def test_multiple_orphans_report_every_repair():
+    """repair_count > 1 at the chain site, over its own expected_names map."""
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "call_a", "tool": "apply_patch"},
+            {"id": "call_b", "name": "read_file"},
+            {"id": "call_c"},
+        ],
+    }
+    delta = [{"type": "function_call_output", "call_id": "call_b", "output": "ok"}]
+    _run_pairing(provider, delta, chained_msg)
+
+    payload = emit.await_args.args[1]
+    assert payload["repair_count"] == 2
+    assert payload["repair_count"] == len(payload["repairs"])
+    assert payload["repairs"] == [
+        {"tool_call_id": "call_a", "tool_name": "apply_patch"},
+        {"tool_call_id": "call_c", "tool_name": "unknown"},
+    ]
+    assert payload["dropped_count"] == 0
+
+
+def test_content_block_tool_name_reaches_the_emitted_event():
+    """Calls recorded as content blocks (no tool_calls field) name their tool.
+
+    The content-block branch populates expected_names separately from the
+    tool_calls branch. Exercised through the emission rather than the return
+    value, because the payload is the only place that lookup surfaces.
+    """
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": [
+            {"type": "tool_call", "id": "call_block1", "name": "write_file"},
+        ],
+    }
+    _run_pairing(provider, [], chained_msg)
+
+    payload = emit.await_args.args[1]
+    assert payload["repair_count"] == 1
+    assert payload["repairs"] == [
+        {"tool_call_id": "call_block1", "tool_name": "write_file"}
+    ]
