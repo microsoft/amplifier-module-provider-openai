@@ -22,6 +22,7 @@ Invariants:
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock
 from openai.types.responses import Response
@@ -335,3 +336,93 @@ def test_chain_delta_request_carries_repaired_pairing():
     assert not any(i.startswith("fc_") for i in ids), (
         "fc_-keyed output reached the wire"
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical repair-event name
+#
+# "a tool call's result went missing and the provider patched over it" is an
+# ECOSYSTEM concept, not an OpenAI one. The kernel registers it as
+# provider:tool_sequence_repaired and six providers emit it -- including this
+# one, for the message-level repair. An unregistered name gets no
+# hooks-logging handler, so every emission is silently discarded before it
+# reaches events.jsonl and the repair becomes invisible to every consumer.
+# ---------------------------------------------------------------------------
+
+
+def _make_provider_with_hooks() -> tuple[OpenAIProvider, AsyncMock]:
+    emit = AsyncMock()
+    coordinator = MagicMock()
+    coordinator.hooks.emit = emit
+    coordinator.get_capability = MagicMock(return_value=None)
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"max_retries": 0, "use_streaming": False},
+        coordinator=coordinator,
+    )
+    return provider, emit
+
+
+def test_emitted_repair_event_is_registered_in_the_kernel():
+    """An unregistered event name is dropped before it reaches events.jsonl."""
+    from amplifier_core.events import ALL_EVENTS
+
+    assert "provider:tool_sequence_repaired" in ALL_EVENTS
+    assert "provider:chain_pairing_repaired" not in ALL_EVENTS, (
+        "if this name ever becomes registered, revisit whether the chain "
+        "repair genuinely warrants a second name for one concept"
+    )
+
+
+def test_chain_repair_emits_the_canonical_event():
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_missing1", "tool": "apply_patch"}],
+    }
+    _run_pairing(provider, [], chained_msg)
+
+    assert emit.await_count == 1
+    name, payload = emit.await_args.args[0], emit.await_args.args[1]
+    assert name == "provider:tool_sequence_repaired", (
+        "emitted a name the kernel does not register -- hooks-logging "
+        "attaches no handler and the repair never reaches events.jsonl"
+    )
+    assert payload["provider"] == provider.name
+    assert payload["repair_count"] == 1
+    assert payload["repairs"] == [
+        {"tool_call_id": "call_missing1", "tool_name": "apply_patch"}
+    ]
+    assert payload["repair_site"] == "chain_pairing", (
+        "the two repair sites must stay distinguishable under one event name"
+    )
+    assert payload["synthesized_for"] == ["call_missing1"]
+
+
+def test_tool_name_falls_back_to_unknown_when_the_record_omits_it():
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_noname"}],
+    }
+    _run_pairing(provider, [], chained_msg)
+
+    payload = emit.await_args.args[1]
+    assert payload["repairs"] == [
+        {"tool_call_id": "call_noname", "tool_name": "unknown"}
+    ]
+
+
+def test_no_event_when_nothing_was_repaired():
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_ok", "tool": "bash"}],
+    }
+    delta = [{"type": "function_call_output", "call_id": "call_ok", "output": "ok"}]
+    _run_pairing(provider, delta, chained_msg)
+
+    assert emit.await_count == 0, "a clean turn must stay silent"

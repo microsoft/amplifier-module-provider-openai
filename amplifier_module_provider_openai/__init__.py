@@ -1287,11 +1287,19 @@ class OpenAIProvider:
            executed tool call.
         """
         expected_ids: list[str] = []
+        # call_id -> tool name, for the canonical repair event's `repairs`
+        # entries. Best-effort: the key carrying the name differs by who wrote
+        # the record ("name" for Anthropic-style storage, "tool" for the
+        # streaming orchestrator), and it is absent entirely in some shapes.
+        expected_names: dict[str, str] = {}
         for tc in chained_msg.get("tool_calls") or []:
             if isinstance(tc, dict):
                 tc_id = tc.get("id") or tc.get("tool_call_id")
                 if tc_id:
                     expected_ids.append(str(tc_id))
+                    expected_names[str(tc_id)] = str(
+                        tc.get("name") or tc.get("tool") or "unknown"
+                    )
         content = chained_msg.get("content")
         if isinstance(content, list):
             for block in content:
@@ -1299,6 +1307,7 @@ class OpenAIProvider:
                     b_id = block.get("id")
                     if b_id and str(b_id) not in expected_ids:
                         expected_ids.append(str(b_id))
+                        expected_names[str(b_id)] = str(block.get("name") or "unknown")
 
         provided_ids: set[str] = set()
         anomalous_items: list[dict[str, Any]] = []
@@ -1351,10 +1360,32 @@ class OpenAIProvider:
             and self.coordinator
             and hasattr(self.coordinator, "hooks")
         ):
+            # Canonical ecosystem event name. "a tool call's result went
+            # missing and the provider patched over it" is not an OpenAI
+            # concept — the kernel names it provider:tool_sequence_repaired,
+            # six providers emit it, and THIS file already emits it for the
+            # message-level repair (_find_missing_tool_results). The
+            # previously-emitted "provider:chain_pairing_repaired" was a
+            # private name for the same category of event: not in the
+            # kernel's event registry, so hooks-logging registered no
+            # handler and every emission was silently discarded, never
+            # reaching events.jsonl. Required fields match the contract the
+            # other providers emit; the chain-specific diagnostics ride along
+            # as additive keys, exactly as synthetic_assistant_count already
+            # does on the message-level emission below.
             await self.coordinator.hooks.emit(
-                "provider:chain_pairing_repaired",
+                "provider:tool_sequence_repaired",
                 {
                     "provider": self.name,
+                    "repair_count": len(missing_ids),
+                    "repairs": [
+                        {
+                            "tool_call_id": cid,
+                            "tool_name": expected_names.get(cid, "unknown"),
+                        }
+                        for cid in missing_ids
+                    ],
+                    "repair_site": "chain_pairing",
                     "expected_call_ids": expected_ids,
                     "provided_call_ids": sorted(provided_ids),
                     "synthesized_for": missing_ids,
