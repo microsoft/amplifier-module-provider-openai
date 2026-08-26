@@ -13,10 +13,19 @@ Invariants:
 - every tool call on the chained-from assistant turn has a
   function_call_output paired BY call_id in the delta input (synthesized
   error output for orphans);
-- fc_-prefixed output ids never reach the wire on the chain path (dropped,
-  loudly — they can pair with nothing server-side);
+- an fc_-prefixed output id that matches NO chained call is dropped,
+  loudly — it can pair with nothing server-side;
+- an fc_-prefixed output id that MATCHES the chained turn's local record
+  (both sides originate from the same ToolCallBlock.id, so this is the
+  realistic mis-keyed state) keeps the REAL output: dropping it only for
+  the orphan branch to synthesize an error under the SAME unpairable id
+  destroys the tool result and repairs nothing;
 - stitched-turn dispatch keys by call_id even for completed calls
   (trial-3's exact flavor).
+
+The composed-state tests below run the WHOLE pairing function against each
+realistic input state (the 3-scenario table), not one branch at a time —
+the original defect lived exactly in the branches' composition.
 """
 
 import asyncio
@@ -254,6 +263,90 @@ def test_fc_keyed_native_output_is_not_dropped():
     synthesized = [i for i in result if i.get("type") == "function_call_output"]
     assert len(synthesized) == 1
     assert synthesized[0]["call_id"] == "call_patch2"
+
+
+# ---------------------------------------------------------------------------
+# Composed-state contract — whole function, one test per realistic state.
+# Expected ids and output call_ids originate from the SAME ToolCallBlock.id
+# (outputs get tool_call_id copied from it), so both branches of the pairing
+# function see one keyspace. The 3 realistic states:
+#   A: fc_/fc_   — legacy mis-keyed record; output id matches the local call
+#   B: call_/fc_ — output keyed by an id matching no chained call
+#   C: call_/call_ — healthy
+# ---------------------------------------------------------------------------
+
+
+def test_composed_state_a_fc_call_and_fc_output_keeps_real_result():
+    """Scenario A (the composition defect): chained call AND output both keyed
+    by the same fc_ id. Pre-fix, the fc_-drop branch destroyed the real output
+    and the orphan branch synthesized an error under the SAME unpairable id —
+    still 400s AND the result is gone. The real output must be kept."""
+    provider = _make_provider()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "fc_abc123", "name": "bash"}],
+    }
+    delta_input = [
+        {
+            "type": "function_call_output",
+            "call_id": "fc_abc123",
+            "output": "REAL RESULT",
+        }
+    ]
+    result = _run_pairing(provider, delta_input, chained_msg)
+
+    outputs = [i for i in result if i.get("type") == "function_call_output"]
+    assert len(outputs) == 1, "exactly one output: no drop, no extra synthesis"
+    assert outputs[0]["call_id"] == "fc_abc123"
+    assert outputs[0]["output"] == "REAL RESULT", (
+        "the real tool result was destroyed by the drop/synthesize composition"
+    )
+    assert "[error]" not in outputs[0]["output"]
+
+
+def test_composed_state_b_call_expected_fc_output_drops_and_synthesizes():
+    """Scenario B: chained call keyed call_, output keyed by an unmatched fc_
+    id. The fc_ output pairs with nothing; drop it and synthesize an error
+    for the orphaned call so the chained request cannot 400."""
+    provider = _make_provider()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_xyz789", "name": "bash"}],
+    }
+    delta_input = [
+        {
+            "type": "function_call_output",
+            "call_id": "fc_abc123",
+            "output": "REAL RESULT",
+        }
+    ]
+    result = _run_pairing(provider, delta_input, chained_msg)
+
+    outputs = [i for i in result if i.get("type") == "function_call_output"]
+    ids = {o["call_id"] for o in outputs}
+    assert ids == {"call_xyz789"}, "fc_ output dropped; orphan repaired by call_id"
+    assert "[error]" in outputs[0]["output"]
+
+
+def test_composed_state_c_healthy_pairing_passes_through_untouched():
+    """Scenario C: call_/call_ — nothing dropped, nothing synthesized."""
+    provider = _make_provider()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_xyz789", "name": "bash"}],
+    }
+    delta_input = [
+        {
+            "type": "function_call_output",
+            "call_id": "call_xyz789",
+            "output": "REAL RESULT",
+        }
+    ]
+    result = _run_pairing(provider, [dict(i) for i in delta_input], chained_msg)
+    assert result == delta_input
 
 
 # ---------------------------------------------------------------------------
@@ -531,3 +624,73 @@ def test_content_block_tool_name_reaches_the_emitted_event():
     assert payload["repairs"] == [
         {"tool_call_id": "call_block1", "tool_name": "write_file"}
     ]
+
+
+def test_kept_fc_output_is_counted_as_kept_not_dropped():
+    """An fc_-keyed output has TWO outcomes, and the payload must say which.
+
+    dropped_count alone under-reports fc_ keying anomalies once the matching
+    fc_/fc_ case is kept rather than dropped: the anomaly is just as real,
+    just as much an upstream dispatch bug, and the outcome differs only in
+    whether the payload survived. Counting it nowhere would re-hide exactly
+    the signal this event was fixed to surface.
+    """
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "fc_abc123", "tool": "bash"}],
+    }
+    delta = [
+        {"type": "function_call_output", "call_id": "fc_abc123", "output": "REAL"},
+    ]
+    _run_pairing(provider, delta, chained_msg)
+
+    assert emit.await_count == 1, "a kept fc_ anomaly must still be reported"
+    payload = emit.await_args.args[1]
+    # Nothing was synthesized and nothing was discarded -- the real output
+    # paired against the chained turn's (identically mis-keyed) local record.
+    assert payload["repair_count"] == 0
+    assert payload["repairs"] == []
+    assert payload["repair_count"] == len(payload["repairs"])
+    assert payload["dropped_count"] == 0
+    assert payload["dropped_item_id_outputs"] == []
+    assert payload["kept_count"] == 1
+    assert payload["kept_item_id_outputs"] == ["fc_abc123"]
+    assert payload["repair_site"] == "chain_pairing"
+
+
+def test_total_fc_anomalies_are_dropped_plus_kept():
+    """A turn carrying both outcomes at once must account for both.
+
+    `dropped_count + kept_count` is the documented way to recover total fc_
+    keying anomalies; a consumer reading dropped_count alone would see 1
+    where 2 occurred.
+    """
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "fc_kept1", "tool": "bash"},  # matches -> kept
+            {"id": "call_ok", "tool": "read_file"},  # healthy pairing
+        ],
+    }
+    delta = [
+        {"type": "function_call_output", "call_id": "fc_kept1", "output": "REAL"},
+        {"type": "function_call_output", "call_id": "call_ok", "output": "ok"},
+        {"type": "function_call_output", "call_id": "fc_stray", "output": "orphan"},
+    ]
+    _run_pairing(provider, delta, chained_msg)
+
+    payload = emit.await_args.args[1]
+    assert payload["kept_count"] == 1
+    assert payload["kept_item_id_outputs"] == ["fc_kept1"]
+    assert payload["dropped_count"] == 1
+    assert payload["dropped_item_id_outputs"] == ["fc_stray"]
+    assert payload["dropped_count"] + payload["kept_count"] == 2, (
+        "total fc_ keying anomalies must be recoverable from the payload"
+    )
+    # Neither anomaly orphaned a genuine call, so nothing was synthesized.
+    assert payload["repair_count"] == 0
+    assert payload["repair_count"] == len(payload["repairs"])

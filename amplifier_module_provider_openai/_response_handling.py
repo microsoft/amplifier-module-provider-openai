@@ -118,9 +118,18 @@ def parse_function_call_block(block: Any) -> tuple[str, str, dict[str, Any]]:
       Tool outputs must pair by call_id (`call_…`); dispatching by the
       Responses-API item id (`fc_…`) makes outputs unpairable and 400s the
       next request.
-    - An incomplete (truncated) call, or one whose non-empty arguments do
-      not parse as JSON, raises FunctionCallTruncationError — it is NEVER
-      surfaced as an executable call with `{}` arguments.
+    - An incomplete (truncated) call raises FunctionCallTruncationError —
+      it is NEVER surfaced as an executable call with `{}` arguments.
+      Truncated-but-unlabeled calls never reach this function: the
+      response-level retry loop (gated on response.status == "incomplete")
+      intercepts them via describe_incomplete_function_calls before
+      conversion.
+    - A NON-incomplete call whose arguments do not parse as JSON is a known
+      model failure mode, not a truncation symptom. It is coerced to `{}`
+      with a loud warning so the tool-error feedback loop can drive
+      recovery — raising here would kill the session on a COMPLETED
+      response (FunctionCallTruncationError is non-retryable and caught
+      nowhere upstream).
     - An empty/absent arguments payload is a legitimate no-argument call.
     """
     call_id, item_id, name, arguments, status = _function_call_fields(block)
@@ -139,18 +148,115 @@ def parse_function_call_block(block: Any) -> tuple[str, str, dict[str, Any]]:
         else:
             try:
                 tool_input = json.loads(tool_input)
-            except json.JSONDecodeError as exc:
-                raise FunctionCallTruncationError(
-                    f"function_call '{name}' (call_id={call_id or item_id}) carries "
-                    f"unparseable JSON arguments ({len(arguments)} chars) — a "
-                    "truncation artifact; refusing to surface it with empty arguments"
-                ) from exc
+            except json.JSONDecodeError:
+                logger.warning(
+                    "[PROVIDER] function_call '%s' (call_id=%s, status=%s) "
+                    "carries unparseable JSON arguments (%d chars) on a "
+                    "non-incomplete call — coercing to {} so the tool error "
+                    "surfaces to the model instead of killing the session. "
+                    "Argument prefix: %.120s",
+                    name,
+                    call_id or item_id,
+                    status,
+                    len(arguments),
+                    arguments,
+                )
+                tool_input = {}
     if tool_input is None:
         tool_input = {}
     if not isinstance(tool_input, dict):
         tool_input = {}
 
     return call_id or item_id or "", name, tool_input
+
+
+def merge_discarded_usage(usage: Usage, discarded_usage_objs: list[Any]) -> Usage:
+    """Fold token counts from discarded attempts into a reported Usage.
+
+    The truncation-retry policy discards a truncated attempt's output and
+    retries with a raised budget. The discarded attempt was still BILLED —
+    a full input pass plus up to the previous output budget (including
+    reasoning tokens) — so its usage must be reported, not silently dropped.
+
+    Each discarded attempt's input is NORMALIZED to the kernel Usage
+    contract before it is added, exactly as the final response's input is
+    normalized by the two conversion paths: OpenAI's raw
+    ``usage.input_tokens`` already CONTAINS ``cache_write_tokens`` as a
+    SUBSET, whereas the contract defines ``input_tokens`` as "fresh +
+    cache_read, cache_write NOT included" so that every consumer can
+    compute ``total_input = input_tokens + cache_write_tokens``. Adding a
+    discarded attempt's RAW input to the already-normalized ``usage``
+    would let that formula double-count the discarded attempt's cache
+    write (measured: a 4,000-token write reported a 24,000 gross where the
+    truth was 20,000). Subtract it out per attempt, then contribute the
+    write to ``cache_write_tokens`` exactly once.
+
+    Args:
+        usage: The Usage built from the final (kept) response, already
+            normalized to the kernel contract.
+        discarded_usage_objs: SDK usage objects from discarded attempts
+            (entries may be None when a response carried no usage).
+
+    Returns:
+        A new Usage with the discarded attempts' tokens added in, still
+        satisfying the contract (gross input reconstructs as
+        ``input_tokens + cache_write_tokens``).
+    """
+    add_input = 0
+    add_output = 0
+    add_reasoning = 0
+    add_cache_read = 0
+    add_cache_write = 0
+    saw_reasoning = False
+    saw_cache_read = False
+    saw_cache_write = False
+
+    for usage_obj in discarded_usage_objs:
+        if usage_obj is None:
+            continue
+        raw_input = getattr(usage_obj, "input_tokens", 0) or 0
+        add_output += getattr(usage_obj, "output_tokens", 0) or 0
+        output_details = getattr(usage_obj, "output_tokens_details", None)
+        if output_details is not None:
+            reasoning = getattr(output_details, "reasoning_tokens", None)
+            if reasoning is not None:
+                saw_reasoning = True
+                add_reasoning += reasoning
+        obj_cache_write = 0
+        input_details = getattr(usage_obj, "input_tokens_details", None)
+        if input_details is not None:
+            cached = getattr(input_details, "cached_tokens", None)
+            if cached is not None:
+                saw_cache_read = True
+                add_cache_read += cached
+            cache_write = getattr(input_details, "cache_write_tokens", None)
+            if cache_write is not None:
+                saw_cache_write = True
+                obj_cache_write = cache_write or 0
+                add_cache_write += obj_cache_write
+        # Normalize this attempt's input to the kernel contract before
+        # adding it to the already-normalized `usage`: the raw vendor total
+        # contains cache_write as a SUBSET, and the write is contributed
+        # separately via `add_cache_write` above. max(0, ...) mirrors the
+        # guard the conversion paths apply to a malformed payload.
+        add_input += max(0, raw_input - obj_cache_write)
+
+    new_input = usage.input_tokens + add_input
+    new_output = usage.output_tokens + add_output
+    updates: dict[str, Any] = {
+        "input_tokens": new_input,
+        "output_tokens": new_output,
+        "total_tokens": new_input + new_output,
+    }
+    if usage.reasoning_tokens is not None or saw_reasoning:
+        updates["reasoning_tokens"] = (usage.reasoning_tokens or 0) + add_reasoning
+    if usage.cache_read_tokens is not None or saw_cache_read:
+        updates["cache_read_tokens"] = (usage.cache_read_tokens or 0) + add_cache_read
+    if usage.cache_write_tokens is not None or saw_cache_write:
+        updates["cache_write_tokens"] = (
+            usage.cache_write_tokens or 0
+        ) + add_cache_write
+    return usage.model_copy(update=updates)
 
 
 def extract_reasoning_text(reasoning_summary: Any) -> str | None:
@@ -276,9 +382,10 @@ def convert_response_with_accumulated_output(
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
-                # P4: call_id-keyed, and NEVER surfaces an incomplete/
-                # truncated call — parse_function_call_block raises
-                # FunctionCallTruncationError instead of coercing to {}.
+                # P4: call_id-keyed. Incomplete (truncated) calls raise
+                # FunctionCallTruncationError; a non-incomplete call with
+                # unparseable arguments coerces to {} with a loud warning
+                # (survivable model failure, not truncation).
                 tool_id, tool_name, tool_input = parse_function_call_block(block)
                 content_blocks.append(
                     ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
@@ -341,8 +448,8 @@ def convert_response_with_accumulated_output(
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
-                # P4: call_id-keyed, and NEVER surfaces an incomplete/
-                # truncated call (see SDK-object branch above).
+                # P4: call_id-keyed (see SDK-object branch above for the
+                # incomplete-vs-unparseable handling).
                 tool_id, tool_name, tool_input = parse_function_call_block(block)
                 content_blocks.append(
                     ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
