@@ -1362,14 +1362,21 @@ class OpenAIProvider:
         ):
             # Canonical ecosystem event name. "a tool call's result went
             # missing and the provider patched over it" is not an OpenAI
-            # concept — the kernel names it provider:tool_sequence_repaired,
-            # six providers emit it, and THIS file already emits it for the
-            # message-level repair (_find_missing_tool_results). The
-            # previously-emitted "provider:chain_pairing_repaired" was a
-            # private name for the same category of event: not in the
-            # kernel's event registry, so hooks-logging registered no
-            # handler and every emission was silently discarded, never
-            # reaching events.jsonl.
+            # concept — the kernel names it provider:tool_sequence_repaired
+            # and six providers emit it, including this one, which already
+            # emits it for the message-level repair
+            # (_find_missing_tool_results).
+            #
+            # The previously-emitted "provider:chain_pairing_repaired" was a
+            # private name for the same category of event, and it reached no
+            # handler. hooks-logging learns event names from THREE sources —
+            # the kernel registry, the "observability.events" capability and
+            # contribution channel, and its own additional_events config —
+            # so absence from the kernel registry alone is not sufficient to
+            # go dark. This provider also registers no observability.events
+            # contributor (provider-gemini does, which is how its private
+            # provider:concurrency event gets logged). Both conditions
+            # together are what silently discarded every emission.
             #
             # There is no formal field contract for this event: events.rs
             # registers the NAME with a one-line doc comment and no schema,
@@ -1380,6 +1387,18 @@ class OpenAIProvider:
             # repaired_tool_ids). Chain-specific diagnostics ride along as
             # additive keys, exactly as synthetic_assistant_count already
             # does on the message-level emission below.
+            #
+            # repair_count counts SYNTHESIZED results only, so it always
+            # equals len(repairs) — the invariant the sibling providers hold
+            # and the one cross-provider repair-volume aggregation depends
+            # on. Dropping an unpairable fc_-keyed output is a different
+            # action, counted separately in dropped_count. This turn can
+            # legitimately drop without synthesizing, so
+            # repair_count: 0 / dropped_count: 1 is a real and
+            # self-describing shape, not a contradiction. The emission is
+            # deliberately NOT gated on repair_count > 0: a dropped output is
+            # exactly the signal that went unobserved before this change, and
+            # suppressing it would re-hide it.
             await self.coordinator.hooks.emit(
                 "provider:tool_sequence_repaired",
                 {
@@ -1393,6 +1412,7 @@ class OpenAIProvider:
                         for cid in missing_ids
                     ],
                     "repair_site": "chain_pairing",
+                    "dropped_count": len(anomalous_items),
                     "expected_call_ids": expected_ids,
                     "provided_call_ids": sorted(provided_ids),
                     "synthesized_for": missing_ids,

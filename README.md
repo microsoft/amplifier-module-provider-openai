@@ -582,6 +582,17 @@ messages = [
 
 **Observability**: Repairs are logged as warnings and emit `provider:tool_sequence_repaired` events for monitoring.
 
+**Two repair sites emit this event.** The provider repairs unpaired tool calls in two distinct places, and each tags its emission with a `repair_site` field so consumers can tell them apart:
+
+| `repair_site` | Where | What it repairs |
+|---------------|-------|-----------------|
+| `message_level` | `_find_missing_tool_results` | A tool call in the local conversation history whose result is absent. Synthetic results are injected into the transcript. |
+| `chain_pairing` | `_enforce_chain_output_pairing` | A tool call that lives server-side in a chained response (`previous_response_id`) whose output is missing from, or mis-keyed in, the delta input. |
+
+Both emissions carry `provider`, `repair_count`, and `repairs` (a list of `{tool_call_id, tool_name}`). `repair_count` counts synthesized results only and always equals `len(repairs)`.
+
+The `chain_pairing` site adds `dropped_count` alongside the chain-specific diagnostics (`expected_call_ids`, `provided_call_ids`, `synthesized_for`, `dropped_item_id_outputs`). Dropping an unpairable output is a separate action from synthesizing a missing one, so a turn may legitimately report `repair_count: 0` with `dropped_count: 1` — the provider dropped an output that could pair with nothing server-side while every genuine call was already correctly paired.
+
 **Philosophy**: This is **graceful degradation** following kernel philosophy - errors in other modules (context management) don't crash the provider or kill the user's session.
 
 ## Dependencies
