@@ -1369,9 +1369,16 @@ class OpenAIProvider:
             # private name for the same category of event: not in the
             # kernel's event registry, so hooks-logging registered no
             # handler and every emission was silently discarded, never
-            # reaching events.jsonl. Required fields match the contract the
-            # other providers emit; the chain-specific diagnostics ride along
-            # as additive keys, exactly as synthetic_assistant_count already
+            # reaching events.jsonl.
+            #
+            # There is no formal field contract for this event: events.rs
+            # registers the NAME with a one-line doc comment and no schema,
+            # and it is absent from CONTRACTS.md's event table. The fields
+            # below follow the de-facto convention (provider / repair_count /
+            # repairs), which anthropic, gemini, ollama and vllm share and
+            # which chat-completions diverges from (repaired_count /
+            # repaired_tool_ids). Chain-specific diagnostics ride along as
+            # additive keys, exactly as synthetic_assistant_count already
             # does on the message-level emission below.
             await self.coordinator.hooks.emit(
                 "provider:tool_sequence_repaired",
@@ -1536,6 +1543,12 @@ class OpenAIProvider:
                         {"tool_call_id": call_id, "tool_name": tool_name}
                         for _, call_id, tool_name, _ in missing
                     ],
+                    # Both sites this provider repairs from emit the same
+                    # event name, so each states which one it is. Set
+                    # explicitly on BOTH: if only one site carried the key, a
+                    # consumer would have to read its ABSENCE as "the other
+                    # site" — an implicit convention nobody declared.
+                    "repair_site": "message_level",
                 }
                 if synthetic_assistant_count > 0:
                     event_data["synthetic_assistant_count"] = synthetic_assistant_count

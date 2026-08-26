@@ -94,6 +94,10 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     assert repair_events[0][1]["provider"] == "openai"
     assert repair_events[0][1]["repair_count"] == 1
     assert repair_events[0][1]["repairs"][0]["tool_name"] == "do_something"
+    # Both repair sites share this event name, so each declares which it is.
+    # Stated explicitly here so a consumer never has to infer the site from
+    # the ABSENCE of the key.
+    assert repair_events[0][1]["repair_site"] == "message_level"
 
     # Synthetic tool result must be inserted IMMEDIATELY after the assistant message,
     # not appended at the end — ordering requirement for LLM APIs.

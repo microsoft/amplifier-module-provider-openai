@@ -400,6 +400,27 @@ def test_chain_repair_emits_the_canonical_event():
     assert payload["synthesized_for"] == ["call_missing1"]
 
 
+def test_tool_name_read_from_the_canonical_name_key():
+    """The canonical ToolCall shape carries the tool under "name".
+
+    amplifier_core.message_models.ToolCall serializes to "name"; the
+    streaming orchestrator writes "tool" (covered above). Both shapes
+    genuinely reach this code, so both branches of the lookup are exercised.
+    """
+    provider, emit = _make_provider_with_hooks()
+    chained_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call_canonical", "name": "read_file"}],
+    }
+    _run_pairing(provider, [], chained_msg)
+
+    payload = emit.await_args.args[1]
+    assert payload["repairs"] == [
+        {"tool_call_id": "call_canonical", "tool_name": "read_file"}
+    ]
+
+
 def test_tool_name_falls_back_to_unknown_when_the_record_omits_it():
     provider, emit = _make_provider_with_hooks()
     chained_msg = {
