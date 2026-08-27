@@ -978,13 +978,41 @@ class OpenAIProvider:
             try:
                 return await self.client.models.list()
             except openai.RateLimitError as e:
+                retry_after = None
+                if hasattr(e, "response") and e.response is not None:
+                    # Standard header (seconds)
+                    ra_header = e.response.headers.get("retry-after")
+                    if ra_header:
+                        try:
+                            retry_after = float(ra_header)
+                        except (ValueError, TypeError):
+                            pass
+                    # Azure-specific fallback (milliseconds, divide by 1000)
+                    # Azure OpenAI returns x-ms-retry-after-ms instead of
+                    # (or in addition to) the standard retry-after header.
+                    if retry_after is None:
+                        ms_header = e.response.headers.get("x-ms-retry-after-ms")
+                        if ms_header:
+                            try:
+                                retry_after = float(ms_header) / 1000.0
+                            except (ValueError, TypeError):
+                                pass
+                # Fail-fast: if retry_after exceeds max_delay, mark non-retryable
+                # so retry_with_backoff raises immediately instead of sleeping.
+                retryable = True
+                if (
+                    retry_after is not None
+                    and retry_after > self._retry_config.max_delay
+                ):
+                    retryable = False
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.RateLimitError(
                     error_msg,
                     provider=self.name,
                     status_code=429,
-                    retryable=True,
+                    retryable=retryable,
+                    retry_after=retry_after,
                 ) from e
             except openai.AuthenticationError as e:
                 body = getattr(e, "body", None)
