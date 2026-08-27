@@ -310,6 +310,28 @@ def _validate_reasoning_mode(reasoning_param: Any) -> None:
     )
 
 
+# reasoning.context (GPT-5.6 "persisted reasoning") selects how much prior
+# reasoning is re-rendered: "auto" (default) | "current_turn" | "all_turns".
+# "current_turn" trims rendered context on long agent loops -- the documented
+# mitigation for context_length_exceeded. Value-validated pre-flight; model
+# support is fail-loud at the API (pre-5.6 rejects it), same stance as `mode`.
+_REASONING_CONTEXT_ALLOWED = frozenset({"auto", "current_turn", "all_turns"})
+
+
+def _validate_reasoning_context(reasoning_param: Any) -> None:
+    """Reject a reasoning.context value the API would not accept."""
+    if not isinstance(reasoning_param, dict):
+        return
+    context = reasoning_param.get("context")
+    if context is None or context in _REASONING_CONTEXT_ALLOWED:
+        return
+    raise kernel_errors.InvalidRequestError(
+        f"reasoning.context must be one of "
+        f"{{'auto', 'current_turn', 'all_turns'}}; got {context!r}. "
+        f"Persisted reasoning requires a GPT-5.6 model."
+    )
+
+
 # prompt_cache_options.mode is a stable enum; ttl currently accepts only "30m" but
 # is left to the API to validate (it is the more volatile field). Verified live
 # against gpt-5.6-sol 2026-07-14. Note: prompt_cache_options COEXISTS with
@@ -378,6 +400,22 @@ def _validate_prompt_cache_options(options: Any) -> None:
         raise kernel_errors.InvalidRequestError(
             f"prompt_cache_options.mode must be one of "
             f"{{'implicit', 'explicit'}}; got {mode!r}."
+        )
+
+
+# text.verbosity (GPT-5.6): controls response length/detail. Opt-in; fail-loud
+# on models that reject it (pre-5.6).
+_TEXT_VERBOSITY_ALLOWED = frozenset({"low", "medium", "high"})
+
+
+def _validate_text_verbosity(verbosity: Any) -> None:
+    """Reject a text.verbosity value the API would not accept (no-op when None)."""
+    if verbosity is None:
+        return
+    if verbosity not in _TEXT_VERBOSITY_ALLOWED:
+        raise kernel_errors.InvalidRequestError(
+            f"text_verbosity must be one of {{'low', 'medium', 'high'}}; "
+            f"got {verbosity!r}."
         )
 
 
@@ -795,6 +833,20 @@ class OpenAIProvider:
         self.safety_identifier: str | None = (
             self.config.get("safety_identifier") or None
         )
+        # text.verbosity (GPT-5.6): "low" | "medium" | "high". Wrapped into the
+        # Responses API `text` object at request time. None = do not send.
+        self.text_verbosity: str | None = self.config.get("text_verbosity") or None
+        # reasoning.context (GPT-5.6 persisted reasoning): flag-gated, default
+        # OFF. Even when the caller supplies reasoning.context on a request,
+        # it is only forwarded when this is explicitly enabled AND the request
+        # is on the chained/stored path (see the chain_active/store_enabled
+        # gate at the forwarding site below) -- on a stateless call (Amplifier
+        # defaults store=False) there is no persisted reasoning state for the
+        # server to apply a context strategy to, so forwarding it there is
+        # meaningless-to-harmful. Mirrors `enable_long_context`.
+        self.enable_reasoning_context: bool = bool(
+            self.config.get("enable_reasoning_context", False)
+        )
 
         # Response chaining for reasoning models — the Responses API's
         # `previous_response_id` mechanism. Tri-state:
@@ -998,6 +1050,28 @@ class OpenAIProvider:
                     prompt="Enable long context (>272K tokens, 2x input / 1.5x output pricing)",
                     required=False,
                     default="false",
+                ),
+                ConfigField(
+                    id="enable_reasoning_context",
+                    display_name="Enable reasoning.context passthrough",
+                    field_type="boolean",
+                    prompt=(
+                        "Forward reasoning.context (GPT-5.6 persisted reasoning: "
+                        "auto/current_turn/all_turns) when the caller supplies it. "
+                        "Only takes effect on the chained/stored request path -- "
+                        "meaningless on stateless calls (Amplifier's default)."
+                    ),
+                    required=False,
+                    default="false",
+                ),
+                ConfigField(
+                    id="text_verbosity",
+                    display_name="Text verbosity",
+                    field_type="choice",
+                    prompt="Response verbosity (GPT-5.6). Leave unset for model default.",
+                    choices=["low", "medium", "high"],
+                    required=False,
+                    default=None,
                 ),
                 ConfigField(
                     id="prompt_cache_key",
@@ -2096,6 +2170,7 @@ class OpenAIProvider:
             reasoning_param = self.reasoning
         _validate_gpt_5_5_pro_effort(model_name, reasoning_param)
         _validate_reasoning_mode(reasoning_param)
+        _validate_reasoning_context(reasoning_param)
         if reasoning_param:
             # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
             if isinstance(reasoning_param, dict):
@@ -2110,6 +2185,36 @@ class OpenAIProvider:
                 _reasoning_mode = reasoning_param.get("mode")
                 if _reasoning_mode is not None:
                     params["reasoning"]["mode"] = _reasoning_mode
+                # reasoning.context (GPT-5.6): persisted-reasoning strategy.
+                # Flag-gated (default off, `enable_reasoning_context`) AND
+                # chain/store-gated: only forwarded when the server is actually
+                # retaining reasoning state for this request (chaining via
+                # previous_response_id, or store=true). On a stateless call
+                # (Amplifier's default store=False) there is nothing persisted
+                # for the server to apply a context strategy to, so sending it
+                # there is meaningless-to-harmful. Mirrors the
+                # encrypted_content stateless/chained split below.
+                _reasoning_context = reasoning_param.get("context")
+                if _reasoning_context is not None:
+                    if not self.enable_reasoning_context:
+                        logger.debug(
+                            "[PROVIDER] Ignoring reasoning.context=%r: "
+                            "enable_reasoning_context is off (default). Set "
+                            "config 'enable_reasoning_context' to opt in.",
+                            _reasoning_context,
+                        )
+                    elif not (chain_active or store_enabled):
+                        logger.debug(
+                            "[PROVIDER] Ignoring reasoning.context=%r: request "
+                            "is stateless (chain_active=%s, store=%s). "
+                            "Persisted-reasoning context only applies when "
+                            "server-side state is retained.",
+                            _reasoning_context,
+                            chain_active,
+                            store_enabled,
+                        )
+                    else:
+                        params["reasoning"]["context"] = _reasoning_context
             else:
                 # String format: use as effort level with default summary
                 params["reasoning"] = {
@@ -2219,6 +2324,14 @@ class OpenAIProvider:
         )
         if safety_identifier is not None:
             params["safety_identifier"] = safety_identifier
+
+        # text.verbosity (GPT-5.6): opt-in response-length control. Guard against
+        # clobbering any pre-existing `text` object (there is none today, but be
+        # defensive -- mirrors the safety_identifier passthrough pattern).
+        text_verbosity = kwargs.get("text_verbosity", self.text_verbosity) or None
+        if text_verbosity is not None:
+            _validate_text_verbosity(text_verbosity)
+            params.setdefault("text", {})["verbosity"] = text_verbosity
 
         # Add background mode parameter for long-running requests (deep research)
         if background_mode:
@@ -3102,6 +3215,8 @@ class OpenAIProvider:
                     continue_params["prompt_cache_options"] = params[
                         "prompt_cache_options"
                     ]
+                if "text" in params:
+                    continue_params["text"] = params["text"]
 
                 # Make continuation call
                 try:
