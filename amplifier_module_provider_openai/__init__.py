@@ -1053,11 +1053,107 @@ class OpenAIProvider:
         List available OpenAI models.
 
         Queries the OpenAI API for available models and filters to GPT-5+ series
-        and deep research models.
-        Raises exception if API query fails (no fallback - caller handles empty lists).
+        and deep research models. The query is retried with the same shared
+        retry_with_backoff()/_retry_config machinery used by complete() on
+        transient failures (5xx, timeouts, connection errors, Cloudflare
+        challenges). Raises the translated kernel error once retries are
+        exhausted, or immediately for non-retryable errors (401/403/404) -
+        no fallback; caller handles empty lists.
         """
-        # Query OpenAI models API - let exceptions propagate
-        models_response = await self.client.models.list()
+
+        async def _do_list_models():
+            try:
+                return await self.client.models.list()
+            except openai.RateLimitError as e:
+                body = getattr(e, "body", None)
+                error_msg = json.dumps(body) if body is not None else str(e)
+                raise kernel_errors.RateLimitError(
+                    error_msg,
+                    provider=self.name,
+                    status_code=429,
+                    retryable=True,
+                ) from e
+            except openai.AuthenticationError as e:
+                body = getattr(e, "body", None)
+                error_msg = json.dumps(body) if body is not None else str(e)
+                raise kernel_errors.AuthenticationError(
+                    error_msg,
+                    provider=self.name,
+                    status_code=getattr(e, "status_code", 401),
+                ) from e
+            except openai.APIStatusError as e:
+                status = getattr(e, "status_code", 500)
+                body = getattr(e, "body", None)
+                error_msg = json.dumps(body) if body is not None else str(e)
+                if status == 403:
+                    if self._is_cloudflare_challenge(e):
+                        logger.warning(
+                            "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+                            "with HTML body) on list_models(). Treating as "
+                            "transient -- will retry."
+                        )
+                        raise kernel_errors.ProviderUnavailableError(
+                            "Cloudflare bot challenge (transient 403 with HTML "
+                            "body). This typically resolves on retry.",
+                            provider=self.name,
+                            status_code=403,
+                            retryable=True,
+                        ) from e
+                    raise kernel_errors.AccessDeniedError(
+                        error_msg,
+                        provider=self.name,
+                        status_code=403,
+                    ) from e
+                if status == 404:
+                    raise kernel_errors.NotFoundError(
+                        error_msg,
+                        provider=self.name,
+                        status_code=404,
+                    ) from e
+                if status >= 500:
+                    raise kernel_errors.ProviderUnavailableError(
+                        error_msg,
+                        provider=self.name,
+                        status_code=status,
+                        retryable=True,
+                    ) from e
+                raise kernel_errors.LLMError(
+                    error_msg,
+                    provider=self.name,
+                    status_code=status,
+                    retryable=False,
+                ) from e
+            except (openai.APIConnectionError, openai.APITimeoutError) as e:
+                # Transport-level failures (DNS, connection reset, timeout) are
+                # genuinely transient.
+                raise kernel_errors.LLMError(
+                    str(e) or f"{type(e).__name__}: (no message)",
+                    provider=self.name,
+                    retryable=True,
+                ) from e
+            except kernel_errors.LLMError:
+                raise  # Already translated, don't double-wrap
+
+        async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
+            """Callback invoked before each retry sleep."""
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    PROVIDER_RETRY,
+                    {
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
+
+        models_response = await retry_with_backoff(
+            _do_list_models,
+            self._retry_config,
+            on_retry=_on_retry,
+        )
         models = []
 
         import re as regex_module
