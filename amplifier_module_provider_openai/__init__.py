@@ -3,7 +3,7 @@ OpenAI provider module for Amplifier.
 Integrates with OpenAI's Responses API.
 """
 
-__all__ = ["mount", "OpenAIProvider"]
+__all__ = ["OpenAIProvider", "mount"]
 
 # Amplifier module metadata
 __amplifier_module_type__ = "provider"
@@ -20,52 +20,55 @@ from decimal import Decimal
 from typing import Any
 
 import openai
-from pydantic import ValidationError
-
-from amplifier_core import ConfigField
-from amplifier_core import ModelInfo
-from amplifier_core import ModuleCoordinator
-from amplifier_core import ProviderInfo
-from amplifier_core import TextContent
-from amplifier_core import ThinkingContent
-from amplifier_core import ToolCallContent
+from amplifier_core import (
+    ConfigField,
+    ModelInfo,
+    ModuleCoordinator,
+    ProviderInfo,
+    TextContent,
+    ThinkingContent,
+    ToolCallContent,
+)
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.events import PROVIDER_RETRY
+from amplifier_core.message_models import ChatRequest, ChatResponse, ToolCall
 from amplifier_core.models import HookResult
 from amplifier_core.utils import redact_secrets
-from amplifier_core.message_models import ChatRequest
-from amplifier_core.message_models import ChatResponse
-from amplifier_core.message_models import ToolCall
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
+from pydantic import ValidationError
 
-from ._constants import BACKGROUND_POLLING_STATUSES
-from ._constants import BACKGROUND_STATUS_FAILED
-from ._constants import DEFAULT_BACKGROUND_TIMEOUT
-from ._constants import DEFAULT_MAX_TOKENS
-from ._constants import DEFAULT_MODEL
-from ._constants import DEFAULT_POLL_INTERVAL
-from ._constants import DEFAULT_REASONING_SUMMARY
-from ._constants import DEFAULT_TIMEOUT
-from ._constants import DEFAULT_PROMPT_CACHE_RETENTION
-from ._constants import DEFAULT_TRUNCATION
-from ._constants import DEEP_RESEARCH_MODELS
-from ._constants import MAX_CONTINUATION_ATTEMPTS
-from ._constants import METADATA_INCOMPLETE_REASON
-from ._constants import METADATA_REASONING_ITEMS
-from ._constants import METADATA_RESPONSE_ID
-from ._constants import METADATA_STATUS
-from ._constants import NATIVE_TOOL_TYPES
-from ._constants import RESPONSE_CHAIN_INVALIDATED
-from ._constants import RESPONSE_NOT_FOUND_ERROR_CODES
-from ._response_handling import FunctionCallTruncationError
-from ._response_handling import merge_discarded_usage
-from ._response_handling import convert_response_with_accumulated_output
-from ._response_handling import describe_incomplete_function_calls
-from ._response_handling import extract_reasoning_text
-from ._response_handling import parse_function_call_block
 from ._capabilities import get_capabilities
+from ._constants import (
+    BACKGROUND_POLLING_STATUSES,
+    BACKGROUND_STATUS_FAILED,
+    DEEP_RESEARCH_MODELS,
+    DEFAULT_BACKGROUND_TIMEOUT,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MODEL,
+    DEFAULT_POLL_INTERVAL,
+    DEFAULT_PROMPT_CACHE_RETENTION,
+    DEFAULT_REASONING_SUMMARY,
+    DEFAULT_TIMEOUT,
+    DEFAULT_TRUNCATION,
+    MAX_CONTINUATION_ATTEMPTS,
+    METADATA_INCOMPLETE_REASON,
+    METADATA_REASONING_ITEMS,
+    METADATA_RESPONSE_ID,
+    METADATA_STATUS,
+    NATIVE_TOOL_TYPES,
+    RESPONSE_CHAIN_INVALIDATED,
+    RESPONSE_NOT_FOUND_ERROR_CODES,
+)
 from ._cost import compute_cost
+from ._response_handling import (
+    FunctionCallTruncationError,
+    convert_response_with_accumulated_output,
+    describe_incomplete_function_calls,
+    extract_reasoning_text,
+    merge_discarded_usage,
+    parse_function_call_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +128,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     def _add_cost(cost) -> None:
         if cost is not None:
-            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal(0)) + cost
             _totals["has_data"] = True
 
     # Get API key from config or environment
@@ -401,6 +404,28 @@ def _validate_prompt_cache_options(options: Any) -> None:
             f"prompt_cache_options.mode must be one of "
             f"{{'implicit', 'explicit'}}; got {mode!r}."
         )
+
+
+def _input_has_cache_breakpoint(input_items: list[Any]) -> bool:
+    """True if any item (or nested content block) carries a breakpoint marker.
+
+    Used by the D2 guardrail: this provider does not attach
+    `prompt_cache_breakpoint` markers anywhere today, so this is always False
+    in current shipped behavior -- which is exactly the condition the
+    guardrail exists to catch.
+    """
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        if "prompt_cache_breakpoint" in item:
+            return True
+        content = item.get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and "prompt_cache_breakpoint" in block
+            for block in content
+        ):
+            return True
+    return False
 
 
 # text.verbosity (GPT-5.6): controls response length/detail. Opt-in; fail-loud
@@ -830,6 +855,9 @@ class OpenAIProvider:
         self.prompt_cache_options: dict | None = (
             self.config.get("prompt_cache_options") or None
         )
+        # D2 guardrail one-shot flag: emit the explicit-mode-with-no-breakpoints
+        # warning at most once per provider instance, not once per request.
+        self._explicit_cache_mode_warned = False
         self.safety_identifier: str | None = (
             self.config.get("safety_identifier") or None
         )
@@ -2317,7 +2345,30 @@ class OpenAIProvider:
         )
         if prompt_cache_options is not None:
             _validate_prompt_cache_options(prompt_cache_options)
-            params["prompt_cache_options"] = prompt_cache_options
+            # D2 guardrail (live-probed 2026-08-28): mode="explicit" with ZERO
+            # prompt_cache_breakpoint markers in `input` disables prompt caching
+            # ENTIRELY -- cache_write_tokens==0 AND cached_tokens==0 on every
+            # request, not just "no explicit-mode benefit". This provider does
+            # not attach breakpoints anywhere today, so this silently converts a
+            # ~95% cache-read workload into 100% full-price input (~10x cost).
+            # Downgrade to implicit and warn once per provider instance.
+            if prompt_cache_options.get(
+                "mode"
+            ) == "explicit" and not _input_has_cache_breakpoint(params["input"]):
+                if not self._explicit_cache_mode_warned:
+                    logger.warning(
+                        "[PROVIDER] prompt_cache_options.mode='explicit' with no "
+                        "prompt_cache_breakpoint markers in input: this disables "
+                        "prompt caching entirely (no reads, no writes), a ~10x "
+                        "input-cost regression vs implicit mode. Downgrading to "
+                        "implicit for this session."
+                    )
+                    self._explicit_cache_mode_warned = True
+                prompt_cache_options = {
+                    k: v for k, v in prompt_cache_options.items() if k != "mode"
+                } or None
+            if prompt_cache_options is not None:
+                params["prompt_cache_options"] = prompt_cache_options
 
         safety_identifier = (
             kwargs.get("safety_identifier", self.safety_identifier) or None
@@ -3295,13 +3346,13 @@ class OpenAIProvider:
                         else 0,
                     )
                     if _cost is not None:
-                        extra_cost = (extra_cost or Decimal("0")) + _cost
+                        extra_cost = (extra_cost or Decimal(0)) + _cost
                 if extra_cost is not None:
                     chat_response.usage = chat_response.usage.model_copy(
                         update={
                             "cost_usd": (
                                 getattr(chat_response.usage, "cost_usd", None)
-                                or Decimal("0")
+                                or Decimal(0)
                             )
                             + extra_cost
                         }
@@ -4170,11 +4221,13 @@ class OpenAIProvider:
         Returns:
             ChatResponse with content blocks
         """
-        from amplifier_core.message_models import TextBlock
-        from amplifier_core.message_models import ThinkingBlock
-        from amplifier_core.message_models import ToolCall
-        from amplifier_core.message_models import ToolCallBlock
-        from amplifier_core.message_models import Usage
+        from amplifier_core.message_models import (
+            TextBlock,
+            ThinkingBlock,
+            ToolCall,
+            ToolCallBlock,
+            Usage,
+        )
 
         content_blocks = []
         tool_calls = []
