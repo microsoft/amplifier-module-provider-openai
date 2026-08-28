@@ -184,6 +184,7 @@ def test_text_only_message_still_works(openai_provider):
     assert content[0]["text"] == "Hello, how are you?"
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_image_vision_integration_with_real_api(test_image_base64):
     """Integration test: Verify ImageBlock works with real OpenAI API.
@@ -195,6 +196,12 @@ async def test_image_vision_integration_with_real_api(test_image_base64):
 
     Requires OPENAI_API_KEY environment variable.
     Skip if not available (unit tests still validate conversion logic).
+
+    Marked 'live' and deselected in CI via `-m "not live"`. CI sets a
+    placeholder OPENAI_API_KEY so other behavioral/structural tests can
+    mount the provider, which defeats the plain `if not api_key: skip`
+    check below (a placeholder key is still truthy) -- the marker is the
+    real CI gate. Run this locally with a real key to validate.
     """
     import os
 
