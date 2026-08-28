@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # A hang must fail LOUDLY and fast, not sit burning runner time until the
+    # 6h default -- a job stuck at "in_progress" reads as "not done yet"
+    # rather than "broken", which is how a false green gets merged.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python = ">=3.11" -- cover the floor and a current minor.
+        python-version: ["3.11", "3.12"]
+    env:
+      # Placeholder, non-functional key. mount() only checks for presence
+      # (not validity) before constructing the provider -- without *some*
+      # key, mount() returns None and every behavioral/structural test
+      # that depends on a mounted provider fails/errors. Tests that need
+      # a real, working key are marked `live` and deselected below.
+      OPENAI_API_KEY: sk-test-placeholder-not-a-real-key-ci-only
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run test suite
+        # Deselects tests marked `live`: two tests need a genuine OpenAI
+        # API key and real network access (list_models() against the
+        # real /models endpoint, and a real vision completion). Run
+        # those locally with a real OPENAI_API_KEY to validate.
+        run: uv run pytest -q -m "not live"
