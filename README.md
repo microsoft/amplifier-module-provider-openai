@@ -78,6 +78,35 @@ config = {
 > is a per-end-user signal (abuse tracking) and must be set per-call via
 > `kwargs`. See [Prompt Caching](#prompt-caching) below.
 
+### Unrecognized config keys
+
+At construction, the provider warns once (with a `did you mean`-style
+suggestion when a close match exists) about any config key it does not
+recognize -- a typo like `promt_cache_retention` or a stale/removed option
+otherwise has no effect and no signal that anything is wrong. The check is
+silent on every key documented above, plus `api_key` / `id` / `module` /
+`source` / `priority` (infrastructure fields an app or kernel may place
+alongside a provider's config).
+
+**Extending the recognized set for a subclass.** A provider module that
+*subclasses* `OpenAIProvider` and passes its own config straight through
+(e.g. `provider-azure-openai`, which wraps this provider for Azure-specific
+auth) can declare its own additional keys so they don't trip this warning:
+
+```python
+from amplifier_module_provider_openai import OpenAIProvider
+
+
+class MyProvider(OpenAIProvider):
+    EXTRA_KNOWN_CONFIG_KEYS = frozenset({"my_custom_key", "another_key"})
+```
+
+`EXTRA_KNOWN_CONFIG_KEYS` defaults to an empty `frozenset` and only widens
+the *recognized* set for that subclass -- it does not suppress the warning
+for genuine typos. A typo of one of the subclass's own declared keys (e.g.
+`my_custom_ky`) still warns, with a suggestion drawn from the combined
+base + subclass key set.
+
 ### Reasoning Effort
 
 The `reasoning_effort` config key (canonical — it matches the kernel's portable

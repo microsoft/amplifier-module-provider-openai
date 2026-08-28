@@ -451,6 +451,109 @@ class TestUnknownConfigKeySweep:
 
 
 # ---------------------------------------------------------------------------
+# EXTRA_KNOWN_CONFIG_KEYS: the subclass extension point
+#
+# Fixes the provider-azure-openai false positive: AzureOpenAIProvider
+# SUBCLASSES OpenAIProvider (see amplifier-module-provider-azure-openai's
+# `_create_azure_provider`) and passes its own config straight through the
+# same `config` dict this constructor reads. Before this extension point,
+# every legitimate azure_endpoint/api_version/use_managed_identity/etc
+# config tripped the generic sweep -- valid config, false positive, exactly
+# the failure mode the sweep was built to prevent.
+# ---------------------------------------------------------------------------
+
+
+class TestExtraKnownConfigKeysExtensionPoint:
+    """A subclass declares `EXTRA_KNOWN_CONFIG_KEYS` to add its own
+    recognized keys to the sweep, without altering base-class behavior."""
+
+    @staticmethod
+    def _make_subclass_provider(extra_keys, **config_overrides):
+        class _ConsumerProvider(OpenAIProvider):
+            EXTRA_KNOWN_CONFIG_KEYS = frozenset(extra_keys)
+
+        config = {"max_retries": 0, "use_streaming": False, **config_overrides}
+        return _ConsumerProvider(api_key="test-key", config=config)
+
+    def test_default_is_empty_frozenset(self):
+        """Direct use of OpenAIProvider (and any subclass that doesn't
+        override the attribute) is completely unaffected."""
+        assert OpenAIProvider.EXTRA_KNOWN_CONFIG_KEYS == frozenset()
+
+    def test_subclass_declared_key_is_silent(self, caplog):
+        """A key the subclass declares via EXTRA_KNOWN_CONFIG_KEYS never
+        warns, even though the base class doesn't consume it."""
+        caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+        self._make_subclass_provider(
+            {"azure_endpoint"},
+            azure_endpoint="https://example.openai.azure.com",
+        )
+
+        matches = [
+            r.message for r in caplog.records if _UNKNOWN_KEY_MARKER in r.message
+        ]
+        assert matches == [], f"consumer-declared key should never warn: {matches}"
+
+    def test_subclass_typo_in_own_key_still_warns_with_suggestion(self, caplog):
+        """A genuine typo of the subclass's OWN declared key must still
+        warn, with a did-you-mean suggestion drawn from the merged set."""
+        caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+        self._make_subclass_provider(
+            {"azure_endpoint"},
+            azure_endpont="https://example.openai.azure.com",
+        )
+
+        matches = [
+            r.message for r in caplog.records if _UNKNOWN_KEY_MARKER in r.message
+        ]
+        assert len(matches) == 1
+        message = matches[0]
+        assert "'azure_endpont'" in message
+        assert "azure_endpoint" in message
+        assert "did you mean" in message.lower()
+
+    def test_subclass_genuine_unknown_key_still_warns(self, caplog):
+        """A subclass's own unrelated typo (no close match anywhere) still
+        warns without fabricating a suggestion."""
+        caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+        self._make_subclass_provider(
+            {"azure_endpoint"}, totally_bogus_azure_key_xyz=True
+        )
+
+        matches = [
+            r.message for r in caplog.records if _UNKNOWN_KEY_MARKER in r.message
+        ]
+        assert len(matches) == 1
+        assert "'totally_bogus_azure_key_xyz'" in matches[0]
+
+    def test_direct_use_still_warns_for_subclass_only_keys(self, caplog):
+        """Guard against accidentally widening the base class: a DIRECT
+        OpenAIProvider instance (no subclass override) must still warn on
+        keys that are only known via some other subclass's extension."""
+        caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+        _make_provider(azure_endpoint="https://example.openai.azure.com")
+
+        matches = [
+            r.message for r in caplog.records if _UNKNOWN_KEY_MARKER in r.message
+        ]
+        assert len(matches) == 1
+        assert "'azure_endpoint'" in matches[0]
+
+    def test_warn_unknown_config_keys_unit_merges_extra_keys(self, caplog):
+        """Unit-level check of the free function's `extra_known_keys` param
+        directly, independent of any subclassing."""
+        from amplifier_module_provider_openai import _warn_unknown_config_keys
+
+        caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+        _warn_unknown_config_keys({"custom_key": 1}, frozenset({"custom_key"}))
+
+        matches = [
+            r.message for r in caplog.records if _UNKNOWN_KEY_MARKER in r.message
+        ]
+        assert matches == []
+
+
+# ---------------------------------------------------------------------------
 # _KNOWN_CONFIG_KEYS bookkeeping
 # ---------------------------------------------------------------------------
 

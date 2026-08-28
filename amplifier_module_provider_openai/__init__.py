@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any
+from typing import Any, ClassVar
 
 import openai
 from amplifier_core import (
@@ -798,7 +798,9 @@ _KNOWN_CONFIG_KEYS: frozenset[str] = (
 )
 
 
-def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
+def _warn_unknown_config_keys(
+    config: dict[str, Any], extra_known_keys: frozenset[str] = frozenset()
+) -> None:
     """Warn once about config keys provider-openai does not recognize.
 
     Generalizes the dedicated 'effort' guard (which stays -- see
@@ -814,13 +816,22 @@ def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
     full set of keys this module reads, plus the recognized-inert and
     infrastructure keys documented above. No false positives are acceptable
     here -- when in doubt, a key belongs in one of those sets, not flagged.
+
+    Args:
+        config: The provider's resolved config dict.
+        extra_known_keys: Additional keys a SUBCLASS declares as its own
+            (see `OpenAIProvider.EXTRA_KNOWN_CONFIG_KEYS`). Merged into the
+            known set for both the unknown-key filter and the did-you-mean
+            suggestion pool, so a consumer's own typo still gets a useful
+            suggestion pointing at its own correct key.
     """
-    unknown = sorted(set(config) - _KNOWN_CONFIG_KEYS)
+    known_keys = _KNOWN_CONFIG_KEYS | extra_known_keys
+    unknown = sorted(set(config) - known_keys)
     if not unknown:
         return
     described = []
     for key in unknown:
-        match = difflib.get_close_matches(key, _KNOWN_CONFIG_KEYS, n=1)
+        match = difflib.get_close_matches(key, known_keys, n=1)
         if match:
             described.append(f"{key!r} (did you mean {match[0]!r}?)")
         else:
@@ -838,6 +849,17 @@ class OpenAIProvider:
 
     name = "openai"
     api_label = "OpenAI"
+
+    # Extension point for subclasses (e.g. provider-azure-openai, which
+    # SUBCLASSES this class and passes its own config straight through the
+    # same `config` dict this constructor reads -- see mount() below).
+    # `_warn_unknown_config_keys` consults this in addition to
+    # `_KNOWN_CONFIG_KEYS`, so a subclass that declares its own config keys
+    # here gets NO false-positive warning for them, while a genuine typo in
+    # either the base or the subclass's keys still warns (with a
+    # did-you-mean suggestion drawn from the merged set). Empty by default:
+    # direct use of OpenAIProvider is completely unaffected.
+    EXTRA_KNOWN_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(
         self,
@@ -914,8 +936,11 @@ class OpenAIProvider:
                 )
         # Generalized sweep: catch every OTHER unrecognized config key (e.g. a
         # typo like 'promt_cache_retention'), not just the effort family above.
+        # `self.EXTRA_KNOWN_CONFIG_KEYS` resolves through the instance's
+        # actual class, so a subclass (e.g. AzureOpenAIProvider) that
+        # overrides the attribute gets its own keys recognized here too.
         # See `_warn_unknown_config_keys` for the full rationale.
-        _warn_unknown_config_keys(self.config)
+        _warn_unknown_config_keys(self.config, self.EXTRA_KNOWN_CONFIG_KEYS)
         self.reasoning_summary = self.config.get(
             "reasoning_summary", DEFAULT_REASONING_SUMMARY
         )
