@@ -9,6 +9,7 @@ __all__ = ["OpenAIProvider", "mount"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import difflib
 import inspect
 import json
 import logging
@@ -468,11 +469,30 @@ def _drop_unsupported_in_memory_retention(
     caps = get_capabilities(model_id)
     if caps.supports_in_memory_retention:
         return retention
+    # Lead with omission -- it's the doc-correct remedy for every model in this
+    # branch. On gpt-5.6-family models specifically, prompt_cache_options.ttl is
+    # the documented replacement mechanism for retention control, so name it
+    # explicitly rather than pointing users at '24h' as if it were the primary
+    # fix. '24h' remains a legacy-compatible value the code still accepts (and
+    # is in fact the provider's own default -- see DEFAULT_PROMPT_CACHE_RETENTION),
+    # so it stays as the secondary alternative for callers who want it anyway.
+    if "gpt-5.6" in model_id:
+        remedy = (
+            "Omit the prompt_cache_retention field (recommended -- gpt-5.6 "
+            "controls retention via prompt_cache_options.ttl instead), or "
+            "pass '24h' for the legacy-compatible alternative."
+        )
+    else:
+        remedy = (
+            "Omit the prompt_cache_retention field (recommended -- uses the "
+            "model's own default), or pass '24h' for the legacy-compatible "
+            "alternative."
+        )
     logger.warning(
         "[PROVIDER] Dropping prompt_cache_retention='in_memory' for model %r: "
-        "model only supports '24h' retention. Omit the field or pass '24h' "
-        "to silence this warning.",
+        "model does not support 'in_memory' retention. %s",
         model_id,
+        remedy,
     )
     return None
 
@@ -718,6 +738,101 @@ def _build_assistant_message_item(
     }
 
 
+# Every config key this module actually reads -- audited against every
+# `self.config.get(...)` call site in the constructor and the request path
+# (_build_params' thinking_budget_* passthrough). 31 entries.
+_CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "base_url",
+        "default_model",
+        "max_tokens",
+        "temperature",
+        "reasoning",
+        "reasoning_effort",
+        "reasoning_summary",
+        "truncation",
+        "enable_state",
+        "raw",
+        "timeout",
+        "filtered",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "prompt_cache_options",
+        "safety_identifier",
+        "text_verbosity",
+        "enable_reasoning_context",
+        "enable_response_chaining",
+        "poll_interval",
+        "background_timeout",
+        "priority",
+        "enable_long_context",
+        "use_streaming",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
+        "max_concurrent_requests",
+        "thinking_budget_tokens",
+        "thinking_budget_buffer",
+    }
+)
+
+# Recognized-but-inert keys: each has its OWN dedicated warning elsewhere
+# (see the effort-family guard in __init__), so they must be excluded from
+# the generic unknown-key sweep below to avoid a confusing double warning.
+_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset({"effort"})
+
+# Infrastructure keys the app/kernel may place in (or alongside) a provider's
+# config block that this module does not itself read. `default_model` and
+# `priority` are already covered by _CONSUMED_CONFIG_KEYS above (the module
+# reads both); the rest are metadata fields a settings-shaped provider entry
+# carries (module/source/id) or credential material handled before this
+# module ever sees a literal value (api_key, normally resolved from a
+# ``${VAR}`` placeholder or the OPENAI_API_KEY environment variable).
+_INFRASTRUCTURE_CONFIG_KEYS: frozenset[str] = frozenset(
+    {"api_key", "id", "module", "source"}
+)
+
+_KNOWN_CONFIG_KEYS: frozenset[str] = (
+    _CONSUMED_CONFIG_KEYS | _RECOGNIZED_INERT_CONFIG_KEYS | _INFRASTRUCTURE_CONFIG_KEYS
+)
+
+
+def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
+    """Warn once about config keys provider-openai does not recognize.
+
+    Generalizes the dedicated 'effort' guard (which stays -- see
+    `_RECOGNIZED_INERT_CONFIG_KEYS`) to every other key: a typo'd or stale
+    option (e.g. ``promt_cache_retention``) is silently inert today, giving
+    the config author no signal their setting had no effect. This surfaces
+    it loudly at mount time -- one combined warning naming every offender,
+    each with a nearest-valid-key suggestion (via `difflib`) when one exists
+    -- instead of leaving it to be discovered as "why doesn't this do
+    anything?".
+
+    Must stay quiet on every legitimate config: `_KNOWN_CONFIG_KEYS` is the
+    full set of keys this module reads, plus the recognized-inert and
+    infrastructure keys documented above. No false positives are acceptable
+    here -- when in doubt, a key belongs in one of those sets, not flagged.
+    """
+    unknown = sorted(set(config) - _KNOWN_CONFIG_KEYS)
+    if not unknown:
+        return
+    described = []
+    for key in unknown:
+        match = difflib.get_close_matches(key, _KNOWN_CONFIG_KEYS, n=1)
+        if match:
+            described.append(f"{key!r} (did you mean {match[0]!r}?)")
+        else:
+            described.append(repr(key))
+    logger.warning(
+        "[PROVIDER] Unrecognized config key(s) for provider-openai: %s. "
+        "These have no effect -- likely a typo or a stale/removed option. "
+        "See the module README for the full list of accepted config keys.",
+        ", ".join(described),
+    )
+
+
 class OpenAIProvider:
     """OpenAI Responses API integration."""
 
@@ -797,6 +912,10 @@ class OpenAIProvider:
                     "'reasoning_effort' (canonical), 'reasoning' (legacy).",
                     _inert_key,
                 )
+        # Generalized sweep: catch every OTHER unrecognized config key (e.g. a
+        # typo like 'promt_cache_retention'), not just the effort family above.
+        # See `_warn_unknown_config_keys` for the full rationale.
+        _warn_unknown_config_keys(self.config)
         self.reasoning_summary = self.config.get(
             "reasoning_summary", DEFAULT_REASONING_SUMMARY
         )
@@ -1091,6 +1210,12 @@ class OpenAIProvider:
                     ),
                     required=False,
                     default="false",
+                    requires_model=True,  # Shown after model selection
+                    # reasoning.context is a GPT-5.6-family feature; hide it for
+                    # every other model so the wizard never writes a config value
+                    # that (a) has no effect and (b) confuses users into thinking
+                    # it applies to their non-5.6 model.
+                    show_when={"default_model": "contains:gpt-5.6"},
                 ),
                 ConfigField(
                     id="text_verbosity",
@@ -1100,6 +1225,10 @@ class OpenAIProvider:
                     choices=["low", "medium", "high"],
                     required=False,
                     default=None,
+                    requires_model=True,  # Shown after model selection
+                    # text.verbosity is a GPT-5.6-family feature per OpenAI docs;
+                    # pre-5.6 models don't accept it, so hide it for those models.
+                    show_when={"default_model": "contains:gpt-5.6"},
                 ),
                 ConfigField(
                     id="prompt_cache_key",
@@ -1126,6 +1255,14 @@ class OpenAIProvider:
                     # `choices`; UI renderers that validate `default in choices`
                     # would reject it. None signals "leave unset" cleanly.
                     default=None,
+                    requires_model=True,  # Shown after model selection
+                    # gpt-5.6-family models reject "in_memory" (auto-dropped to
+                    # "24h" with a warning -- see _drop_unsupported_in_memory_
+                    # retention) and manage retention via prompt_cache_options.ttl
+                    # instead. Hiding the field for those models stops the wizard
+                    # from writing a value the runtime will immediately reject
+                    # (the gpt-5.6-luna defect this gating exists to prevent).
+                    show_when={"default_model": "not_contains:gpt-5.6"},
                 ),
                 ConfigField(
                     id="enable_response_chaining",
