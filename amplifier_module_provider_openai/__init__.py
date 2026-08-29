@@ -785,7 +785,7 @@ def _decode_reasoning_state(
 
 # Every config key this module actually reads -- audited against every
 # `self.config.get(...)` call site in the constructor and the request path
-# (_build_params' thinking_budget_* passthrough). 31 entries.
+# (_build_params' thinking_budget_* passthrough). 32 entries.
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "base_url",
@@ -807,6 +807,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "text_verbosity",
         "enable_reasoning_context",
         "enable_response_chaining",
+        "reasoning_replay_scope",
         "poll_interval",
         "background_timeout",
         "priority",
@@ -1112,6 +1113,27 @@ class OpenAIProvider:
                 "so responses ARE retained server-side. For a full ZDR posture set "
                 "enable_state=false as well."
             )
+
+        # D2: how much prior reasoning to replay inline on stateless requests.
+        #   "turn" (default) -- assistant turns since the last user message. Preserves
+        #                      the in-flight tool loop (README "single turn" guidance)
+        #                      at flat cost, independent of conversation length.
+        #   "all"            -- every turn's reasoning. Unbounded growth; ~1,200 chars
+        #                      per blob, >50% of payload by turn 4 in live probing.
+        #                      This was the pre-fix behavior on the stateless path.
+        #   "none"           -- no inline reasoning replay. Escape hatch only.
+        # Not exposed as a ConfigField -- it is a tuning knob, not a deployment
+        # decision, and the wizard is already dense. Same precedent as
+        # `safety_identifier`.
+        _scope = self.config.get("reasoning_replay_scope", "turn")
+        if _scope not in ("turn", "all", "none"):
+            logger.warning(
+                "[PROVIDER] Unknown reasoning_replay_scope=%r; falling back to 'turn'. "
+                "Valid: turn | all | none.",
+                _scope,
+            )
+            _scope = "turn"
+        self.reasoning_replay_scope: str = _scope
 
         # Deep research / background mode configuration
         self.poll_interval = self.config.get("poll_interval", DEFAULT_POLL_INTERVAL)
@@ -3741,6 +3763,7 @@ class OpenAIProvider:
         messages: list[dict[str, Any]],
         *,
         skip_reasoning_reinsertion: bool = False,
+        reasoning_replay_scope: str | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
@@ -3751,12 +3774,31 @@ class OpenAIProvider:
 
         Args:
             messages: List of message dicts from ChatRequest
+            skip_reasoning_reinsertion: When True (chaining active), never emit
+                reasoning items -- the server already holds that state.
+            reasoning_replay_scope: Overrides self.reasoning_replay_scope for
+                this call ("turn" | "all" | "none"). None inherits config.
 
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
         """
         openai_messages = []
         i = 0
+
+        # D3: bound how far back reasoning items are replayed inline. One
+        # gate, computed once, applied at the single emission site below --
+        # both collection sites keep appending to reasoning_items_to_add
+        # unchanged, so the orphan-stripping guard's semantics are untouched.
+        _scope = reasoning_replay_scope or self.reasoning_replay_scope
+        if _scope == "all":
+            _reasoning_cutoff = -1  # every index qualifies
+        elif _scope == "none":
+            _reasoning_cutoff = len(messages)  # no index qualifies
+        else:  # "turn"
+            _reasoning_cutoff = max(
+                (idx for idx, m in enumerate(messages) if m.get("role") == "user"),
+                default=-1,
+            )
 
         while i < len(messages):
             msg = messages[i]
@@ -4212,8 +4254,11 @@ class OpenAIProvider:
 
                 # Add reasoning items as TOP-LEVEL entries (before assistant message)
                 # Per OpenAI Responses API: reasoning items must be top-level, not in message content
-                for reasoning_item in reasoning_items_to_add:
-                    openai_messages.append(reasoning_item)
+                # D3: bounded by reasoning_replay_scope -- only emit for assistant
+                # turns after the cutoff (collection above is unaffected).
+                if i > _reasoning_cutoff:
+                    for reasoning_item in reasoning_items_to_add:
+                        openai_messages.append(reasoning_item)
 
                 # Only add assistant message if there's content
                 if assistant_content:

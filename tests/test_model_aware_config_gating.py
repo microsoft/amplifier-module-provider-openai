@@ -24,6 +24,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 from amplifier_core.message_models import ChatRequest, Message
+
 from amplifier_module_provider_openai import OpenAIProvider
 
 # ---------------------------------------------------------------------------
@@ -577,6 +578,7 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
         | _RECOGNIZED_INERT_CONFIG_KEYS
         | _INFRASTRUCTURE_CONFIG_KEYS
     )
-    # 31 keys the survey counted, audited against every `self.config.get(...)`
+    # 32 keys the survey counted (was 31; Change D added
+    # reasoning_replay_scope), audited against every `self.config.get(...)`
     # call site in the constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 31
+    assert len(_CONSUMED_CONFIG_KEYS) == 32

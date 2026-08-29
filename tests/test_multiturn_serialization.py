@@ -217,7 +217,12 @@ class TestReasoningOrphanStrip:
                     _Block(type="text", text="Here is my answer."),
                 ],
             },
-            {"role": "user", "content": "continue"},
+            # NOTE: deliberately NO trailing new user message -- Change D's
+            # default reasoning_replay_scope="turn" bounds replay to
+            # assistant turns SINCE THE LAST USER MESSAGE. A trailing new
+            # user turn would put this assistant turn's reasoning before
+            # that cutoff, which is out of scope for what this test checks
+            # (orphan-stripping), not a real assertion about D's boundary.
         ]
         reasoning = self._reasoning(provider._convert_messages(messages))
         ids = [r.get("id") for r in reasoning]
@@ -267,7 +272,9 @@ class TestReasoningOrphanStrip:
                     _Block(type="text", text="done"),
                 ],
             },
-            {"role": "user", "content": "go"},
+            # See note in test_mixed_turn_drops_orphan_keeps_usable: no
+            # trailing new user turn, so Change D's turn-scope cutoff does
+            # not exclude this assistant turn's reasoning.
         ]
         reasoning = self._reasoning(provider._convert_messages(messages))
         assert [r.get("id") for r in reasoning] == ["rs_a", "rs_b"]
