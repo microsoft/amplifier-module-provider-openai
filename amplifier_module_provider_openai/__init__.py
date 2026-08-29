@@ -2223,18 +2223,9 @@ class OpenAIProvider:
             all_messages_for_conversion.append(conv_msg.model_dump())
 
         # Decide chaining BEFORE message conversion so we can suppress
-        # encrypted-content re-insertion when chain_active is True.
+        # encrypted-content re-insertion when chain_will_attach is True.
         model_name = kwargs.get("model", self.default_model)
         chain_active = self._should_chain_responses(model_name, kwargs)
-
-        # Convert to OpenAI Responses API message format
-        input_messages = self._convert_messages(
-            all_messages_for_conversion,
-            skip_reasoning_reinsertion=chain_active,
-        )
-        logger.info(
-            f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
-        )
 
         # Check for previous response metadata to preserve reasoning state across turns
         previous_response_id = None
@@ -2273,12 +2264,6 @@ class OpenAIProvider:
                 previous_response_id = None
             self._reset_chain_on_next_request = False
 
-        # Prepare request parameters per Responses API spec
-        params = {
-            "model": model_name,
-            "input": input_messages,  # Array of message objects, not text string
-        }
-
         # Check for background mode (used for deep research and long-running requests)
         # Background mode requires store=True per OpenAI API requirements
         background_mode = kwargs.get("background", False)
@@ -2300,7 +2285,8 @@ class OpenAIProvider:
         #                                  AND attaches previous_response_id
         #   - enable_state (legacy)      → broad server-state opt-in
         # Per-call kwargs override config for both.
-        # (chain_active was already resolved above before _convert_messages)
+        # (chain_active, previous_response_id, and the compaction reset were
+        # already resolved above, before this point.)
 
         store_enabled = kwargs.get("store", self.enable_state)
         if background_mode:
@@ -2308,14 +2294,41 @@ class OpenAIProvider:
             logger.info("[PROVIDER] Background mode enabled, forcing store=True")
         if chain_active:
             store_enabled = True  # chaining requires server-side state
+
+        # Chaining is only real if a prior id survived every reset AND we will
+        # actually attach it. `chain_active` alone is a *configuration* signal; it
+        # says nothing about whether the server holds state for THIS request.
+        # Keying conversion on it is what produced replayed function_calls with no
+        # reasoning items on every post-compaction turn.
+        chain_will_attach = bool(previous_response_id) and (
+            self._chaining_permitted(kwargs) and (chain_active or store_enabled)
+        )
+
+        # Convert to OpenAI Responses API message format
+        input_messages = self._convert_messages(
+            all_messages_for_conversion,
+            skip_reasoning_reinsertion=chain_will_attach,
+        )
+        logger.info(
+            f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
+        )
+
+        # Prepare request parameters per Responses API spec
+        params = {
+            "model": model_name,
+            "input": input_messages,  # Array of message objects, not text string
+        }
         params["store"] = store_enabled
 
-        # Attach previous_response_id when:
-        #   - we found one in the last assistant's metadata, AND
-        #   - either chaining is active for this model, OR
-        #     legacy enable_state is on (preserves existing behavior).
+        # Attach previous_response_id when chain_will_attach resolved True above:
+        # a prior id survived every reset, chaining is permitted (see
+        # _chaining_permitted / Change C), and either chain_active or legacy
+        # enable_state wants server-side retention. This is the SAME predicate
+        # that gated message conversion above, so "did we suppress reasoning
+        # re-insertion" and "did we attach previous_response_id" can never
+        # disagree again.
         # Track on params for downstream invalidation-retry logic.
-        if previous_response_id and (chain_active or store_enabled):
+        if chain_will_attach:
             params["previous_response_id"] = previous_response_id
             logger.debug(
                 "[PROVIDER] Using previous_response_id=%s (chain_active=%s, store=%s)",
@@ -2382,7 +2395,6 @@ class OpenAIProvider:
                 "[PROVIDER] Skipping previous_response_id (chain_active=False, store=False). "
                 "Relying on explicit reasoning re-insertion from metadata/content."
             )
-
         if instructions:
             params["instructions"] = instructions
 
@@ -2737,6 +2749,22 @@ class OpenAIProvider:
         # disable the stream-event loop for that path.
         supports_streaming = not background_mode
 
+        def _rebuild_stateless_input() -> list[dict[str, Any]]:
+            """Re-convert with reasoning replay ON, for the chain-broken retry paths.
+
+            `input_messages` was converted with reasoning suppressed because a chain
+            was going to be attached. Once the chain is gone the server holds nothing,
+            so the replay must be restored -- otherwise the retry resends function_call
+            items with no originating reasoning items (OpenAI's #1 migration error).
+            Bounded by the same turn-scoped policy as every other stateless replay
+            (see reasoning_replay_scope), so this cannot re-inflate an overflowing
+            payload without limit.
+            """
+            return self._convert_messages(
+                all_messages_for_conversion,
+                skip_reasoning_reinsertion=False,
+            )
+
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info
@@ -2758,9 +2786,15 @@ class OpenAIProvider:
                     overflow_id = params.pop("previous_response_id")
                     # Chain is gone -> the server holds no prior context, so
                     # restore the full converted history (mirrors the 404
-                    # invalidation path). Retrying with only the delta would
-                    # silently drop the entire prior conversation.
-                    params["input"] = input_messages
+                    # invalidation path), this time WITH reasoning items
+                    # replayed (A6/A7) -- otherwise the retry resends
+                    # function_call items with no originating reasoning items.
+                    # Retrying with only the delta would silently drop the
+                    # entire prior conversation.
+                    params["input"] = _rebuild_stateless_input()
+                    params["include"] = [
+                        "reasoning.encrypted_content"
+                    ]  # server holds nothing now
                     logger.warning(
                         "[PROVIDER] context_length_exceeded with active "
                         "response chain (previous_response_id=%s). Breaking "
@@ -3084,7 +3118,10 @@ class OpenAIProvider:
                         # documented recovery is previous_response_id=null +
                         # full input; retrying with only the delta would
                         # silently drop the entire prior conversation.
-                        params["input"] = input_messages
+                        params["input"] = _rebuild_stateless_input()
+                        params["include"] = [
+                            "reasoning.encrypted_content"
+                        ]  # server holds nothing now
                         logger.warning(
                             "[PROVIDER] previous_response_id=%s invalidated by server "
                             "(code=%s). Retrying without chain.",
@@ -3103,14 +3140,13 @@ class OpenAIProvider:
                             )
                         # Recurse once. Do NOT loop indefinitely: by removing
                         # the field, the next call cannot hit this branch again.
-                        # NOTE: when chain_active was True we also suppressed
-                        # encrypted-content re-insertion in _convert_messages.
-                        # That decision is locked into input_messages already;
-                        # the retry uses the same input. The server will treat
-                        # this as a fresh prefix — equivalent to today's
-                        # stateless reasoning behavior. Reasoning state for
-                        # *this* turn is lost; next turn re-chains via the
-                        # response_id we get from this retry.
+                        # Reasoning replay is RESTORED here (A6/A7): the chain
+                        # just broke, so the server holds nothing for this
+                        # turn, and _rebuild_stateless_input() re-converts with
+                        # skip_reasoning_reinsertion=False, bounded by
+                        # reasoning_replay_scope. This is a fresh stateless
+                        # prefix; next turn re-chains via the response_id we
+                        # get from this retry.
                         return await _do_complete()
                     # Fall through to existing 404 handling
                     raise kernel_errors.NotFoundError(
