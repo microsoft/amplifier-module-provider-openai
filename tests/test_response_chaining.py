@@ -15,12 +15,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import openai
 import pytest
-from amplifier_core import ModuleCoordinator, llm_errors as kernel_errors
+from amplifier_core import ModuleCoordinator
+from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import (
     ChatRequest,
     Message,
     TextBlock,
     ThinkingBlock,
+    ToolCallBlock,
 )
 from httpx import Request as HttpxRequest
 from httpx import Response as HttpxResponse
@@ -30,7 +32,6 @@ from amplifier_module_provider_openai._constants import (
     METADATA_RESPONSE_ID,
     RESPONSE_CHAIN_INVALIDATED,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -188,10 +189,10 @@ def test_chain_auto_on_for_reasoning_model_first_turn():
     assert "previous_response_id" not in params, (
         f"First turn should have no previous_response_id, got {params.get('previous_response_id')}"
     )
-    # No encrypted_content include on chaining path
+    # A5 (probe P1 PASS): include is unconditional now, even on the chaining path.
     include = params.get("include", [])
-    assert "reasoning.encrypted_content" not in include, (
-        f"Chaining path must not request encrypted_content; got include={include}"
+    assert "reasoning.encrypted_content" in include, (
+        f"include=reasoning.encrypted_content must still be requested (probe P1 PASS); got include={include}"
     )
 
 
@@ -208,9 +209,10 @@ def test_chain_auto_on_for_reasoning_model_second_turn():
     assert params.get("previous_response_id") == "resp_abc", (
         f"Second turn should forward previous_response_id, got {params.get('previous_response_id')}"
     )
+    # A5 (probe P1 PASS): include is unconditional now, even on the chaining path.
     include = params.get("include", [])
-    assert "reasoning.encrypted_content" not in include, (
-        f"Chaining path must not request encrypted_content; got include={include}"
+    assert "reasoning.encrypted_content" in include, (
+        f"include=reasoning.encrypted_content must still be requested (probe P1 PASS); got include={include}"
     )
 
 
@@ -329,8 +331,22 @@ def test_chain_auto_string_normalized():
 # ---------------------------------------------------------------------------
 
 
-def test_encrypted_content_not_requested_when_chaining_active():
-    """Q4: don't send include=reasoning.encrypted_content with chaining."""
+def test_encrypted_content_requested_even_when_chaining_active():
+    """A5 (post reasoning-continuity-fix spec): include is now UNCONDITIONAL.
+
+    Probe P1 (2026-08-29, probes/p1_include_chained_probe.py /
+    probes/_p1_include_probe_results.json) measured per-hop cached_tokens on
+    a live gpt-5.6-luna chained tool loop with vs. without
+    include=["reasoning.encrypted_content"] and found the difference
+    cache-neutral (0-4 tokens out of ~1,500-1,600, both arms ~96% cache_read
+    share on hops R2-R4) -- verdict PASS. `include` only changes the
+    *response* shape returned by the server, not the *request* prefix
+    caching keys on. So the provider now requests ciphertext whenever the
+    model will reason, chained or not, which lets every reset/resume path
+    replay reasoning regardless of whether the response that produced it was
+    chained (see Change B). This replaces the old (pre-fix) invariant that
+    chaining suppressed `include` entirely.
+    """
     provider = _make_provider(default_model="gpt-5.5")  # auto → chain_active=True
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
@@ -338,8 +354,9 @@ def test_encrypted_content_not_requested_when_chaining_active():
 
     params = _captured_params(provider)
     include = params.get("include", [])
-    assert "reasoning.encrypted_content" not in include, (
-        f"Chaining active: must NOT send include=reasoning.encrypted_content; got {include}"
+    assert "reasoning.encrypted_content" in include, (
+        f"Chaining active: include=reasoning.encrypted_content must still be "
+        f"requested (probe P1 PASS); got {include}"
     )
 
 
@@ -381,11 +398,44 @@ def test_thinkingblock_not_reinserted_when_chaining_active():
 
 
 def test_thinkingblock_still_reinserted_when_chaining_off():
-    """Regression: stateless path keeps the existing reinsertion behavior."""
+    """Regression: stateless path keeps the existing reinsertion behavior,
+    for reasoning that belongs to the CURRENT (not yet complete) turn.
+
+    Updated for Change D (reasoning_replay_scope, default "turn"): replay is
+    now bounded to assistant turns SINCE THE LAST USER MESSAGE (README:502's
+    "single turn spans multiple API calls" guarantee), not unconditionally
+    across every completed turn. This fixture models a same-turn tool-loop
+    continuation (one user message, one assistant reply-with-tool-call so
+    far, tool result appended, no new user message yet) instead of a fresh
+    follow-up turn, so the guarantee this test protects (stateless replay
+    still works when chaining is off) is exercised inside its actual scope.
+    """
     provider = _make_provider(default_model="gpt-5.5", enable_response_chaining=False)
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
-    request = _request_with_prior_response_id("resp_prev", prior_thinking=True)
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="Hi"),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(
+                        thinking="some reasoning",
+                        content=[
+                            {
+                                "encrypted_content": "encrypted_blob_xyz",
+                                "id": "rs_abc",
+                                "summary": "some reasoning",
+                            }
+                        ],
+                    ),
+                    ToolCallBlock(id="call_1", name="lookup", input={"key": "x"}),
+                ],
+                metadata={METADATA_RESPONSE_ID: "resp_prev"},
+            ),
+            Message(role="tool", content="tool result", tool_call_id="call_1"),
+        ]
+    )
     asyncio.run(provider.complete(request))
 
     params = _captured_params(provider)
@@ -396,7 +446,7 @@ def test_thinkingblock_still_reinserted_when_chaining_off():
         if isinstance(item, dict) and item.get("type") == "reasoning"
     ]
     assert len(reasoning_items) >= 1, (
-        f"Stateless path must re-insert reasoning item into input; got input={input_items}"
+        f"Stateless path must re-insert current-turn reasoning item into input; got input={input_items}"
     )
 
 
@@ -601,4 +651,149 @@ def test_streaming_response_id_propagates_to_metadata():
     assert chat_response.metadata.get(METADATA_RESPONSE_ID) == "resp_new_turn", (
         f"Streaming ChatResponse must carry METADATA_RESPONSE_ID='resp_new_turn'; "
         f"got metadata={chat_response.metadata}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Change C -- knob orthogonality: enable_response_chaining=False is authoritative
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_chain_false_ignores_enable_state():
+    """enable_response_chaining=False + enable_state=True must NOT attach.
+
+    Fails today (pre-Change-C main): :2225's disjunction
+    `if previous_response_id and (chain_active or store_enabled):` attaches
+    whenever store_enabled is True, even when the operator explicitly opted
+    out of chaining via enable_response_chaining=False. That silently
+    defeats a ZDR/regulated-industry compliance control.
+    """
+    provider = _make_provider(
+        default_model="gpt-5.5",
+        enable_response_chaining=False,
+        enable_state=True,
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    request = _request_with_prior_response_id("resp_should_not_attach")
+    asyncio.run(provider.complete(request))
+
+    params = _captured_params(provider)
+    assert "previous_response_id" not in params, (
+        "enable_response_chaining=False must be authoritative over legacy "
+        f"enable_state=True; got previous_response_id={params.get('previous_response_id')}"
+    )
+
+
+def test_explicit_chain_false_still_replays_reasoning():
+    """The chaining opt-out must not also cost reasoning continuity.
+
+    Same config as test_explicit_chain_false_ignores_enable_state: with
+    chaining off, prior ThinkingBlock state must still be replayed inline
+    (skip_reasoning_reinsertion must be False, keyed on chain_will_attach,
+    not on legacy store_enabled). Uses a same-turn, mid-tool-loop fixture
+    (see test_thinkingblock_still_reinserted_when_chaining_off) so the
+    reasoning falls within Change D's default "turn" replay scope.
+    """
+    provider = _make_provider(
+        default_model="gpt-5.5",
+        enable_response_chaining=False,
+        enable_state=True,
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="Hi"),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(
+                        thinking="some reasoning",
+                        content=[
+                            {
+                                "encrypted_content": "encrypted_blob_xyz",
+                                "id": "rs_abc",
+                                "summary": "some reasoning",
+                            }
+                        ],
+                    ),
+                    ToolCallBlock(id="call_1", name="lookup", input={"key": "x"}),
+                ],
+                metadata={METADATA_RESPONSE_ID: "resp_should_not_attach"},
+            ),
+            Message(role="tool", content="tool result", tool_call_id="call_1"),
+        ]
+    )
+    asyncio.run(provider.complete(request))
+
+    params = _captured_params(provider)
+    input_items = params.get("input", [])
+    reasoning_items = [
+        item
+        for item in input_items
+        if isinstance(item, dict) and item.get("type") == "reasoning"
+    ]
+    assert len(reasoning_items) >= 1, (
+        "Chaining opt-out must still replay current-turn reasoning items inline; "
+        f"got input={input_items}"
+    )
+
+
+def test_auto_chaining_unaffected_by_helper():
+    """ "auto" + reasoning model + prior id -> chain still attaches.
+
+    Guards against collateral damage from _chaining_permitted /
+    chain_will_attach: the common "auto" path must be unaffected.
+    """
+    provider = _make_provider(default_model="gpt-5.5")  # auto
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    request = _request_with_prior_response_id("resp_auto")
+    asyncio.run(provider.complete(request))
+
+    params = _captured_params(provider)
+    assert params.get("previous_response_id") == "resp_auto", (
+        f"'auto' chaining for a reasoning model must still attach; got {params.get('previous_response_id')}"
+    )
+
+
+def test_kwarg_false_overrides_config_true():
+    """Per-call kwarg enable_response_chaining=False overrides config True.
+
+    Precedence (documented at _should_chain_responses/_chaining_permitted):
+    kwargs > config > "auto" default.
+    """
+    provider = _make_provider(default_model="gpt-5.5", enable_response_chaining=True)
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    request = _request_with_prior_response_id("resp_kwarg_false")
+    asyncio.run(provider.complete(request, enable_response_chaining=False))
+
+    params = _captured_params(provider)
+    assert "previous_response_id" not in params, (
+        "Per-call kwarg enable_response_chaining=False must override config "
+        f"True; got previous_response_id={params.get('previous_response_id')}"
+    )
+
+
+def test_conflict_warning_emitted_at_mount(caplog):
+    """Mount-time warning fires for the enable_response_chaining=False +
+    enable_state=True combination (Change C3)."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_openai"):
+        _make_provider(
+            default_model="gpt-5.5",
+            enable_response_chaining=False,
+            enable_state=True,
+        )
+
+    assert any(
+        "enable_response_chaining=false" in record.message
+        and "enable_state=true" in record.message
+        for record in caplog.records
+    ), (
+        f"Expected a mount-time warning about the enable_response_chaining=false "
+        f"+ enable_state=true conflict; got messages={[r.message for r in caplog.records]}"
     )

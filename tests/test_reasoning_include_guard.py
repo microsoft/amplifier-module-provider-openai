@@ -16,7 +16,6 @@ from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -95,19 +94,27 @@ def test_include_sent_when_reasoning_active_store_false():
     assert kwargs["include"] == ["reasoning.encrypted_content"]
 
 
-def test_no_include_when_store_true():
-    """When store=true, include parameter should NOT be sent (not needed)."""
+def test_include_requested_even_when_store_true():
+    """A5 (reasoning-continuity-fix spec, probe P1 PASS): include is now
+    UNCONDITIONAL. Superseded: this used to assert include was suppressed
+    when store=true (on the theory it wasn't "needed" for stored responses).
+    Probe P1 (probes/p1_include_chained_probe.py) found requesting
+    ciphertext is cache-neutral even on a fully chained/stored request, and
+    capturing it unconditionally is what lets every reset/resume path
+    replay reasoning regardless of whether the response was chained or
+    stored (see Change B's data-loss fix)."""
     provider = _make_provider(enable_state=True, enable_response_chaining=False)
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
-        reasoning_effort="high",  # Reasoning active, but store=true
+        reasoning_effort="high",  # Reasoning active, store=true
     )
     asyncio.run(provider.complete(request))
 
     kwargs = _get_call_kwargs(provider)
-    assert "include" not in kwargs, (
-        "When store=true, 'include' should NOT be sent (stored responses "
-        "don't need encrypted_content)"
+    assert "include" in kwargs and kwargs["include"] == [
+        "reasoning.encrypted_content"
+    ], (
+        f"include=reasoning.encrypted_content must still be requested (probe P1 PASS); got {kwargs.get('include')}"
     )
 
 

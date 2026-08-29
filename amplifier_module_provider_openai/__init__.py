@@ -2524,12 +2524,24 @@ class OpenAIProvider:
         # when store=false (Amplifier's default), causing orphaned reasoning references.
         # Exception: explicit effort="none" suppresses include (caller opted out of reasoning).
         #
-        # When chaining is active, server holds reasoning state under
-        # previous_response_id. Re-inserting encrypted_content inline would
-        # (a) be redundant and (b) actively hurt the cache prefix because the
-        # ciphertext changes per call. So skip encrypted-content include when
-        # chaining is on; only request it on stateless/non-reasoning paths.
-        if not store_enabled and not chain_active:
+        # A5 (probe P1, pre-registered in the reasoning-continuity-fix spec):
+        # requesting include=["reasoning.encrypted_content"] on an
+        # ALREADY-CHAINED request (previous_response_id attached) does NOT
+        # bust the prompt-cache prefix -- `include` only changes the
+        # *response* shape returned by the server, not the *request* prefix
+        # caching keys on. Verified live on gpt-5.6-luna: per-hop
+        # cached_tokens differed by 0-4 tokens out of ~1,500-1,600 (R2-R4,
+        # ~96% cache_read share in both arms) between an arm requesting
+        # include and an otherwise-identical arm that omitted it -- see
+        # probes/p1_include_chained_probe.py /
+        # probes/_p1_include_probe_results.json ("verdict": "PASS").
+        # So ciphertext capture is now UNCONDITIONAL: request it whenever the
+        # model will reason, chained or not. This lets every reset/resume
+        # path replay reasoning regardless of whether the response that
+        # produced it was chained -- previously, a response captured while
+        # chaining had encrypted_content=None and was permanently unreplayable
+        # after a chain break or resume (see Change B).
+        if True:
             caps = get_capabilities(model_name)
             active_effort: str | None = None
             if "reasoning" in params:
