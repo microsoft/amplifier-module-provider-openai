@@ -108,12 +108,13 @@ def test_long_context_garbage_value_fails_loud_at_mount(garbage):
 #     real bool passthrough, absent -> default.
 #
 # Audited config keys affected by the same anti-pattern (see PR body for the
-# full audit table): enable_state, raw, filtered, enable_long_context,
-# enable_reasoning_context, use_streaming, retry_jitter.
+# full audit table): raw, hide_dated_models, enable_long_context,
+# use_streaming, retry_jitter.
 #
-# enable_state / enable_reasoning_context remain covered here even though
-# their config surface is slated for removal in a later change -- the
-# attributes still exist and are still parsed via _parse_config_bool today.
+# enable_state / enable_reasoning_context were removed entirely (both
+# attributes are gone; see test_config_migration_warnings.py). `filtered`
+# was renamed to `hide_dated_models` (see test_config_renames.py for the
+# rename-alias coverage) -- this matrix now tests the NEW name only.
 # ---------------------------------------------------------------------------
 
 
@@ -121,18 +122,13 @@ def test_long_context_garbage_value_fails_loud_at_mount(garbage):
     "key,default",
     [
         ("raw", False),
-        ("filtered", True),
+        ("hide_dated_models", True),
         ("enable_long_context", False),
         ("use_streaming", True),
     ],
 )
 class TestPerKeyBoolCoercion:
-    """Constructor-level coercion for every affected simple-boolean config key.
-
-    enable_state / enable_reasoning_context were removed from this list --
-    both config keys are gone (recognized-but-inert now); see
-    test_config_migration_warnings.py for their coverage.
-    """
+    """Constructor-level coercion for every affected simple-boolean config key."""
 
     def test_string_false_is_false(self, key, default):
         provider = _make_provider(**{key: "false"})

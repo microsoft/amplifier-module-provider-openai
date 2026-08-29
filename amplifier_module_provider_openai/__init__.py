@@ -315,6 +315,38 @@ def _parse_config_bool(key: str, raw: Any, default: bool) -> bool:
     )
 
 
+def _read_renamed_config(config: dict[str, Any], new: str, old: str) -> Any:
+    """Read `new`, falling back to the deprecated `old` with one warning.
+
+    The new key always wins when present (even when both are set) -- a
+    config that has been migrated is never overridden by a stale leftover.
+    The warning fires only when `old` is the value actually used, so a
+    fully migrated config is silent and a config carrying both is told
+    plainly which one won.
+    """
+    if config.get(new) not in (None, ""):
+        if config.get(old) not in (None, ""):
+            logger.warning(
+                "[PROVIDER] Config keys '%s' (deprecated) and '%s' are BOTH "
+                "set; '%s' wins. Remove '%s'.",
+                old,
+                new,
+                new,
+                old,
+            )
+        return config.get(new)
+    if config.get(old) not in (None, ""):
+        logger.warning(
+            "[PROVIDER] Config key '%s' is deprecated and was renamed to "
+            "'%s'. The old name still works but will be removed; rename it "
+            "in your settings.yaml / bundle config block.",
+            old,
+            new,
+        )
+        return config.get(old)
+    return None
+
+
 # reasoning.mode selects the reasoning strategy. Verified live against gpt-5.6-sol
 # 2026-07-14: mode in {"standard", "pro"} ("pro" = deeper internal reasoning, one
 # final answer). Only forwarded when the caller sets it; models that do not support
@@ -765,7 +797,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "base_url",
         "default_model",
-        "max_tokens",
+        "max_output_tokens",
         "temperature",
         "reasoning",
         "reasoning_effort",
@@ -773,7 +805,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "truncation",
         "raw",
         "timeout",
-        "filtered",
+        "hide_dated_models",
         "prompt_cache_key",
         "prompt_cache_retention",
         "prompt_cache_options",
@@ -790,6 +822,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "max_retry_delay",
         "retry_jitter",
         "max_concurrent_requests",
+        "extra_request_params",
     }
 )
 
@@ -834,8 +867,16 @@ _INFRASTRUCTURE_CONFIG_KEYS: frozenset[str] = frozenset(
     {"api_key", "id", "module", "source"}
 )
 
+# Deprecated aliases (old name -> new name lives in _read_renamed_config call
+# sites). Must stay "known" or they would draw a SECOND, generic unknown-key
+# warning on top of the targeted deprecation warning each already gets.
+_DEPRECATED_ALIAS_CONFIG_KEYS: frozenset[str] = frozenset({"max_tokens", "filtered"})
+
 _KNOWN_CONFIG_KEYS: frozenset[str] = (
-    _CONSUMED_CONFIG_KEYS | _RECOGNIZED_INERT_CONFIG_KEYS | _INFRASTRUCTURE_CONFIG_KEYS
+    _CONSUMED_CONFIG_KEYS
+    | _RECOGNIZED_INERT_CONFIG_KEYS
+    | _DEPRECATED_ALIAS_CONFIG_KEYS
+    | _INFRASTRUCTURE_CONFIG_KEYS
 )
 
 
@@ -931,7 +972,9 @@ class OpenAIProvider:
         # which defaults to its capability table). An explicit config value
         # still wins. DEFAULT_MAX_TOKENS survives only as the documented
         # fallback when capability data is absent (see _resolve_max_tokens).
-        self.max_tokens = self.config.get("max_tokens")
+        self.max_output_tokens = _read_renamed_config(
+            self.config, "max_output_tokens", "max_tokens"
+        )
         self.temperature = self.config.get(
             "temperature", None
         )  # None = not sent (some models don't support it)
@@ -983,8 +1026,10 @@ class OpenAIProvider:
             "raw", self.config.get("raw"), False
         )  # Include raw payload in events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
-        self.filtered = _parse_config_bool(
-            "filtered", self.config.get("filtered"), True
+        self.hide_dated_models = _parse_config_bool(
+            "hide_dated_models",
+            _read_renamed_config(self.config, "hide_dated_models", "filtered"),
+            True,
         )  # Filter to curated model list by default
 
         # Prompt-caching hint parameters (Responses API top-level fields).
@@ -1135,6 +1180,59 @@ class OpenAIProvider:
         self._max_concurrent_requests = int(
             self.config.get("max_concurrent_requests", 5)
         )
+
+        # extra_request_params: the documented escape hatch for Responses API
+        # parameters this provider does not model (including `store`, which
+        # is otherwise managed automatically). Merged into `params` LAST, so
+        # it overrides every value the provider computed -- deliberately.
+        # Never a ConfigField; settings-only.
+        _extra = self.config.get("extra_request_params") or {}
+        if not isinstance(_extra, dict):
+            raise ValueError(
+                f"Invalid config 'extra_request_params'={_extra!r} for "
+                f"provider-openai: must be a mapping of Responses API "
+                f"parameter names to values (got {type(_extra).__name__}). "
+                f"Fix the provider config (settings.yaml / bundle config "
+                f"block)."
+            )
+        self.extra_request_params: dict[str, Any] = dict(_extra)
+        # Keys already warned about, so a long session never repeats itself.
+        # A set (not a one-shot bool) because the primary request and the
+        # continuation request build different param sets -- a collision
+        # that only occurs on continuation must still be reported exactly
+        # once, not hidden.
+        self._extra_params_warned_keys: set[str] = set()
+
+    def _merge_extra_request_params(self, params: dict[str, Any]) -> None:
+        """Merge config `extra_request_params` into *params*, user-wins.
+
+        This is the documented escape hatch for Responses API parameters
+        this provider does not model (including `store`, which is
+        otherwise managed automatically). It is applied LAST, so it
+        overrides every value the provider computed -- deliberately.
+        Whoever sets it owns the consequences: an unknown or malformed
+        parameter is an API 400, not a provider bug.
+
+        Clobbers are warned once per key per provider instance, naming the
+        keys.
+        """
+        if not self.extra_request_params:
+            return
+        clobbered = sorted(
+            k
+            for k in self.extra_request_params
+            if k in params and k not in self._extra_params_warned_keys
+        )
+        if clobbered:
+            self._extra_params_warned_keys.update(clobbered)
+            logger.warning(
+                "[PROVIDER] extra_request_params overrides provider-computed "
+                "request parameter(s): %s. This is intentional and supported -- "
+                "you own the consequences (a rejected value surfaces as an API "
+                "400, not a provider error).",
+                ", ".join(clobbered),
+            )
+        params.update(self.extra_request_params)
 
     @property
     def client(self) -> AsyncOpenAI:
@@ -1432,10 +1530,10 @@ class OpenAIProvider:
             ):
                 continue
 
-            # Skip dated versions when filtered (e.g., gpt-5-2025-08-07) - duplicates of aliases
+            # Skip dated versions when hide_dated_models (e.g., gpt-5-2025-08-07) - duplicates of aliases
             # But always include deep research aliases (o3-deep-research, o4-mini-deep-research)
             if (
-                self.filtered
+                self.hide_dated_models
                 and not is_deep_research
                 and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id)
             ):
@@ -1942,7 +2040,7 @@ class OpenAIProvider:
             # cross-provider parity confound. Explicit request/kwargs/config
             # values still win; DEFAULT_MAX_TOKENS is only the fallback when
             # capability data is absent.
-            max_tokens = kwargs.get("max_tokens", self.max_tokens)
+            max_tokens = kwargs.get("max_tokens", self.max_output_tokens)
             if max_tokens is None:
                 caps = get_capabilities(params["model"])
                 max_tokens = caps.max_output_tokens or DEFAULT_MAX_TOKENS
@@ -2180,6 +2278,10 @@ class OpenAIProvider:
             caps_for_auto = get_capabilities(model_name)
             if caps_for_auto.default_reasoning_effort is not None:
                 params["reasoning"] = {"summary": "auto"}
+
+        # extra_request_params: the documented escape hatch, merged LAST so
+        # it reflects in the emitted `raw` payload below (owner-beware).
+        self._merge_extra_request_params(params)
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -2924,6 +3026,11 @@ class OpenAIProvider:
                     ]
                 if "text" in params:
                     continue_params["text"] = params["text"]
+
+                # extra_request_params applies to EVERY request this provider
+                # issues, not just the first. Merged last here too, for the
+                # same reason and with the same owner-beware semantics.
+                self._merge_extra_request_params(continue_params)
 
                 # Make continuation call
                 try:

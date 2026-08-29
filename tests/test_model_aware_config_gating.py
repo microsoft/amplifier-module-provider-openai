@@ -541,6 +541,7 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
     non-overlapping, so the audit trail in the module stays legible."""
     from amplifier_module_provider_openai import (
         _CONSUMED_CONFIG_KEYS,
+        _DEPRECATED_ALIAS_CONFIG_KEYS,
         _INFRASTRUCTURE_CONFIG_KEYS,
         _KNOWN_CONFIG_KEYS,
         _RECOGNIZED_INERT_CONFIG_KEYS,
@@ -548,14 +549,17 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
 
     assert _CONSUMED_CONFIG_KEYS.isdisjoint(_RECOGNIZED_INERT_CONFIG_KEYS)
     assert _CONSUMED_CONFIG_KEYS.isdisjoint(_INFRASTRUCTURE_CONFIG_KEYS)
+    assert _CONSUMED_CONFIG_KEYS.isdisjoint(_DEPRECATED_ALIAS_CONFIG_KEYS)
     assert _RECOGNIZED_INERT_CONFIG_KEYS.isdisjoint(_INFRASTRUCTURE_CONFIG_KEYS)
     assert _KNOWN_CONFIG_KEYS == (
         _CONSUMED_CONFIG_KEYS
         | _RECOGNIZED_INERT_CONFIG_KEYS
+        | _DEPRECATED_ALIAS_CONFIG_KEYS
         | _INFRASTRUCTURE_CONFIG_KEYS
     )
-    # 27 keys the survey counted: 32 - 5 removed (enable_state,
+    # 28 keys the survey counted: 32 - 5 removed (enable_state,
     # enable_reasoning_context, enable_response_chaining,
-    # thinking_budget_tokens, thinking_budget_buffer), audited against every
-    # `self.config.get(...)` call site in the constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 27
+    # thinking_budget_tokens, thinking_budget_buffer) + 1 added
+    # (extra_request_params), audited against every `self.config.get(...)`
+    # call site in the constructor and request path.
+    assert len(_CONSUMED_CONFIG_KEYS) == 28
