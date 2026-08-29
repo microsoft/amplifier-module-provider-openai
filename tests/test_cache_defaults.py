@@ -9,16 +9,13 @@ Verifies that:
 """
 
 import asyncio
-import logging
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
-from amplifier_module_provider_openai._capabilities import ModelCapabilities
-
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_cache_params.py pattern)
@@ -97,32 +94,6 @@ def test_explicit_in_memory_retention_passes_through_for_gpt_5_4():
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     asyncio.run(provider.complete(_simple_request()))
     assert _captured_params(provider)["prompt_cache_retention"] == "in_memory"
-
-
-def test_default_24h_dropped_for_24h_rejecting_model(caplog):
-    """Model with supports_24h_retention=False → default '24h' is dropped with WARNING."""
-    fake_caps = ModelCapabilities(
-        family="hypothetical",
-        supports_in_memory_retention=True,
-        supports_24h_retention=False,
-    )
-    caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
-
-    with patch(
-        "amplifier_module_provider_openai.get_capabilities",
-        return_value=fake_caps,
-    ):
-        provider = _make_provider(default_model="hypothetical-model")
-        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
-        asyncio.run(provider.complete(_simple_request()))
-
-    params = _captured_params(provider)
-    assert "prompt_cache_retention" not in params
-    assert any(
-        "24h" in r.message and "hypothetical-model" in r.message
-        for r in caplog.records
-        if r.levelno == logging.WARNING
-    )
 
 
 # ---------------------------------------------------------------------------

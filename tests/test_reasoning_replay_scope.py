@@ -92,7 +92,7 @@ def test_turn_scope_replays_only_since_last_user():
         _user_turn("q3"),
         _thinking_turn("t3", "a3"),
     ]
-    converted = provider._convert_messages(messages, skip_reasoning_reinsertion=False)
+    converted = provider._convert_messages(messages)
     ids = _reasoning_ids(converted)
     assert ids == ["rs_t3"], (
         f"Turn-scoped replay must emit ONLY the last turn's reasoning item; got {ids}"
@@ -111,7 +111,7 @@ def test_turn_scope_replays_all_tool_steps_in_turn():
         _thinking_turn("step2", "a2"),
         _thinking_turn("step3", "a3"),
     ]
-    converted = provider._convert_messages(messages, skip_reasoning_reinsertion=False)
+    converted = provider._convert_messages(messages)
     ids = _reasoning_ids(converted)
     assert ids == ["rs_step1", "rs_step2", "rs_step3"], (
         f"All tool-loop steps within the current turn must be replayed; got {ids}"
@@ -135,7 +135,7 @@ def test_all_scope_replays_everything():
         _user_turn("q3"),
         _thinking_turn("t3", "a3"),
     ]
-    converted = provider._convert_messages(messages, skip_reasoning_reinsertion=False)
+    converted = provider._convert_messages(messages)
     ids = _reasoning_ids(converted)
     assert ids == ["rs_t1", "rs_t2", "rs_t3"], (
         f"'all' scope must replay every turn's reasoning items; got {ids}"
@@ -152,7 +152,7 @@ def test_none_scope_replays_nothing():
         _user_turn("q2"),
         _thinking_turn("t2", "a2"),
     ]
-    converted = provider._convert_messages(messages, skip_reasoning_reinsertion=False)
+    converted = provider._convert_messages(messages)
     ids = _reasoning_ids(converted)
     assert ids == [], f"'none' scope must replay zero reasoning items; got {ids}"
 
@@ -173,34 +173,6 @@ def test_invalid_scope_falls_back_to_turn_with_warning(caplog):
         f"Expected a warning naming the invalid scope; got messages="
         f"{[r.message for r in caplog.records]}"
     )
-
-
-# ---------------------------------------------------------------------------
-# Interaction with chaining
-# ---------------------------------------------------------------------------
-
-
-def test_scope_does_not_affect_chained_path():
-    """When skip_reasoning_reinsertion=True (chain_will_attach), ZERO
-    reasoning items are emitted regardless of reasoning_replay_scope -- the
-    scope only bounds STATELESS replay; chaining suppresses replay entirely
-    (server already holds the state)."""
-    messages = [
-        _user_turn("q1"),
-        _thinking_turn("t1", "a1"),
-        _user_turn("q2"),
-        _thinking_turn("t2", "a2"),
-    ]
-    for scope in ("turn", "all", "none"):
-        provider = _provider(reasoning_replay_scope=scope)
-        converted = provider._convert_messages(
-            messages, skip_reasoning_reinsertion=True
-        )
-        ids = _reasoning_ids(converted)
-        assert ids == [], (
-            f"Chained path (skip_reasoning_reinsertion=True) must emit zero "
-            f"reasoning items under scope={scope!r}; got {ids}"
-        )
 
 
 # ---------------------------------------------------------------------------

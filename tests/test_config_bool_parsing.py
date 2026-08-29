@@ -5,21 +5,13 @@ straight through with no coercion, or coerced it with `bool(raw)`. The
 app-cli wizard writes `field_type="boolean"` values as the STRINGS "true" /
 "false" (not Python bools), and hand-edited YAML commonly quotes booleans
 too. `bool("false")` is True -- any non-empty string is truthy in Python --
-so a config author who wrote `enable_response_chaining: "false"` got the
-*opposite* of what they asked for.
-
-Caught live during a DTU A/B (2026-08-29): the wire-contract check found the
-"stateless" arm (config `enable_response_chaining: "false"`) attaching
-`previous_response_id` on 13/14 requests -- chaining was silently ON. Impact
-is worst for ZDR/regulated-industry users: PR #73 made
-`enable_response_chaining=false` the authoritative ZDR opt-out, and choosing
-"false" in the wizard delivered the exact opposite, silently.
+so a config author who wrote `enable_long_context: "false"` got the
+*opposite* of what they asked for: a silently-enabled ~2x-cost setting.
 
 This file exercises:
-  (a) the A/B's exact failure shape for `enable_response_chaining`
+  (a) the truthiness-bug failure shape for `enable_long_context`
   (b) per-key string/bool/absent coercion for every affected key
   (c) mount-time fail-loud on garbage values
-  (d) "auto" (and blank/absent) still resolves to "auto" for the tri-state key
 """
 
 import asyncio
@@ -56,109 +48,36 @@ class DummyResponse:
         self.id = response_id
 
 
-def _request_with_prior_response_id(response_id: str = "resp_abc") -> ChatRequest:
-    from amplifier_module_provider_openai._constants import METADATA_RESPONSE_ID
-
-    msgs = [
-        Message(role="user", content="Hi"),
-        Message(
-            role="assistant",
-            content="Hello!",
-            metadata={METADATA_RESPONSE_ID: response_id},
-        ),
-        Message(role="user", content="Follow-up"),
-    ]
-    return ChatRequest(messages=msgs)
-
-
 def _captured_params(provider: OpenAIProvider):
     return provider.client.responses.create.call_args.kwargs
 
 
 # ---------------------------------------------------------------------------
-# (a) The A/B's exact failure shape: enable_response_chaining="false"
-#     (STRING) must NOT attach previous_response_id.
+# (a) The truthiness-bug failure shape: enable_long_context="false" (STRING)
+#     must NOT enable long context. Retargeted from the historical
+#     enable_response_chaining example (that config key/code path is gone --
+#     the provider is stateless-only) onto the current live boolean key that
+#     shares the exact same truthiness hazard.
 # ---------------------------------------------------------------------------
 
 
-def test_ab_evidence_string_false_disables_chaining():
-    """config enable_response_chaining="false" (string) -> stateless.
+def test_string_false_disables_long_context():
+    """config enable_long_context="false" (string) must resolve to False.
 
-    This is the exact shape the DTU A/B caught: a "stateless" arm configured
-    with the string "false" (what the wizard writes, and what the README's
-    ZDR guidance tells operators to set) must never attach
-    previous_response_id. Pre-fix, `bool("false")` is True, so this failed:
-    previous_response_id WAS attached.
+    Pre-fix pattern: `bool("false")` is True, so this silently enabled a
+    ~2x-cost setting for exactly the operators who asked it to be off.
     """
-    provider = _make_provider(default_model="gpt-5.5", enable_response_chaining="false")
-    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
-
-    request = _request_with_prior_response_id("resp_should_not_appear")
-    asyncio.run(provider.complete(request))
-
-    params = _captured_params(provider)
-    assert "previous_response_id" not in params, (
-        "config enable_response_chaining='false' (string) must NOT attach "
-        f"previous_response_id; got previous_response_id={params.get('previous_response_id')!r}. "
-        "This is the ZDR opt-out silently failing."
-    )
-    assert params["store"] is False, (
-        f"String 'false' opt-out should have store=False, got store={params.get('store')!r}"
+    provider = _make_provider(default_model="gpt-5.6-sol", enable_long_context="false")
+    assert provider.enable_long_context is False, (
+        "enable_long_context='false' (string) must resolve to False; got "
+        f"{provider.enable_long_context!r}"
     )
 
 
-def test_ab_evidence_string_true_enables_chaining():
-    """Symmetric case: enable_response_chaining="true" (string) DOES chain."""
-    provider = _make_provider(
-        default_model="gpt-5-mini", enable_response_chaining="true"
-    )
-    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
-
-    request = _request_with_prior_response_id("resp_forced")
-    asyncio.run(provider.complete(request))
-
-    params = _captured_params(provider)
-    assert params.get("previous_response_id") == "resp_forced", (
-        "config enable_response_chaining='true' (string) should force chaining "
-        f"on even for a non-reasoning model; got {params.get('previous_response_id')!r}"
-    )
-    assert params["store"] is True
-
-
-# ---------------------------------------------------------------------------
-# (d) 'auto' (and blank/absent) still resolves to 'auto' for the tri-state key
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("raw", ["auto", "AUTO", " Auto ", "", None])
-def test_chaining_auto_and_blank_normalize_to_auto(raw):
-    if raw is None:
-        provider = _make_provider(default_model="gpt-5.5")
-    else:
-        provider = _make_provider(default_model="gpt-5.5", enable_response_chaining=raw)
-    assert provider.enable_response_chaining == "auto", (
-        f"raw={raw!r} should normalize to 'auto', got {provider.enable_response_chaining!r}"
-    )
-
-
-@pytest.mark.parametrize(
-    "raw,expected",
-    [
-        ("true", True),
-        ("TRUE", True),
-        (" True ", True),
-        (True, True),
-        ("false", False),
-        ("FALSE", False),
-        (" False ", False),
-        (False, False),
-    ],
-)
-def test_chaining_bool_and_string_bool_variants(raw, expected):
-    provider = _make_provider(default_model="gpt-5.5", enable_response_chaining=raw)
-    assert provider.enable_response_chaining is expected, (
-        f"raw={raw!r} should resolve to {expected!r}, got {provider.enable_response_chaining!r}"
-    )
+def test_string_true_enables_long_context():
+    """Symmetric case: enable_long_context="true" (string) resolves to True."""
+    provider = _make_provider(default_model="gpt-5.6-sol", enable_long_context="true")
+    assert provider.enable_long_context is True
 
 
 # ---------------------------------------------------------------------------
@@ -167,37 +86,21 @@ def test_chaining_bool_and_string_bool_variants(raw, expected):
 
 
 @pytest.mark.parametrize(
-    "garbage", ["flase", "yes", "1", "0", "disabled", "off", "TrueFalse"]
+    "garbage", ["flase", "yes-ish", "1x", "0x", "disabled", "off", "TrueFalse"]
 )
-def test_chaining_garbage_value_fails_loud_at_mount(garbage):
+def test_long_context_garbage_value_fails_loud_at_mount(garbage):
     with pytest.raises(ValueError) as exc_info:
-        _make_provider(default_model="gpt-5.5", enable_response_chaining=garbage)
+        _make_provider(default_model="gpt-5.6-sol", enable_long_context=garbage)
     message = str(exc_info.value)
-    assert "enable_response_chaining" in message, (
+    assert "enable_long_context" in message, (
         f"Error must name the config key; got: {message}"
     )
     assert repr(garbage) in message or garbage in message, (
         f"Error must name the received value {garbage!r}; got: {message}"
     )
-    assert "auto" in message.lower(), (
-        f"Error must name the accepted values (incl. 'auto'); got: {message}"
+    assert "true" in message.lower() and "false" in message.lower(), (
+        f"Error must name the accepted values; got: {message}"
     )
-
-
-def test_parse_config_chaining_unit():
-    """Direct unit coverage of the tri-state parser."""
-    from amplifier_module_provider_openai import _parse_config_chaining
-
-    assert _parse_config_chaining(None) == "auto"
-    assert _parse_config_chaining("") == "auto"
-    assert _parse_config_chaining("auto") == "auto"
-    assert _parse_config_chaining("AUTO") == "auto"
-    assert _parse_config_chaining(True) is True
-    assert _parse_config_chaining(False) is False
-    assert _parse_config_chaining("true") is True
-    assert _parse_config_chaining("false") is False
-    with pytest.raises(ValueError, match="enable_response_chaining"):
-        _parse_config_chaining("nope")
 
 
 # ---------------------------------------------------------------------------
@@ -205,19 +108,22 @@ def test_parse_config_chaining_unit():
 #     real bool passthrough, absent -> default.
 #
 # Audited config keys affected by the same anti-pattern (see PR body for the
-# full audit table): enable_state, raw, filtered, enable_long_context,
-# enable_reasoning_context, use_streaming, retry_jitter.
+# full audit table): raw, hide_dated_models, enable_long_context,
+# use_streaming, retry_jitter.
+#
+# enable_state / enable_reasoning_context were removed entirely (both
+# attributes are gone; see test_config_migration_warnings.py). `filtered`
+# was renamed to `hide_dated_models` (see test_config_renames.py for the
+# rename-alias coverage) -- this matrix now tests the NEW name only.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "key,default",
     [
-        ("enable_state", False),
         ("raw", False),
-        ("filtered", True),
+        ("hide_dated_models", True),
         ("enable_long_context", False),
-        ("enable_reasoning_context", False),
         ("use_streaming", True),
     ],
 )
@@ -337,13 +243,14 @@ def test_parse_config_bool_unit():
 
 
 # ---------------------------------------------------------------------------
-# Behavioral confirmation: enable_state string "false" no longer forces
-# store=True via truthiness (regression guard for the no-coercion sites).
+# Behavioral confirmation: the provider is always stateless (store=False)
+# regardless of legacy enable_state, since store is no longer read from
+# config/kwargs at all -- only background mode can force it True.
 # ---------------------------------------------------------------------------
 
 
-def test_enable_state_string_false_does_not_force_store_true():
-    provider = _make_provider(default_model="gpt-5-mini", enable_state="false")
+def test_enable_state_no_longer_affects_store():
+    provider = _make_provider(default_model="gpt-5-mini", enable_state="true")
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
     asyncio.run(
@@ -352,7 +259,8 @@ def test_enable_state_string_false_does_not_force_store_true():
 
     params = _captured_params(provider)
     assert params["store"] is False, (
-        f"enable_state='false' (string) must resolve to store=False; got {params.get('store')!r}"
+        "store must be False on every non-background request regardless of "
+        f"legacy enable_state; got store={params.get('store')!r}"
     )
 
 

@@ -149,7 +149,7 @@ def test_turn_scope_survives_tail_ephemeral_injections():
             source="hooks-status-context",
         ),
     ]
-    converted = provider._convert_messages(messages, skip_reasoning_reinsertion=False)
+    converted = provider._convert_messages(messages)
     ids = _reasoning_ids(converted)
     assert ids == ["rs_t1"], (
         f"Ephemeral tail injections must not count as turn boundaries; got {ids}"
@@ -178,7 +178,7 @@ def test_genuine_user_turn_still_bounds_replay_under_ephemeral_tail():
             source="hooks-status-context",
         ),
     ]
-    converted = provider._convert_messages(messages, skip_reasoning_reinsertion=False)
+    converted = provider._convert_messages(messages)
     ids = _reasoning_ids(converted)
     assert ids == ["rs_t2"], (
         f"A genuine user message must still bound turn-scoped replay "
@@ -259,13 +259,11 @@ def _live_post_compaction_request(
 
 
 def test_reset_path_carries_reasoning_under_live_ephemeral_tail():
-    """The post-compaction RESET request (provider._reset_chain_on_next_request
-    = True, the same path proven by test_reset_path_reasoning_continuity.py)
-    must carry the surviving reasoning item even with the live ephemeral tail
-    appended. FAILS on current main -- the tail collapses the turn window."""
+    """The post-compaction stateless request must carry the surviving
+    reasoning item even with the live ephemeral tail appended. FAILS
+    without the fix -- the tail collapses the turn window."""
     provider = _make_reset_provider(default_model="gpt-5.5")
     provider.client.responses.create = AsyncMock(return_value=_DummyResponse())
-    provider._reset_chain_on_next_request = True
 
     asyncio.run(provider.complete(_live_post_compaction_request()))
 
@@ -304,7 +302,7 @@ def test_all_ephemeral_users_yields_unbounded_cutoff():
         _ephemeral_user("[compacted]", source="context-compaction"),
         _thinking_turn("t1", "a1"),
     ]
-    converted = provider._convert_messages(messages, skip_reasoning_reinsertion=False)
+    converted = provider._convert_messages(messages)
     ids = _reasoning_ids(converted)
     assert ids == ["rs_t1"], (
         f"All-ephemeral-users edge case must still replay reasoning (cutoff=-1 "
@@ -330,7 +328,7 @@ def test_non_ephemeral_metadata_behaves_as_before():
         _user_turn("q2"),  # no metadata key at all
         _thinking_turn("t2", "a2"),
     ]
-    converted = provider._convert_messages(messages, skip_reasoning_reinsertion=False)
+    converted = provider._convert_messages(messages)
     ids = _reasoning_ids(converted)
     assert ids == ["rs_t2"], (
         f"Non-ephemeral / absent metadata must not change turn-boundary "

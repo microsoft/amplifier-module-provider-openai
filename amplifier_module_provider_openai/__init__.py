@@ -33,7 +33,6 @@ from amplifier_core import (
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.events import PROVIDER_RETRY
 from amplifier_core.message_models import ChatRequest, ChatResponse, ToolCall
-from amplifier_core.models import HookResult
 from amplifier_core.utils import redact_secrets
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
@@ -58,8 +57,6 @@ from ._constants import (
     METADATA_RESPONSE_ID,
     METADATA_STATUS,
     NATIVE_TOOL_TYPES,
-    RESPONSE_CHAIN_INVALIDATED,
-    RESPONSE_NOT_FOUND_ERROR_CODES,
 )
 from ._cost import compute_cost
 from ._response_handling import (
@@ -143,38 +140,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         api_key=api_key, config=config, coordinator=coordinator, add_cost=_add_cost
     )
     await coordinator.mount("providers", provider, name="openai")
-
-    # Break the OpenAI Responses API response chain whenever the context is
-    # compacted, so the provider stops rebuilding the pre-compaction
-    # server-side context via previous_response_id (which drives unbounded
-    # input-token growth -> context_length_exceeded). The default context
-    # module emits the literal "context:compaction"; other context managers use
-    # the kernel's "context:pre_compact"/"context:post_compact". Subscribe to
-    # all three so the fix survives a swapped context module.
-    async def _on_compaction(event: str, data: dict[str, Any]) -> HookResult:
-        provider._reset_chain_on_next_request = True
-        logger.info(
-            "[PROVIDER] Compaction event '%s' received; breaking OpenAI "
-            "response chain on next request.",
-            event,
-        )
-        return HookResult()
-
-    if hasattr(coordinator, "hooks") and coordinator.hooks is not None:
-        for _compaction_event in (
-            "context:compaction",
-            "context:pre_compact",
-            "context:post_compact",
-        ):
-            try:
-                coordinator.hooks.on(_compaction_event, _on_compaction)
-            except Exception as sub_err:  # pragma: no cover - defensive
-                logger.warning(
-                    "[PROVIDER] Could not subscribe to '%s' for compaction "
-                    "chain reset: %s",
-                    _compaction_event,
-                    sub_err,
-                )
 
     coordinator.register_contributor(
         "session.cost",
@@ -306,8 +271,9 @@ def _parse_config_bool(key: str, raw: Any, default: bool) -> bool:
     assigning the raw value straight through and relying on truthiness at
     the call site -- is wrong for both: `bool("false")` and `if "false":`
     are both True, since ANY non-empty string is truthy. That silently
-    inverts the operator's intent (see `enable_response_chaining`, where
-    this exact bug made the ZDR opt-out "false" turn chaining ON).
+    inverts the operator's intent (see `enable_long_context`, where this
+    exact bug would silently enable a ~2x-cost setting from a
+    wizard-written string "false").
 
     Accepts:
       - key absent / value None / value "" -> `default`
@@ -349,45 +315,36 @@ def _parse_config_bool(key: str, raw: Any, default: bool) -> bool:
     )
 
 
-def _parse_config_chaining(raw: Any) -> str | bool:
-    """Parse the tri-state `enable_response_chaining` config value.
+def _read_renamed_config(config: dict[str, Any], new: str, old: str) -> Any:
+    """Read `new`, falling back to the deprecated `old` with one warning.
 
-    Tri-state, per the ConfigField choices=["auto", "true", "false"]:
-      - key absent / value None / "" / "auto" (case-insensitive, stripped)
-        -> "auto" (on iff the model supports reasoning)
-      - real bool -> itself, unchanged (force on/off regardless of model)
-      - str "true" / "false" (case-insensitive, stripped) -> True/False
-
-    Mirrors `_parse_config_bool`'s rationale: `bool(raw)` on the STRING
-    "false" (exactly what the wizard writes, and what the ZDR opt-out
-    guidance in the README tells operators to set) previously resolved to
-    True, silently re-enabling chaining -- and therefore
-    `previous_response_id` retention -- for exactly the deployments that
-    most needed it off.
-
-    Raises:
-        ValueError: `raw` is not "auto"/bool/"true"/"false". Surfaces at
-            mount time naming the key, the value received, and the
-            accepted values -- never silently falls through to `bool()`.
+    The new key always wins when present (even when both are set) -- a
+    config that has been migrated is never overridden by a stale leftover.
+    The warning fires only when `old` is the value actually used, so a
+    fully migrated config is silent and a config carrying both is told
+    plainly which one won.
     """
-    if raw is None or raw == "":
-        return "auto"
-    if isinstance(raw, str) and raw.strip().lower() == "auto":
-        return "auto"
-    if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, str):
-        normalized = raw.strip().lower()
-        if normalized == "true":
-            return True
-        if normalized == "false":
-            return False
-    raise ValueError(
-        f"Invalid config 'enable_response_chaining'={raw!r} for "
-        f"provider-openai. Accepted values: 'auto' (default), true/false "
-        f"(also as strings, case-insensitive). Fix the provider config "
-        f"(settings.yaml / bundle config block)."
-    )
+    if config.get(new) not in (None, ""):
+        if config.get(old) not in (None, ""):
+            logger.warning(
+                "[PROVIDER] Config keys '%s' (deprecated) and '%s' are BOTH "
+                "set; '%s' wins. Remove '%s'.",
+                old,
+                new,
+                new,
+                old,
+            )
+        return config.get(new)
+    if config.get(old) not in (None, ""):
+        logger.warning(
+            "[PROVIDER] Config key '%s' is deprecated and was renamed to "
+            "'%s'. The old name still works but will be removed; rename it "
+            "in your settings.yaml / bundle config block.",
+            old,
+            new,
+        )
+        return config.get(old)
+    return None
 
 
 # reasoning.mode selects the reasoning strategy. Verified live against gpt-5.6-sol
@@ -484,9 +441,7 @@ def _extract_error_fields(body: object) -> tuple[str | None, str | None]:
 def _is_context_overflow(err_code: str | None, raw_msg: str) -> bool:
     """True when an OpenAI error denotes context-window overflow.
 
-    Code first -- stable, and mirrors the existing 404 chain-invalidation
-    precedent in this file (``err_code in RESPONSE_NOT_FOUND_ERROR_CODES``).
-    Message substrings are a fallback only.
+    Code first -- stable. Message substrings are a fallback only.
     """
     if err_code is not None and err_code in _CONTEXT_OVERFLOW_ERROR_CODES:
         return True
@@ -506,28 +461,6 @@ def _validate_prompt_cache_options(options: Any) -> None:
             f"prompt_cache_options.mode must be one of "
             f"{{'implicit', 'explicit'}}; got {mode!r}."
         )
-
-
-def _input_has_cache_breakpoint(input_items: list[Any]) -> bool:
-    """True if any item (or nested content block) carries a breakpoint marker.
-
-    Used by the D2 guardrail: this provider does not attach
-    `prompt_cache_breakpoint` markers anywhere today, so this is always False
-    in current shipped behavior -- which is exactly the condition the
-    guardrail exists to catch.
-    """
-    for item in input_items:
-        if not isinstance(item, dict):
-            continue
-        if "prompt_cache_breakpoint" in item:
-            return True
-        content = item.get("content")
-        if isinstance(content, list) and any(
-            isinstance(block, dict) and "prompt_cache_breakpoint" in block
-            for block in content
-        ):
-            return True
-    return False
 
 
 # text.verbosity (GPT-5.6): controls response length/detail. Opt-in; fail-loud
@@ -594,33 +527,6 @@ def _drop_unsupported_in_memory_retention(
         "model does not support 'in_memory' retention. %s",
         model_id,
         remedy,
-    )
-    return None
-
-
-def _drop_unsupported_24h_retention(model_id: str, retention: str | None) -> str | None:
-    """Return *retention* unless `"24h"` would be rejected by the model.
-
-    Mirror of `_drop_unsupported_in_memory_retention`. The capability flag
-    `supports_24h_retention` is True for all current model families
-    (smoke-tested against gpt-4o, gpt-5.x, o-series — all accept "24h"
-    despite not being formally enumerated in the cookbook list). Future
-    families that prove to reject "24h" can flip the flag False on their
-    branch in `_capabilities.py`.
-
-    Returns None when the value should be dropped. Otherwise returns
-    *retention* unchanged.
-    """
-    if retention != "24h":
-        return retention
-    caps = get_capabilities(model_id)
-    if caps.supports_24h_retention:
-        return retention
-    logger.warning(
-        "[PROVIDER] Dropping prompt_cache_retention='24h' for model %r: "
-        "model rejects 24h retention. Omit the field or pass 'in_memory' "
-        "to silence this warning.",
-        model_id,
     )
     return None
 
@@ -885,29 +791,26 @@ def _decode_reasoning_state(
 
 
 # Every config key this module actually reads -- audited against every
-# `self.config.get(...)` call site in the constructor and the request path
-# (_build_params' thinking_budget_* passthrough). 32 entries.
+# `self.config.get(...)` call site in the constructor and the request path.
+# 27 entries. (Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.)
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "base_url",
         "default_model",
-        "max_tokens",
+        "max_output_tokens",
         "temperature",
         "reasoning",
         "reasoning_effort",
         "reasoning_summary",
         "truncation",
-        "enable_state",
         "raw",
         "timeout",
-        "filtered",
+        "hide_dated_models",
         "prompt_cache_key",
         "prompt_cache_retention",
         "prompt_cache_options",
         "safety_identifier",
         "text_verbosity",
-        "enable_reasoning_context",
-        "enable_response_chaining",
         "reasoning_replay_scope",
         "poll_interval",
         "background_timeout",
@@ -919,15 +822,39 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "max_retry_delay",
         "retry_jitter",
         "max_concurrent_requests",
-        "thinking_budget_tokens",
-        "thinking_budget_buffer",
+        "extra_request_params",
     }
 )
 
-# Recognized-but-inert keys: each has its OWN dedicated warning elsewhere
-# (see the effort-family guard in __init__), so they must be excluded from
-# the generic unknown-key sweep below to avoid a confusing double warning.
-_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset({"effort"})
+# Recognized-but-inert keys. Each gets its OWN targeted warning from the loop
+# in __init__ (see below), so they are excluded from the generic unknown-key
+# sweep via _KNOWN_CONFIG_KEYS -- a key must never produce two warnings.
+_INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
+    "effort": (
+        "not consumed by provider-openai and has no effect. Accepted effort "
+        "keys: 'reasoning_effort' (canonical), 'reasoning' (legacy)."
+    ),
+    "enable_response_chaining": (
+        "removed -- the provider is always stateless now "
+        "(see README \u00a7Conversation state)."
+    ),
+    "enable_state": (
+        "removed -- store is managed automatically (false, except background "
+        "mode which requires true); use extra_request_params to force it."
+    ),
+    "enable_reasoning_context": (
+        "removed -- reasoning.context is now forwarded whenever you supply it "
+        "in the legacy `reasoning` dict, e.g. "
+        'reasoning = {effort = "high", context = "current_turn"}.'
+    ),
+    "thinking_budget_tokens": (
+        "removed -- extended_thinking still forces high reasoning effort, but "
+        "no longer adjusts max_output_tokens. Set max_output_tokens directly."
+    ),
+    "thinking_budget_buffer": ("removed -- see thinking_budget_tokens."),
+}
+
+_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset(_INERT_CONFIG_KEY_MESSAGES)
 
 # Infrastructure keys the app/kernel may place in (or alongside) a provider's
 # config block that this module does not itself read. `default_model` and
@@ -940,8 +867,16 @@ _INFRASTRUCTURE_CONFIG_KEYS: frozenset[str] = frozenset(
     {"api_key", "id", "module", "source"}
 )
 
+# Deprecated aliases (old name -> new name lives in _read_renamed_config call
+# sites). Must stay "known" or they would draw a SECOND, generic unknown-key
+# warning on top of the targeted deprecation warning each already gets.
+_DEPRECATED_ALIAS_CONFIG_KEYS: frozenset[str] = frozenset({"max_tokens", "filtered"})
+
 _KNOWN_CONFIG_KEYS: frozenset[str] = (
-    _CONSUMED_CONFIG_KEYS | _RECOGNIZED_INERT_CONFIG_KEYS | _INFRASTRUCTURE_CONFIG_KEYS
+    _CONSUMED_CONFIG_KEYS
+    | _RECOGNIZED_INERT_CONFIG_KEYS
+    | _DEPRECATED_ALIAS_CONFIG_KEYS
+    | _INFRASTRUCTURE_CONFIG_KEYS
 )
 
 
@@ -1027,17 +962,6 @@ class OpenAIProvider:
         self.config = config or {}
         self.coordinator = coordinator
 
-        # One-shot flag set by the compaction hook handlers registered in
-        # mount(). When the context manager compacts (or a swapped context
-        # module fires its pre/post-compaction event), the local transcript
-        # shrinks but the most recent assistant message may still carry a
-        # pre-compaction openai:response_id. Chaining from it via
-        # previous_response_id makes OpenAI rebuild the full pre-compaction
-        # server-side context, so input tokens climb without bound until
-        # context_length_exceeded. This flag tells the next request to break
-        # the chain so it restarts from the compacted view.
-        self._reset_chain_on_next_request = False
-
         # Configuration with sensible defaults (from _constants.py - single source of truth)
         self.base_url = self.config.get(
             "base_url", None
@@ -1048,7 +972,9 @@ class OpenAIProvider:
         # which defaults to its capability table). An explicit config value
         # still wins. DEFAULT_MAX_TOKENS survives only as the documented
         # fallback when capability data is absent (see _resolve_max_tokens).
-        self.max_tokens = self.config.get("max_tokens")
+        self.max_output_tokens = _read_renamed_config(
+            self.config, "max_output_tokens", "max_tokens"
+        )
         self.temperature = self.config.get(
             "temperature", None
         )  # None = not sent (some models don't support it)
@@ -1071,15 +997,14 @@ class OpenAIProvider:
                 self.reasoning_effort,
                 self.reasoning,
             )
-        # Loudness guard against silently-inert config: warn about
-        # effort-family keys this provider does NOT consume.
-        for _inert_key in ("effort",):
+        # Loudness guard against silently-inert config: each recognized-but-
+        # removed/inert key gets its own targeted warning naming what to do
+        # instead. Never a double warning: these keys are excluded from the
+        # generic unknown-key sweep below via _KNOWN_CONFIG_KEYS.
+        for _inert_key, _inert_msg in _INERT_CONFIG_KEY_MESSAGES.items():
             if _inert_key in self.config:
                 logger.warning(
-                    "[PROVIDER] Config key '%s' is not consumed by "
-                    "provider-openai and has no effect. Accepted effort keys: "
-                    "'reasoning_effort' (canonical), 'reasoning' (legacy).",
-                    _inert_key,
+                    "[PROVIDER] Config key '%s' is %s", _inert_key, _inert_msg
                 )
         # Generalized sweep: catch every OTHER unrecognized config key (e.g. a
         # typo like 'promt_cache_retention'), not just the effort family above.
@@ -1097,15 +1022,14 @@ class OpenAIProvider:
         # `config={"truncation": "auto"}` to opt into the legacy auto-drop
         # behavior.
         self.truncation = self.config.get("truncation", DEFAULT_TRUNCATION)
-        self.enable_state = _parse_config_bool(
-            "enable_state", self.config.get("enable_state"), False
-        )
         self.raw = _parse_config_bool(
             "raw", self.config.get("raw"), False
         )  # Include raw payload in events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
-        self.filtered = _parse_config_bool(
-            "filtered", self.config.get("filtered"), True
+        self.hide_dated_models = _parse_config_bool(
+            "hide_dated_models",
+            _read_renamed_config(self.config, "hide_dated_models", "filtered"),
+            True,
         )  # Filter to curated model list by default
 
         # Prompt-caching hint parameters (Responses API top-level fields).
@@ -1144,78 +1068,35 @@ class OpenAIProvider:
             "prompt_cache_retention", DEFAULT_PROMPT_CACHE_RETENTION
         )
         self.prompt_cache_retention: str | None = _retention if _retention else None
-        # prompt_cache_options (GPT-5.6): explicit prompt-cache control that COEXISTS
-        # with prompt_cache_retention. Shape {"mode": "implicit"|"explicit", "ttl":
-        # "30m"}; default None = do not send. Verified live 2026-07-14.
+        # prompt_cache_options (GPT-5.6): {"mode": "implicit"|"explicit", "ttl": "30m"}.
+        # `ttl` passes through untouched. `mode: "explicit"` is REJECTED here: this
+        # provider ships no prompt_cache_breakpoint mechanism anywhere, and explicit
+        # mode with zero breakpoints disables prompt caching ENTIRELY -- no reads, no
+        # writes -- turning a ~95% cache-read workload into 100% full-price input
+        # (~10x, live-probed 2026-08-28). Validated once at mount instead of scanning
+        # every request's input array.
         self.prompt_cache_options: dict | None = (
             self.config.get("prompt_cache_options") or None
         )
-        # D2 guardrail one-shot flag: emit the explicit-mode-with-no-breakpoints
-        # warning at most once per provider instance, not once per request.
-        self._explicit_cache_mode_warned = False
+        if self.prompt_cache_options is not None:
+            _validate_prompt_cache_options(self.prompt_cache_options)
+            if self.prompt_cache_options.get("mode") == "explicit":
+                logger.warning(
+                    "[PROVIDER] prompt_cache_options.mode='explicit' is not supported "
+                    "by this provider: no prompt_cache_breakpoint mechanism ships "
+                    "here, and explicit mode with zero breakpoints disables prompt "
+                    "caching entirely (~10x input-cost regression). Dropping 'mode'; "
+                    "implicit caching is used. 'ttl' passes through unchanged."
+                )
+                self.prompt_cache_options = {
+                    k: v for k, v in self.prompt_cache_options.items() if k != "mode"
+                } or None
         self.safety_identifier: str | None = (
             self.config.get("safety_identifier") or None
         )
         # text.verbosity (GPT-5.6): "low" | "medium" | "high". Wrapped into the
         # Responses API `text` object at request time. None = do not send.
         self.text_verbosity: str | None = self.config.get("text_verbosity") or None
-        # reasoning.context (GPT-5.6 persisted reasoning): flag-gated, default
-        # OFF. Even when the caller supplies reasoning.context on a request,
-        # it is only forwarded when this is explicitly enabled AND the request
-        # is on the chained/stored path (see the chain_active/store_enabled
-        # gate at the forwarding site below) -- on a stateless call (Amplifier
-        # defaults store=False) there is no persisted reasoning state for the
-        # server to apply a context strategy to, so forwarding it there is
-        # meaningless-to-harmful. Mirrors `enable_long_context`.
-        self.enable_reasoning_context: bool = _parse_config_bool(
-            "enable_reasoning_context",
-            self.config.get("enable_reasoning_context"),
-            False,
-        )
-
-        # Response chaining for reasoning models — the Responses API's
-        # `previous_response_id` mechanism. Tri-state:
-        #   "auto" (default) — on iff get_capabilities(model).supports_reasoning
-        #   True             — force on regardless of model
-        #   False            — force off (ZDR / privacy / regulated-industry opt-out)
-        #
-        # When active, three things happen on each call to a reasoning model:
-        #   (a) params["store"] = True
-        #   (b) params["previous_response_id"] = <id from last assistant.metadata>
-        #       (when a prior response_id is available; first turn has none)
-        #   (c) `include=["reasoning.encrypted_content"]` is NOT requested,
-        #       and ThinkingBlocks are NOT re-inserted into the input array
-        #       (server holds the reasoning state under previous_response_id;
-        #       sending encrypted blobs inline busts the cache prefix).
-        #
-        # Per OpenAI Cookbook 201 §4.5: Responses API + chaining gives 40–80%
-        # better cache utilization on reasoning workloads vs. stateless mode.
-        #
-        # Interaction with `enable_state`:
-        #   - `enable_state` remains the broad server-state switch (e.g. for
-        #     callers that need response retrieval/inspection regardless of
-        #     reasoning).
-        #   - `enable_response_chaining` is the cache-driven knob for
-        #     reasoning models specifically.
-        #   - When chaining resolves to True, `store=True` is forced (chaining
-        #     requires it). Otherwise `enable_state` decides `store`.
-        raw_chain = self.config.get("enable_response_chaining")
-        self.enable_response_chaining: str | bool = _parse_config_chaining(raw_chain)
-
-        # C3: enable_response_chaining=False is a ZDR / regulated-industry
-        # opt-out and is now authoritative (see _chaining_permitted) -- legacy
-        # enable_state=True can no longer silently re-attach
-        # previous_response_id behind it. That still leaves enable_state=True
-        # forcing store=True (server-side retention), which is a SEPARATE leak
-        # the operator must close explicitly if a full ZDR posture is needed.
-        if self.enable_response_chaining is False and self.enable_state:
-            logger.warning(
-                "[PROVIDER] enable_response_chaining=false with enable_state=true. "
-                "Chaining is DISABLED (the explicit opt-out wins) -- previous_response_id "
-                "will never be attached. However enable_state=true still sets store=true, "
-                "so responses ARE retained server-side. For a full ZDR posture set "
-                "enable_state=false as well."
-            )
 
         # D2: how much prior reasoning to replay inline on stateless requests.
         #   "turn" (default) -- assistant turns since the last user message. Preserves
@@ -1299,6 +1180,62 @@ class OpenAIProvider:
         self._max_concurrent_requests = int(
             self.config.get("max_concurrent_requests", 5)
         )
+
+        # extra_request_params: the documented escape hatch for Responses API
+        # parameters this provider does not model (including `store`, which
+        # is otherwise managed automatically). Merged into `params` LAST, so
+        # it overrides every value the provider computed -- deliberately.
+        # Never a ConfigField; settings-only.
+        _extra = self.config.get("extra_request_params") or {}
+        if not isinstance(_extra, dict):
+            # ValueError (not TypeError) is the mount-time config-validation
+            # contract this module uses everywhere (mirrors _parse_config_bool
+            # / _resolve_config_reasoning_effort); the wizard/tests key on it.
+            raise ValueError(  # noqa: TRY004
+                f"Invalid config 'extra_request_params'={_extra!r} for "
+                f"provider-openai: must be a mapping of Responses API "
+                f"parameter names to values (got {type(_extra).__name__}). "
+                f"Fix the provider config (settings.yaml / bundle config "
+                f"block)."
+            )
+        self.extra_request_params: dict[str, Any] = dict(_extra)
+        # Keys already warned about, so a long session never repeats itself.
+        # A set (not a one-shot bool) because the primary request and the
+        # continuation request build different param sets -- a collision
+        # that only occurs on continuation must still be reported exactly
+        # once, not hidden.
+        self._extra_params_warned_keys: set[str] = set()
+
+    def _merge_extra_request_params(self, params: dict[str, Any]) -> None:
+        """Merge config `extra_request_params` into *params*, user-wins.
+
+        This is the documented escape hatch for Responses API parameters
+        this provider does not model (including `store`, which is
+        otherwise managed automatically). It is applied LAST, so it
+        overrides every value the provider computed -- deliberately.
+        Whoever sets it owns the consequences: an unknown or malformed
+        parameter is an API 400, not a provider bug.
+
+        Clobbers are warned once per key per provider instance, naming the
+        keys.
+        """
+        if not self.extra_request_params:
+            return
+        clobbered = sorted(
+            k
+            for k in self.extra_request_params
+            if k in params and k not in self._extra_params_warned_keys
+        )
+        if clobbered:
+            self._extra_params_warned_keys.update(clobbered)
+            logger.warning(
+                "[PROVIDER] extra_request_params overrides provider-computed "
+                "request parameter(s): %s. This is intentional and supported -- "
+                "you own the consequences (a rejected value surfaces as an API "
+                "400, not a provider error).",
+                ", ".join(clobbered),
+            )
+        params.update(self.extra_request_params)
 
     @property
     def client(self) -> AsyncOpenAI:
@@ -1400,7 +1337,7 @@ class OpenAIProvider:
                     id="reasoning_effort",
                     display_name="Reasoning Effort",
                     field_type="choice",
-                    prompt="Select reasoning effort level",
+                    prompt="Reasoning effort — higher is smarter, slower, costlier",
                     choices=["none", "low", "medium", "high", "xhigh", "max"],
                     default="none",
                     required=False,
@@ -1410,89 +1347,22 @@ class OpenAIProvider:
                     id="enable_long_context",
                     display_name="Enable long context",
                     field_type="boolean",
-                    prompt="Enable long context (>272K tokens, 2x input / 1.5x output pricing)",
+                    prompt="Allow requests over 272K input tokens (\u22482\u00d7 cost)",
                     required=False,
                     default="false",
-                ),
-                ConfigField(
-                    id="enable_reasoning_context",
-                    display_name="Enable reasoning.context passthrough",
-                    field_type="boolean",
-                    prompt=(
-                        "Forward reasoning.context (GPT-5.6 persisted reasoning: "
-                        "auto/current_turn/all_turns) when the caller supplies it. "
-                        "Only takes effect on the chained/stored request path -- "
-                        "meaningless on stateless calls (Amplifier's default)."
-                    ),
-                    required=False,
-                    default="false",
-                    requires_model=True,  # Shown after model selection
-                    # reasoning.context is a GPT-5.6-family feature; hide it for
-                    # every other model so the wizard never writes a config value
-                    # that (a) has no effect and (b) confuses users into thinking
-                    # it applies to their non-5.6 model.
+                    requires_model=True,  # NEW -- needed for show_when to see default_model
+                    # Matches exactly the models with modelled long rates
+                    # (_LONG_RATES, _cost.py) -- gpt-5.6-sol/-terra/-luna (and
+                    # the over-included -cyber, harmless: the flag still
+                    # widens its reported window correctly). gpt-5.5 has NO
+                    # threshold at all (the flag would be a total no-op) and
+                    # gpt-5.4*/-mini/-nano have a threshold but no long rates
+                    # (cost-neutral) -- neither belongs behind this specific
+                    # ~2x-cost prompt. show_when is AND-only with one
+                    # predicate per key, so a three-way set is not
+                    # expressible; this is the single expressible predicate
+                    # that matches the models where the flag has a real cost.
                     show_when={"default_model": "contains:gpt-5.6"},
-                ),
-                ConfigField(
-                    id="text_verbosity",
-                    display_name="Text verbosity",
-                    field_type="choice",
-                    prompt="Response verbosity (GPT-5.6). Leave unset for model default.",
-                    choices=["low", "medium", "high"],
-                    required=False,
-                    default=None,
-                    requires_model=True,  # Shown after model selection
-                    # text.verbosity is a GPT-5.6-family feature per OpenAI docs;
-                    # pre-5.6 models don't accept it, so hide it for those models.
-                    show_when={"default_model": "contains:gpt-5.6"},
-                ),
-                ConfigField(
-                    id="prompt_cache_key",
-                    display_name="Prompt cache key",
-                    field_type="text",
-                    prompt=(
-                        "Stable identifier for OpenAI prompt-cache routing "
-                        "(e.g. conversation ID or tenant+system-prompt-version)"
-                    ),
-                    required=False,
-                    default="",
-                ),
-                ConfigField(
-                    id="prompt_cache_retention",
-                    display_name="Prompt cache retention",
-                    field_type="choice",
-                    prompt=(
-                        "Cache retention window. Leave unset to use the model "
-                        "default (recommended)."
-                    ),
-                    choices=["in_memory", "24h"],
-                    required=False,
-                    # default=None (not "") because "" is not a member of
-                    # `choices`; UI renderers that validate `default in choices`
-                    # would reject it. None signals "leave unset" cleanly.
-                    default=None,
-                    requires_model=True,  # Shown after model selection
-                    # gpt-5.6-family models reject "in_memory" (auto-dropped to
-                    # "24h" with a warning -- see _drop_unsupported_in_memory_
-                    # retention) and manage retention via prompt_cache_options.ttl
-                    # instead. Hiding the field for those models stops the wizard
-                    # from writing a value the runtime will immediately reject
-                    # (the gpt-5.6-luna defect this gating exists to prevent).
-                    show_when={"default_model": "not_contains:gpt-5.6"},
-                ),
-                ConfigField(
-                    id="enable_response_chaining",
-                    display_name="Enable response chaining",
-                    field_type="choice",
-                    prompt=(
-                        "Response chaining for reasoning models via previous_response_id. "
-                        '"auto" (default) enables chaining for reasoning-capable models '
-                        'only. Set to "false" to disable for ZDR / regulated-industry '
-                        "deployments that cannot retain server-side state."
-                    ),
-                    choices=["auto", "true", "false"],
-                    required=False,
-                    default="auto",
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
                 # ConfigField. It is a per-end-user signal, not a per-deployment
@@ -1500,6 +1370,13 @@ class OpenAIProvider:
                 # global value, which defeats its abuse-tracking purpose. The
                 # provider still accepts it via per-call kwargs and (for tests
                 # and unusual deployments) via the config dict.
+                #
+                # NOTE: text_verbosity, prompt_cache_key, and
+                # prompt_cache_retention are settings-only now (no
+                # ConfigField) -- the wizard was reduced to 4 fields. The
+                # config keys still work exactly as before; only the wizard
+                # prompt is gone. Set them directly in settings.yaml / the
+                # bundle config block if needed.
             ],
         )
 
@@ -1629,10 +1506,10 @@ class OpenAIProvider:
             ):
                 continue
 
-            # Skip dated versions when filtered (e.g., gpt-5-2025-08-07) - duplicates of aliases
+            # Skip dated versions when hide_dated_models (e.g., gpt-5-2025-08-07) - duplicates of aliases
             # But always include deep research aliases (o3-deep-research, o4-mini-deep-research)
             if (
-                self.filtered
+                self.hide_dated_models
                 and not is_deep_research
                 and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id)
             ):
@@ -1681,6 +1558,11 @@ class OpenAIProvider:
         """
         # Known display name mappings
         display_names = {
+            "gpt-5.6": "GPT 5.6",
+            "gpt-5.6-sol": "GPT 5.6 Sol",
+            "gpt-5.6-terra": "GPT 5.6 Terra",
+            "gpt-5.6-luna": "GPT 5.6 Luna",
+            "gpt-5.6-cyber": "GPT 5.6 Cyber",
             "gpt-5.5": "GPT 5.5",
             "gpt-5.5-pro": "GPT 5.5 Pro",
             "gpt-5.4": "GPT 5.4",
@@ -1692,9 +1574,7 @@ class OpenAIProvider:
             "gpt-5.1-codex": "GPT-5.1 codex",
             "gpt-5-mini": "GPT-5 mini",
             "o3-deep-research": "o3 Deep Research",
-            "o3-deep-research-2025-06-26": "o3 Deep Research (2025-06-26)",
             "o4-mini-deep-research": "o4-mini Deep Research",
-            "o4-mini-deep-research-2025-06-26": "o4-mini Deep Research (2025-06-26)",
         }
 
         if model_id in display_names:
@@ -1732,9 +1612,8 @@ class OpenAIProvider:
     ) -> list:
         """Build input for continuation call in stateless mode.
 
-        Instead of using previous_response_id (requires store:true), we include
-        the accumulated output in the next request's input to preserve context.
-        This allows continuation to work in stateless mode.
+        The accumulated output is included in the next request's input to
+        preserve context -- the provider is always stateless.
 
         Per OpenAI Responses API docs: "context += response.output" - the API
         accepts output items (reasoning, message, tool_call) directly in the
@@ -1802,221 +1681,6 @@ class OpenAIProvider:
             )
 
         return continuation_input
-
-    async def _enforce_chain_output_pairing(
-        self,
-        delta_input: list[dict[str, Any]],
-        chained_msg: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """Chain-aware pairing invariant for the response-chaining delta path.
-
-        When a request chains via previous_response_id, the function_call
-        items live SERVER-SIDE in the chained response; the delta input
-        carries only the outputs. The server requires every call in the
-        chained response to have a paired output in this input, matched
-        BY call_id — an unpaired call is a non-retryable 400
-        ("No tool output found for function call ...") that kills the
-        session. The generic wire backstop in _convert_messages cannot
-        protect this case (no function_call items in the input to check).
-
-        A paired output is any envelope in _PAIRED_OUTPUT_ITEM_TYPES, NOT
-        function_call_output alone: native tools require their own result
-        envelope (apply_patch_call_output, computer_call_output). Counting
-        only function_call_output made every chained apply_patch/computer
-        call look orphaned, so its genuine result was shipped alongside a
-        synthesized "result missing" error for the SAME call_id — two
-        contradictory results for one call, inviting the model to re-run
-        an already-applied patch.
-
-        Enforced here, against the LOCAL record of the chained turn (the
-        assistant message's tool_calls):
-        1. every chained tool call id must have a matching output — an
-           error output is synthesized for any orphan;
-        2. an fc_-prefixed function_call_output id (a Responses-API ITEM
-           id, not a call id) indicates an upstream keying bug. Both
-           branches see the SAME keyspace (expected ids and output
-           call_ids both originate from ToolCallBlock.id), so two
-           sub-cases exist:
-           - the fc_ id MATCHES a chained call id: the local record of
-             the turn is keyed by the same fc_ id (legacy pre-P4
-             history). Dropping the real output and synthesizing an
-             error keyed by the same id would destroy the payload while
-             changing nothing on the wire — so the REAL output is KEPT,
-             with a loud warning;
-           - the fc_ id matches NO chained call id: it can pair with
-             nothing, so it is dropped with a loud warning — observed
-             live killing a session even for a COMPLETED, successfully
-             executed tool call.
-           Native result envelopes are never subject to this drop (see
-           the scoping note at the check itself).
-        """
-        expected_ids: list[str] = []
-        # call_id -> tool name, for the canonical repair event's `repairs`
-        # entries. Best-effort: the key carrying the name differs by who wrote
-        # the record ("name" for Anthropic-style storage, "tool" for the
-        # streaming orchestrator), and it is absent entirely in some shapes.
-        expected_names: dict[str, str] = {}
-        for tc in chained_msg.get("tool_calls") or []:
-            if isinstance(tc, dict):
-                tc_id = tc.get("id") or tc.get("tool_call_id")
-                if tc_id:
-                    expected_ids.append(str(tc_id))
-                    expected_names[str(tc_id)] = str(
-                        tc.get("name") or tc.get("tool") or "unknown"
-                    )
-        content = chained_msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_call":
-                    b_id = block.get("id")
-                    if b_id and str(b_id) not in expected_ids:
-                        expected_ids.append(str(b_id))
-                        expected_names[str(b_id)] = str(block.get("name") or "unknown")
-
-        provided_ids: set[str] = set()
-        anomalous_items: list[dict[str, Any]] = []
-        kept_anomalous_ids: list[str] = []
-        kept: list[dict[str, Any]] = []
-        for item in delta_input:
-            item_type = item.get("type") if isinstance(item, dict) else None
-            if item_type in _PAIRED_OUTPUT_ITEM_TYPES:
-                call_id = str(item.get("call_id") or "")
-                # fc_-keyed drop stays scoped to function_call_output: that is
-                # the envelope the upstream dispatch-keying bug was observed on,
-                # and dropping a native output would destroy a real, otherwise
-                # unrecoverable tool result.
-                if item_type == "function_call_output" and call_id.startswith("fc_"):
-                    if call_id in expected_ids:
-                        # The chained turn's LOCAL record is keyed by the same
-                        # fc_ id — the pairing is internally consistent, just
-                        # mis-keyed upstream. Dropping this output would
-                        # destroy the real tool result only for the orphan
-                        # branch to synthesize an error output under the SAME
-                        # unpairable id: strictly worse. Keep the real output.
-                        kept_anomalous_ids.append(call_id)
-                        logger.warning(
-                            "[PROVIDER] Chain pairing: function_call_output %s "
-                            "is keyed by an ITEM id (fc_), but the chained "
-                            "turn's local tool-call record uses the same id — "
-                            "keeping the REAL output (len %d) rather than "
-                            "destroying it. This indicates an upstream "
-                            "dispatch-keying bug (likely pre-P4 history).",
-                            call_id,
-                            len(str(item.get("output") or "")),
-                        )
-                        provided_ids.add(call_id)
-                        kept.append(item)
-                        continue
-                    anomalous_items.append(item)
-                    logger.warning(
-                        "[PROVIDER] Chain pairing: dropping function_call_output "
-                        "keyed by ITEM id %s (output len %d) — fc_ ids cannot "
-                        "pair with any server-side call; this indicates an "
-                        "upstream dispatch-keying bug.",
-                        call_id,
-                        len(str(item.get("output") or "")),
-                    )
-                    continue
-                provided_ids.add(call_id)
-            kept.append(item)
-
-        missing_ids = [cid for cid in expected_ids if cid not in provided_ids]
-        for cid in missing_ids:
-            logger.warning(
-                "[PROVIDER] Chain pairing: synthesizing error output for "
-                "orphaned chained call %s (expected=%s, provided=%s).",
-                cid,
-                expected_ids,
-                sorted(provided_ids),
-            )
-            kept.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": cid,
-                    "output": (
-                        "[error] Tool execution result missing for this call "
-                        "(chained-turn pairing repair). The result was lost or "
-                        "mis-keyed; re-issue the tool call if still needed."
-                    ),
-                }
-            )
-
-        if (
-            (missing_ids or anomalous_items or kept_anomalous_ids)
-            and self.coordinator
-            and hasattr(self.coordinator, "hooks")
-        ):
-            # Canonical ecosystem event name. "a tool call's result went
-            # missing and the provider patched over it" is not an OpenAI
-            # concept — the kernel names it provider:tool_sequence_repaired
-            # and six providers emit it, including this one, which already
-            # emits it for the message-level repair
-            # (_find_missing_tool_results).
-            #
-            # The previously-emitted "provider:chain_pairing_repaired" was a
-            # private name for the same category of event, and it reached no
-            # handler. hooks-logging learns event names from THREE sources —
-            # the kernel registry, the "observability.events" capability and
-            # contribution channel, and its own additional_events config —
-            # so absence from the kernel registry alone is not sufficient to
-            # go dark. This provider also registers no observability.events
-            # contributor (provider-gemini does, which is how its private
-            # provider:concurrency event gets logged). Both conditions
-            # together are what silently discarded every emission.
-            #
-            # There is no formal field contract for this event: events.rs
-            # registers the NAME with a one-line doc comment and no schema,
-            # and it is absent from CONTRACTS.md's event table. The fields
-            # below follow the de-facto convention (provider / repair_count /
-            # repairs), which anthropic, gemini, ollama and vllm share and
-            # which chat-completions diverges from (repaired_count /
-            # repaired_tool_ids). Chain-specific diagnostics ride along as
-            # additive keys, exactly as synthetic_assistant_count already
-            # does on the message-level emission below.
-            #
-            # repair_count counts SYNTHESIZED results only, so it always
-            # equals len(repairs) — the invariant the sibling providers hold
-            # and the one cross-provider repair-volume aggregation depends
-            # on. Dropping an unpairable fc_-keyed output is a different
-            # action, counted separately in dropped_count. This turn can
-            # legitimately drop without synthesizing, so
-            # repair_count: 0 / dropped_count: 1 is a real and
-            # self-describing shape, not a contradiction. The emission is
-            # deliberately NOT gated on repair_count > 0: a dropped output is
-            # exactly the signal that went unobserved before this change, and
-            # suppressing it would re-hide it.
-            await self.coordinator.hooks.emit(
-                "provider:tool_sequence_repaired",
-                {
-                    "provider": self.name,
-                    "repair_count": len(missing_ids),
-                    "repairs": [
-                        {
-                            "tool_call_id": cid,
-                            "tool_name": expected_names.get(cid, "unknown"),
-                        }
-                        for cid in missing_ids
-                    ],
-                    "repair_site": "chain_pairing",
-                    "dropped_count": len(anomalous_items),
-                    # An fc_-keyed output is now one of TWO outcomes, not one:
-                    # dropped (pairs with nothing) or KEPT (its id matches the
-                    # chained turn's local record). dropped_count alone would
-                    # therefore under-report fc_ keying anomalies — the very
-                    # signal this event was fixed to surface — because every
-                    # kept output would vanish from the counts. Total fc_
-                    # anomalies on a turn = dropped_count + kept_count.
-                    "kept_count": len(kept_anomalous_ids),
-                    "expected_call_ids": expected_ids,
-                    "provided_call_ids": sorted(provided_ids),
-                    "synthesized_for": missing_ids,
-                    "dropped_item_id_outputs": [
-                        str(i.get("call_id")) for i in anomalous_items
-                    ],
-                    "kept_item_id_outputs": kept_anomalous_ids,
-                },
-            )
-        return kept
 
     def _find_missing_tool_results(
         self, messages: list
@@ -2188,33 +1852,6 @@ class OpenAIProvider:
             return []
         return response.tool_calls
 
-    def _should_chain_responses(self, model_id: str, kwargs: dict[str, Any]) -> bool:
-        """Resolve whether response chaining is active for *this* call.
-
-        Precedence (highest first):
-          1. kwargs["enable_response_chaining"]  (per-call override)
-          2. self.enable_response_chaining       (config)
-          3. "auto" → caps.supports_reasoning
-        """
-        override = kwargs.get("enable_response_chaining", self.enable_response_chaining)
-        if override is True:
-            return True
-        if override is False:
-            return False
-        # "auto"
-        return get_capabilities(model_id).supports_reasoning
-
-    def _chaining_permitted(self, kwargs: dict[str, Any]) -> bool:
-        """False only when chaining is EXPLICITLY disabled.
-
-        `enable_response_chaining=False` is a ZDR / regulated-industry opt-out
-        (see the tri-state doc at the config site). It is authoritative: legacy
-        `enable_state=True` must not silently re-attach previous_response_id
-        behind an operator who explicitly opted out. "auto" and True both permit.
-        """
-        override = kwargs.get("enable_response_chaining", self.enable_response_chaining)
-        return override is not False
-
     async def _create_response(self, params: dict[str, Any]) -> Any:
         """Call `client.responses.create(**params)`.
 
@@ -2331,47 +1968,7 @@ class OpenAIProvider:
         for conv_msg in conversation:
             all_messages_for_conversion.append(conv_msg.model_dump())
 
-        # Decide chaining BEFORE message conversion so we can suppress
-        # encrypted-content re-insertion when chain_will_attach is True.
         model_name = kwargs.get("model", self.default_model)
-        chain_active = self._should_chain_responses(model_name, kwargs)
-
-        # Check for previous response metadata to preserve reasoning state across turns
-        previous_response_id = None
-        if message_list:
-            # Look at the last assistant message for metadata
-            for msg in reversed(message_list):
-                if msg.role == "assistant":
-                    # Check if message has our metadata
-                    msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else msg
-                    if isinstance(msg_dict, dict) and msg_dict.get("metadata"):
-                        metadata = msg_dict["metadata"]
-                        prev_id = metadata.get(METADATA_RESPONSE_ID)
-                        if prev_id:
-                            previous_response_id = prev_id
-                            logger.info(
-                                f"[PROVIDER] Found previous_response_id={prev_id} "
-                                f"from last assistant message - will preserve reasoning state"
-                            )
-                            break
-
-        # If a compaction fired since the last request, break the chain now.
-        # The stored previous_response_id points at the pre-compaction
-        # server-side context; chaining from it would rebuild the un-compacted
-        # transcript server-side and grow input tokens without bound. Dropping
-        # it forces a fresh prefix built from the compacted local transcript
-        # (which is still sent in full via `input`). One-shot: consume and
-        # clear so subsequent turns chain normally from the new post-compaction
-        # response.
-        if self._reset_chain_on_next_request:
-            if previous_response_id is not None:
-                logger.info(
-                    "[PROVIDER] Breaking response chain after compaction "
-                    "(dropping previous_response_id=%s).",
-                    previous_response_id,
-                )
-                previous_response_id = None
-            self._reset_chain_on_next_request = False
 
         # Check for background mode (used for deep research and long-running requests)
         # Background mode requires store=True per OpenAI API requirements
@@ -2387,37 +1984,10 @@ class OpenAIProvider:
                 f"[PROVIDER] Deep research model detected: {model_name}, background={background_mode}"
             )
 
-        # ---- Response chaining resolution (PR-B) -----------------------------
-        # Three knobs interact:
-        #   - background_mode            → forces store=True
-        #   - enable_response_chaining   → for reasoning models, forces store=True
-        #                                  AND attaches previous_response_id
-        #   - enable_state (legacy)      → broad server-state opt-in
-        # Per-call kwargs override config for both.
-        # (chain_active, previous_response_id, and the compaction reset were
-        # already resolved above, before this point.)
-
-        store_enabled = kwargs.get("store", self.enable_state)
-        if background_mode:
-            store_enabled = True
-            logger.info("[PROVIDER] Background mode enabled, forcing store=True")
-        if chain_active:
-            store_enabled = True  # chaining requires server-side state
-
-        # Chaining is only real if a prior id survived every reset AND we will
-        # actually attach it. `chain_active` alone is a *configuration* signal; it
-        # says nothing about whether the server holds state for THIS request.
-        # Keying conversion on it is what produced replayed function_calls with no
-        # reasoning items on every post-compaction turn.
-        chain_will_attach = bool(previous_response_id) and (
-            self._chaining_permitted(kwargs) and (chain_active or store_enabled)
-        )
-
-        # Convert to OpenAI Responses API message format
-        input_messages = self._convert_messages(
-            all_messages_for_conversion,
-            skip_reasoning_reinsertion=chain_will_attach,
-        )
+        # Convert to OpenAI Responses API message format. Always the FULL
+        # local transcript -- the provider is stateless-only, there is no
+        # chain-truncated delta to convert instead.
+        input_messages = self._convert_messages(all_messages_for_conversion)
         logger.info(
             f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
         )
@@ -2427,83 +1997,14 @@ class OpenAIProvider:
             "model": model_name,
             "input": input_messages,  # Array of message objects, not text string
         }
-        params["store"] = store_enabled
+        # Amplifier is always stateless: store=false, full input, turn-scoped
+        # reasoning replay. Background mode is the ONE exception -- the API
+        # requires the response to be retrievable for polling, so it forces
+        # store=true per-request. Operators who genuinely need server-side
+        # retention set it via extra_request_params and own the consequences
+        # (see README "Conversation state").
+        params["store"] = bool(background_mode)
 
-        # Attach previous_response_id when chain_will_attach resolved True above:
-        # a prior id survived every reset, chaining is permitted (see
-        # _chaining_permitted / Change C), and either chain_active or legacy
-        # enable_state wants server-side retention. This is the SAME predicate
-        # that gated message conversion above, so "did we suppress reasoning
-        # re-insertion" and "did we attach previous_response_id" can never
-        # disagree again.
-        # Track on params for downstream invalidation-retry logic.
-        if chain_will_attach:
-            params["previous_response_id"] = previous_response_id
-            logger.debug(
-                "[PROVIDER] Using previous_response_id=%s (chain_active=%s, store=%s)",
-                previous_response_id,
-                chain_active,
-                store_enabled,
-            )
-            # previous_response_id already carries the full prior
-            # request+response as server-side state. Re-sending the entire
-            # local conversation in `input` double-counts every prior token
-            # server-side. Send ONLY the delta: developer context for this turn
-            # plus the conversation messages added AFTER the chained assistant
-            # turn.
-            chain_idx = None
-            for i in range(len(conversation) - 1, -1, -1):
-                cm = conversation[i]
-                cm_dict = cm.model_dump() if hasattr(cm, "model_dump") else cm
-                if (
-                    getattr(cm, "role", None) == "assistant"
-                    and isinstance(cm_dict, dict)
-                    and cm_dict.get("metadata")
-                    and cm_dict["metadata"].get(METADATA_RESPONSE_ID)
-                    == previous_response_id
-                ):
-                    chain_idx = i
-                    break
-            if chain_idx is not None:
-                delta_for_conversion = [dev.model_dump() for dev in developer_msgs] + [
-                    cm.model_dump() for cm in conversation[chain_idx + 1 :]
-                ]
-                params["input"] = self._convert_messages(
-                    delta_for_conversion,
-                    skip_reasoning_reinsertion=chain_active,
-                )
-                # Pathway #2 (chain-aware pairing invariant): the server-side
-                # response referenced by previous_response_id carries the
-                # function_call items; the delta input carries only outputs.
-                # The generic wire backstop in _convert_messages cannot see
-                # server-side calls, so enforce here: every tool call issued
-                # by the assistant turn being chained from MUST have a
-                # function_call_output paired BY call_id in this delta, or
-                # the API 400s ("No tool output found for function call ...")
-                # and kills the session. Observed live: a COMPLETED,
-                # successfully-executed tool call still 400'd because its
-                # output was keyed by the fc_ item id instead of call_id.
-                chained_msg = conversation[chain_idx]
-                chained_dict = (
-                    chained_msg.model_dump()
-                    if hasattr(chained_msg, "model_dump")
-                    else chained_msg
-                )
-                params["input"] = await self._enforce_chain_output_pairing(
-                    params["input"],
-                    chained_dict if isinstance(chained_dict, dict) else {},
-                )
-                logger.info(
-                    "[PROVIDER] Response chaining active: trimmed input to delta "
-                    "(%d local messages -> %d API messages after previous_response_id)",
-                    len(delta_for_conversion),
-                    len(params["input"]),
-                )
-        elif previous_response_id:
-            logger.debug(
-                "[PROVIDER] Skipping previous_response_id (chain_active=False, store=False). "
-                "Relying on explicit reasoning re-insertion from metadata/content."
-            )
         if instructions:
             params["instructions"] = instructions
 
@@ -2518,7 +2019,7 @@ class OpenAIProvider:
             # cross-provider parity confound. Explicit request/kwargs/config
             # values still win; DEFAULT_MAX_TOKENS is only the fallback when
             # capability data is absent.
-            max_tokens = kwargs.get("max_tokens", self.max_tokens)
+            max_tokens = kwargs.get("max_tokens", self.max_output_tokens)
             if max_tokens is None:
                 caps = get_capabilities(params["model"])
                 max_tokens = caps.max_output_tokens or DEFAULT_MAX_TOKENS
@@ -2589,36 +2090,16 @@ class OpenAIProvider:
                 _reasoning_mode = reasoning_param.get("mode")
                 if _reasoning_mode is not None:
                     params["reasoning"]["mode"] = _reasoning_mode
-                # reasoning.context (GPT-5.6): persisted-reasoning strategy.
-                # Flag-gated (default off, `enable_reasoning_context`) AND
-                # chain/store-gated: only forwarded when the server is actually
-                # retaining reasoning state for this request (chaining via
-                # previous_response_id, or store=true). On a stateless call
-                # (Amplifier's default store=False) there is nothing persisted
-                # for the server to apply a context strategy to, so sending it
-                # there is meaningless-to-harmful. Mirrors the
-                # encrypted_content stateless/chained split below.
+                # reasoning.context (GPT-5.6 persisted reasoning): forwarded
+                # UNGATED whenever the caller supplies it in an explicit
+                # `reasoning` dict -- an explicit reasoning dict is a
+                # deliberate provider-specific override (same stance as
+                # `mode` above); the caller owns the consequences.
+                # `_validate_reasoning_context` above already rejected any
+                # value the API would reject.
                 _reasoning_context = reasoning_param.get("context")
                 if _reasoning_context is not None:
-                    if not self.enable_reasoning_context:
-                        logger.debug(
-                            "[PROVIDER] Ignoring reasoning.context=%r: "
-                            "enable_reasoning_context is off (default). Set "
-                            "config 'enable_reasoning_context' to opt in.",
-                            _reasoning_context,
-                        )
-                    elif not (chain_active or store_enabled):
-                        logger.debug(
-                            "[PROVIDER] Ignoring reasoning.context=%r: request "
-                            "is stateless (chain_active=%s, store=%s). "
-                            "Persisted-reasoning context only applies when "
-                            "server-side state is retained.",
-                            _reasoning_context,
-                            chain_active,
-                            store_enabled,
-                        )
-                    else:
-                        params["reasoning"]["context"] = _reasoning_context
+                    params["reasoning"]["context"] = _reasoning_context
             else:
                 # String format: use as effort level with default summary
                 params["reasoning"] = {
@@ -2634,22 +2115,20 @@ class OpenAIProvider:
         # Exception: explicit effort="none" suppresses include (caller opted out of reasoning).
         #
         # A5 (probe P1, pre-registered in the reasoning-continuity-fix spec):
-        # requesting include=["reasoning.encrypted_content"] on an
-        # ALREADY-CHAINED request (previous_response_id attached) does NOT
-        # bust the prompt-cache prefix -- `include` only changes the
-        # *response* shape returned by the server, not the *request* prefix
-        # caching keys on. Verified live on gpt-5.6-luna: per-hop
-        # cached_tokens differed by 0-4 tokens out of ~1,500-1,600 (R2-R4,
-        # ~96% cache_read share in both arms) between an arm requesting
-        # include and an otherwise-identical arm that omitted it -- see
+        # requesting include=["reasoning.encrypted_content"] does NOT bust
+        # the prompt-cache prefix -- `include` only changes the *response*
+        # shape returned by the server, not the *request* prefix caching
+        # keys on. Verified live on gpt-5.6-luna: per-hop cached_tokens
+        # differed by 0-4 tokens out of ~1,500-1,600 (R2-R4, ~96%
+        # cache_read share in both arms) between an arm requesting include
+        # and an otherwise-identical arm that omitted it -- see
         # probes/p1_include_chained_probe.py /
         # probes/_p1_include_probe_results.json ("verdict": "PASS").
-        # So ciphertext capture is now UNCONDITIONAL: request it whenever the
-        # model will reason, chained or not. This lets every reset/resume
-        # path replay reasoning regardless of whether the response that
-        # produced it was chained -- previously, a response captured while
-        # chaining had encrypted_content=None and was permanently unreplayable
-        # after a chain break or resume (see Change B).
+        # So ciphertext capture is UNCONDITIONAL: request it whenever the
+        # model will reason. This lets every reset/resume path replay
+        # reasoning regardless of what produced it -- the provider is
+        # stateless-only, so encrypted_content is the only durable handle
+        # on reasoning state across turns.
         if True:
             caps = get_capabilities(model_name)
             active_effort: str | None = None
@@ -2710,15 +2189,12 @@ class OpenAIProvider:
         prompt_cache_retention = (
             kwargs.get("prompt_cache_retention", self.prompt_cache_retention) or None
         )
-        # Drop retention values the model is known to reject. Each helper is
-        # a no-op unless its target value is set AND the capability flag is
-        # False. Today only `supports_in_memory_retention=False` (gpt-5.5)
-        # actually fires; `supports_24h_retention=False` is reserved for
-        # future families that prove to reject "24h".
+        # Drop retention values the model is known to reject. No-op unless
+        # the value is set AND the capability flag is False -- today only
+        # `supports_in_memory_retention=False` (gpt-5.5) actually fires.
+        # The mirror-image `supports_24h_retention` gate was removed: proven
+        # dormant (defaults True, no branch anywhere ever set it False).
         prompt_cache_retention = _drop_unsupported_in_memory_retention(
-            model_name, prompt_cache_retention
-        )
-        prompt_cache_retention = _drop_unsupported_24h_retention(
             model_name, prompt_cache_retention
         )
         if prompt_cache_retention is not None:
@@ -2733,30 +2209,7 @@ class OpenAIProvider:
         )
         if prompt_cache_options is not None:
             _validate_prompt_cache_options(prompt_cache_options)
-            # D2 guardrail (live-probed 2026-08-28): mode="explicit" with ZERO
-            # prompt_cache_breakpoint markers in `input` disables prompt caching
-            # ENTIRELY -- cache_write_tokens==0 AND cached_tokens==0 on every
-            # request, not just "no explicit-mode benefit". This provider does
-            # not attach breakpoints anywhere today, so this silently converts a
-            # ~95% cache-read workload into 100% full-price input (~10x cost).
-            # Downgrade to implicit and warn once per provider instance.
-            if prompt_cache_options.get(
-                "mode"
-            ) == "explicit" and not _input_has_cache_breakpoint(params["input"]):
-                if not self._explicit_cache_mode_warned:
-                    logger.warning(
-                        "[PROVIDER] prompt_cache_options.mode='explicit' with no "
-                        "prompt_cache_breakpoint markers in input: this disables "
-                        "prompt caching entirely (no reads, no writes), a ~10x "
-                        "input-cost regression vs implicit mode. Downgrading to "
-                        "implicit for this session."
-                    )
-                    self._explicit_cache_mode_warned = True
-                prompt_cache_options = {
-                    k: v for k, v in prompt_cache_options.items() if k != "mode"
-                } or None
-            if prompt_cache_options is not None:
-                params["prompt_cache_options"] = prompt_cache_options
+            params["prompt_cache_options"] = prompt_cache_options
 
         safety_identifier = (
             kwargs.get("safety_identifier", self.safety_identifier) or None
@@ -2781,7 +2234,6 @@ class OpenAIProvider:
         )
 
         thinking_enabled = bool(kwargs.get("extended_thinking"))
-        thinking_budget = None
         if thinking_enabled:
             if "reasoning" not in params:
                 params["reasoning"] = {
@@ -2789,31 +2241,9 @@ class OpenAIProvider:
                     or self.config.get("reasoning_effort", "high"),
                     "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
                 }
-
-            budget_tokens = (
-                kwargs.get("thinking_budget_tokens")
-                or self.config.get("thinking_budget_tokens")
-                or 0
-            )
-            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
-                "thinking_budget_buffer", 1024
-            )
-
-            if budget_tokens:
-                thinking_budget = budget_tokens
-                target_tokens = budget_tokens + buffer_tokens
-                if params.get("max_output_tokens"):
-                    params["max_output_tokens"] = max(
-                        params["max_output_tokens"], target_tokens
-                    )
-                else:
-                    params["max_output_tokens"] = target_tokens
-
             logger.info(
-                "[PROVIDER] Extended thinking enabled (effort=%s, budget=%s, buffer=%s)",
+                "[PROVIDER] Extended thinking enabled (effort=%s)",
                 params["reasoning"]["effort"],
-                thinking_budget or "default",
-                buffer_tokens,
             )
 
         # Auto-enable reasoning summary for models that reason by default.
@@ -2828,6 +2258,10 @@ class OpenAIProvider:
             if caps_for_auto.default_reasoning_effort is not None:
                 params["reasoning"] = {"summary": "auto"}
 
+        # extra_request_params: the documented escape hatch, merged LAST so
+        # it reflects in the emitted `raw` payload below (owner-beware).
+        self._merge_extra_request_params(params)
+
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             request_payload: dict[str, Any] = {
@@ -2836,8 +2270,6 @@ class OpenAIProvider:
                 "message_count": len(message_list),
                 "has_instructions": bool(instructions),
                 "reasoning_enabled": params.get("reasoning") is not None,
-                "thinking_enabled": thinking_enabled,
-                "thinking_budget": thinking_budget,
                 "background_mode": background_mode,
             }
             if self.raw:
@@ -2870,81 +2302,24 @@ class OpenAIProvider:
         # disable the stream-event loop for that path.
         supports_streaming = not background_mode
 
-        def _rebuild_stateless_input() -> list[dict[str, Any]]:
-            """Re-convert with reasoning replay ON, for the chain-broken retry paths.
-
-            `input_messages` was converted with reasoning suppressed because a chain
-            was going to be attached. Once the chain is gone the server holds nothing,
-            so the replay must be restored -- otherwise the retry resends function_call
-            items with no originating reasoning items (OpenAI's #1 migration error).
-            Bounded by the same turn-scoped policy as every other stateless replay
-            (see reasoning_replay_scope), so this cannot re-inflate an overflowing
-            payload without limit.
-            """
-            return self._convert_messages(
-                all_messages_for_conversion,
-                skip_reasoning_reinsertion=False,
-            )
-
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info
 
             async def _handle_context_overflow(e: Exception, error_msg: str):
-                """Break an active response chain, then raise ContextLengthError.
+                """Raise ContextLengthError. Shared by the 400 path and the
+                streaming APIError path, which surface the same underlying
+                condition.
 
-                Shared by the 400 path and the streaming APIError path, which
-                surface the same underlying condition.
+                The provider is stateless: `input` already carries the full
+                local transcript and there is no server-side context to drop,
+                so there is nothing a retry could shrink. Raising immediately
+                fails fast instead of burning max_retries on a request that
+                cannot succeed. ContextLengthError is non-retryable and is
+                consumed for presentation -- the CLI renders a "Context
+                Length Exceeded" panel. Compaction is the context manager's
+                job, driven by its own token threshold at request-build time.
                 """
-                # An overflow while a response chain is active almost always
-                # means previous_response_id is holding a large pre-compaction
-                # server-side context. Break the chain once and retry with the
-                # full (compacted) local transcript so the request is bounded
-                # by the local view. This is the self-heal that also covers the
-                # resume path, where a fresh process re-lifts a stale on-disk
-                # openai:response_id before any compaction event has fired.
-                if "previous_response_id" in params:
-                    overflow_id = params.pop("previous_response_id")
-                    # Chain is gone -> the server holds no prior context, so
-                    # restore the full converted history (mirrors the 404
-                    # invalidation path), this time WITH reasoning items
-                    # replayed (A6/A7) -- otherwise the retry resends
-                    # function_call items with no originating reasoning items.
-                    # Retrying with only the delta would silently drop the
-                    # entire prior conversation.
-                    params["input"] = _rebuild_stateless_input()
-                    params["include"] = [
-                        "reasoning.encrypted_content"
-                    ]  # server holds nothing now
-                    logger.warning(
-                        "[PROVIDER] context_length_exceeded with active "
-                        "response chain (previous_response_id=%s). Breaking "
-                        "chain and retrying with full compacted input.",
-                        overflow_id,
-                    )
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        await self.coordinator.hooks.emit(
-                            RESPONSE_CHAIN_INVALIDATED,
-                            {
-                                "provider": self.name,
-                                "model": params.get("model"),
-                                "invalidated_id": overflow_id,
-                                "error_code": "context_length_exceeded",
-                            },
-                        )
-                    # Retry once. previous_response_id is gone, so a second
-                    # overflow cannot re-enter this branch — it falls through
-                    # to the ContextLengthError below, which is non-retryable
-                    # and so fails fast instead of burning max_retries on a
-                    # request that cannot succeed. Raising the typed error does
-                    # not trigger recovery: compaction is driven by the context
-                    # manager's own token threshold at request-build time, not
-                    # by provider errors, and nothing catches
-                    # ContextLengthError to retry. It is consumed for
-                    # presentation -- the CLI renders a "Context Length
-                    # Exceeded" panel with an actionable tip rather than a
-                    # generic error.
-                    return await _do_complete()
                 raise kernel_errors.ContextLengthError(
                     error_msg,
                     provider=self.name,
@@ -3220,56 +2595,9 @@ class OpenAIProvider:
                         status_code=403,
                     ) from e
                 if status == 404:
-                    # Specific case: previous_response_id is unknown/expired.
-                    # Retry once without the field (graceful chain rebuild).
-                    err_code = None
-                    if isinstance(body, dict):
-                        err_code = (body.get("error") or {}).get("code")
-                    raw_msg_404 = str(e).lower()
-                    is_chain_invalidation = (
-                        err_code in RESPONSE_NOT_FOUND_ERROR_CODES
-                        or "previous_response_id" in raw_msg_404
-                    )
-                    if is_chain_invalidation and "previous_response_id" in params:
-                        invalidated_id = params.pop("previous_response_id")
-                        # When chaining was active we trimmed params["input"]
-                        # down to the post-chain delta. With the chain now
-                        # invalidated the server holds no prior context, so
-                        # restore the full converted history. OpenAI's
-                        # documented recovery is previous_response_id=null +
-                        # full input; retrying with only the delta would
-                        # silently drop the entire prior conversation.
-                        params["input"] = _rebuild_stateless_input()
-                        params["include"] = [
-                            "reasoning.encrypted_content"
-                        ]  # server holds nothing now
-                        logger.warning(
-                            "[PROVIDER] previous_response_id=%s invalidated by server "
-                            "(code=%s). Retrying without chain.",
-                            invalidated_id,
-                            err_code,
-                        )
-                        if self.coordinator and hasattr(self.coordinator, "hooks"):
-                            await self.coordinator.hooks.emit(
-                                RESPONSE_CHAIN_INVALIDATED,
-                                {
-                                    "provider": self.name,
-                                    "model": params.get("model"),
-                                    "invalidated_id": invalidated_id,
-                                    "error_code": err_code,
-                                },
-                            )
-                        # Recurse once. Do NOT loop indefinitely: by removing
-                        # the field, the next call cannot hit this branch again.
-                        # Reasoning replay is RESTORED here (A6/A7): the chain
-                        # just broke, so the server holds nothing for this
-                        # turn, and _rebuild_stateless_input() re-converts with
-                        # skip_reasoning_reinsertion=False, bounded by
-                        # reasoning_replay_scope. This is a fresh stateless
-                        # prefix; next turn re-chains via the response_id we
-                        # get from this retry.
-                        return await _do_complete()
-                    # Fall through to existing 404 handling
+                    # params can never contain "previous_response_id" -- the
+                    # provider is stateless-only, so there is no chain to
+                    # invalidate and retry without.
                     raise kernel_errors.NotFoundError(
                         error_msg,
                         provider=self.name,
@@ -3613,7 +2941,7 @@ class OpenAIProvider:
 
                 logger.info(
                     f"[PROVIDER] Response incomplete (reason: {incomplete_reason}), "
-                    f"auto-continuing with previous_response_id={final_response.id} "
+                    f"auto-continuing (response_id={final_response.id}) "
                     f"(continuation {continuation_count}/{MAX_CONTINUATION_ATTEMPTS})"
                 )
 
@@ -3630,11 +2958,11 @@ class OpenAIProvider:
                         },
                     )
 
-                # Build continuation params using input-based pattern (stateless-compatible)
-                # Instead of previous_response_id (requires store:true), we include the
-                # accumulated output in the input to preserve context
+                # Build continuation params using input-based pattern.
+                # params["input"] is the full converted history; the provider
+                # is always stateless.
                 continuation_input = self._build_continuation_input(
-                    input_messages, accumulated_output
+                    params["input"], accumulated_output
                 )
 
                 continue_params = {
@@ -3659,11 +2987,8 @@ class OpenAIProvider:
                     continue_params["parallel_tool_calls"] = params.get(
                         "parallel_tool_calls", True
                     )
-                # Note: continue_params intentionally does NOT inherit
-                # previous_response_id. The incomplete-continuation path uses
-                # _build_continuation_input() to carry context forward
-                # explicitly. Mixing previous_response_id with a rebuilt input
-                # array would double-count tokens.
+                # The provider is stateless: context is carried forward
+                # explicitly in the rebuilt input array.
                 if "store" in params:
                     continue_params["store"] = params["store"]
                 if "prompt_cache_key" in params:
@@ -3680,6 +3005,11 @@ class OpenAIProvider:
                     ]
                 if "text" in params:
                     continue_params["text"] = params["text"]
+
+                # extra_request_params applies to EVERY request this provider
+                # issues, not just the first. Merged last here too, for the
+                # same reason and with the same owner-beware semantics.
+                self._merge_extra_request_params(continue_params)
 
                 # Make continuation call
                 try:
@@ -3919,7 +3249,6 @@ class OpenAIProvider:
         self,
         messages: list[dict[str, Any]],
         *,
-        skip_reasoning_reinsertion: bool = False,
         reasoning_replay_scope: str | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
@@ -3931,8 +3260,6 @@ class OpenAIProvider:
 
         Args:
             messages: List of message dicts from ChatRequest
-            skip_reasoning_reinsertion: When True (chaining active), never emit
-                reasoning items -- the server already holds that state.
             reasoning_replay_scope: Overrides self.reasoning_replay_scope for
                 this call ("turn" | "all" | "none"). None inherits config.
 
@@ -4224,7 +3551,9 @@ class OpenAIProvider:
                                     # Always include summary (required by OpenAI API).
                                     # Use thinking text when available, falling back to
                                     # the decoded stored summary, empty list otherwise.
-                                    thinking_text = block.get("thinking") or stored_summary
+                                    thinking_text = (
+                                        block.get("thinking") or stored_summary
+                                    )
                                     reasoning_item["summary"] = (
                                         [
                                             {
@@ -4235,16 +3564,7 @@ class OpenAIProvider:
                                         if thinking_text
                                         else []
                                     )
-                                    if skip_reasoning_reinsertion:
-                                        # Chaining is active: server holds reasoning state under
-                                        # previous_response_id. Don't re-emit encrypted_content
-                                        # (would bust the cache prefix) and don't emit bare rs_*
-                                        # IDs (server already knows them).
-                                        pass
-                                    else:
-                                        reasoning_items_to_add.append(
-                                            reasoning_item
-                                        )
+                                    reasoning_items_to_add.append(reasoning_item)
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
                             if block.type == "text":
@@ -4371,14 +3691,7 @@ class OpenAIProvider:
                                         else []
                                     )
 
-                                    if skip_reasoning_reinsertion:
-                                        # Chaining is active: server holds reasoning state under
-                                        # previous_response_id. Don't re-emit encrypted_content
-                                        # (would bust the cache prefix) and don't emit bare rs_*
-                                        # IDs (server already knows them).
-                                        pass
-                                    else:
-                                        reasoning_items_to_add.append(reasoning_item)
+                                    reasoning_items_to_add.append(reasoning_item)
 
                 # Handle simple string content
                 elif isinstance(content, str) and content:
@@ -4387,17 +3700,7 @@ class OpenAIProvider:
                 # Defensive: strip orphaned reasoning items that have no encrypted_content.
                 # These occur when the model reasoned but include=[reasoning.encrypted_content]
                 # was not requested — the reasoning ID exists but can't be sent back, causing 404s.
-                #
-                # When chaining is active (skip_reasoning_reinsertion=True), the server holds
-                # reasoning state under previous_response_id; we deliberately did not collect
-                # encrypted_content into reasoning_items_to_add. So the "metadata has reasoning
-                # IDs but list is empty" condition is the expected steady state, not an orphan.
-                # Skip the orphan check to avoid spurious warnings and unnecessary clears.
-                if (
-                    not skip_reasoning_reinsertion
-                    and metadata
-                    and metadata.get(METADATA_REASONING_ITEMS)
-                ):
+                if metadata and metadata.get(METADATA_REASONING_ITEMS):
                     # Strip PER-ITEM: a reasoning item without encrypted_content is
                     # an orphaned reference the API rejects (bare rs_* id -> 404).
                     # A turn can mix usable and orphaned reasoning items (e.g. one
@@ -4524,14 +3827,12 @@ class OpenAIProvider:
         # slipped through, synthesize an error output rather than letting the
         # request 400.
         #
-        # "Paired" is _PAIRED_OUTPUT_ITEM_TYPES — the same vocabulary
-        # _enforce_chain_output_pairing enforces — NOT function_call_output
+        # "Paired" is _PAIRED_OUTPUT_ITEM_TYPES, NOT function_call_output
         # alone. A native tool's result is emitted in its own envelope
         # (apply_patch_call_output / computer_call_output) above, so counting
         # only function_call_output declares a real, successful native result
         # missing and appends a fabricated "result missing" error beside it:
-        # two contradictory results for one call_id. Both enforcement sites
-        # answer the same question and must answer it identically.
+        # two contradictory results for one call_id.
         output_call_ids = {
             item.get("call_id")
             for item in openai_messages
@@ -5069,7 +4370,9 @@ class OpenAIProvider:
         # Build metadata with provider-specific state
         metadata = {}
 
-        # Response ID (for next turn's previous_response_id)
+        # Response ID -- captured for correlating a stored transcript turn to
+        # an OpenAI response (support/debug). Never read back into a later
+        # request: the provider is stateless-only.
         if hasattr(response, "id"):
             metadata[METADATA_RESPONSE_ID] = response.id
 

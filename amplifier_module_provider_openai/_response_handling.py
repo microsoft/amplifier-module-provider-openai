@@ -547,7 +547,9 @@ def convert_response_with_accumulated_output(
     # Build metadata with provider-specific state
     metadata = {}
 
-    # Response ID (for next turn's previous_response_id)
+    # Response ID -- captured for correlating a stored transcript turn to an
+    # OpenAI response (support/debug). Never read back into a later request:
+    # the provider is stateless-only, no previous_response_id chaining.
     if hasattr(final_response, "id"):
         metadata[METADATA_RESPONSE_ID] = final_response.id
 

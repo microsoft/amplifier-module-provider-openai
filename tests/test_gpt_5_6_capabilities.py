@@ -35,8 +35,6 @@ class TestGPT56Family:
         pin False so a future edit can't silently revert the suppression."""
         caps = get_capabilities(model)
         assert caps.supports_in_memory_retention is False
-        # 24h is the accepted default and must never be dropped for gpt-5.6.
-        assert caps.supports_24h_retention is True
 
     def test_gpt_5_6_dated_snapshot_resolves(self):
         """A dated snapshot (what the API can echo in response.model) resolves the

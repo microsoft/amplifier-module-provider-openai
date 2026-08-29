@@ -4,9 +4,8 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 from amplifier_core import ModuleCoordinator
-from amplifier_core.message_models import ChatRequest
-from amplifier_core.message_models import Message
-from amplifier_core.message_models import ToolCallBlock
+from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock
+
 from amplifier_module_provider_openai import OpenAIProvider
 
 
@@ -34,7 +33,10 @@ class FakeCoordinator:
         self.hooks = FakeHooks()
 
 
-def test_extended_thinking_enables_reasoning_and_budget_adjustment():
+def test_extended_thinking_forces_high_effort_without_budget_arithmetic():
+    """extended_thinking still forces high reasoning effort, but no longer
+    adjusts max_output_tokens -- the budget/buffer arithmetic was removed.
+    Set max_output_tokens directly if a larger budget is needed."""
     provider = OpenAIProvider(
         api_key="test-key", config={"max_tokens": 1024, "use_streaming": False}
     )
@@ -43,16 +45,13 @@ def test_extended_thinking_enables_reasoning_and_budget_adjustment():
     messages = [Message(role="user", content="Hello")]
     request = ChatRequest(messages=messages)
 
-    asyncio.run(
-        provider.complete(request, extended_thinking=True, thinking_budget_tokens=6000)
-    )
+    asyncio.run(provider.complete(request, extended_thinking=True))
 
     provider.client.responses.create.assert_awaited()
     call_kwargs = provider.client.responses.create.await_args_list[0].kwargs
 
     assert call_kwargs["reasoning"]["effort"] == "high"
-    # Default buffer is 1024 tokens, so expect budget + buffer to override defaults
-    assert call_kwargs["max_output_tokens"] == 7024
+    assert call_kwargs["max_output_tokens"] == 1024
 
 
 def test_tool_call_sequence_missing_tool_message_is_repaired():

@@ -34,8 +34,8 @@ DEFAULT_TRUNCATION: str | None = None
 # Default prompt-cache retention. OpenAI's per-model server-side default
 # is "in_memory" (5–10 min) for gpt-5.4 and below, "24h" for gpt-5.5+.
 # Forcing "24h" everywhere stabilizes cache lifetime across the curated
-# model list. Models that reject "24h" are gated by
-# `ModelCapabilities.supports_24h_retention`.
+# model list. Models that reject "in_memory" are gated by
+# `ModelCapabilities.supports_in_memory_retention`.
 DEFAULT_PROMPT_CACHE_RETENTION: str | None = "24h"
 
 # Maximum number of continuation attempts for incomplete responses
@@ -70,15 +70,11 @@ NATIVE_TOOL_TYPES = frozenset(
     }
 )
 
-# Deep research model identifiers
-DEEP_RESEARCH_MODELS = frozenset(
-    {
-        "o3-deep-research",
-        "o3-deep-research-2025-06-26",
-        "o4-mini-deep-research",
-        "o4-mini-deep-research-2025-06-26",
-    }
-)
+# Deep research model aliases. Dated snapshots (e.g. o3-deep-research-2026-XX-XX)
+# are matched by the `startswith` checks at every consumer, so enumerating them
+# here is redundant AND goes stale -- the two 2025-06-26 entries removed here had
+# outlived their snapshots.
+DEEP_RESEARCH_MODELS = frozenset({"o3-deep-research", "o4-mini-deep-research"})
 
 # Background response status values
 BACKGROUND_STATUS_QUEUED = "queued"
@@ -94,20 +90,5 @@ BACKGROUND_POLLING_STATUSES = frozenset(
         BACKGROUND_STATUS_QUEUED,
         BACKGROUND_STATUS_IN_PROGRESS,
         BACKGROUND_STATUS_SEARCHING,
-    }
-)
-
-# Hook event emitted when the server rejects previous_response_id.
-# Caller observability: lets dashboards count chain breaks vs. cache hits.
-RESPONSE_CHAIN_INVALIDATED = "provider:response_chain_invalidated"
-
-# OpenAI error codes that signal "previous_response_id is unknown/expired/foreign-key".
-# Detected against error.body["error"]["code"] (preferred) or, as a fallback,
-# substring match against the raw error message. Keep this set narrow — we do
-# NOT want to swallow generic 4xx errors as "chain invalidations".
-RESPONSE_NOT_FOUND_ERROR_CODES = frozenset(
-    {
-        "response_not_found",
-        "previous_response_not_found",
     }
 )
