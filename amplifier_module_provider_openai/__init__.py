@@ -3952,8 +3952,21 @@ class OpenAIProvider:
         elif _scope == "none":
             _reasoning_cutoff = len(messages)  # no index qualifies
         else:  # "turn"
+            # Ephemeral messages (metadata.ephemeral=True) are not turn
+            # boundaries -- they are regenerated tail content injected AFTER
+            # the real conversation (context-simple's compaction notice,
+            # loop-streaming's per-iteration hook-status injection), not a
+            # new user turn. Live post-compaction message lists always end
+            # with 1-2 of these; counting them as the boundary collapses the
+            # turn window to empty (cutoff lands on the last message index),
+            # so EVERY post-compaction request replays zero reasoning items.
             _reasoning_cutoff = max(
-                (idx for idx, m in enumerate(messages) if m.get("role") == "user"),
+                (
+                    idx
+                    for idx, m in enumerate(messages)
+                    if m.get("role") == "user"
+                    and not (m.get("metadata") or {}).get("ephemeral")
+                ),
                 default=-1,
             )
 
@@ -4413,6 +4426,16 @@ class OpenAIProvider:
                 # Per OpenAI Responses API: reasoning items must be top-level, not in message content
                 # D3: bounded by reasoning_replay_scope -- only emit for assistant
                 # turns after the cutoff (collection above is unaffected).
+                if reasoning_items_to_add:
+                    # Observability: the live capture wave could not confirm the
+                    # resolved cutoff from captures alone -- this closes that gap.
+                    logger.debug(
+                        "[PROVIDER] reasoning replay gate: msg_idx=%d cutoff=%d candidates=%d emit=%s",
+                        i,
+                        _reasoning_cutoff,
+                        len(reasoning_items_to_add),
+                        i > _reasoning_cutoff,
+                    )
                 if i > _reasoning_cutoff:
                     for reasoning_item in reasoning_items_to_add:
                         openai_messages.append(reasoning_item)
