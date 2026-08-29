@@ -110,11 +110,11 @@ def test_text_verbosity_forwarded_on_continuation():
 
 
 class TestConfigFieldPresent:
-    def test_text_verbosity_field_present(self):
+    def test_text_verbosity_is_settings_only_not_a_config_field(self):
+        """Config-surface V2 reduced the wizard to 4 fields; text_verbosity
+        is settings-only now (the config key still works exactly as
+        before -- see test_text_verbosity_forwarded_when_set below)."""
         provider = _make_provider()
         info = provider.get_info()
         field = next((f for f in info.config_fields if f.id == "text_verbosity"), None)
-        assert field is not None
-        assert field.field_type == "choice"
-        assert field.choices == ["low", "medium", "high"]
-        assert field.required is False
+        assert field is None

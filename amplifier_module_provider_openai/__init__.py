@@ -1334,7 +1334,7 @@ class OpenAIProvider:
                     id="reasoning_effort",
                     display_name="Reasoning Effort",
                     field_type="choice",
-                    prompt="Select reasoning effort level",
+                    prompt="Reasoning effort — higher is smarter, slower, costlier",
                     choices=["none", "low", "medium", "high", "xhigh", "max"],
                     default="none",
                     required=False,
@@ -1344,56 +1344,22 @@ class OpenAIProvider:
                     id="enable_long_context",
                     display_name="Enable long context",
                     field_type="boolean",
-                    prompt="Enable long context (>272K tokens, 2x input / 1.5x output pricing)",
+                    prompt="Allow requests over 272K input tokens (\u22482\u00d7 cost)",
                     required=False,
                     default="false",
-                ),
-                ConfigField(
-                    id="text_verbosity",
-                    display_name="Text verbosity",
-                    field_type="choice",
-                    prompt="Response verbosity (GPT-5.6). Leave unset for model default.",
-                    choices=["low", "medium", "high"],
-                    required=False,
-                    default=None,
-                    requires_model=True,  # Shown after model selection
-                    # text.verbosity is a GPT-5.6-family feature per OpenAI docs;
-                    # pre-5.6 models don't accept it, so hide it for those models.
+                    requires_model=True,  # NEW -- needed for show_when to see default_model
+                    # Matches exactly the models with modelled long rates
+                    # (_LONG_RATES, _cost.py) -- gpt-5.6-sol/-terra/-luna (and
+                    # the over-included -cyber, harmless: the flag still
+                    # widens its reported window correctly). gpt-5.5 has NO
+                    # threshold at all (the flag would be a total no-op) and
+                    # gpt-5.4*/-mini/-nano have a threshold but no long rates
+                    # (cost-neutral) -- neither belongs behind this specific
+                    # ~2x-cost prompt. show_when is AND-only with one
+                    # predicate per key, so a three-way set is not
+                    # expressible; this is the single expressible predicate
+                    # that matches the models where the flag has a real cost.
                     show_when={"default_model": "contains:gpt-5.6"},
-                ),
-                ConfigField(
-                    id="prompt_cache_key",
-                    display_name="Prompt cache key",
-                    field_type="text",
-                    prompt=(
-                        "Stable identifier for OpenAI prompt-cache routing "
-                        "(e.g. conversation ID or tenant+system-prompt-version)"
-                    ),
-                    required=False,
-                    default="",
-                ),
-                ConfigField(
-                    id="prompt_cache_retention",
-                    display_name="Prompt cache retention",
-                    field_type="choice",
-                    prompt=(
-                        "Cache retention window. Leave unset to use the model "
-                        "default (recommended)."
-                    ),
-                    choices=["in_memory", "24h"],
-                    required=False,
-                    # default=None (not "") because "" is not a member of
-                    # `choices`; UI renderers that validate `default in choices`
-                    # would reject it. None signals "leave unset" cleanly.
-                    default=None,
-                    requires_model=True,  # Shown after model selection
-                    # gpt-5.6-family models reject "in_memory" (auto-dropped to
-                    # "24h" with a warning -- see _drop_unsupported_in_memory_
-                    # retention) and manage retention via prompt_cache_options.ttl
-                    # instead. Hiding the field for those models stops the wizard
-                    # from writing a value the runtime will immediately reject
-                    # (the gpt-5.6-luna defect this gating exists to prevent).
-                    show_when={"default_model": "not_contains:gpt-5.6"},
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
                 # ConfigField. It is a per-end-user signal, not a per-deployment
@@ -1401,6 +1367,13 @@ class OpenAIProvider:
                 # global value, which defeats its abuse-tracking purpose. The
                 # provider still accepts it via per-call kwargs and (for tests
                 # and unusual deployments) via the config dict.
+                #
+                # NOTE: text_verbosity, prompt_cache_key, and
+                # prompt_cache_retention are settings-only now (no
+                # ConfigField) -- the wizard was reduced to 4 fields. The
+                # config keys still work exactly as before; only the wizard
+                # prompt is gone. Set them directly in settings.yaml / the
+                # bundle config block if needed.
             ],
         )
 

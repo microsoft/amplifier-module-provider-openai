@@ -113,32 +113,24 @@ def _field_as_dict(field) -> dict[str, Any]:
 
 
 class TestConfigFieldGatingMetadata:
-    """The three model-sensitive fields must carry requires_model=True and
-    the show_when predicate that hides/shows them per model family."""
+    """enable_long_context now carries requires_model=True and a show_when
+    gating it to gpt-5.6-family models (X1 decision). text_verbosity and
+    prompt_cache_retention are no longer ConfigFields at all (config-surface
+    V2 reduced the wizard to 4 fields) -- see test_wizard_surface.py."""
 
-    def test_prompt_cache_retention_requires_model_and_hides_for_5_6(self):
-        field = _field(_make_provider(), "prompt_cache_retention")
-        assert field.requires_model is True
-        assert field.show_when == {"default_model": "not_contains:gpt-5.6"}
-
-    def test_text_verbosity_requires_model_and_shows_only_for_5_6(self):
-        field = _field(_make_provider(), "text_verbosity")
+    def test_enable_long_context_requires_model_and_shows_only_for_5_6(self):
+        field = _field(_make_provider(), "enable_long_context")
         assert field.requires_model is True
         assert field.show_when == {"default_model": "contains:gpt-5.6"}
 
     def test_untouched_fields_keep_no_gating(self):
         """Do-NOT-touch scope check: reasoning_effort keeps its existing
         requires_model=True with NO show_when (all values valid somewhere,
-        per the task's explicit exclusion), and prompt_cache_key/
-        enable_response_chaining are untouched (no requires_model)."""
+        per the task's explicit exclusion)."""
         provider = _make_provider()
         reasoning_effort = _field(provider, "reasoning_effort")
         assert reasoning_effort.requires_model is True
         assert reasoning_effort.show_when is None
-
-        prompt_cache_key = _field(provider, "prompt_cache_key")
-        assert prompt_cache_key.requires_model is False
-        assert prompt_cache_key.show_when is None
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +139,8 @@ class TestConfigFieldGatingMetadata:
 
 
 class TestShowWhenConsumerSimulation:
-    """Drive the three gated ConfigFields through the real wizard predicate
-    logic (`_should_show_field`) for representative models, mirroring how
+    """Drive enable_long_context through the real wizard predicate logic
+    (`_should_show_field`) for representative models, mirroring how
     amplifier_app_cli.provider_config_utils.configure_provider evaluates
     post-model-selection fields."""
 
@@ -160,37 +152,25 @@ class TestShowWhenConsumerSimulation:
         return {
             f.id: _field_as_dict(f)
             for f in info.config_fields
-            if f.id in ("prompt_cache_retention", "text_verbosity")
+            if f.id in ("enable_long_context",)
         }
 
-    def test_prompt_cache_retention_hidden_for_every_5_6_tier(self):
-        fields = self._gated_fields(_make_provider())
-        for model in self.GPT_5_6_MODELS:
-            collected = {"default_model": model}
-            assert (
-                _should_show_field(fields["prompt_cache_retention"], collected) is False
-            ), f"prompt_cache_retention should be hidden for {model}"
-
-    def test_prompt_cache_retention_shown_for_non_5_6_models(self):
-        fields = self._gated_fields(_make_provider())
-        for model in self.NON_5_6_MODELS:
-            collected = {"default_model": model}
-            assert (
-                _should_show_field(fields["prompt_cache_retention"], collected) is True
-            ), f"prompt_cache_retention should be shown for {model}"
-
-    def test_text_verbosity_shown_only_for_5_6_tiers(self):
+    def test_enable_long_context_shown_only_for_5_6_tiers(self):
         fields = self._gated_fields(_make_provider())
         for model in self.GPT_5_6_MODELS:
             assert (
-                _should_show_field(fields["text_verbosity"], {"default_model": model})
+                _should_show_field(
+                    fields["enable_long_context"], {"default_model": model}
+                )
                 is True
-            ), f"text_verbosity should be shown for {model}"
+            ), f"enable_long_context should be shown for {model}"
         for model in self.NON_5_6_MODELS:
             assert (
-                _should_show_field(fields["text_verbosity"], {"default_model": model})
+                _should_show_field(
+                    fields["enable_long_context"], {"default_model": model}
+                )
                 is False
-            ), f"text_verbosity should be hidden for {model}"
+            ), f"enable_long_context should be hidden for {model}"
 
     def test_gpt_5_6_alias_bare_form_also_gates_correctly(self):
         """README: the bare 'gpt-5.6' alias resolves to gpt-5.6-sol, but the
@@ -198,8 +178,7 @@ class TestShowWhenConsumerSimulation:
         it must still match the 'gpt-5.6' substring."""
         fields = self._gated_fields(_make_provider())
         collected = {"default_model": "gpt-5.6"}
-        assert _should_show_field(fields["prompt_cache_retention"], collected) is False
-        assert _should_show_field(fields["text_verbosity"], collected) is True
+        assert _should_show_field(fields["enable_long_context"], collected) is True
 
 
 # ---------------------------------------------------------------------------
