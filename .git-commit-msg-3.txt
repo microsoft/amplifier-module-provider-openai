@@ -1,0 +1,37 @@
+refactor(cache): validate prompt_cache_options explicit mode at mount
+
+Moves the "mode: explicit with zero prompt_cache_breakpoint markers
+disables prompt caching entirely" guardrail from a per-request runtime
+scan to a one-time mount-time validation:
+
+- self.prompt_cache_options is now resolved and validated in __init__:
+  mode="explicit" is downgraded to implicit (mode key stripped, ttl and
+  other keys preserved) with a warning logged exactly once, at
+  construction.
+- Removed _input_has_cache_breakpoint() (no longer needed -- this
+  provider ships no prompt_cache_breakpoint attachment mechanism, so the
+  per-request scan was always going to find nothing) and the
+  self._explicit_cache_mode_warned one-shot flag (superseded by
+  validating once at mount instead of tracking "have I warned yet").
+- The request-building site collapses to: if prompt_cache_options is not
+  None, validate the shape/mode enum and forward verbatim.
+
+Deliberate residual gap, documented: a caller passing
+prompt_cache_options={"mode": "explicit"} via PER-CALL KWARGS bypasses
+mount validation and reaches the wire -- consistent with this provider's
+existing stance on explicit caller overrides (the caller owns the
+consequences).
+
+Test delta: rewrote the D2 guardrail tests in
+test_gpt_5_6_reasoning_and_cache.py to assert the warning/downgrade at
+construction rather than at request time; removed the now-nonexistent
+_input_has_cache_breakpoint() unit tests and the patch()-simulated
+breakpoint-precondition tests (no longer meaningful -- the gate no longer
+inspects `input`); the kwarg-override test now asserts the documented
+bypass instead of a (removed) runtime gate. Removed the
+ModelCapabilities(supports_24h_retention=...) references left over from
+commit 2 in test_cache_defaults.py. 773 passed, 2 deselected.
+
+Generated with Amplifier (https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>

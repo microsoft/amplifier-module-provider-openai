@@ -431,27 +431,6 @@ def _validate_prompt_cache_options(options: Any) -> None:
         )
 
 
-def _input_has_cache_breakpoint(input_items: list[Any]) -> bool:
-    """True if any item (or nested content block) carries a breakpoint marker.
-
-    Used by the D2 guardrail: this provider does not attach
-    `prompt_cache_breakpoint` markers anywhere today, so this is always False
-    in current shipped behavior -- which is exactly the condition the
-    guardrail exists to catch.
-    """
-    for item in input_items:
-        if not isinstance(item, dict):
-            continue
-        if "prompt_cache_breakpoint" in item:
-            return True
-        content = item.get("content")
-        if isinstance(content, list) and any(
-            isinstance(block, dict) and "prompt_cache_breakpoint" in block
-            for block in content
-        ):
-            return True
-    return False
-
 
 # text.verbosity (GPT-5.6): controls response length/detail. Opt-in; fail-loud
 # on models that reject it (pre-5.6).
@@ -1029,15 +1008,29 @@ class OpenAIProvider:
             "prompt_cache_retention", DEFAULT_PROMPT_CACHE_RETENTION
         )
         self.prompt_cache_retention: str | None = _retention if _retention else None
-        # prompt_cache_options (GPT-5.6): explicit prompt-cache control that COEXISTS
-        # with prompt_cache_retention. Shape {"mode": "implicit"|"explicit", "ttl":
-        # "30m"}; default None = do not send. Verified live 2026-07-14.
+        # prompt_cache_options (GPT-5.6): {"mode": "implicit"|"explicit", "ttl": "30m"}.
+        # `ttl` passes through untouched. `mode: "explicit"` is REJECTED here: this
+        # provider ships no prompt_cache_breakpoint mechanism anywhere, and explicit
+        # mode with zero breakpoints disables prompt caching ENTIRELY -- no reads, no
+        # writes -- turning a ~95% cache-read workload into 100% full-price input
+        # (~10x, live-probed 2026-08-28). Validated once at mount instead of scanning
+        # every request's input array.
         self.prompt_cache_options: dict | None = (
             self.config.get("prompt_cache_options") or None
         )
-        # D2 guardrail one-shot flag: emit the explicit-mode-with-no-breakpoints
-        # warning at most once per provider instance, not once per request.
-        self._explicit_cache_mode_warned = False
+        if self.prompt_cache_options is not None:
+            _validate_prompt_cache_options(self.prompt_cache_options)
+            if self.prompt_cache_options.get("mode") == "explicit":
+                logger.warning(
+                    "[PROVIDER] prompt_cache_options.mode='explicit' is not supported "
+                    "by this provider: no prompt_cache_breakpoint mechanism ships "
+                    "here, and explicit mode with zero breakpoints disables prompt "
+                    "caching entirely (~10x input-cost regression). Dropping 'mode'; "
+                    "implicit caching is used. 'ttl' passes through unchanged."
+                )
+                self.prompt_cache_options = {
+                    k: v for k, v in self.prompt_cache_options.items() if k != "mode"
+                } or None
         self.safety_identifier: str | None = (
             self.config.get("safety_identifier") or None
         )
@@ -2134,30 +2127,7 @@ class OpenAIProvider:
         )
         if prompt_cache_options is not None:
             _validate_prompt_cache_options(prompt_cache_options)
-            # D2 guardrail (live-probed 2026-08-28): mode="explicit" with ZERO
-            # prompt_cache_breakpoint markers in `input` disables prompt caching
-            # ENTIRELY -- cache_write_tokens==0 AND cached_tokens==0 on every
-            # request, not just "no explicit-mode benefit". This provider does
-            # not attach breakpoints anywhere today, so this silently converts a
-            # ~95% cache-read workload into 100% full-price input (~10x cost).
-            # Downgrade to implicit and warn once per provider instance.
-            if prompt_cache_options.get(
-                "mode"
-            ) == "explicit" and not _input_has_cache_breakpoint(params["input"]):
-                if not self._explicit_cache_mode_warned:
-                    logger.warning(
-                        "[PROVIDER] prompt_cache_options.mode='explicit' with no "
-                        "prompt_cache_breakpoint markers in input: this disables "
-                        "prompt caching entirely (no reads, no writes), a ~10x "
-                        "input-cost regression vs implicit mode. Downgrading to "
-                        "implicit for this session."
-                    )
-                    self._explicit_cache_mode_warned = True
-                prompt_cache_options = {
-                    k: v for k, v in prompt_cache_options.items() if k != "mode"
-                } or None
-            if prompt_cache_options is not None:
-                params["prompt_cache_options"] = prompt_cache_options
+            params["prompt_cache_options"] = prompt_cache_options
 
         safety_identifier = (
             kwargs.get("safety_identifier", self.safety_identifier) or None
