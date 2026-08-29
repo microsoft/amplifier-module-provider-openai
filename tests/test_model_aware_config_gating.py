@@ -126,11 +126,6 @@ class TestConfigFieldGatingMetadata:
         assert field.requires_model is True
         assert field.show_when == {"default_model": "contains:gpt-5.6"}
 
-    def test_enable_reasoning_context_requires_model_and_shows_only_for_5_6(self):
-        field = _field(_make_provider(), "enable_reasoning_context")
-        assert field.requires_model is True
-        assert field.show_when == {"default_model": "contains:gpt-5.6"}
-
     def test_untouched_fields_keep_no_gating(self):
         """Do-NOT-touch scope check: reasoning_effort keeps its existing
         requires_model=True with NO show_when (all values valid somewhere,
@@ -165,8 +160,7 @@ class TestShowWhenConsumerSimulation:
         return {
             f.id: _field_as_dict(f)
             for f in info.config_fields
-            if f.id
-            in ("prompt_cache_retention", "text_verbosity", "enable_reasoning_context")
+            if f.id in ("prompt_cache_retention", "text_verbosity")
         }
 
     def test_prompt_cache_retention_hidden_for_every_5_6_tier(self):
@@ -198,23 +192,6 @@ class TestShowWhenConsumerSimulation:
                 is False
             ), f"text_verbosity should be hidden for {model}"
 
-    def test_enable_reasoning_context_shown_only_for_5_6_tiers(self):
-        fields = self._gated_fields(_make_provider())
-        for model in self.GPT_5_6_MODELS:
-            assert (
-                _should_show_field(
-                    fields["enable_reasoning_context"], {"default_model": model}
-                )
-                is True
-            ), f"enable_reasoning_context should be shown for {model}"
-        for model in self.NON_5_6_MODELS:
-            assert (
-                _should_show_field(
-                    fields["enable_reasoning_context"], {"default_model": model}
-                )
-                is False
-            ), f"enable_reasoning_context should be hidden for {model}"
-
     def test_gpt_5_6_alias_bare_form_also_gates_correctly(self):
         """README: the bare 'gpt-5.6' alias resolves to gpt-5.6-sol, but the
         wizard gates on the STRING the user selected (before resolution) --
@@ -223,7 +200,6 @@ class TestShowWhenConsumerSimulation:
         collected = {"default_model": "gpt-5.6"}
         assert _should_show_field(fields["prompt_cache_retention"], collected) is False
         assert _should_show_field(fields["text_verbosity"], collected) is True
-        assert _should_show_field(fields["enable_reasoning_context"], collected) is True
 
 
 # ---------------------------------------------------------------------------

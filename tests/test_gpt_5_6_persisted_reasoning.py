@@ -5,14 +5,13 @@ fetched 2026-07-14): reasoning.context in {"auto", "current_turn", "all_turns"}.
 "current_turn" trims rendered reasoning context on long agent loops -- the
 documented mitigation for context_length_exceeded.
 
-Salvaged from PR #48 (upstream commit 314b9b5) with a REQUIRED gate the
-original PR lacked: forwarding is flag-gated (`enable_reasoning_context`,
-default off) AND chain/store-gated (only forwarded on the chained/stored
-request path -- mirrors the existing encrypted-content stateless/chained
-split). Without both gates this would fire on stateless calls (Amplifier's
-default is store=False), where a persisted-reasoning strategy is
-meaningless-to-harmful because there is no server-side reasoning state for
-it to apply to.
+Forwarding is UNGATED: whenever the caller supplies `reasoning.context` in an
+explicit `reasoning` dict, it is forwarded as-is (same stance as `mode` --
+an explicit reasoning dict is a deliberate provider-specific override, and
+the caller owns the consequences). The historical `enable_reasoning_context`
+flag gate and the chain/store gate (both tied to the now-removed
+`previous_response_id` chaining path) are gone -- the provider is
+stateless-only. `_validate_reasoning_context` still rejects bad values.
 """
 
 import asyncio
@@ -91,12 +90,11 @@ def test_validate_reasoning_context_rejects(bad):
 # ---------------------------------------------------------------------------
 
 
-def test_reasoning_context_forwarded_when_enabled_and_chained():
-    """Happy path: flag on, and gpt-5.6-sol chains by default (auto +
-    supports_reasoning), so chain_active is True -- context is forwarded."""
-    provider = _make_provider(
-        default_model="gpt-5.6-sol", enable_reasoning_context=True
-    )
+def test_reasoning_context_forwarded_ungated():
+    """An explicit reasoning.context value is forwarded unconditionally --
+    no flag, no chain/store gate. The provider is stateless-only; an
+    explicit `reasoning` dict is a deliberate override the caller owns."""
+    provider = _make_provider(default_model="gpt-5.6-sol")
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     asyncio.run(
         provider.complete(
@@ -110,61 +108,36 @@ def test_reasoning_context_forwarded_when_enabled_and_chained():
 
 
 def test_reasoning_context_absent_when_not_set():
-    provider = _make_provider(
-        default_model="gpt-5.6-sol", enable_reasoning_context=True
-    )
+    provider = _make_provider(default_model="gpt-5.6-sol")
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     asyncio.run(provider.complete(_simple_request(), reasoning={"effort": "medium"}))
     assert "context" not in _captured_params(provider)["reasoning"]
 
 
-def test_reasoning_context_disabled_by_default():
-    """The flag defaults off: even on the chained path, with a valid context
-    value supplied, nothing is forwarded unless enable_reasoning_context=True."""
-    provider = _make_provider(default_model="gpt-5.6-sol")  # flag NOT set
-    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
-    asyncio.run(
-        provider.complete(
-            _simple_request(),
-            reasoning={"effort": "high", "context": "current_turn"},
-        )
-    )
-    assert "context" not in _captured_params(provider)["reasoning"]
-
-
-def test_reasoning_context_never_forwarded_on_stateless_request_even_when_configured():
-    """Chain-state gate: even with the flag enabled and a valid context value
-    supplied, a stateless request (chain_active=False, store=False -- the
-    Amplifier default) must NEVER carry reasoning.context. There is no
-    server-side reasoning state on a stateless call for a persisted-reasoning
-    strategy to apply to."""
+def test_reasoning_context_forwarded_even_with_leftover_legacy_config():
+    """Stale `enable_reasoning_context` config (recognized-but-inert) must
+    not suppress forwarding -- the flag gate no longer exists."""
     provider = _make_provider(
-        default_model="gpt-5.6-sol",
-        enable_reasoning_context=True,
-        enable_response_chaining=False,  # force chain_active=False
+        default_model="gpt-5.6-sol", enable_reasoning_context=False
     )
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     asyncio.run(
         provider.complete(
             _simple_request(),
             reasoning={"effort": "high", "context": "current_turn"},
-            store=False,
         )
     )
     reasoning = _captured_params(provider)["reasoning"]
-    assert "context" not in reasoning
+    assert reasoning["context"] == "current_turn"
 
 
 def test_reasoning_context_forwarded_on_continuation():
     """reasoning.context must survive an incomplete->continuation sequence.
 
     It lives inside the `reasoning` dict, already forwarded via the existing
-    `if "reasoning" in params` continuation-forward line -- this test pins
-    that it survives (with the flag enabled and the chained default path).
+    `if "reasoning" in params` continuation-forward line.
     """
-    provider = _make_provider(
-        default_model="gpt-5.6-sol", enable_reasoning_context=True
-    )
+    provider = _make_provider(default_model="gpt-5.6-sol")
     incomplete_resp = SimpleNamespace(
         status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
     )
