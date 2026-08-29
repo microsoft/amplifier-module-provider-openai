@@ -1188,7 +1188,10 @@ class OpenAIProvider:
         # Never a ConfigField; settings-only.
         _extra = self.config.get("extra_request_params") or {}
         if not isinstance(_extra, dict):
-            raise ValueError(
+            # ValueError (not TypeError) is the mount-time config-validation
+            # contract this module uses everywhere (mirrors _parse_config_bool
+            # / _resolve_config_reasoning_effort); the wizard/tests key on it.
+            raise ValueError(  # noqa: TRY004
                 f"Invalid config 'extra_request_params'={_extra!r} for "
                 f"provider-openai: must be a mapping of Responses API "
                 f"parameter names to values (got {type(_extra).__name__}). "

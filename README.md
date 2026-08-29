@@ -29,7 +29,7 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 
 ## Supported Models
 
-- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** 1.05M context, adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
+- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
 - `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5
@@ -37,64 +37,93 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 
 ## Configuration
 
+The wizard collects four fields (`api_key`, `base_url`, `reasoning_effort`,
+`enable_long_context`) plus the app's own model picker. Every other setting is
+configured directly in `settings.yaml` / the bundle config block — see the
+[settings-key reference](#settings-key-reference) below for the full list.
+
 ```toml
 [[providers]]
 module = "provider-openai"
 name = "openai"
 config = {
-    base_url = null,                       # Optional custom endpoint (null = OpenAI default)
     default_model = "gpt-5.6-sol",
-    max_tokens = null,                     # Output-token budget. null (default) = the model
-                                           # capability's max_output_tokens (e.g. 128K for
-                                           # gpt-5.x); set a number to cap explicitly. The
-                                           # old fixed 4096 default silently truncated large
-                                           # tool calls mid-arguments.
-    temperature = 0.7,
-    reasoning_effort = "low",              # CANONICAL effort key: none|minimal|low|medium|
-                                           # high|xhigh|max (set is model-specific; gpt-5.6
-                                           # adds "max", rejects "minimal"). Validated at
-                                           # mount. "none"/unset sends no reasoning param.
-    reasoning = null,                      # LEGACY alias, still works. Use when you need the
-                                           # dict form to also set reasoning.mode:
-                                           # {effort="high", mode="pro"}. If both are set,
-                                           # reasoning_effort wins and a warning is logged.
-    reasoning_summary = "detailed",        # Reasoning verbosity: auto|concise|detailed
-    truncation = null,                     # null omits the field; OpenAI returns an explicit
-                                           # error on context overflow. Opt in to legacy
-                                           # auto-drop with truncation = "auto" (busts cache).
-    prompt_cache_key = "",                 # Stable cache-routing identifier; empty = unset
-    prompt_cache_retention = "24h",        # "24h" | "in_memory" | null (use model default)
-                                           # gpt-5.6 rejects "in_memory" (auto-dropped to 24h).
-    prompt_cache_options = null,           # GPT-5.6 explicit cache control, COEXISTS with
-                                           # retention: {mode="explicit", ttl="30m"}. null = unset.
-    enable_response_chaining = "auto",     # "auto" | true | false  (reasoning-model chaining)
-    enable_state = false,
-    reasoning_replay_scope = "turn",       # "turn" | "all" | "none"  (bounds inline reasoning
-                                           # replay on stateless requests; see
-                                           # [Reasoning State Preservation](#reasoning-state-preservation))
-    debug = false,                         # Enable standard debug events
-    raw_debug = false                      # Enable ultra-verbose raw API I/O logging
+    reasoning_effort = "low",              # none|minimal|low|medium|high|xhigh|max
+    max_output_tokens = null,              # null = the model's capability max
+    prompt_cache_retention = "24h",        # "24h" | "in_memory" | null
+    # ...see the settings-key reference table for every key
 }
 ```
 
 > Note: `safety_identifier` is intentionally NOT a deployment config field. It
 > is a per-end-user signal (abuse tracking) and must be set per-call via
-> `kwargs`. See [Prompt Caching](#prompt-caching) below.
+> `kwargs`.
+
+### Settings-key reference
+
+Every config key the provider reads. `OpenAI param` is the Responses API
+parameter the key maps to, or **Amplifier-only** when it has no direct API
+counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
+
+| Key | OpenAI param | What it does | Cost impact | Wizard? |
+| --- | --- | --- | --- | --- |
+| `api_key` | (auth) | OpenAI API key. Resolved from `OPENAI_API_KEY` if unset. | — | ✅ |
+| `base_url` | (client) | Custom endpoint. `null` = OpenAI default. | — | ✅ |
+| `default_model` | `model` | Model id used when a request doesn't pin one. | — | (picker) |
+| `reasoning_effort` | `reasoning.effort` | Session-default reasoning effort (canonical key). `"none"`/unset sends nothing. | Higher effort = more reasoning tokens, slower, costlier. | ✅ |
+| `enable_long_context` | **Amplifier-only** | Changes the *reported* context window (see [Long context](#long-context)). Does not map to an API param. | **≈2× on gpt-5.6 when input exceeds 272K** — whole-request re-rating. | ✅ |
+| `max_output_tokens` | `max_output_tokens` | Output-token budget. `null` = the model capability's max. **Config key is `max_output_tokens`; the per-call kwarg is still `max_tokens`.** | Caps output length. | |
+| `reasoning` | `reasoning` | LEGACY effort alias. Use for the dict form (`{effort=..., mode="pro", context=...}`). `reasoning_effort` wins if both set. | See `reasoning_effort`. | |
+| `reasoning_summary` | `reasoning.summary` | Reasoning verbosity: `auto`\|`concise`\|`detailed`. | `detailed` uses more output tokens. | |
+| `truncation` | `truncation` | `null` (default) omits the field; API errors on overflow. `"auto"` drops oldest messages (busts cache). | `"auto"` lowers cache hit rate. | |
+| `raw` | **Amplifier-only** | When `true`, includes the full (redacted) request payload in `llm:request` events. | — | |
+| `timeout` | (client) | Per-request timeout seconds. | — | |
+| `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
+| `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
+| `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime. | |
+| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); `ttl` passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
+| `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
+| `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
+| `reasoning_replay_scope` | **Amplifier-only** | Bounds inline reasoning replay: `turn` (default) \| `all` \| `none`. | `"all"` grows the payload without bound (~1,200 chars/blob). | |
+| `poll_interval` | (background) | Seconds between background-mode status polls. | — | |
+| `background_timeout` | (background) | Timeout seconds for background (deep-research) requests. | — | |
+| `priority` | **Amplifier-only** | Provider selection priority (lower = higher). | — | |
+| `use_streaming` | (transport) | Chunked HTTP transport (default `true`). Not progressive UI streaming. | — | |
+| `max_retries` / `min_retry_delay` / `max_retry_delay` / `retry_jitter` | (retry) | Shared retry-with-backoff configuration. | — | |
+| `max_concurrent_requests` | **Amplifier-only** | Process-wide in-flight concurrency gate (default 5; 0 disables). | — | |
+| `extra_request_params` | **Amplifier-only (escape hatch)** | Arbitrary Responses API params, merged LAST, user wins. Own the consequences. Round-tripped by app-cli config tooling. | Depends on what you set. | |
+
+**Deprecated aliases** (still work, warn once, will be removed):
+
+| Old key | Use instead |
+| --- | --- |
+| `max_tokens` | `max_output_tokens` |
+| `filtered` | `hide_dated_models` |
+
+**Removed keys** (each emits a targeted migration warning naming what to do instead):
+
+| Removed key | Migration |
+| --- | --- |
+| `enable_response_chaining` | Removed — the provider is always stateless now (see [Conversation state](#conversation-state)). |
+| `enable_state` | Removed — `store` is managed automatically (false, except background mode which requires true); use `extra_request_params` to force it. |
+| `enable_reasoning_context` | Removed — `reasoning.context` is now forwarded whenever you supply it in the legacy `reasoning` dict, e.g. `reasoning = {effort = "high", context = "current_turn"}`. |
+| `thinking_budget_tokens` | Removed — `extended_thinking` still forces high reasoning effort, but no longer adjusts `max_output_tokens`. Set `max_output_tokens` directly. |
+| `thinking_budget_buffer` | Removed — see `thinking_budget_tokens`. |
 
 ### Unrecognized config keys
 
 At construction, the provider warns once (with a `did you mean`-style
 suggestion when a close match exists) about any config key it does not
-recognize -- a typo like `promt_cache_retention` or a stale/removed option
-otherwise has no effect and no signal that anything is wrong. The check is
-silent on every key documented above, plus `api_key` / `id` / `module` /
-`source` / `priority` (infrastructure fields an app or kernel may place
-alongside a provider's config).
+recognize. The check is silent on every key documented above, on the
+deprecated aliases and removed-but-recognized keys (which get their own
+targeted warnings), and on `api_key` / `id` / `module` / `source` / `priority`
+(infrastructure fields an app or kernel may place alongside a provider's
+config).
 
 **Extending the recognized set for a subclass.** A provider module that
 *subclasses* `OpenAIProvider` and passes its own config straight through
-(e.g. `provider-azure-openai`, which wraps this provider for Azure-specific
-auth) can declare its own additional keys so they don't trip this warning:
+(e.g. `provider-azure-openai`) can declare its own additional keys so they
+don't trip this warning:
 
 ```python
 from amplifier_module_provider_openai import OpenAIProvider
@@ -104,27 +133,12 @@ class MyProvider(OpenAIProvider):
     EXTRA_KNOWN_CONFIG_KEYS = frozenset({"my_custom_key", "another_key"})
 ```
 
-`EXTRA_KNOWN_CONFIG_KEYS` defaults to an empty `frozenset` and only widens
-the *recognized* set for that subclass -- it does not suppress the warning
-for genuine typos. A typo of one of the subclass's own declared keys (e.g.
-`my_custom_ky`) still warns, with a suggestion drawn from the combined
-base + subclass key set.
-
 ### Reasoning Effort
 
 The `reasoning_effort` config key (canonical — it matches the kernel's portable
 `request.reasoning_effort` field) sets a session-level default reasoning effort
-applied to **every** request, so you can opt into stronger reasoning once
-instead of supplying it per-request. The legacy `reasoning` key remains a
-working alias; when both are set, `reasoning_effort` wins (a warning is logged).
-
-```yaml
-providers:
-  - module: provider-openai
-    config:
-      default_model: gpt-5.6-sol
-      reasoning_effort: xhigh  # legacy alias: reasoning
-```
+applied to **every** request. The legacy `reasoning` key remains a working
+alias; when both are set, `reasoning_effort` wins (a warning is logged).
 
 Precedence (highest wins):
 
@@ -137,241 +151,151 @@ Precedence (highest wins):
 
 Notes:
 
-- **`"none"` and unset both send no reasoning parameter.** `"none"` is the
-  provisioning default and means "use the provider/model default behavior" —
-  it deliberately does not emit `reasoning={"effort": "none"}`.
+- **`"none"` and unset both send no reasoning parameter.**
 - **Values are validated at mount**, not at request time. An unrecognized
   effort, or one the default model rejects (`gpt-5.5-pro` accepts only
   `medium`, `high`, `xhigh`), raises immediately instead of surfacing as an
   HTTP 400 mid-session.
-- **Non-reasoning models are skipped with a warning**, not an error — the
-  config is ignored rather than producing an API failure.
+- **Non-reasoning models are skipped with a warning**, not an error.
 - Use the legacy `reasoning` key when you need the dict form to also set
-  `reasoning.mode`, e.g. `{effort = "high", mode = "pro"}`.
+  `reasoning.mode` (`{effort = "high", mode = "pro"}`) or `reasoning.context`
+  (GPT-5.6 persisted reasoning) — both are forwarded ungated for an explicit
+  `reasoning` dict; the caller owns the consequences.
 
-## Prompt Caching
+## Conversation state
 
-The provider exposes OpenAI's prompt-caching hint parameters (`prompt_cache_key`,
-`prompt_cache_retention`, `safety_identifier`) plus an `enable_response_chaining`
-toggle that activates the Responses API's `previous_response_id` mechanism for
-reasoning models.
+**The provider is always stateless.** Every request carries the full converted
+input and `store: false`. There is no chaining flag and no chaining code path —
+`previous_response_id` is never sent.
 
-See also: [OpenAI Cookbook — Prompt Caching 201](https://cookbook.openai.com/examples/prompt_caching_201).
-
-### TL;DR — what the defaults give you
-
-- `prompt_cache_retention = "24h"` — extended GPU-local KV storage on every
-  supported model, instead of OpenAI's per-model `"in_memory"` default
-  (5–10 min) for gpt-5.4 and below.
-- `enable_response_chaining = "auto"` — for reasoning-capable models, the
-  provider sends `store = true` and `previous_response_id` on subsequent
-  turns, and stops re-inserting encrypted reasoning blocks inline. Empirical
-  smoke against gpt-5.5 measured 85% prefix cache hit on turn 2 with chaining
-  on, vs 0% off.
-- `truncation = null` — the field is omitted from requests so the cached
-  prefix is never silently rewritten on context overflow. Opt back into the
-  legacy auto-drop behavior with `truncation = "auto"`.
-
-`prompt_cache_key` is empty by default; setting it is opt-in. `safety_identifier`
-is kwargs-only.
-
-### `prompt_cache_key` — cache-routing identifier
-
-OpenAI shards Responses API traffic across machines by hashing the first ~256
-input tokens. Without a stable key, requests with identical prefixes still hit
-the same shard most of the time, but as soon as anything in the prefix shifts
-(time-of-day stamp, shuffled tools, rewritten system prompt), routing diverges.
-A stable `prompt_cache_key` keeps a logical conversation pinned to one machine
-regardless of small prefix drift, and is the recommended cache signal as of
-OpenAI's July 2025 guidance. (The legacy `user` field still works on the API
-but is no longer the recommended cache signal.)
-
-Granularity guidance:
-
-| Deployment shape                            | Recommended key                                   |
-| ------------------------------------------- | ------------------------------------------------- |
-| Single-user agent loop (typical Amplifier)  | conversation/session ID, e.g. `"conv_abc123"`     |
-| Multi-tenant with shared system prompt      | `f"{tenant_id}:{system_prompt_version}"`          |
-| Low-volume single-session                   | leave unset; prefix-hash routing is sufficient    |
-
-Watch out for the **~15 RPM threshold per (prefix, key) pair**. Past that, OpenAI
-spills overflow requests to fresh machines; high-volume conversations should
-prefer a key that distributes across tenants/sessions rather than one global
-constant.
-
-### `prompt_cache_retention` — TTL hint
-
-| Value         | Meaning                                                                             |
-| ------------- | ----------------------------------------------------------------------------------- |
-| `"24h"`       | Extended GPU-local KV storage. Provider default for all supported models.           |
-| `"in_memory"` | 5–10 min in-process cache. OpenAI's per-model default for gpt-5.4 and below.        |
-| `null`        | Field omitted; OpenAI picks the per-model default.                                  |
-
-The capability layer auto-drops values a model would reject:
-
-- gpt-5.5+ rejects `"in_memory"` — provider drops it with a `[PROVIDER] Dropping
-  prompt_cache_retention='in_memory'` warning.
-- Any future model that rejects `"24h"` (capability flag `supports_24h_retention
-  = False`) gets the field dropped the same way.
-
-You do not need to special-case retention per model; the default `"24h"` is
-safe everywhere.
-
-### `enable_response_chaining` — reasoning-model chaining
-
-Tri-state config (and per-call kwarg). Controls whether the provider uses the
-Responses API's `previous_response_id` mechanism, which is the high-leverage
-caching path for reasoning models:
-
-| Value     | Behavior                                                                                       |
-| --------- | ---------------------------------------------------------------------------------------------- |
-| `"auto"`  | On iff `get_capabilities(model).supports_reasoning` is True. Default. Right answer for most.   |
-| `true`    | Force on regardless of model. Useful for testing or non-reasoning models that still benefit.   |
-| `false`   | Force off. Use for ZDR / regulated-industry deployments that cannot retain server-side state.  |
-
-When chaining is active for a reasoning model, on each call:
-
-1. `store = true` is set automatically (chaining requires it; this overrides
-   `enable_state` for reasoning models).
-2. `previous_response_id = <id from last assistant.metadata>` is sent on
-   subsequent turns.
-3. `include=["reasoning.encrypted_content"]` is requested regardless of
-   whether chaining is active — live measurement (see below) found this
-   cache-neutral, so ciphertext is captured unconditionally and every
-   reset/resume path can replay reasoning (see
-   [Reasoning State Preservation](#reasoning-state-preservation)).
-
-**`enable_response_chaining = false` is authoritative.** It NEVER attaches
-`previous_response_id`, regardless of the legacy `enable_state` setting — this
-is the ZDR / regulated-industry opt-out and must not be silently overridden.
-If you set `enable_response_chaining = false` together with `enable_state =
-true`, the provider warns at mount time: chaining is disabled as requested,
-but `enable_state = true` still sets `store = true`, so responses ARE
-retained server-side. For a full ZDR posture, set `enable_state = false` too
-(see [Recommended configurations](#recommended-configurations)).
-
-For non-reasoning models, or `enable_response_chaining = false`, behavior is
-unchanged: stateless mode with explicit reasoning re-insertion, bounded by
-`reasoning_replay_scope` (see
-[Reasoning State Preservation](#reasoning-state-preservation)).
-
-On `previous_response_id` invalidation (HTTP 404 + `response_not_found`, or a
-`context_length_exceeded` overflow while a chain is active), the provider
-retries once without the field — restoring the full converted history
-**with reasoning items re-inserted** (bounded by `reasoning_replay_scope`) so
-the retry does not replay `function_call` items without their originating
-`reasoning` items — and emits a `provider:response_chain_invalidated` event.
-The same reasoning-continuity guarantee applies to a post-compaction chain
-reset: the request immediately after a compaction event drops
-`previous_response_id` but keeps `store = true` (so the next turn can still
-chain) and re-inserts reasoning items + `include`, because the server no
-longer holds state for that one request.
+- **The one exception:** background mode (deep research) forces `store: true`
+  per-request, internally, because the Responses API requires the response to
+  be retrievable for polling.
+- **Encrypted reasoning replay.** `include: ["reasoning.encrypted_content"]` is
+  requested whenever the model will reason; reasoning items are replayed inline,
+  bounded by `reasoning_replay_scope` (default `"turn"` — assistant turns since
+  the last non-ephemeral user message). See
+  [Reasoning state preservation](#reasoning-state-preservation).
+- **ZDR posture.** With `store: false` on every non-background request and no
+  `previous_response_id` anywhere, the ZDR opt-out is now the *default and only*
+  behaviour — the `enable_response_chaining = false` incantation older versions
+  prescribed is obsolete and unnecessary. Operators who *want* server-side
+  retention must opt in explicitly via `extra_request_params = { store = true }`.
 
 ### `reasoning_replay_scope` — bounded stateless reasoning replay
 
-On the stateless path (chaining off, or a chain-broken retry), the provider
-re-inserts prior `ThinkingBlock` state inline. Unbounded, this grows linearly
-with conversation length: encrypted reasoning blobs measured ~1,200 chars
-each, over 50% of the replayed payload by turn 4 in live probing. This config
-key bounds how far back that replay reaches:
+The provider re-inserts prior `ThinkingBlock` state inline on every request.
+Unbounded, this grows linearly with conversation length (encrypted reasoning
+blobs measured ~1,200 chars each, over 50% of the payload by turn 4 in live
+probing). This key bounds how far back replay reaches:
 
-| Value            | Behavior                                                                                     |
-| ---------------- | ---------------------------------------------------------------------------------------------- |
-| `"turn"` (default) | Replay reasoning only for assistant turns since the last user message — the in-flight tool loop, per OpenAI's own "single turn spans multiple API calls" guidance. Flat cost, independent of conversation length. |
-| `"all"`          | Replay every turn's reasoning. Unbounded growth (pre-fix behavior on the stateless path). Escape hatch if cross-turn replay measurably helps your workload. |
-| `"none"`         | No inline reasoning replay. |
+| Value | Behavior |
+| --- | --- |
+| `"turn"` (default) | Replay reasoning only for assistant turns since the last non-ephemeral user message — the in-flight tool loop, per OpenAI's "single turn spans multiple API calls" guidance. Flat cost, independent of conversation length. |
+| `"all"` | Replay every turn's reasoning. Unbounded growth. Escape hatch. |
+| `"none"` | No inline reasoning replay. |
 
-An unrecognized value falls back to `"turn"` with a warning. Not exposed as a
-deployment `ConfigField` (same precedent as `safety_identifier`) — it's a
-tuning knob, not a per-deployment decision most operators need to touch.
+An unrecognized value falls back to `"turn"` with a warning.
 
-This bound does **not** affect the chained path (chaining suppresses replay
-entirely — the server already holds the state) nor the amount of reasoning
-*collected* for the orphan-stripping guard, only how much is *emitted*
-inline.
+## Prompt Caching
 
-### `safety_identifier` — kwargs-only
+The provider exposes OpenAI's prompt-caching hint parameters. Defaults:
+`prompt_cache_retention = "24h"` (extended GPU-local KV storage on every
+supported model), `prompt_cache_key` unset, `truncation = null` (the field is
+omitted so the cached prefix is never silently rewritten on overflow).
 
-The request-side counterpart to `prompt_cache_key`: an abuse-tracking signal
-that should carry a per-end-user value. Intentionally NOT exposed as a
-deployment `ConfigField` — surfacing it in deployment config invites operators
-to set one global value, which defeats its purpose. Set it via per-call
-`kwargs` only.
+See also: [OpenAI Cookbook — Prompt Caching 201](https://cookbook.openai.com/examples/prompt_caching_201).
 
-### Behavioral change: `truncation` default
+### `prompt_cache_key` — cache-routing identifier
 
-The `truncation` default flipped from `"auto"` to `null` (omit the field).
+OpenAI shards Responses API traffic by hashing the first ~256 input tokens. A
+stable `prompt_cache_key` keeps a logical conversation pinned to one machine
+regardless of small prefix drift, and is the recommended cache signal as of
+OpenAI's July 2025 guidance.
 
-- Before: silently dropped oldest messages on context overflow.
-- After: OpenAI returns an explicit `context_length_exceeded` error.
+| Deployment shape | Recommended key |
+| --- | --- |
+| Single-user agent loop (typical Amplifier) | conversation/session ID |
+| Multi-tenant with shared system prompt | `f"{tenant_id}:{system_prompt_version}"` |
+| Low-volume single-session | leave unset; prefix-hash routing is sufficient |
 
-Reason: `truncation = "auto"` rewrites the cached prefix and is on OpenAI's own
-troubleshooting checklist as a top cause of low cache hit rates. To opt back
-into the legacy auto-drop:
+### `prompt_cache_retention` — TTL hint
+
+| Value | Meaning |
+| --- | --- |
+| `"24h"` | Extended GPU-local KV storage. Provider default. |
+| `"in_memory"` | 5–10 min in-process cache. Rejected by gpt-5.5/5.6 (auto-dropped to `"24h"` with a warning). |
+| `null` | Field omitted; OpenAI picks the per-model default. |
+
+### `prompt_cache_options` — explicit-mode dropped at mount
+
+`prompt_cache_options` is `{mode, ttl}`. **`mode: "explicit"` is rejected at
+mount** and downgraded to implicit with a one-time warning (the `ttl` key
+passes through unchanged): this provider ships no `prompt_cache_breakpoint`
+mechanism anywhere, and explicit mode with zero breakpoints disables prompt
+caching **entirely** — no reads, no writes — turning a ~95% cache-read workload
+into 100% full-price input (~10× regression, live-probed 2026-08-28).
+
+> Residual gap, by design: a caller passing
+> `prompt_cache_options={"mode": "explicit"}` via **per-call kwargs** bypasses
+> mount validation and reaches the wire. This is consistent with the provider's
+> stance on explicit caller overrides — the caller owns the consequences.
+
+### `extra_request_params`
+
+The documented escape hatch for Responses API parameters this provider does not
+model (including `store`). It is a dict, **settings-only** (never a
+`ConfigField`), merged into the request params **last** — after every
+provider-computed key — so it overrides anything the provider set, deliberately.
+
+- **User wins, loudly.** Any provider-computed key it clobbers is named in a
+  one-time warning per key per provider instance. You own the consequences: an
+  unknown or malformed parameter surfaces as an API 400, not a provider bug.
+- **Applies to every request**, including the incomplete-continuation request.
+- **The documented way to force `store: true`**:
+  `extra_request_params = { store = true }`.
+- Round-tripped by app-cli config tooling (see app-cli #286).
 
 ```toml
-config = { truncation = "auto" }
+config = { extra_request_params = { store = true, seed = 42 } }
 ```
 
-### Recommended configurations
+## Long context
 
-**Single-user agent loop (typical Amplifier session):** defaults are correct.
-For high-volume sessions, optionally pin to a session ID:
+`enable_long_context` (default off) controls the **reported** context window;
+it does not map to an API parameter.
 
-```toml
-config = { prompt_cache_key = "session_${SESSION_ID}" }
-```
+- The threshold is measured on **INPUT tokens only**, at **272,000**.
+- The boundary is **strict**: exactly 272,000 is short-context; `> 272,000` is
+  long.
+- On **gpt-5.6**, exceeding it re-rates the **ENTIRE request** — input, output,
+  cached, and cache-write tokens — at long rates. **Whole-request, not
+  marginal-on-the-overage.**
+- **Which models actually have the tier:** `gpt-5.6-sol` / `-terra` / `-luna`
+  are the only models with modelled long rates. `gpt-5.4` and variants carry a
+  272K threshold but have **no long rates modelled**, so the flag only changes
+  the *reported* window for them. **`gpt-5.5` has no threshold at all** — the
+  flag is a no-op there.
+- **What the flag does:** with it off (default), `get_info`/`list_models`
+  report the 272K threshold as the context window, so unpinned sessions compact
+  against the standard-priced window. With it on, they report the full measured
+  window (900,000 for 5.6 — empirically measured, not the ~1.05M marketing
+  number).
 
-**Multi-tenant deployment:** key per tenant + system-prompt version to shard
-load while preserving cache stickiness. Use `safety_identifier` per-call for
-abuse tracking:
+The `enable_long_context` ConfigField is gated (`show_when`) to gpt-5.6-family
+models — the only models where the flag carries a cost consequence.
 
-```toml
-config = { prompt_cache_key = "tenant_42:sysprompt_v7" }
-# In application code, per request:
-# await provider.complete(request, safety_identifier="end_user_abc")
-```
+## Debugging (`raw`)
 
-**ZDR / regulated industries:** disable chaining so no server-side state is
-retained for reasoning models:
-
-```toml
-config = { enable_response_chaining = false, enable_state = false }
-```
-
-### Observability
-
-Cache hit rate surfaces as `usage.cache_read_tokens` on responses, and is
-emitted in `llm:response` events as `cache_read_tokens`. Note: OpenAI does NOT
-report a `cache_creation_tokens` metric (unlike Anthropic) — cache writes are
-implicit and not counted separately.
-
-Chain invalidation is observable via the `provider:response_chain_invalidated`
-event.
-
-## Debug Configuration
-
-**Standard Debug** (`debug: true`):
-
-- Emits `llm:request:debug` and `llm:response:debug` events
-- Contains request/response summaries with message counts, model info, usage stats
-- Moderate log volume, suitable for development
-
-**Raw Debug** (`debug: true, raw_debug: true`):
-
-- Emits `llm:request:raw` and `llm:response:raw` events
-- Contains complete, unmodified request params and response objects
-- Extreme log volume, use only for deep provider integration debugging
-- Captures the exact data sent to/from OpenAI API before any processing
-
-**Example**:
+Set `raw: true` to include the full, redacted request payload in the
+`llm:request` event this provider emits. This is the only debug toggle the
+module reads; there is no separate `debug` / `raw_debug` event tier.
 
 ```yaml
 providers:
   - module: provider-openai
     config:
-      debug: true # Enable debug events
-      raw_debug: true # Enable raw API I/O capture
+      raw: true
       default_model: gpt-5.6-sol
 ```
 
@@ -381,325 +305,104 @@ providers:
 export OPENAI_API_KEY="your-api-key-here"
 ```
 
-## Usage
-
-```python
-# In amplifier configuration
-[provider]
-name = "openai"
-model = "gpt-5.5"
-```
-
 ## Features
-
-### Responses API Capabilities
-
-- **Reasoning Control** - Adjust reasoning effort (minimal, low, medium, high, xhigh)
-- **Reasoning Summary Verbosity** - Control detail level of reasoning output (auto, concise, detailed)
-- **Extended Thinking Toggle** - Enables high-effort reasoning with automatic token budgeting
-- **Explicit Reasoning Preservation** - Re-inserts reasoning items (with encrypted content) into conversation for robust multi-turn reasoning
-- **Prompt Caching Hints** - `prompt_cache_key`, `prompt_cache_retention` (default `"24h"`), and per-call `safety_identifier` wired into the request builder. See [Prompt Caching](#prompt-caching).
-- **Response Chaining for Reasoning Models** - `enable_response_chaining` activates `previous_response_id` for reasoning models, materially improving prefix cache hit rate (default `"auto"`).
-- **Cache-Stable Truncation** - `truncation` defaults to `null` (omitted) so the cached prefix is never silently rewritten on context overflow.
-- **Stateful Conversations** - Optional conversation persistence
-- **Native Tools** - Built-in web search, image generation, code interpreter
-- **Structured Output** - JSON schema-based output formatting
-- **Function Calling** - Custom tool use support
-- **Token Counting** - Usage tracking and management (including `cache_read_tokens`)
 
 ### Reasoning Summary Levels
 
-The `reasoning_summary` config controls the verbosity of reasoning blocks in the model's response:
+`reasoning_summary` controls the verbosity of reasoning blocks:
 
-- **`auto`** (default if not specified) - Model decides appropriate detail level
-- **`concise`** - Brief reasoning summaries (faster, fewer tokens)
-- **`detailed`** - Verbose reasoning output similar to Anthropic's extended thinking blocks
-
-**Example comparison:**
-
-```yaml
-# Concise reasoning (brief summaries)
-providers:
-  - module: provider-openai
-    config:
-      reasoning: "medium"
-      reasoning_summary: "concise"
-
-# Detailed reasoning (verbose like Anthropic's thinking blocks)
-providers:
-  - module: provider-openai
-    config:
-      reasoning: "high"
-      reasoning_summary: "detailed"
-```
-
-**Note:** Detailed reasoning consumes more output tokens but provides deeper insight into the model's thought process, useful for complex problem-solving and debugging.
+- **`auto`** — Model decides appropriate detail level
+- **`concise`** — Brief reasoning summaries (faster, fewer tokens)
+- **`detailed`** — Verbose reasoning output (default here)
 
 ### Tool Calling
 
-The provider detects OpenAI Responses API `function_call` / `tool_call`
-blocks automatically, decodes JSON arguments, and returns standard
-`ToolCall` objects to Amplifier. No extra configuration is required—tools
-declared in your config or profiles execute as soon as the model requests
-them.
+The provider detects OpenAI Responses API `function_call` / `tool_call` blocks
+automatically, decodes JSON arguments, and returns standard `ToolCall` objects
+to Amplifier. No extra configuration is required.
 
 ### Incomplete Response Auto-Continuation
 
-The provider automatically handles incomplete responses from the OpenAI Responses API:
+When OpenAI returns `status: "incomplete"` (e.g. `max_output_tokens` reached),
+the provider automatically continues generation until the response is complete
+(up to `MAX_CONTINUATION_ATTEMPTS`, default 5), then returns a single merged
+`ChatResponse`.
 
-**The Problem**: OpenAI may return `status: "incomplete"` when generation is cut off due to:
+The continuation is **input-based and stateless**: the accumulated output so
+far is appended to the request's own input array (as an `incomplete`-stamped
+assistant message) and re-sent — there is no `previous_response_id`. Each
+continuation carries the same inherited params as the primary request,
+including `extra_request_params`.
 
-- `max_output_tokens` limit reached
-- Content filter triggered
-- Other API constraints
+Each continuation emits a `provider:incomplete_continuation` event.
 
-**The Solution**: The provider automatically continues generation using `previous_response_id` until the response is complete:
-
-1. **Transparent continuation** - Makes follow-up calls automatically (up to 5 attempts)
-2. **Output accumulation** - Merges reasoning items and messages from all continuations
-3. **Single response** - Returns complete ChatResponse to orchestrator
-4. **Full observability** - Emits `provider:incomplete_continuation` events for each continuation
-
-**Example flow**:
-
-```python
-# User request triggers large response
-response = await provider.complete(request)
-
-# Provider internally (if incomplete):
-# 1. Initial call returns status="incomplete", reason="max_output_tokens"
-# 2. Continuation 1: Uses previous_response_id, gets more output
-# 3. Continuation 2: Uses previous_response_id, gets final output
-# 4. Returns merged response with all content
-
-# Orchestrator receives complete response, unaware of continuations
-```
-
-**Configuration**: Set maximum continuation attempts (default: 5):
-
-```python
-# In _constants.py
-MAX_CONTINUATION_ATTEMPTS = 5  # Prevents infinite loops
-```
-
-**Observability**: Monitor via events in session logs:
-
-```json
-{
-  "event": "provider:incomplete_continuation",
-  "provider": "openai",
-  "response_id": "resp_abc123",
-  "reason": "max_output_tokens",
-  "continuation_number": 1,
-  "max_attempts": 5
-}
-```
+> **Known limitation (pre-existing, unchanged):** `_build_continuation_input`
+> carries forward only accumulated `output_text` — reasoning items and
+> tool/function calls from the truncated output are not replayed into the
+> continuation. The mid-`function_call` truncation case is handled earlier and
+> more aggressively by the truncation-retry policy (discard + retry once at the
+> model's max output budget).
 
 ### Reasoning State Preservation
 
-The provider preserves reasoning state across conversation **steps** for improved multi-turn performance:
+The provider preserves reasoning state across conversation **steps** (each API
+call within a turn, e.g. a tool loop) via **explicit, inline reasoning
+re-insertion** — the only mechanism, since the provider is stateless-only.
 
-**The Problem**: Reasoning models (o3, o4, gpt-5.5) produce internal reasoning traces (rs\_\* IDs) that improve subsequent responses by ~3-5% when preserved. This is especially critical when tool calls are involved.
-
-**Important Distinction**:
-
-- **Turn**: A user prompt → (possibly multiple API calls) → final assistant response
-- **Step**: Each individual API call within a turn (tool call loops = multiple steps per turn)
-- **Reasoning items must be preserved across STEPS, not just TURNS**
-
-**The Solution**: The provider uses **explicit reasoning re-insertion** for robust step-by-step reasoning:
-
-1. **Requests encrypted content** - API call includes `include=["reasoning.encrypted_content"]`
-2. **Stores complete reasoning state** - Both encrypted content and reasoning ID stored in `ThinkingBlock.content` field
-3. **Re-inserts reasoning items** - Explicitly converts reasoning blocks back to OpenAI format in subsequent turns
-4. **Maintains metadata** - Also tracks reasoning IDs in metadata for backward compatibility
-
-**How it works** (tool call example showing step-by-step preservation):
-
-```python
-# Step 1: User asks question requiring tool
-response_1 = await provider.complete(request)
-# response_1.output contains:
-#   - reasoning item: rs_abc123 (with encrypted_content)
-#   - tool_call: get_weather(latitude=48.8566, longitude=2.3522)
-#
-# Provider stores ThinkingBlock with:
-#   - thinking: "reasoning summary text"
-#   - content: [encrypted_content, "rs_abc123"]  # Full reasoning state
-#   - metadata: {"openai:reasoning_items": ["rs_abc123"], ...}
-
-# Orchestrator executes tool, adds result to context
-# (Note: This is still within the SAME TURN, just a different STEP)
-
-# Step 2: Provider called again with tool result (SAME TURN!)
-response_2 = await provider.complete(request_with_tool_result)
-# Provider reconstructs reasoning item from previous step:
-# {
-#   "type": "reasoning",
-#   "id": "rs_abc123",
-#   "encrypted_content": "...",  # From ThinkingBlock.content[0]
-#   "summary": [{"type": "summary_text", "text": "..."}]
-# }
-# OpenAI receives: [user_msg, reasoning_item, tool_call, tool_result]
-# Model uses preserved reasoning from step 1 to generate final answer
-```
-
-**Key insight from OpenAI docs**: "While this is another API call, we consider this as a single turn in the conversation." Reasoning must be preserved across steps (API calls) within the same turn, especially when tools are involved. This is also the scope `reasoning_replay_scope` bounds replay to by default (see [Configuration](#configuration)) — it does not by itself say whether replaying *earlier* turns' reasoning adds value; that's left as an explicit tuning knob (`reasoning_replay_scope = "all"`) rather than assumed.
-
-**Benefits**:
-
-- **More robust** - Explicit re-insertion doesn't rely on server-side state
-- **Stateless compatible** - Works with `store: false` configuration
-- **Better multi-turn performance** - ~5% improvement per OpenAI benchmarks
-- **Critical for tool calling** - Recommended by OpenAI for reasoning models with tools
-- **Follows OpenAI docs** - Implements "context += response.output" pattern
-- **Ciphertext always captured** - `include=["reasoning.encrypted_content"]` is
-  requested unconditionally, even while chaining is active. Live measurement
-  found this cache-neutral (requesting `include` on an already-chained call
-  changes the *response* shape returned, not the *request* prefix caching
-  keys on), so every reset/resume path can replay reasoning regardless of
-  whether the response that produced it was chained.
+1. **Requests encrypted content** — every reasoning-capable request includes
+   `include=["reasoning.encrypted_content"]` (unconditional — live measurement
+   found it cache-neutral).
+2. **Stores complete reasoning state** — encrypted content and reasoning id are
+   stored in `ThinkingBlock.content`.
+3. **Re-inserts reasoning items** — reasoning blocks are converted back to
+   OpenAI top-level `reasoning` items on subsequent requests, bounded by
+   `reasoning_replay_scope`.
 
 **`ThinkingBlock.content` encoding**: reasoning state is stored as a
 single-element list containing a named dict —
-`content: [{"encrypted_content": ..., "id": "rs_*", "summary": ...}]` — not a
-positional `[encrypted_content, reasoning_id]` list. A named dict survives
-Amplifier's transcript sanitizer (which drops `None` values/entries) without
-losing the *meaning* of what remains: `{"id": "rs_abc"}` after
-`encrypted_content: None` is dropped is still unambiguously an id, whereas a
-positional list collapsing to `["rs_abc"]` is not distinguishable from
-ciphertext without guessing. The provider still reads two legacy on-disk
-shapes for backward compatibility with transcripts written before this
-change (a 2-element positional list, and a 1-element collapsed list —
-detected by the `rs_*` id prefix, never guessed positionally); a legacy
-1-element block whose id cannot be paired with ciphertext is unrecoverable
-and is dropped with a warning (it was never written with the ciphertext
-present, so this is not new data loss — it makes the pre-existing loss
-audible instead of silent).
+`content: [{"encrypted_content": ..., "id": "rs_*", "summary": ...}]`. A named
+dict survives Amplifier's transcript sanitizer (which drops `None` values)
+without losing the *meaning* of what remains. The provider still reads two
+legacy on-disk shapes (a 2-element positional list, and a 1-element collapsed
+list detected by the `rs_*` id prefix); a legacy 1-element block whose id
+cannot be paired with ciphertext is unrecoverable and is dropped with a warning.
 
-### Automatic Context Management (Truncation)
+### Context overflow
 
-The provider supports OpenAI's optional `truncation` parameter for automatic
-conversation history management. **The default flipped from `"auto"` to `null`
-(omitted)** as of PR #34, because `truncation = "auto"` rewrites the cached
-prefix on overflow and busts prompt caching.
-
-**Configuration**:
-
-```yaml
-providers:
-  - module: provider-openai
-    config:
-      truncation: null    # Default. Field omitted; OpenAI errors on overflow.
-      # OR
-      truncation: "auto"  # Opt in: drop oldest messages on overflow (busts cache).
-```
-
-**How `"auto"` works** (when explicitly opted in):
-
-- OpenAI automatically removes oldest messages when context limit approached
-- FIFO (first-in, first-out) - most recent messages preserved
-- Transparent to application - no errors or warnings
-- Works with all conversation types (reasoning, tools, multi-turn)
-
-**Trade-offs**:
-
-- `null` (default): explicit `context_length_exceeded` error on overflow,
-  but the cached prefix is preserved across turns.
-- `"auto"`: simplicity and never-hit-the-limit, at the cost of cache hit
-  rate. Listed on OpenAI's troubleshooting checklist as a top cause of
-  low cache utilization.
-
-**When to use `"auto"`**:
-
-- Legacy behavior compatibility, or workloads where simplicity outweighs
-  cache efficiency. For most users, the new default (`null`) is correct;
-  pair it with explicit context management upstream.
-
-See also: [Prompt Caching](#prompt-caching) for the broader cache-stability rationale.
+The provider is stateless: the request's `input` already carries the full local
+transcript, so there is nothing a retry could shrink. A `context_length_exceeded`
+400 (or the equivalent streaming error) raises `ContextLengthError`
+**immediately** — no retry. Compaction is the context manager's job, driven by
+its own token threshold at request-build time.
 
 ### Metadata Keys
 
 The provider populates `ChatResponse.metadata` with OpenAI-specific state:
 
-| Key                         | Type        | Description                                                       |
-| --------------------------- | ----------- | ----------------------------------------------------------------- |
-| `openai:response_id`        | `str`       | Response ID for continuation and reasoning preservation           |
-| `openai:status`             | `str`       | Response status: `"completed"` or `"incomplete"`                  |
-| `openai:incomplete_reason`  | `str`       | Reason if incomplete: `"max_output_tokens"` or `"content_filter"` |
-| `openai:reasoning_items`    | `list[str]` | Reasoning item IDs (rs\_\*) for state preservation                |
-| `openai:continuation_count` | `int`       | Number of auto-continuations performed (if > 0)                   |
+| Key | Type | Description |
+| --- | --- | --- |
+| `openai:response_id` | `str` | Response id (captured for support/debug correlation; never read back into a later request). |
+| `openai:status` | `str` | `"completed"` or `"incomplete"`. |
+| `openai:incomplete_reason` | `str` | `"max_output_tokens"` or `"content_filter"`. |
+| `openai:reasoning_items` | `list[str]` | Reasoning item ids (`rs_*`) for state preservation. |
+| `openai:continuation_count` | `int` | Number of auto-continuations performed (if > 0). |
 
-**Example metadata**:
-
-```python
-{
-    "openai:response_id": "resp_05fb664e4d9dca6a016920b9b1153c819487f88da867114925",
-    "openai:status": "completed",
-    "openai:reasoning_items": ["rs_05fb664e4d9dca6a016920b9b1daac81949b7ea950bddef95a"],
-    "openai:continuation_count": 2
-}
-```
-
-**Namespacing**: All keys use `openai:` prefix to prevent collisions with other providers (per kernel philosophy).
+All keys use the `openai:` prefix to prevent collisions with other providers.
 
 ### Graceful Error Recovery
 
-The provider implements graceful degradation for incomplete tool call sequences:
+If tool results are missing from conversation history (context-management bugs,
+parsing errors, state corruption), the provider detects the unpaired tool calls
+and injects synthetic `[SYSTEM ERROR: Tool result missing]` results so the API
+accepts the request and the session continues, rather than crashing.
 
-**The Problem**: If tool results are missing from conversation history (due to context compaction bugs, parsing errors, or state corruption), the OpenAI API rejects the entire request, breaking the user's session.
-
-**The Solution**: The provider automatically detects missing tool results and injects synthetic results that:
-
-1. **Make the failure visible** - LLM sees `[SYSTEM ERROR: Tool result missing]` message
-2. **Maintain conversation validity** - API accepts the request, session continues
-3. **Enable recovery** - LLM can acknowledge the error and ask user to retry
-4. **Provide observability** - Emits `provider:tool_sequence_repaired` event with details
-
-**Example**:
-
-```python
-# Broken conversation history (missing tool result)
-messages = [
-    {"role": "assistant", "tool_calls": [{"id": "call_123", "function": {"name": "get_weather", ...}}]},
-    # MISSING: {"role": "tool", "tool_call_id": "call_123", "content": "..."}
-    {"role": "user", "content": "Thanks"}
-]
-
-# Provider injects synthetic result:
-{
-    "role": "tool",
-    "tool_call_id": "call_123",
-    "content": "[SYSTEM ERROR: Tool result missing from conversation history]\n\nTool: get_weather\n..."
-}
-
-# LLM responds: "I notice the weather tool failed. Let me try again..."
-# Session continues instead of crashing
-```
-
-**Observability**: Repairs are logged as warnings and emit `provider:tool_sequence_repaired` events for monitoring.
-
-**Two repair sites emit this event.** The provider repairs unpaired tool calls in two distinct places, and each tags its emission with a `repair_site` field so consumers can tell them apart:
-
-| `repair_site` | Where | What it repairs |
-|---------------|-------|-----------------|
-| `message_level` | `_find_missing_tool_results` | A tool call in the local conversation history whose result is absent. Synthetic results are injected into the transcript. |
-| `chain_pairing` | `_enforce_chain_output_pairing` | A tool call that lives server-side in a chained response (`previous_response_id`) whose output is missing from, or mis-keyed in, the delta input. |
-
-Both emissions carry `provider`, `repair_count`, and `repairs` (a list of `{tool_call_id, tool_name}`). `repair_count` counts synthesized results only and always equals `len(repairs)`.
-
-The `chain_pairing` site adds `dropped_count` and `kept_count` alongside the chain-specific diagnostics (`expected_call_ids`, `provided_call_ids`, `synthesized_for`, `dropped_item_id_outputs`, `kept_item_id_outputs`). Dropping an unpairable output is a separate action from synthesizing a missing one, so a turn may legitimately report `repair_count: 0` with `dropped_count: 1` — the provider dropped an output that could pair with nothing server-side while every genuine call was already correctly paired.
-
-An `fc_`-keyed (Responses-API item id) output has **two** possible outcomes, and each is counted separately:
-
-| Field | Outcome |
-|-------|---------|
-| `dropped_count` / `dropped_item_id_outputs` | The `fc_` id matches no chained call. It can pair with nothing server-side, so it is discarded and the orphaned call gets a synthesized error result. |
-| `kept_count` / `kept_item_id_outputs` | The `fc_` id matches the chained turn's local tool-call record — both were keyed from the same `ToolCallBlock.id`. The real tool output is **kept**: dropping it would destroy the payload while the orphan repair re-synthesized an error under that same unpairable id, which is strictly worse. |
-
-Total `fc_` keying anomalies observed on a turn is therefore `dropped_count + kept_count`, not `dropped_count` alone.
-
-**Philosophy**: This is **graceful degradation** following kernel philosophy - errors in other modules (context management) don't crash the provider or kill the user's session.
+Repairs emit a `provider:tool_sequence_repaired` event carrying `provider`,
+`repair_count`, and `repairs` (a list of `{tool_call_id, tool_name}`), with
+`repair_site: "message_level"`. `repair_count` counts synthesized results and
+always equals `len(repairs)`. A wire-level backstop in `_convert_messages`
+provides the same protection at the request-format boundary for the full
+`_PAIRED_OUTPUT_ITEM_TYPES` vocabulary (function / apply_patch / computer
+outputs).
 
 ## Dependencies
 
@@ -729,4 +432,3 @@ This project may contain trademarks or logos for projects, products, or services
 trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
-Any use of third-party trademarks or logos are subject to those third-party's policies.
