@@ -366,16 +366,30 @@ def convert_response_with_accumulated_output(
 
                 # Create thinking block if there's reasoning text OR encrypted state to preserve
                 if reasoning_text or encrypted_content:
-                    # Store reasoning state in content field for re-insertion
-                    # content[0] = encrypted_content (for full reasoning continuity)
-                    # content[1] = reasoning_id (rs_* ID for OpenAI)
+                    # Named dict, NOT a positional list -- see Change B in
+                    # stateless-reset-fix-spec.md: amplifier_foundation's
+                    # sanitize_for_json drops None from lists, which silently
+                    # collapsed [None, "rs_abc"] -> ["rs_abc"] and made every
+                    # block captured without ciphertext permanently
+                    # unreplayable after resume. A dict survives the same
+                    # key-dropping without losing what each surviving value
+                    # MEANS. See _decode_reasoning_state in __init__.py for
+                    # the back-compat reader (this file has no reader of its
+                    # own -- reasoning replay always goes through
+                    # amplifier_module_provider_openai._convert_messages).
                     content_blocks.append(
                         ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=[
+                                {
+                                    "encrypted_content": encrypted_content,
+                                    "id": reasoning_id,
+                                    "summary": reasoning_text or None,
+                                }
+                            ],
                         )
                     )
                     event_blocks.append(ThinkingContent(text=reasoning_text or ""))
@@ -432,16 +446,22 @@ def convert_response_with_accumulated_output(
 
                 # Create thinking block if there's reasoning text OR encrypted state to preserve
                 if reasoning_text or encrypted_content:
-                    # Store reasoning state in content field for re-insertion
-                    # content[0] = encrypted_content (for full reasoning continuity)
-                    # content[1] = reasoning_id (rs_* ID for OpenAI)
+                    # Named dict, NOT a positional list -- see Change B in
+                    # stateless-reset-fix-spec.md (same rationale as the
+                    # SDK-object branch above).
                     content_blocks.append(
                         ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=[
+                                {
+                                    "encrypted_content": encrypted_content,
+                                    "id": reasoning_id,
+                                    "summary": reasoning_text or None,
+                                }
+                            ],
                         )
                     )
                     event_blocks.append(ThinkingContent(text=reasoning_text or ""))

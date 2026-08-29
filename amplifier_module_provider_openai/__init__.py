@@ -738,6 +738,51 @@ def _build_assistant_message_item(
     }
 
 
+def _decode_reasoning_state(
+    block_content: Any,
+) -> tuple[str | None, str | None, str | None]:
+    """Decode ThinkingBlock.content -> (encrypted_content, reasoning_id, summary).
+
+    Three on-disk shapes must all be read (transcripts persist across upgrades):
+
+      1. NEW named:      [{"encrypted_content": ..., "id": "rs_*", "summary": ...}]
+         Note sanitize_for_json also drops None VALUES from dicts, so
+         "encrypted_content" may be absent entirely -- that is expected and
+         unambiguous, because the surviving keys keep their meaning.
+      2. OLD positional: [encrypted_content, reasoning_id]        (len == 2)
+      3. OLD collapsed:  ["rs_*"]                                 (len == 1)
+         sanitize_for_json dropped a None ciphertext from slot 0, sliding the
+         rs_* id into it. Detected BY PREFIX -- never positionally -- so an id
+         is never misread as ciphertext.
+
+    Returns (None, None, None) when nothing usable is present.
+    """
+    if not block_content or not isinstance(block_content, list):
+        return None, None, None
+
+    first = block_content[0]
+
+    # Shape 1 -- named dict
+    if isinstance(first, dict):
+        return (
+            first.get("encrypted_content") or None,
+            first.get("id") or None,
+            first.get("summary") or None,
+        )
+
+    # Shape 2 -- legacy positional, intact
+    if len(block_content) >= 2:
+        return (block_content[0] or None, block_content[1] or None, None)
+
+    # Shape 3 -- legacy positional, ciphertext dropped by the sanitizer.
+    # Slot 0 holds the rs_* id. Prefix check ONLY: a value that is not an
+    # rs_* id is not recoverable state and must not be guessed at.
+    if isinstance(first, str) and first.startswith("rs_"):
+        return None, first, None
+
+    return None, None, None
+
+
 # Every config key this module actually reads -- audited against every
 # `self.config.get(...)` call site in the constructor and the request path
 # (_build_params' thinking_budget_* passthrough). 31 entries.
@@ -3952,41 +3997,42 @@ class OpenAIProvider:
                                 # Extract reasoning state for top-level insertion
                                 # Reasoning items must be top-level in input, not in message content!
                                 block_content = block.get("content")
-                                if block_content and len(block_content) >= 2:
-                                    encrypted_content = block_content[0]
-                                    reasoning_id = block_content[1]
-                                    if reasoning_id:
-                                        reasoning_item = {
-                                            "type": "reasoning",
-                                            "id": reasoning_id,
-                                        }
-                                        if encrypted_content:
-                                            reasoning_item["encrypted_content"] = (
-                                                encrypted_content
-                                            )
-                                        # Always include summary (required by OpenAI API).
-                                        # Use thinking text when available, empty list otherwise.
-                                        thinking_text = block.get("thinking")
-                                        reasoning_item["summary"] = (
-                                            [
-                                                {
-                                                    "type": "summary_text",
-                                                    "text": thinking_text,
-                                                }
-                                            ]
-                                            if thinking_text
-                                            else []
+                                encrypted_content, reasoning_id, stored_summary = (
+                                    _decode_reasoning_state(block_content)
+                                )
+                                if reasoning_id:
+                                    reasoning_item = {
+                                        "type": "reasoning",
+                                        "id": reasoning_id,
+                                    }
+                                    if encrypted_content:
+                                        reasoning_item["encrypted_content"] = (
+                                            encrypted_content
                                         )
-                                        if skip_reasoning_reinsertion:
-                                            # Chaining is active: server holds reasoning state under
-                                            # previous_response_id. Don't re-emit encrypted_content
-                                            # (would bust the cache prefix) and don't emit bare rs_*
-                                            # IDs (server already knows them).
-                                            pass
-                                        else:
-                                            reasoning_items_to_add.append(
-                                                reasoning_item
-                                            )
+                                    # Always include summary (required by OpenAI API).
+                                    # Use thinking text when available, falling back to
+                                    # the decoded stored summary, empty list otherwise.
+                                    thinking_text = block.get("thinking") or stored_summary
+                                    reasoning_item["summary"] = (
+                                        [
+                                            {
+                                                "type": "summary_text",
+                                                "text": thinking_text,
+                                            }
+                                        ]
+                                        if thinking_text
+                                        else []
+                                    )
+                                    if skip_reasoning_reinsertion:
+                                        # Chaining is active: server holds reasoning state under
+                                        # previous_response_id. Don't re-emit encrypted_content
+                                        # (would bust the cache prefix) and don't emit bare rs_*
+                                        # IDs (server already knows them).
+                                        pass
+                                    else:
+                                        reasoning_items_to_add.append(
+                                            reasoning_item
+                                        )
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
                             if block.type == "text":
@@ -4072,16 +4118,13 @@ class OpenAIProvider:
                                                 "arguments": tc_args_str,
                                             }
                                         )
-                            elif (
-                                block.type == "thinking"
-                                and hasattr(block, "content")
-                                and block.content
-                                and len(block.content) >= 2
-                            ):
+                            elif block.type == "thinking":
                                 # Extract reasoning state for top-level insertion
                                 # Reasoning items must be top-level in input, not in message content!
-                                encrypted_content = block.content[0]
-                                reasoning_id = block.content[1]
+                                block_content = getattr(block, "content", None)
+                                encrypted_content, reasoning_id, stored_summary = (
+                                    _decode_reasoning_state(block_content)
+                                )
 
                                 if (
                                     reasoning_id
@@ -4098,12 +4141,13 @@ class OpenAIProvider:
                                         )
 
                                     # Always include summary (required by OpenAI API).
-                                    # Use thinking text when available, empty list otherwise.
+                                    # Use thinking text when available, falling back to
+                                    # the decoded stored summary, empty list otherwise.
                                     thinking_text = (
                                         getattr(block, "thinking", None)
                                         if hasattr(block, "thinking")
                                         else None
-                                    )
+                                    ) or stored_summary
                                     reasoning_item["summary"] = (
                                         [
                                             {
@@ -4494,15 +4538,25 @@ class OpenAIProvider:
 
                     # Create thinking block if there's reasoning text OR encrypted state to preserve
                     if reasoning_text or encrypted_content:
-                        # Store reasoning state in content field for re-insertion
-                        # content[0] = encrypted_content (for full reasoning continuity)
-                        # content[1] = reasoning_id (rs_* ID for OpenAI)
+                        # Named dict, NOT a positional list. amplifier_foundation's
+                        # sanitize_for_json drops None from lists (serialization.py:54-61),
+                        # which silently collapsed [None, "rs_abc"] -> ["rs_abc"] and made
+                        # every block captured without ciphertext permanently unreplayable
+                        # after resume. A dict survives the same key-dropping without
+                        # losing what each surviving value MEANS. See
+                        # _decode_reasoning_state for the back-compat reader.
                         thinking_block = ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=[
+                                {
+                                    "encrypted_content": encrypted_content,
+                                    "id": reasoning_id,
+                                    "summary": reasoning_text or None,
+                                }
+                            ],
                         )
                         logger.info(
                             f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
@@ -4616,15 +4670,25 @@ class OpenAIProvider:
 
                     # Create thinking block if there's reasoning text OR encrypted state to preserve
                     if reasoning_text or encrypted_content:
-                        # Store reasoning state in content field for re-insertion
-                        # content[0] = encrypted_content (for full reasoning continuity)
-                        # content[1] = reasoning_id (rs_* ID for OpenAI)
+                        # Named dict, NOT a positional list. amplifier_foundation's
+                        # sanitize_for_json drops None from lists (serialization.py:54-61),
+                        # which silently collapsed [None, "rs_abc"] -> ["rs_abc"] and made
+                        # every block captured without ciphertext permanently unreplayable
+                        # after resume. A dict survives the same key-dropping without
+                        # losing what each surviving value MEANS. See
+                        # _decode_reasoning_state for the back-compat reader.
                         thinking_block = ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=[
+                                {
+                                    "encrypted_content": encrypted_content,
+                                    "id": reasoning_id,
+                                    "summary": reasoning_text or None,
+                                }
+                            ],
                         )
                         logger.info(
                             f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
