@@ -1053,6 +1053,21 @@ class OpenAIProvider:
         else:
             self.enable_response_chaining = bool(raw_chain)
 
+        # C3: enable_response_chaining=False is a ZDR / regulated-industry
+        # opt-out and is now authoritative (see _chaining_permitted) -- legacy
+        # enable_state=True can no longer silently re-attach
+        # previous_response_id behind it. That still leaves enable_state=True
+        # forcing store=True (server-side retention), which is a SEPARATE leak
+        # the operator must close explicitly if a full ZDR posture is needed.
+        if self.enable_response_chaining is False and self.enable_state:
+            logger.warning(
+                "[PROVIDER] enable_response_chaining=false with enable_state=true. "
+                "Chaining is DISABLED (the explicit opt-out wins) -- previous_response_id "
+                "will never be attached. However enable_state=true still sets store=true, "
+                "so responses ARE retained server-side. For a full ZDR posture set "
+                "enable_state=false as well."
+            )
+
         # Deep research / background mode configuration
         self.poll_interval = self.config.get("poll_interval", DEFAULT_POLL_INTERVAL)
         self.background_timeout = self.config.get(
@@ -2012,6 +2027,17 @@ class OpenAIProvider:
             return False
         # "auto"
         return get_capabilities(model_id).supports_reasoning
+
+    def _chaining_permitted(self, kwargs: dict[str, Any]) -> bool:
+        """False only when chaining is EXPLICITLY disabled.
+
+        `enable_response_chaining=False` is a ZDR / regulated-industry opt-out
+        (see the tri-state doc at the config site). It is authoritative: legacy
+        `enable_state=True` must not silently re-attach previous_response_id
+        behind an operator who explicitly opted out. "auto" and True both permit.
+        """
+        override = kwargs.get("enable_response_chaining", self.enable_response_chaining)
+        return override is not False
 
     async def _create_response(self, params: dict[str, Any]) -> Any:
         """Call `client.responses.create(**params)`.
