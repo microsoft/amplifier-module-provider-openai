@@ -289,6 +289,107 @@ def _resolve_config_reasoning_effort(value: Any, model_id: str) -> str | None:
     return normalized
 
 
+# Vocabulary accepted by `_parse_config_bool` for plain (non-tri-state)
+# boolean config keys. Deliberately tight -- true/false plus the common
+# yes/no and 1/0 spellings, case-insensitive and whitespace-stripped.
+# Anything outside this set is treated as a typo, not a truthy value.
+_CONFIG_BOOL_TRUE_STRINGS = frozenset({"true", "1", "yes"})
+_CONFIG_BOOL_FALSE_STRINGS = frozenset({"false", "0", "no"})
+
+
+def _parse_config_bool(key: str, raw: Any, default: bool) -> bool:
+    """Parse a boolean-ish provider-config value, tolerating string bools.
+
+    The app-cli wizard writes `field_type="boolean"` values as the STRINGS
+    "true" / "false" (not Python bools), and hand-edited YAML commonly
+    quotes booleans too. Naively coercing that with `bool(raw)` -- or worse,
+    assigning the raw value straight through and relying on truthiness at
+    the call site -- is wrong for both: `bool("false")` and `if "false":`
+    are both True, since ANY non-empty string is truthy. That silently
+    inverts the operator's intent (see `enable_response_chaining`, where
+    this exact bug made the ZDR opt-out "false" turn chaining ON).
+
+    Accepts:
+      - key absent / value None / value "" -> `default`
+      - real bool -> itself, unchanged
+      - str in {"true", "1", "yes"} (case-insensitive, stripped) -> True
+      - str in {"false", "0", "no"} (case-insensitive, stripped) -> False
+
+    Args:
+        key: The config key name, for the error message only.
+        raw: The value as read from config, e.g. `self.config.get(key)`
+            (NOT `self.config.get(key, default)` -- pass the default
+            separately so an explicit blank/None in config still resolves
+            through this function rather than bypassing it).
+        default: Value to use when the key is absent, None, or "".
+
+    Returns:
+        The resolved boolean.
+
+    Raises:
+        ValueError: `raw` is not one of the accepted spellings above. This
+            surfaces at mount time -- loud and immediate -- instead of
+            silently doing the wrong thing for the rest of the session.
+    """
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in _CONFIG_BOOL_TRUE_STRINGS:
+            return True
+        if normalized in _CONFIG_BOOL_FALSE_STRINGS:
+            return False
+    raise ValueError(
+        f"Invalid config {key!r}={raw!r} for provider-openai. "
+        f"Accepted values: true/false (also 1/0, yes/no; case-insensitive, "
+        f"whitespace ignored). Fix the provider config (settings.yaml / "
+        f"bundle config block)."
+    )
+
+
+def _parse_config_chaining(raw: Any) -> str | bool:
+    """Parse the tri-state `enable_response_chaining` config value.
+
+    Tri-state, per the ConfigField choices=["auto", "true", "false"]:
+      - key absent / value None / "" / "auto" (case-insensitive, stripped)
+        -> "auto" (on iff the model supports reasoning)
+      - real bool -> itself, unchanged (force on/off regardless of model)
+      - str "true" / "false" (case-insensitive, stripped) -> True/False
+
+    Mirrors `_parse_config_bool`'s rationale: `bool(raw)` on the STRING
+    "false" (exactly what the wizard writes, and what the ZDR opt-out
+    guidance in the README tells operators to set) previously resolved to
+    True, silently re-enabling chaining -- and therefore
+    `previous_response_id` retention -- for exactly the deployments that
+    most needed it off.
+
+    Raises:
+        ValueError: `raw` is not "auto"/bool/"true"/"false". Surfaces at
+            mount time naming the key, the value received, and the
+            accepted values -- never silently falls through to `bool()`.
+    """
+    if raw is None or raw == "":
+        return "auto"
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        return "auto"
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(
+        f"Invalid config 'enable_response_chaining'={raw!r} for "
+        f"provider-openai. Accepted values: 'auto' (default), true/false "
+        f"(also as strings, case-insensitive). Fix the provider config "
+        f"(settings.yaml / bundle config block)."
+    )
+
+
 # reasoning.mode selects the reasoning strategy. Verified live against gpt-5.6-sol
 # 2026-07-14: mode in {"standard", "pro"} ("pro" = deeper internal reasoning, one
 # final answer). Only forwarded when the caller sets it; models that do not support
@@ -996,11 +1097,15 @@ class OpenAIProvider:
         # `config={"truncation": "auto"}` to opt into the legacy auto-drop
         # behavior.
         self.truncation = self.config.get("truncation", DEFAULT_TRUNCATION)
-        self.enable_state = self.config.get("enable_state", False)
-        self.raw = self.config.get("raw", False)  # Include raw payload in events
+        self.enable_state = _parse_config_bool(
+            "enable_state", self.config.get("enable_state"), False
+        )
+        self.raw = _parse_config_bool(
+            "raw", self.config.get("raw"), False
+        )  # Include raw payload in events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
-        self.filtered = self.config.get(
-            "filtered", True
+        self.filtered = _parse_config_bool(
+            "filtered", self.config.get("filtered"), True
         )  # Filter to curated model list by default
 
         # Prompt-caching hint parameters (Responses API top-level fields).
@@ -1062,8 +1167,10 @@ class OpenAIProvider:
         # defaults store=False) there is no persisted reasoning state for the
         # server to apply a context strategy to, so forwarding it there is
         # meaningless-to-harmful. Mirrors `enable_long_context`.
-        self.enable_reasoning_context: bool = bool(
-            self.config.get("enable_reasoning_context", False)
+        self.enable_reasoning_context: bool = _parse_config_bool(
+            "enable_reasoning_context",
+            self.config.get("enable_reasoning_context"),
+            False,
         )
 
         # Response chaining for reasoning models — the Responses API's
@@ -1092,12 +1199,8 @@ class OpenAIProvider:
         #     reasoning models specifically.
         #   - When chaining resolves to True, `store=True` is forced (chaining
         #     requires it). Otherwise `enable_state` decides `store`.
-        raw_chain = self.config.get("enable_response_chaining", "auto")
-        # Coerce: accept "auto" | True | False | None | "" → normalize to "auto"|True|False
-        if raw_chain in (None, "", "auto"):
-            self.enable_response_chaining: str | bool = "auto"
-        else:
-            self.enable_response_chaining = bool(raw_chain)
+        raw_chain = self.config.get("enable_response_chaining")
+        self.enable_response_chaining: str | bool = _parse_config_chaining(raw_chain)
 
         # C3: enable_response_chaining=False is a ZDR / regulated-industry
         # opt-out and is now authoritative (see _chaining_permitted) -- legacy
@@ -1147,21 +1250,27 @@ class OpenAIProvider:
         # Long context flag — when False (default), GPT-5.4 reports 272K context
         # (the pricing threshold) instead of the full 1,050K window, keeping costs
         # predictable.  Set to True to advertise the full context window.
-        self.enable_long_context = self.config.get("enable_long_context", False)
+        self.enable_long_context = _parse_config_bool(
+            "enable_long_context", self.config.get("enable_long_context"), False
+        )
 
         # Streaming flag — when True (default), uses client.responses.stream() with
         # chunked HTTP transport to prevent timeouts on large context requests.
         # This is NOT progressive token streaming to the user; it collects the complete
         # response before returning, matching what the Anthropic provider does.
         # Set to False to use the blocking create() path (useful for tests / compat).
-        self.use_streaming = self.config.get("use_streaming", True)
+        self.use_streaming = _parse_config_bool(
+            "use_streaming", self.config.get("use_streaming"), True
+        )
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
             max_retries=int(self.config.get("max_retries", 5)),
             initial_delay=float(self.config.get("min_retry_delay", 1.0)),
             max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=bool(self.config.get("retry_jitter", True)),
+            jitter=_parse_config_bool(
+                "retry_jitter", self.config.get("retry_jitter"), True
+            ),
         )
 
         # Track tool call IDs that have been repaired with synthetic results.
