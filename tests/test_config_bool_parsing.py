@@ -120,16 +120,19 @@ def test_long_context_garbage_value_fails_loud_at_mount(garbage):
 @pytest.mark.parametrize(
     "key,default",
     [
-        ("enable_state", False),
         ("raw", False),
         ("filtered", True),
         ("enable_long_context", False),
-        ("enable_reasoning_context", False),
         ("use_streaming", True),
     ],
 )
 class TestPerKeyBoolCoercion:
-    """Constructor-level coercion for every affected simple-boolean config key."""
+    """Constructor-level coercion for every affected simple-boolean config key.
+
+    enable_state / enable_reasoning_context were removed from this list --
+    both config keys are gone (recognized-but-inert now); see
+    test_config_migration_warnings.py for their coverage.
+    """
 
     def test_string_false_is_false(self, key, default):
         provider = _make_provider(**{key: "false"})

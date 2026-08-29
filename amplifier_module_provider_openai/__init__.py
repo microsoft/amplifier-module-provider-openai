@@ -431,7 +431,6 @@ def _validate_prompt_cache_options(options: Any) -> None:
         )
 
 
-
 # text.verbosity (GPT-5.6): controls response length/detail. Opt-in; fail-loud
 # on models that reject it (pre-5.6).
 _TEXT_VERBOSITY_ALLOWED = frozenset({"low", "medium", "high"})
@@ -760,8 +759,8 @@ def _decode_reasoning_state(
 
 
 # Every config key this module actually reads -- audited against every
-# `self.config.get(...)` call site in the constructor and the request path
-# (_build_params' thinking_budget_* passthrough). 32 entries.
+# `self.config.get(...)` call site in the constructor and the request path.
+# 27 entries. (Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.)
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "base_url",
@@ -772,7 +771,6 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "reasoning_effort",
         "reasoning_summary",
         "truncation",
-        "enable_state",
         "raw",
         "timeout",
         "filtered",
@@ -781,8 +779,6 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "prompt_cache_options",
         "safety_identifier",
         "text_verbosity",
-        "enable_reasoning_context",
-        "enable_response_chaining",
         "reasoning_replay_scope",
         "poll_interval",
         "background_timeout",
@@ -794,15 +790,38 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "max_retry_delay",
         "retry_jitter",
         "max_concurrent_requests",
-        "thinking_budget_tokens",
-        "thinking_budget_buffer",
     }
 )
 
-# Recognized-but-inert keys: each has its OWN dedicated warning elsewhere
-# (see the effort-family guard in __init__), so they must be excluded from
-# the generic unknown-key sweep below to avoid a confusing double warning.
-_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset({"effort"})
+# Recognized-but-inert keys. Each gets its OWN targeted warning from the loop
+# in __init__ (see below), so they are excluded from the generic unknown-key
+# sweep via _KNOWN_CONFIG_KEYS -- a key must never produce two warnings.
+_INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
+    "effort": (
+        "not consumed by provider-openai and has no effect. Accepted effort "
+        "keys: 'reasoning_effort' (canonical), 'reasoning' (legacy)."
+    ),
+    "enable_response_chaining": (
+        "removed -- the provider is always stateless now "
+        "(see README \u00a7Conversation state)."
+    ),
+    "enable_state": (
+        "removed -- store is managed automatically (false, except background "
+        "mode which requires true); use extra_request_params to force it."
+    ),
+    "enable_reasoning_context": (
+        "removed -- reasoning.context is now forwarded whenever you supply it "
+        "in the legacy `reasoning` dict, e.g. "
+        'reasoning = {effort = "high", context = "current_turn"}.'
+    ),
+    "thinking_budget_tokens": (
+        "removed -- extended_thinking still forces high reasoning effort, but "
+        "no longer adjusts max_output_tokens. Set max_output_tokens directly."
+    ),
+    "thinking_budget_buffer": ("removed -- see thinking_budget_tokens."),
+}
+
+_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset(_INERT_CONFIG_KEY_MESSAGES)
 
 # Infrastructure keys the app/kernel may place in (or alongside) a provider's
 # config block that this module does not itself read. `default_model` and
@@ -935,15 +954,14 @@ class OpenAIProvider:
                 self.reasoning_effort,
                 self.reasoning,
             )
-        # Loudness guard against silently-inert config: warn about
-        # effort-family keys this provider does NOT consume.
-        for _inert_key in ("effort",):
+        # Loudness guard against silently-inert config: each recognized-but-
+        # removed/inert key gets its own targeted warning naming what to do
+        # instead. Never a double warning: these keys are excluded from the
+        # generic unknown-key sweep below via _KNOWN_CONFIG_KEYS.
+        for _inert_key, _inert_msg in _INERT_CONFIG_KEY_MESSAGES.items():
             if _inert_key in self.config:
                 logger.warning(
-                    "[PROVIDER] Config key '%s' is not consumed by "
-                    "provider-openai and has no effect. Accepted effort keys: "
-                    "'reasoning_effort' (canonical), 'reasoning' (legacy).",
-                    _inert_key,
+                    "[PROVIDER] Config key '%s' is %s", _inert_key, _inert_msg
                 )
         # Generalized sweep: catch every OTHER unrecognized config key (e.g. a
         # typo like 'promt_cache_retention'), not just the effort family above.
@@ -961,9 +979,6 @@ class OpenAIProvider:
         # `config={"truncation": "auto"}` to opt into the legacy auto-drop
         # behavior.
         self.truncation = self.config.get("truncation", DEFAULT_TRUNCATION)
-        self.enable_state = _parse_config_bool(
-            "enable_state", self.config.get("enable_state"), False
-        )
         self.raw = _parse_config_bool(
             "raw", self.config.get("raw"), False
         )  # Include raw payload in events
@@ -1037,16 +1052,6 @@ class OpenAIProvider:
         # text.verbosity (GPT-5.6): "low" | "medium" | "high". Wrapped into the
         # Responses API `text` object at request time. None = do not send.
         self.text_verbosity: str | None = self.config.get("text_verbosity") or None
-        # reasoning.context (GPT-5.6 persisted reasoning): retained for the
-        # legacy `reasoning` dict path (`reasoning = {context = "..."}`)
-        # forwarded ungated at the request-building site below -- an explicit
-        # reasoning dict is a deliberate provider-specific override, and the
-        # caller owns the consequences.
-        self.enable_reasoning_context: bool = _parse_config_bool(
-            "enable_reasoning_context",
-            self.config.get("enable_reasoning_context"),
-            False,
-        )
 
         # D2: how much prior reasoning to replay inline on stateless requests.
         #   "turn" (default) -- assistant turns since the last user message. Preserves
@@ -2152,7 +2157,6 @@ class OpenAIProvider:
         )
 
         thinking_enabled = bool(kwargs.get("extended_thinking"))
-        thinking_budget = None
         if thinking_enabled:
             if "reasoning" not in params:
                 params["reasoning"] = {
@@ -2160,31 +2164,9 @@ class OpenAIProvider:
                     or self.config.get("reasoning_effort", "high"),
                     "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
                 }
-
-            budget_tokens = (
-                kwargs.get("thinking_budget_tokens")
-                or self.config.get("thinking_budget_tokens")
-                or 0
-            )
-            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
-                "thinking_budget_buffer", 1024
-            )
-
-            if budget_tokens:
-                thinking_budget = budget_tokens
-                target_tokens = budget_tokens + buffer_tokens
-                if params.get("max_output_tokens"):
-                    params["max_output_tokens"] = max(
-                        params["max_output_tokens"], target_tokens
-                    )
-                else:
-                    params["max_output_tokens"] = target_tokens
-
             logger.info(
-                "[PROVIDER] Extended thinking enabled (effort=%s, budget=%s, buffer=%s)",
+                "[PROVIDER] Extended thinking enabled (effort=%s)",
                 params["reasoning"]["effort"],
-                thinking_budget or "default",
-                buffer_tokens,
             )
 
         # Auto-enable reasoning summary for models that reason by default.
@@ -2207,8 +2189,6 @@ class OpenAIProvider:
                 "message_count": len(message_list),
                 "has_instructions": bool(instructions),
                 "reasoning_enabled": params.get("reasoning") is not None,
-                "thinking_enabled": thinking_enabled,
-                "thinking_budget": thinking_budget,
                 "background_mode": background_mode,
             }
             if self.raw:

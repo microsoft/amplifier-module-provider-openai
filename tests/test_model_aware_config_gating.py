@@ -554,7 +554,8 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
         | _RECOGNIZED_INERT_CONFIG_KEYS
         | _INFRASTRUCTURE_CONFIG_KEYS
     )
-    # 32 keys the survey counted (was 31; Change D added
-    # reasoning_replay_scope), audited against every `self.config.get(...)`
-    # call site in the constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 32
+    # 27 keys the survey counted: 32 - 5 removed (enable_state,
+    # enable_reasoning_context, enable_response_chaining,
+    # thinking_budget_tokens, thinking_budget_buffer), audited against every
+    # `self.config.get(...)` call site in the constructor and request path.
+    assert len(_CONSUMED_CONFIG_KEYS) == 27
