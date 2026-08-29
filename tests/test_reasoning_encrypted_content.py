@@ -22,7 +22,6 @@ from amplifier_module_provider_openai._response_handling import (
     convert_response_with_accumulated_output,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -98,7 +97,13 @@ def test_thinking_block_created_with_encrypted_content_only():
         f"got {len(thinking_blocks)}. Content: {result.content}"
     )
     block = thinking_blocks[0]
-    assert block.content == ["encrypted_blob_abc123", "rs_enc_only"]
+    assert block.content == [
+        {
+            "encrypted_content": "encrypted_blob_abc123",
+            "id": "rs_enc_only",
+            "summary": None,
+        }
+    ]  # B1: named-dict encoding, not positional
     assert block.thinking == ""  # Empty string, not None — no summary text
 
 
@@ -131,7 +136,13 @@ def test_thinking_block_created_with_summary_only():
     )
     block = thinking_blocks[0]
     assert block.thinking == "I thought about it"
-    assert block.content == [None, "rs_summary_only"]
+    assert block.content == [
+        {
+            "encrypted_content": None,
+            "id": "rs_summary_only",
+            "summary": "I thought about it",
+        }
+    ]  # B1: named-dict encoding, not positional
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +170,13 @@ def test_thinking_block_created_with_both():
     assert len(thinking_blocks) == 1
     block = thinking_blocks[0]
     assert block.thinking == "Step-by-step reasoning"
-    assert block.content == ["encrypted_blob_xyz", "rs_both"]
+    assert block.content == [
+        {
+            "encrypted_content": "encrypted_blob_xyz",
+            "id": "rs_both",
+            "summary": "Step-by-step reasoning",
+        }
+    ]  # B1: named-dict encoding, not positional
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +218,13 @@ def test_thinking_block_created_with_encrypted_content_only_dict_format():
         f"got {len(thinking_blocks)}. Content: {result.content}"
     )
     block = thinking_blocks[0]
-    assert block.content == ["encrypted_dict_blob", "rs_dict_enc"]
+    assert block.content == [
+        {
+            "encrypted_content": "encrypted_dict_blob",
+            "id": "rs_dict_enc",
+            "summary": None,
+        }
+    ]  # B1: named-dict encoding, not positional
     assert block.thinking == ""
 
 
@@ -265,17 +288,22 @@ def test_no_auto_reasoning_for_non_reasoning_model():
 # ---------------------------------------------------------------------------
 
 
-def test_encrypted_content_suppressed_under_chaining():
-    """When chaining is active, encrypted_content include is NOT sent.
+def test_encrypted_content_requested_under_chaining():
+    """A5 (reasoning-continuity-fix spec, probe P1 PASS): include is now
+    UNCONDITIONAL, even when chaining is active.
 
-    Regression for PR-B: the two mechanisms (chaining via previous_response_id
-    and inline encrypted_content) were previously belt-and-suspenders for
-    enable_state=True; PR-B drops encrypted_content because it busts the
-    cache prefix.
+    Superseded regression for PR-B: PR-B originally dropped encrypted_content
+    while chaining because it was assumed to bust the cache prefix. Probe P1
+    (2026-08-29, probes/p1_include_chained_probe.py) measured this live on
+    gpt-5.6-luna and found it cache-neutral (0-4 tokens out of ~1,500-1,600
+    on hops with an actual prefix to cache) -- `include` only changes the
+    *response* shape, not the *request* prefix caching keys on. So ciphertext
+    is now always captured, letting every reset/resume path replay reasoning
+    regardless of whether the response was chained (see Change B).
 
     Chaining is "auto" by default and resolves to True for gpt-5.5
     (supports_reasoning=True). So with default config on a reasoning model,
-    include=[reasoning.encrypted_content] must be absent from the API params.
+    include=[reasoning.encrypted_content] must be present in the API params.
     """
     provider = _make_provider(default_model="gpt-5.5")
     provider.client.responses.create = AsyncMock(
@@ -293,8 +321,8 @@ def test_encrypted_content_suppressed_under_chaining():
 
     kwargs = _get_call_kwargs(provider)
     include = kwargs.get("include", [])
-    assert "reasoning.encrypted_content" not in include, (
+    assert "reasoning.encrypted_content" in include, (
         "With chaining active (auto + reasoning model), "
-        "include=reasoning.encrypted_content must NOT be sent. "
+        "include=reasoning.encrypted_content must still be sent (probe P1 PASS). "
         f"Got include={include}"
     )

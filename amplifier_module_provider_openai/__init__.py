@@ -738,9 +738,54 @@ def _build_assistant_message_item(
     }
 
 
+def _decode_reasoning_state(
+    block_content: Any,
+) -> tuple[str | None, str | None, str | None]:
+    """Decode ThinkingBlock.content -> (encrypted_content, reasoning_id, summary).
+
+    Three on-disk shapes must all be read (transcripts persist across upgrades):
+
+      1. NEW named:      [{"encrypted_content": ..., "id": "rs_*", "summary": ...}]
+         Note sanitize_for_json also drops None VALUES from dicts, so
+         "encrypted_content" may be absent entirely -- that is expected and
+         unambiguous, because the surviving keys keep their meaning.
+      2. OLD positional: [encrypted_content, reasoning_id]        (len == 2)
+      3. OLD collapsed:  ["rs_*"]                                 (len == 1)
+         sanitize_for_json dropped a None ciphertext from slot 0, sliding the
+         rs_* id into it. Detected BY PREFIX -- never positionally -- so an id
+         is never misread as ciphertext.
+
+    Returns (None, None, None) when nothing usable is present.
+    """
+    if not block_content or not isinstance(block_content, list):
+        return None, None, None
+
+    first = block_content[0]
+
+    # Shape 1 -- named dict
+    if isinstance(first, dict):
+        return (
+            first.get("encrypted_content") or None,
+            first.get("id") or None,
+            first.get("summary") or None,
+        )
+
+    # Shape 2 -- legacy positional, intact
+    if len(block_content) >= 2:
+        return (block_content[0] or None, block_content[1] or None, None)
+
+    # Shape 3 -- legacy positional, ciphertext dropped by the sanitizer.
+    # Slot 0 holds the rs_* id. Prefix check ONLY: a value that is not an
+    # rs_* id is not recoverable state and must not be guessed at.
+    if isinstance(first, str) and first.startswith("rs_"):
+        return None, first, None
+
+    return None, None, None
+
+
 # Every config key this module actually reads -- audited against every
 # `self.config.get(...)` call site in the constructor and the request path
-# (_build_params' thinking_budget_* passthrough). 31 entries.
+# (_build_params' thinking_budget_* passthrough). 32 entries.
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "base_url",
@@ -762,6 +807,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "text_verbosity",
         "enable_reasoning_context",
         "enable_response_chaining",
+        "reasoning_replay_scope",
         "poll_interval",
         "background_timeout",
         "priority",
@@ -1052,6 +1098,42 @@ class OpenAIProvider:
             self.enable_response_chaining: str | bool = "auto"
         else:
             self.enable_response_chaining = bool(raw_chain)
+
+        # C3: enable_response_chaining=False is a ZDR / regulated-industry
+        # opt-out and is now authoritative (see _chaining_permitted) -- legacy
+        # enable_state=True can no longer silently re-attach
+        # previous_response_id behind it. That still leaves enable_state=True
+        # forcing store=True (server-side retention), which is a SEPARATE leak
+        # the operator must close explicitly if a full ZDR posture is needed.
+        if self.enable_response_chaining is False and self.enable_state:
+            logger.warning(
+                "[PROVIDER] enable_response_chaining=false with enable_state=true. "
+                "Chaining is DISABLED (the explicit opt-out wins) -- previous_response_id "
+                "will never be attached. However enable_state=true still sets store=true, "
+                "so responses ARE retained server-side. For a full ZDR posture set "
+                "enable_state=false as well."
+            )
+
+        # D2: how much prior reasoning to replay inline on stateless requests.
+        #   "turn" (default) -- assistant turns since the last user message. Preserves
+        #                      the in-flight tool loop (README "single turn" guidance)
+        #                      at flat cost, independent of conversation length.
+        #   "all"            -- every turn's reasoning. Unbounded growth; ~1,200 chars
+        #                      per blob, >50% of payload by turn 4 in live probing.
+        #                      This was the pre-fix behavior on the stateless path.
+        #   "none"           -- no inline reasoning replay. Escape hatch only.
+        # Not exposed as a ConfigField -- it is a tuning knob, not a deployment
+        # decision, and the wizard is already dense. Same precedent as
+        # `safety_identifier`.
+        _scope = self.config.get("reasoning_replay_scope", "turn")
+        if _scope not in ("turn", "all", "none"):
+            logger.warning(
+                "[PROVIDER] Unknown reasoning_replay_scope=%r; falling back to 'turn'. "
+                "Valid: turn | all | none.",
+                _scope,
+            )
+            _scope = "turn"
+        self.reasoning_replay_scope: str = _scope
 
         # Deep research / background mode configuration
         self.poll_interval = self.config.get("poll_interval", DEFAULT_POLL_INTERVAL)
@@ -2013,6 +2095,17 @@ class OpenAIProvider:
         # "auto"
         return get_capabilities(model_id).supports_reasoning
 
+    def _chaining_permitted(self, kwargs: dict[str, Any]) -> bool:
+        """False only when chaining is EXPLICITLY disabled.
+
+        `enable_response_chaining=False` is a ZDR / regulated-industry opt-out
+        (see the tri-state doc at the config site). It is authoritative: legacy
+        `enable_state=True` must not silently re-attach previous_response_id
+        behind an operator who explicitly opted out. "auto" and True both permit.
+        """
+        override = kwargs.get("enable_response_chaining", self.enable_response_chaining)
+        return override is not False
+
     async def _create_response(self, params: dict[str, Any]) -> Any:
         """Call `client.responses.create(**params)`.
 
@@ -2130,18 +2223,9 @@ class OpenAIProvider:
             all_messages_for_conversion.append(conv_msg.model_dump())
 
         # Decide chaining BEFORE message conversion so we can suppress
-        # encrypted-content re-insertion when chain_active is True.
+        # encrypted-content re-insertion when chain_will_attach is True.
         model_name = kwargs.get("model", self.default_model)
         chain_active = self._should_chain_responses(model_name, kwargs)
-
-        # Convert to OpenAI Responses API message format
-        input_messages = self._convert_messages(
-            all_messages_for_conversion,
-            skip_reasoning_reinsertion=chain_active,
-        )
-        logger.info(
-            f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
-        )
 
         # Check for previous response metadata to preserve reasoning state across turns
         previous_response_id = None
@@ -2180,12 +2264,6 @@ class OpenAIProvider:
                 previous_response_id = None
             self._reset_chain_on_next_request = False
 
-        # Prepare request parameters per Responses API spec
-        params = {
-            "model": model_name,
-            "input": input_messages,  # Array of message objects, not text string
-        }
-
         # Check for background mode (used for deep research and long-running requests)
         # Background mode requires store=True per OpenAI API requirements
         background_mode = kwargs.get("background", False)
@@ -2207,7 +2285,8 @@ class OpenAIProvider:
         #                                  AND attaches previous_response_id
         #   - enable_state (legacy)      → broad server-state opt-in
         # Per-call kwargs override config for both.
-        # (chain_active was already resolved above before _convert_messages)
+        # (chain_active, previous_response_id, and the compaction reset were
+        # already resolved above, before this point.)
 
         store_enabled = kwargs.get("store", self.enable_state)
         if background_mode:
@@ -2215,14 +2294,41 @@ class OpenAIProvider:
             logger.info("[PROVIDER] Background mode enabled, forcing store=True")
         if chain_active:
             store_enabled = True  # chaining requires server-side state
+
+        # Chaining is only real if a prior id survived every reset AND we will
+        # actually attach it. `chain_active` alone is a *configuration* signal; it
+        # says nothing about whether the server holds state for THIS request.
+        # Keying conversion on it is what produced replayed function_calls with no
+        # reasoning items on every post-compaction turn.
+        chain_will_attach = bool(previous_response_id) and (
+            self._chaining_permitted(kwargs) and (chain_active or store_enabled)
+        )
+
+        # Convert to OpenAI Responses API message format
+        input_messages = self._convert_messages(
+            all_messages_for_conversion,
+            skip_reasoning_reinsertion=chain_will_attach,
+        )
+        logger.info(
+            f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
+        )
+
+        # Prepare request parameters per Responses API spec
+        params = {
+            "model": model_name,
+            "input": input_messages,  # Array of message objects, not text string
+        }
         params["store"] = store_enabled
 
-        # Attach previous_response_id when:
-        #   - we found one in the last assistant's metadata, AND
-        #   - either chaining is active for this model, OR
-        #     legacy enable_state is on (preserves existing behavior).
+        # Attach previous_response_id when chain_will_attach resolved True above:
+        # a prior id survived every reset, chaining is permitted (see
+        # _chaining_permitted / Change C), and either chain_active or legacy
+        # enable_state wants server-side retention. This is the SAME predicate
+        # that gated message conversion above, so "did we suppress reasoning
+        # re-insertion" and "did we attach previous_response_id" can never
+        # disagree again.
         # Track on params for downstream invalidation-retry logic.
-        if previous_response_id and (chain_active or store_enabled):
+        if chain_will_attach:
             params["previous_response_id"] = previous_response_id
             logger.debug(
                 "[PROVIDER] Using previous_response_id=%s (chain_active=%s, store=%s)",
@@ -2289,7 +2395,6 @@ class OpenAIProvider:
                 "[PROVIDER] Skipping previous_response_id (chain_active=False, store=False). "
                 "Relying on explicit reasoning re-insertion from metadata/content."
             )
-
         if instructions:
             params["instructions"] = instructions
 
@@ -2419,12 +2524,24 @@ class OpenAIProvider:
         # when store=false (Amplifier's default), causing orphaned reasoning references.
         # Exception: explicit effort="none" suppresses include (caller opted out of reasoning).
         #
-        # When chaining is active, server holds reasoning state under
-        # previous_response_id. Re-inserting encrypted_content inline would
-        # (a) be redundant and (b) actively hurt the cache prefix because the
-        # ciphertext changes per call. So skip encrypted-content include when
-        # chaining is on; only request it on stateless/non-reasoning paths.
-        if not store_enabled and not chain_active:
+        # A5 (probe P1, pre-registered in the reasoning-continuity-fix spec):
+        # requesting include=["reasoning.encrypted_content"] on an
+        # ALREADY-CHAINED request (previous_response_id attached) does NOT
+        # bust the prompt-cache prefix -- `include` only changes the
+        # *response* shape returned by the server, not the *request* prefix
+        # caching keys on. Verified live on gpt-5.6-luna: per-hop
+        # cached_tokens differed by 0-4 tokens out of ~1,500-1,600 (R2-R4,
+        # ~96% cache_read share in both arms) between an arm requesting
+        # include and an otherwise-identical arm that omitted it -- see
+        # probes/p1_include_chained_probe.py /
+        # probes/_p1_include_probe_results.json ("verdict": "PASS").
+        # So ciphertext capture is now UNCONDITIONAL: request it whenever the
+        # model will reason, chained or not. This lets every reset/resume
+        # path replay reasoning regardless of whether the response that
+        # produced it was chained -- previously, a response captured while
+        # chaining had encrypted_content=None and was permanently unreplayable
+        # after a chain break or resume (see Change B).
+        if True:
             caps = get_capabilities(model_name)
             active_effort: str | None = None
             if "reasoning" in params:
@@ -2644,6 +2761,22 @@ class OpenAIProvider:
         # disable the stream-event loop for that path.
         supports_streaming = not background_mode
 
+        def _rebuild_stateless_input() -> list[dict[str, Any]]:
+            """Re-convert with reasoning replay ON, for the chain-broken retry paths.
+
+            `input_messages` was converted with reasoning suppressed because a chain
+            was going to be attached. Once the chain is gone the server holds nothing,
+            so the replay must be restored -- otherwise the retry resends function_call
+            items with no originating reasoning items (OpenAI's #1 migration error).
+            Bounded by the same turn-scoped policy as every other stateless replay
+            (see reasoning_replay_scope), so this cannot re-inflate an overflowing
+            payload without limit.
+            """
+            return self._convert_messages(
+                all_messages_for_conversion,
+                skip_reasoning_reinsertion=False,
+            )
+
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info
@@ -2665,9 +2798,15 @@ class OpenAIProvider:
                     overflow_id = params.pop("previous_response_id")
                     # Chain is gone -> the server holds no prior context, so
                     # restore the full converted history (mirrors the 404
-                    # invalidation path). Retrying with only the delta would
-                    # silently drop the entire prior conversation.
-                    params["input"] = input_messages
+                    # invalidation path), this time WITH reasoning items
+                    # replayed (A6/A7) -- otherwise the retry resends
+                    # function_call items with no originating reasoning items.
+                    # Retrying with only the delta would silently drop the
+                    # entire prior conversation.
+                    params["input"] = _rebuild_stateless_input()
+                    params["include"] = [
+                        "reasoning.encrypted_content"
+                    ]  # server holds nothing now
                     logger.warning(
                         "[PROVIDER] context_length_exceeded with active "
                         "response chain (previous_response_id=%s). Breaking "
@@ -2991,7 +3130,10 @@ class OpenAIProvider:
                         # documented recovery is previous_response_id=null +
                         # full input; retrying with only the delta would
                         # silently drop the entire prior conversation.
-                        params["input"] = input_messages
+                        params["input"] = _rebuild_stateless_input()
+                        params["include"] = [
+                            "reasoning.encrypted_content"
+                        ]  # server holds nothing now
                         logger.warning(
                             "[PROVIDER] previous_response_id=%s invalidated by server "
                             "(code=%s). Retrying without chain.",
@@ -3010,14 +3152,13 @@ class OpenAIProvider:
                             )
                         # Recurse once. Do NOT loop indefinitely: by removing
                         # the field, the next call cannot hit this branch again.
-                        # NOTE: when chain_active was True we also suppressed
-                        # encrypted-content re-insertion in _convert_messages.
-                        # That decision is locked into input_messages already;
-                        # the retry uses the same input. The server will treat
-                        # this as a fresh prefix — equivalent to today's
-                        # stateless reasoning behavior. Reasoning state for
-                        # *this* turn is lost; next turn re-chains via the
-                        # response_id we get from this retry.
+                        # Reasoning replay is RESTORED here (A6/A7): the chain
+                        # just broke, so the server holds nothing for this
+                        # turn, and _rebuild_stateless_input() re-converts with
+                        # skip_reasoning_reinsertion=False, bounded by
+                        # reasoning_replay_scope. This is a fresh stateless
+                        # prefix; next turn re-chains via the response_id we
+                        # get from this retry.
                         return await _do_complete()
                     # Fall through to existing 404 handling
                     raise kernel_errors.NotFoundError(
@@ -3670,6 +3811,7 @@ class OpenAIProvider:
         messages: list[dict[str, Any]],
         *,
         skip_reasoning_reinsertion: bool = False,
+        reasoning_replay_scope: str | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
@@ -3680,12 +3822,31 @@ class OpenAIProvider:
 
         Args:
             messages: List of message dicts from ChatRequest
+            skip_reasoning_reinsertion: When True (chaining active), never emit
+                reasoning items -- the server already holds that state.
+            reasoning_replay_scope: Overrides self.reasoning_replay_scope for
+                this call ("turn" | "all" | "none"). None inherits config.
 
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
         """
         openai_messages = []
         i = 0
+
+        # D3: bound how far back reasoning items are replayed inline. One
+        # gate, computed once, applied at the single emission site below --
+        # both collection sites keep appending to reasoning_items_to_add
+        # unchanged, so the orphan-stripping guard's semantics are untouched.
+        _scope = reasoning_replay_scope or self.reasoning_replay_scope
+        if _scope == "all":
+            _reasoning_cutoff = -1  # every index qualifies
+        elif _scope == "none":
+            _reasoning_cutoff = len(messages)  # no index qualifies
+        else:  # "turn"
+            _reasoning_cutoff = max(
+                (idx for idx, m in enumerate(messages) if m.get("role") == "user"),
+                default=-1,
+            )
 
         while i < len(messages):
             msg = messages[i]
@@ -3926,41 +4087,42 @@ class OpenAIProvider:
                                 # Extract reasoning state for top-level insertion
                                 # Reasoning items must be top-level in input, not in message content!
                                 block_content = block.get("content")
-                                if block_content and len(block_content) >= 2:
-                                    encrypted_content = block_content[0]
-                                    reasoning_id = block_content[1]
-                                    if reasoning_id:
-                                        reasoning_item = {
-                                            "type": "reasoning",
-                                            "id": reasoning_id,
-                                        }
-                                        if encrypted_content:
-                                            reasoning_item["encrypted_content"] = (
-                                                encrypted_content
-                                            )
-                                        # Always include summary (required by OpenAI API).
-                                        # Use thinking text when available, empty list otherwise.
-                                        thinking_text = block.get("thinking")
-                                        reasoning_item["summary"] = (
-                                            [
-                                                {
-                                                    "type": "summary_text",
-                                                    "text": thinking_text,
-                                                }
-                                            ]
-                                            if thinking_text
-                                            else []
+                                encrypted_content, reasoning_id, stored_summary = (
+                                    _decode_reasoning_state(block_content)
+                                )
+                                if reasoning_id:
+                                    reasoning_item = {
+                                        "type": "reasoning",
+                                        "id": reasoning_id,
+                                    }
+                                    if encrypted_content:
+                                        reasoning_item["encrypted_content"] = (
+                                            encrypted_content
                                         )
-                                        if skip_reasoning_reinsertion:
-                                            # Chaining is active: server holds reasoning state under
-                                            # previous_response_id. Don't re-emit encrypted_content
-                                            # (would bust the cache prefix) and don't emit bare rs_*
-                                            # IDs (server already knows them).
-                                            pass
-                                        else:
-                                            reasoning_items_to_add.append(
-                                                reasoning_item
-                                            )
+                                    # Always include summary (required by OpenAI API).
+                                    # Use thinking text when available, falling back to
+                                    # the decoded stored summary, empty list otherwise.
+                                    thinking_text = block.get("thinking") or stored_summary
+                                    reasoning_item["summary"] = (
+                                        [
+                                            {
+                                                "type": "summary_text",
+                                                "text": thinking_text,
+                                            }
+                                        ]
+                                        if thinking_text
+                                        else []
+                                    )
+                                    if skip_reasoning_reinsertion:
+                                        # Chaining is active: server holds reasoning state under
+                                        # previous_response_id. Don't re-emit encrypted_content
+                                        # (would bust the cache prefix) and don't emit bare rs_*
+                                        # IDs (server already knows them).
+                                        pass
+                                    else:
+                                        reasoning_items_to_add.append(
+                                            reasoning_item
+                                        )
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
                             if block.type == "text":
@@ -4046,16 +4208,13 @@ class OpenAIProvider:
                                                 "arguments": tc_args_str,
                                             }
                                         )
-                            elif (
-                                block.type == "thinking"
-                                and hasattr(block, "content")
-                                and block.content
-                                and len(block.content) >= 2
-                            ):
+                            elif block.type == "thinking":
                                 # Extract reasoning state for top-level insertion
                                 # Reasoning items must be top-level in input, not in message content!
-                                encrypted_content = block.content[0]
-                                reasoning_id = block.content[1]
+                                block_content = getattr(block, "content", None)
+                                encrypted_content, reasoning_id, stored_summary = (
+                                    _decode_reasoning_state(block_content)
+                                )
 
                                 if (
                                     reasoning_id
@@ -4072,12 +4231,13 @@ class OpenAIProvider:
                                         )
 
                                     # Always include summary (required by OpenAI API).
-                                    # Use thinking text when available, empty list otherwise.
+                                    # Use thinking text when available, falling back to
+                                    # the decoded stored summary, empty list otherwise.
                                     thinking_text = (
                                         getattr(block, "thinking", None)
                                         if hasattr(block, "thinking")
                                         else None
-                                    )
+                                    ) or stored_summary
                                     reasoning_item["summary"] = (
                                         [
                                             {
@@ -4142,8 +4302,11 @@ class OpenAIProvider:
 
                 # Add reasoning items as TOP-LEVEL entries (before assistant message)
                 # Per OpenAI Responses API: reasoning items must be top-level, not in message content
-                for reasoning_item in reasoning_items_to_add:
-                    openai_messages.append(reasoning_item)
+                # D3: bounded by reasoning_replay_scope -- only emit for assistant
+                # turns after the cutoff (collection above is unaffected).
+                if i > _reasoning_cutoff:
+                    for reasoning_item in reasoning_items_to_add:
+                        openai_messages.append(reasoning_item)
 
                 # Only add assistant message if there's content
                 if assistant_content:
@@ -4468,15 +4631,25 @@ class OpenAIProvider:
 
                     # Create thinking block if there's reasoning text OR encrypted state to preserve
                     if reasoning_text or encrypted_content:
-                        # Store reasoning state in content field for re-insertion
-                        # content[0] = encrypted_content (for full reasoning continuity)
-                        # content[1] = reasoning_id (rs_* ID for OpenAI)
+                        # Named dict, NOT a positional list. amplifier_foundation's
+                        # sanitize_for_json drops None from lists (serialization.py:54-61),
+                        # which silently collapsed [None, "rs_abc"] -> ["rs_abc"] and made
+                        # every block captured without ciphertext permanently unreplayable
+                        # after resume. A dict survives the same key-dropping without
+                        # losing what each surviving value MEANS. See
+                        # _decode_reasoning_state for the back-compat reader.
                         thinking_block = ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=[
+                                {
+                                    "encrypted_content": encrypted_content,
+                                    "id": reasoning_id,
+                                    "summary": reasoning_text or None,
+                                }
+                            ],
                         )
                         logger.info(
                             f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
@@ -4590,15 +4763,25 @@ class OpenAIProvider:
 
                     # Create thinking block if there's reasoning text OR encrypted state to preserve
                     if reasoning_text or encrypted_content:
-                        # Store reasoning state in content field for re-insertion
-                        # content[0] = encrypted_content (for full reasoning continuity)
-                        # content[1] = reasoning_id (rs_* ID for OpenAI)
+                        # Named dict, NOT a positional list. amplifier_foundation's
+                        # sanitize_for_json drops None from lists (serialization.py:54-61),
+                        # which silently collapsed [None, "rs_abc"] -> ["rs_abc"] and made
+                        # every block captured without ciphertext permanently unreplayable
+                        # after resume. A dict survives the same key-dropping without
+                        # losing what each surviving value MEANS. See
+                        # _decode_reasoning_state for the back-compat reader.
                         thinking_block = ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=[
+                                {
+                                    "encrypted_content": encrypted_content,
+                                    "id": reasoning_id,
+                                    "summary": reasoning_text or None,
+                                }
+                            ],
                         )
                         logger.info(
                             f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "

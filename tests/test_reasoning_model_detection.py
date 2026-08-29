@@ -18,7 +18,6 @@ from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -202,7 +201,10 @@ def test_reasoning_continuity_with_encrypted_content():
                 "openai:reasoning_items": ["rs_abc123"],
             },
         },
-        {"role": "user", "content": "Are you sure?"},
+        # NOTE: no trailing new user turn -- Change D's default
+        # reasoning_replay_scope="turn" bounds replay to assistant turns
+        # since the last user message; a new turn here would put this
+        # assistant turn's reasoning out of scope for what this test checks.
     ]
 
     result = provider._convert_messages(messages)
@@ -244,7 +246,8 @@ def test_summary_field_always_present_even_without_thinking_text():
             ],
             "metadata": {"openai:reasoning_items": ["rs_no_summary"]},
         },
-        {"role": "user", "content": "Follow-up"},
+        # NOTE: no trailing new user turn -- see note in
+        # test_reasoning_continuity_with_encrypted_content.
     ]
 
     result = provider._convert_messages(messages_dict)
@@ -284,7 +287,8 @@ def test_summary_field_always_present_object_path():
             "content": [thinking_block, text_block],
             "metadata": {"openai:reasoning_items": ["rs_obj_no_summary"]},
         },
-        {"role": "user", "content": "Follow-up"},
+        # NOTE: no trailing new user turn -- see note in
+        # test_reasoning_continuity_with_encrypted_content.
     ]
 
     result = provider._convert_messages(messages)
