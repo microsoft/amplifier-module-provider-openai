@@ -1555,6 +1555,11 @@ class OpenAIProvider:
         """
         # Known display name mappings
         display_names = {
+            "gpt-5.6": "GPT 5.6",
+            "gpt-5.6-sol": "GPT 5.6 Sol",
+            "gpt-5.6-terra": "GPT 5.6 Terra",
+            "gpt-5.6-luna": "GPT 5.6 Luna",
+            "gpt-5.6-cyber": "GPT 5.6 Cyber",
             "gpt-5.5": "GPT 5.5",
             "gpt-5.5-pro": "GPT 5.5 Pro",
             "gpt-5.4": "GPT 5.4",
@@ -1566,9 +1571,7 @@ class OpenAIProvider:
             "gpt-5.1-codex": "GPT-5.1 codex",
             "gpt-5-mini": "GPT-5 mini",
             "o3-deep-research": "o3 Deep Research",
-            "o3-deep-research-2025-06-26": "o3 Deep Research (2025-06-26)",
             "o4-mini-deep-research": "o4-mini Deep Research",
-            "o4-mini-deep-research-2025-06-26": "o4-mini Deep Research (2025-06-26)",
         }
 
         if model_id in display_names:

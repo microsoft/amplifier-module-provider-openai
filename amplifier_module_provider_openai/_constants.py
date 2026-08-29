@@ -70,15 +70,11 @@ NATIVE_TOOL_TYPES = frozenset(
     }
 )
 
-# Deep research model identifiers
-DEEP_RESEARCH_MODELS = frozenset(
-    {
-        "o3-deep-research",
-        "o3-deep-research-2025-06-26",
-        "o4-mini-deep-research",
-        "o4-mini-deep-research-2025-06-26",
-    }
-)
+# Deep research model aliases. Dated snapshots (e.g. o3-deep-research-2026-XX-XX)
+# are matched by the `startswith` checks at every consumer, so enumerating them
+# here is redundant AND goes stale -- the two 2025-06-26 entries removed here had
+# outlived their snapshots.
+DEEP_RESEARCH_MODELS = frozenset({"o3-deep-research", "o4-mini-deep-research"})
 
 # Background response status values
 BACKGROUND_STATUS_QUEUED = "queued"
