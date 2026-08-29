@@ -69,6 +69,9 @@ config = {
                                            # retention: {mode="explicit", ttl="30m"}. null = unset.
     enable_response_chaining = "auto",     # "auto" | true | false  (reasoning-model chaining)
     enable_state = false,
+    reasoning_replay_scope = "turn",       # "turn" | "all" | "none"  (bounds inline reasoning
+                                           # replay on stateless requests; see
+                                           # [Reasoning State Preservation](#reasoning-state-preservation))
     debug = false,                         # Enable standard debug events
     raw_debug = false                      # Enable ultra-verbose raw API I/O logging
 }
@@ -226,24 +229,66 @@ caching path for reasoning models:
 | `true`    | Force on regardless of model. Useful for testing or non-reasoning models that still benefit.   |
 | `false`   | Force off. Use for ZDR / regulated-industry deployments that cannot retain server-side state.  |
 
-When chaining is active for a reasoning model, three things happen on each call:
+When chaining is active for a reasoning model, on each call:
 
 1. `store = true` is set automatically (chaining requires it; this overrides
    `enable_state` for reasoning models).
 2. `previous_response_id = <id from last assistant.metadata>` is sent on
    subsequent turns.
-3. Encrypted reasoning items (`include=["reasoning.encrypted_content"]` and
-   re-insertion in `_convert_messages`) are NOT sent — the server holds
-   reasoning state under `previous_response_id`, and inlining encrypted blobs
-   would bust the cache prefix.
+3. `include=["reasoning.encrypted_content"]` is requested regardless of
+   whether chaining is active — live measurement (see below) found this
+   cache-neutral, so ciphertext is captured unconditionally and every
+   reset/resume path can replay reasoning (see
+   [Reasoning State Preservation](#reasoning-state-preservation)).
+
+**`enable_response_chaining = false` is authoritative.** It NEVER attaches
+`previous_response_id`, regardless of the legacy `enable_state` setting — this
+is the ZDR / regulated-industry opt-out and must not be silently overridden.
+If you set `enable_response_chaining = false` together with `enable_state =
+true`, the provider warns at mount time: chaining is disabled as requested,
+but `enable_state = true` still sets `store = true`, so responses ARE
+retained server-side. For a full ZDR posture, set `enable_state = false` too
+(see [Recommended configurations](#recommended-configurations)).
 
 For non-reasoning models, or `enable_response_chaining = false`, behavior is
-unchanged: stateless mode with explicit reasoning re-insertion (see
+unchanged: stateless mode with explicit reasoning re-insertion, bounded by
+`reasoning_replay_scope` (see
 [Reasoning State Preservation](#reasoning-state-preservation)).
 
-On `previous_response_id` invalidation (HTTP 404 + `response_not_found`), the
-provider retries once without the field and emits a
-`provider:response_chain_invalidated` event.
+On `previous_response_id` invalidation (HTTP 404 + `response_not_found`, or a
+`context_length_exceeded` overflow while a chain is active), the provider
+retries once without the field — restoring the full converted history
+**with reasoning items re-inserted** (bounded by `reasoning_replay_scope`) so
+the retry does not replay `function_call` items without their originating
+`reasoning` items — and emits a `provider:response_chain_invalidated` event.
+The same reasoning-continuity guarantee applies to a post-compaction chain
+reset: the request immediately after a compaction event drops
+`previous_response_id` but keeps `store = true` (so the next turn can still
+chain) and re-inserts reasoning items + `include`, because the server no
+longer holds state for that one request.
+
+### `reasoning_replay_scope` — bounded stateless reasoning replay
+
+On the stateless path (chaining off, or a chain-broken retry), the provider
+re-inserts prior `ThinkingBlock` state inline. Unbounded, this grows linearly
+with conversation length: encrypted reasoning blobs measured ~1,200 chars
+each, over 50% of the replayed payload by turn 4 in live probing. This config
+key bounds how far back that replay reaches:
+
+| Value            | Behavior                                                                                     |
+| ---------------- | ---------------------------------------------------------------------------------------------- |
+| `"turn"` (default) | Replay reasoning only for assistant turns since the last user message — the in-flight tool loop, per OpenAI's own "single turn spans multiple API calls" guidance. Flat cost, independent of conversation length. |
+| `"all"`          | Replay every turn's reasoning. Unbounded growth (pre-fix behavior on the stateless path). Escape hatch if cross-turn replay measurably helps your workload. |
+| `"none"`         | No inline reasoning replay. |
+
+An unrecognized value falls back to `"turn"` with a warning. Not exposed as a
+deployment `ConfigField` (same precedent as `safety_identifier`) — it's a
+tuning knob, not a per-deployment decision most operators need to touch.
+
+This bound does **not** affect the chained path (chaining suppresses replay
+entirely — the server already holds the state) nor the amount of reasoning
+*collected* for the orphan-stripping guard, only how much is *emitted*
+inline.
 
 ### `safety_identifier` — kwargs-only
 
@@ -499,7 +544,7 @@ response_2 = await provider.complete(request_with_tool_result)
 # Model uses preserved reasoning from step 1 to generate final answer
 ```
 
-**Key insight from OpenAI docs**: "While this is another API call, we consider this as a single turn in the conversation." Reasoning must be preserved across steps (API calls) within the same turn, especially when tools are involved.
+**Key insight from OpenAI docs**: "While this is another API call, we consider this as a single turn in the conversation." Reasoning must be preserved across steps (API calls) within the same turn, especially when tools are involved. This is also the scope `reasoning_replay_scope` bounds replay to by default (see [Configuration](#configuration)) — it does not by itself say whether replaying *earlier* turns' reasoning adds value; that's left as an explicit tuning knob (`reasoning_replay_scope = "all"`) rather than assumed.
 
 **Benefits**:
 
@@ -508,6 +553,29 @@ response_2 = await provider.complete(request_with_tool_result)
 - **Better multi-turn performance** - ~5% improvement per OpenAI benchmarks
 - **Critical for tool calling** - Recommended by OpenAI for reasoning models with tools
 - **Follows OpenAI docs** - Implements "context += response.output" pattern
+- **Ciphertext always captured** - `include=["reasoning.encrypted_content"]` is
+  requested unconditionally, even while chaining is active. Live measurement
+  found this cache-neutral (requesting `include` on an already-chained call
+  changes the *response* shape returned, not the *request* prefix caching
+  keys on), so every reset/resume path can replay reasoning regardless of
+  whether the response that produced it was chained.
+
+**`ThinkingBlock.content` encoding**: reasoning state is stored as a
+single-element list containing a named dict —
+`content: [{"encrypted_content": ..., "id": "rs_*", "summary": ...}]` — not a
+positional `[encrypted_content, reasoning_id]` list. A named dict survives
+Amplifier's transcript sanitizer (which drops `None` values/entries) without
+losing the *meaning* of what remains: `{"id": "rs_abc"}` after
+`encrypted_content: None` is dropped is still unambiguously an id, whereas a
+positional list collapsing to `["rs_abc"]` is not distinguishable from
+ciphertext without guessing. The provider still reads two legacy on-disk
+shapes for backward compatibility with transcripts written before this
+change (a 2-element positional list, and a 1-element collapsed list —
+detected by the `rs_*` id prefix, never guessed positionally); a legacy
+1-element block whose id cannot be paired with ciphertext is unrecoverable
+and is dropped with a warning (it was never written with the ciphertext
+present, so this is not new data loss — it makes the pre-existing loss
+audible instead of silent).
 
 ### Automatic Context Management (Truncation)
 
