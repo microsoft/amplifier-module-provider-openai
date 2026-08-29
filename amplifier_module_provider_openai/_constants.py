@@ -34,8 +34,8 @@ DEFAULT_TRUNCATION: str | None = None
 # Default prompt-cache retention. OpenAI's per-model server-side default
 # is "in_memory" (5–10 min) for gpt-5.4 and below, "24h" for gpt-5.5+.
 # Forcing "24h" everywhere stabilizes cache lifetime across the curated
-# model list. Models that reject "24h" are gated by
-# `ModelCapabilities.supports_24h_retention`.
+# model list. Models that reject "in_memory" are gated by
+# `ModelCapabilities.supports_in_memory_retention`.
 DEFAULT_PROMPT_CACHE_RETENTION: str | None = "24h"
 
 # Maximum number of continuation attempts for incomplete responses

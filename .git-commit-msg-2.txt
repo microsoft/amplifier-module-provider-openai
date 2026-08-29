@@ -1,0 +1,20 @@
+refactor(retention): drop the dormant supports_24h_retention gate
+
+Proven can't-fire: the field defaulted True and no branch anywhere ever
+set it False (verified by grep across _capabilities.py). Removed:
+
+- ModelCapabilities.supports_24h_retention field + docstring
+- _drop_unsupported_24h_retention() and its call site
+- The DEFAULT_PROMPT_CACHE_RETENTION comment referencing the removed flag
+
+_drop_unsupported_in_memory_retention() is untouched -- it genuinely fires
+for gpt-5.5 and gpt-5.6.
+
+Test delta: removed the now-meaningless supports_24h_retention assertions
+from test_gpt_5_5_capabilities.py, test_gpt_5_6_capabilities.py, and the
+ModelCapabilities(supports_24h_retention=False) construction test in
+test_cache_defaults.py (the kwarg no longer exists). 777 passed, 2 deselected.
+
+Generated with Amplifier (https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>

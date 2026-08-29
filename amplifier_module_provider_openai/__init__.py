@@ -521,33 +521,6 @@ def _drop_unsupported_in_memory_retention(
     return None
 
 
-def _drop_unsupported_24h_retention(model_id: str, retention: str | None) -> str | None:
-    """Return *retention* unless `"24h"` would be rejected by the model.
-
-    Mirror of `_drop_unsupported_in_memory_retention`. The capability flag
-    `supports_24h_retention` is True for all current model families
-    (smoke-tested against gpt-4o, gpt-5.x, o-series — all accept "24h"
-    despite not being formally enumerated in the cookbook list). Future
-    families that prove to reject "24h" can flip the flag False on their
-    branch in `_capabilities.py`.
-
-    Returns None when the value should be dropped. Otherwise returns
-    *retention* unchanged.
-    """
-    if retention != "24h":
-        return retention
-    caps = get_capabilities(model_id)
-    if caps.supports_24h_retention:
-        return retention
-    logger.warning(
-        "[PROVIDER] Dropping prompt_cache_retention='24h' for model %r: "
-        "model rejects 24h retention. Omit the field or pass 'in_memory' "
-        "to silence this warning.",
-        model_id,
-    )
-    return None
-
-
 def _computer_action_to_dict(action: Any) -> dict[str, Any]:
     """Normalize one `computer_call` action entry to a plain dict.
 
@@ -2141,15 +2114,12 @@ class OpenAIProvider:
         prompt_cache_retention = (
             kwargs.get("prompt_cache_retention", self.prompt_cache_retention) or None
         )
-        # Drop retention values the model is known to reject. Each helper is
-        # a no-op unless its target value is set AND the capability flag is
-        # False. Today only `supports_in_memory_retention=False` (gpt-5.5)
-        # actually fires; `supports_24h_retention=False` is reserved for
-        # future families that prove to reject "24h".
+        # Drop retention values the model is known to reject. No-op unless
+        # the value is set AND the capability flag is False -- today only
+        # `supports_in_memory_retention=False` (gpt-5.5) actually fires.
+        # The mirror-image `supports_24h_retention` gate was removed: proven
+        # dormant (defaults True, no branch anywhere ever set it False).
         prompt_cache_retention = _drop_unsupported_in_memory_retention(
-            model_name, prompt_cache_retention
-        )
-        prompt_cache_retention = _drop_unsupported_24h_retention(
             model_name, prompt_cache_retention
         )
         if prompt_cache_retention is not None:
