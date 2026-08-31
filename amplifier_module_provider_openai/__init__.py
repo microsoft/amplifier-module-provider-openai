@@ -1797,7 +1797,13 @@ class OpenAIProvider:
                         and not getattr(next_msg, "tool_call_id", None)
                         and not (
                             isinstance(next_msg.content, str)
-                            and next_msg.content.strip().startswith("<system-reminder>")
+                            # Prefix match (no closing bracket): covers both
+                            # `<system-reminder source="...">` (per-source)
+                            # and the `<system-reminders>` (plural) envelope.
+                            # Same prefix rule as the separately-shipping
+                            # amplifier-foundation `is_real_user_message` fix
+                            # -- kept identical so the two never drift apart.
+                            and next_msg.content.strip().startswith("<system-reminder")
                         )
                     )
                     if is_real_user:

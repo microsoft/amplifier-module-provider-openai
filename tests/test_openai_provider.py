@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock
 
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock
-
 from amplifier_module_provider_openai import OpenAIProvider
 
 
@@ -276,4 +275,155 @@ def test_fm3_synthetic_assistant_response_inserted_before_user_message():
         if e[0] == "provider:tool_sequence_repaired"
     ]
     assert len(repair_events) == 1
+    assert repair_events[0][1].get("synthetic_assistant_count") == 1
+
+
+# ---------------------------------------------------------------------------
+# FM3 bare-tag matcher (system-reminder redesign W4.1)
+#
+# Bug: the guard used `.startswith("<system-reminder>")` -- WITH the closing
+# bracket. That exact literal never occurs: every real injection is either
+# `<system-reminder source="...">` (per-source) or the new `<system-reminders>`
+# envelope. The guard was dead code -- FM3 always treated a following reminder
+# block as a genuine user message and inserted a synthetic assistant "close"
+# in front of it. Fix: prefix match on `<system-reminder` (no closing
+# bracket), which covers both shapes. Same prefix rule as the separately-
+# shipping `amplifier-foundation` `is_real_user_message` fix.
+# ---------------------------------------------------------------------------
+
+
+def test_fm3_does_not_insert_synthetic_before_source_attributed_reminder():
+    """A `<system-reminder source="...">` block following missing tool
+    results must NOT get a synthetic assistant inserted before it -- it is
+    not a real user message. FAILS on the dead `<system-reminder>` (exact,
+    closing-bracket) matcher: every real reminder carries a source attribute,
+    so it never matches and a synthetic assistant is wrongly inserted."""
+    provider = OpenAIProvider(
+        api_key="[REDACTED:SECRET]", config={"use_streaming": False}
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    messages = [
+        Message(
+            role="assistant",
+            content=[
+                ToolCallBlock(
+                    id="call_reminder", name="search", input={"query": "test"}
+                )
+            ],
+        ),
+        Message(
+            role="user",
+            content='<system-reminder source="hooks-status-context">stuff</system-reminder>',
+        ),
+    ]
+    request = ChatRequest(messages=messages)
+
+    asyncio.run(provider.complete(request))
+
+    # No FM3 synthetic assistant close: [assistant, synthetic_tool_result, reminder]
+    assert len(request.messages) == 3, (
+        f"Expected no synthetic assistant before a reminder block; got "
+        f"{[m.role for m in request.messages]}"
+    )
+    assert request.messages[1].role == "tool"
+    assert request.messages[2].role == "user"
+    assert request.messages[2].content.startswith(  # pyright: ignore[reportAttributeAccessIssue]
+        "<system-reminder source="
+    )
+
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
+    assert len(repair_events) == 1
+    assert "synthetic_assistant_count" not in repair_events[0][1], (
+        "No synthetic assistant should have been inserted before a reminder block "
+        "(the key is only present in the event when count > 0)"
+    )
+
+
+def test_fm3_does_not_insert_synthetic_before_reminder_envelope():
+    """Same as above, for the new `<system-reminders>` (plural) envelope
+    tag. FAILS on the dead matcher for the same reason -- the envelope also
+    never matches the exact `<system-reminder>` literal."""
+    provider = OpenAIProvider(
+        api_key="[REDACTED:SECRET]", config={"use_streaming": False}
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    messages = [
+        Message(
+            role="assistant",
+            content=[
+                ToolCallBlock(
+                    id="call_envelope", name="search", input={"query": "test"}
+                )
+            ],
+        ),
+        Message(
+            role="user",
+            content=(
+                "<system-reminders>\n"
+                '<system-reminder source="hooks-status-context">stuff</system-reminder>\n'
+                "</system-reminders>"
+            ),
+        ),
+    ]
+    request = ChatRequest(messages=messages)
+
+    asyncio.run(provider.complete(request))
+
+    assert len(request.messages) == 3, (
+        f"Expected no synthetic assistant before a reminder envelope; got "
+        f"{[m.role for m in request.messages]}"
+    )
+    assert request.messages[1].role == "tool"
+    assert request.messages[2].role == "user"
+    assert request.messages[2].content.startswith(  # pyright: ignore[reportAttributeAccessIssue]
+        "<system-reminders>"
+    )
+
+
+def test_fm3_still_inserts_synthetic_before_genuine_user_message():
+    """Regression guard against over-matching: a genuine user message
+    (not a reminder block) must still get the synthetic assistant close.
+    Passes before and after the fix."""
+    provider = OpenAIProvider(
+        api_key="[REDACTED:SECRET]", config={"use_streaming": False}
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    messages = [
+        Message(
+            role="assistant",
+            content=[
+                ToolCallBlock(id="call_genuine", name="search", input={"query": "test"})
+            ],
+        ),
+        Message(role="user", content="What were the results?"),
+    ]
+    request = ChatRequest(messages=messages)
+
+    asyncio.run(provider.complete(request))
+
+    # [assistant, synthetic_tool_result, synthetic_assistant_close, user]
+    assert len(request.messages) == 4
+    assert request.messages[2].role == "assistant"
+    assert isinstance(request.messages[2].content, str)
+    assert "interrupted" in request.messages[2].content.lower()
+    assert request.messages[3].role == "user"
+
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert repair_events[0][1].get("synthetic_assistant_count") == 1
