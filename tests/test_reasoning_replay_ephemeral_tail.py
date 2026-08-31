@@ -27,10 +27,10 @@ from unittest.mock import AsyncMock
 from amplifier_core.message_models import (
     ChatRequest,
     Message,
+    TextBlock,
     ThinkingBlock,
     ToolCallBlock,
 )
-
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._constants import METADATA_RESPONSE_ID
 
@@ -333,4 +333,132 @@ def test_non_ephemeral_metadata_behaves_as_before():
     assert ids == ["rs_t2"], (
         f"Non-ephemeral / absent metadata must not change turn-boundary "
         f"behavior; got {ids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. Pre-user ephemeral block (system-reminder redesign W1/W4.2 pinning)
+#
+# W1 (separate repo: amplifier-module-loop-streaming) moves the turn-start
+# reminder block to BEFORE the real user message:
+#   [..., block(ephemeral, reminder_placement="pre_user"), user(real), assistant, ...]
+# instead of after it. No code change is required in THIS repo for that shape
+# -- the `not ephemeral` filter already keeps the cutoff on the real user
+# message regardless of whether the ephemeral block sits before or after it,
+# because `max()` picks the highest qualifying index either way. These tests
+# pin that fact so a future change is never free to assume otherwise, and so
+# that dropping `metadata.ephemeral` from the block anywhere in the pipeline
+# is caught here rather than silently degrading reasoning replay in prod.
+# ---------------------------------------------------------------------------
+
+
+def test_turn_scope_cutoff_ignores_a_pre_user_ephemeral_block():
+    """A leading ephemeral reminder block (written BEFORE the real user
+    message, per the system-reminder redesign) must not be mistaken for the
+    turn boundary itself, and must not widen or narrow the turn-scoped
+    replay window. The cutoff must land on the REAL user message's index --
+    exactly the same place it would land with no block present at all.
+    Passes at 8eb761f (documented as a pin, not a fail-before proof); exists
+    so a future change that drops `metadata.ephemeral` from the pre-user
+    block fails HERE, loudly."""
+    provider = _provider()
+
+    messages = [
+        _user_turn("q1"),
+        _thinking_turn("t1", "a1"),
+        _ephemeral_user(
+            "<system-reminders>...</system-reminders>",
+            reminder_placement="pre_user",
+        ),
+        _user_turn("q2"),
+        _thinking_turn("t2", "a2"),
+    ]
+    converted = provider._convert_messages(messages)
+    ids = _reasoning_ids(converted)
+    assert ids == ["rs_t2"], (
+        f"Turn-scoped replay must be cut at the REAL user message (q2), not "
+        f"widened by the preceding ephemeral reminder block, and not "
+        f"collapsed to zero either; got {ids}"
+    )
+
+    # Comparison case: the identical shape MINUS the leading block must
+    # produce the identical result -- proof the block is truly inert here.
+    messages_no_block = [
+        _user_turn("q1"),
+        _thinking_turn("t1", "a1"),
+        _user_turn("q2"),
+        _thinking_turn("t2", "a2"),
+    ]
+    converted_no_block = provider._convert_messages(messages_no_block)
+    assert _reasoning_ids(converted_no_block) == ids, (
+        "The pre-user ephemeral block must be a no-op for cutoff placement"
+    )
+
+
+def test_pre_user_ephemeral_block_survives_conversion():
+    """End-to-end: the block's `metadata.ephemeral` (and `persisted` /
+    `reminder_placement`) must survive from the pydantic `Message` object,
+    through `.model_dump()`, to the dicts `_convert_messages` actually
+    inspects -- otherwise the cutoff filter above would silently stop
+    seeing it. Uses the same reset-path harness as
+    `test_reset_path_carries_reasoning_under_live_ephemeral_tail` above, but
+    with the ephemeral block placed BEFORE turn 2's user message (the
+    system-reminder redesign's `pre_user` placement) rather than after it.
+    Turn 2's own mid-loop reasoning (rs_t2, emitted after the cutoff) must
+    survive; turn 1's (rs_t1, before the cutoff) correctly does not -- that
+    is the pre-existing turn-scope behavior, unaffected by this shape."""
+    provider = _make_reset_provider(default_model="gpt-5.5")
+    provider.client.responses.create = AsyncMock(return_value=_DummyResponse())
+
+    msgs = [
+        Message(role="user", content="Hi (turn 1)"),
+        Message(
+            role="assistant",
+            content=[
+                _pydantic_reasoning_block("t1"),
+                TextBlock(type="text", text="a1"),
+            ],
+        ),
+        Message(
+            role="user",
+            content="<system-reminders>...</system-reminders>",
+            metadata={
+                "ephemeral": True,
+                "persisted": True,
+                "reminder_placement": "pre_user",
+            },
+        ),
+        Message(role="user", content="Hi (turn 2)"),
+        Message(
+            role="assistant",
+            content=[
+                _pydantic_reasoning_block("t2"),
+                ToolCallBlock(id="call_1", name="lookup", input={"key": "a"}),
+            ],
+            metadata={METADATA_RESPONSE_ID: "resp_precompaction"},
+        ),
+        Message(role="tool", content="tool result", tool_call_id="call_1"),
+    ]
+    request = ChatRequest(messages=msgs)
+
+    asyncio.run(provider.complete(request))
+
+    mock = cast(AsyncMock, provider.client.responses.create)
+    params = mock.call_args.kwargs
+    input_items = params.get("input", [])
+    reasoning_items = [
+        it
+        for it in input_items
+        if isinstance(it, dict) and it.get("type") == "reasoning"
+    ]
+    assert any(it.get("id") == "rs_t2" for it in reasoning_items), (
+        f"Turn 2's reasoning item must survive being requested with a "
+        f"pre-user ephemeral block ahead of its own user message; the "
+        f"block's metadata.ephemeral must have reached _convert_messages "
+        f"intact for the cutoff to land correctly; got input={input_items}"
+    )
+    assert not any(it.get("id") == "rs_t1" for it in reasoning_items), (
+        f"Turn 1's reasoning is out of scope (before the cutoff) and must "
+        f"still be excluded -- unaffected by the pre-user block; "
+        f"got {reasoning_items}"
     )
