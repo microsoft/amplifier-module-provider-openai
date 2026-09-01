@@ -309,36 +309,36 @@ def test_dated_snapshot_matches_alias_pricing(
     [
         (
             "gpt-5.6-sol",
+            Decimal("4.00"),
+            Decimal("20.00"),
+            Decimal("0.40"),
             Decimal("5.00"),
+            Decimal("8.00"),
             Decimal("30.00"),
-            Decimal("0.50"),
-            Decimal("6.25"),
+            Decimal("0.80"),
             Decimal("10.00"),
-            Decimal("45.00"),
-            Decimal("1.00"),
-            Decimal("12.50"),
         ),
         (
             "gpt-5.6-terra",
+            Decimal("2.00"),
+            Decimal("12.00"),
+            Decimal("0.20"),
             Decimal("2.50"),
-            Decimal("15.00"),
-            Decimal("0.25"),
-            Decimal("3.125"),
+            Decimal("4.00"),
+            Decimal("18.00"),
+            Decimal("0.40"),
             Decimal("5.00"),
-            Decimal("22.50"),
-            Decimal("0.50"),
-            Decimal("6.25"),
         ),
         (
             "gpt-5.6-luna",
-            Decimal("1.00"),
-            Decimal("6.00"),
-            Decimal("0.10"),
-            Decimal("1.25"),
-            Decimal("2.00"),
-            Decimal("9.00"),
             Decimal("0.20"),
-            Decimal("2.50"),
+            Decimal("1.20"),
+            Decimal("0.02"),
+            Decimal("0.25"),
+            Decimal("0.40"),
+            Decimal("1.80"),
+            Decimal("0.04"),
+            Decimal("0.50"),
         ),
     ],
 )
@@ -386,11 +386,11 @@ def test_gpt_56_family_rates(
 def test_gpt_56_no_triple_charge_mixed_turn():
     """A turn mixing fresh + cached + written tokens charges each bucket once (Sol).
 
-    fresh = 1000 - 200 cached - 300 written = 500 @ $5/M   = 0.0025
-    write = 300 @ $6.25/M                                  = 0.001875
-    read  = 200 @ $0.50/M                                  = 0.0001
-    out   = 100 @ $30/M                                    = 0.003
-    total                                                  = 0.007475
+    fresh = 1000 - 200 cached - 300 written = 500 @ $4/M   = 0.002
+    write = 300 @ $5/M                                     = 0.0015
+    read  = 200 @ $0.40/M                                  = 0.00008
+    out   = 100 @ $20/M                                    = 0.002
+    total                                                  = 0.00558
     """
     result = compute_cost(
         "gpt-5.6-sol",
@@ -399,20 +399,20 @@ def test_gpt_56_no_triple_charge_mixed_turn():
         cached_tokens=200,
         cache_write_tokens=300,
     )
-    assert result == Decimal("0.007475"), f"got {result!r}"
+    assert result == Decimal("0.00558"), f"got {result!r}"
 
 
 def test_gpt_56_golden_from_real_usage():
-    """Reality-derived golden: exact token counts captured from live gpt-5.6-sol.
+    """Current-rate golden using exact token counts captured from live gpt-5.6-sol.
 
     Source: two real Responses-API calls with an identical >1024-token prefix
-    (see projects/gpt-5-6-support/ground-truth/usage-real.json). These are the
-    numbers the API actually returned -- not synthetic.
+    (see projects/gpt-5-6-support/ground-truth/usage-real.json). The API supplied
+    the usage/token evidence; expected costs below are computed at current rates.
 
     WRITE call: input=2655, cache_write=2652, cached=0, output=5
-        fresh=3 @5 + 2652 @6.25 + 5 @30 = 0.000015 + 0.016575 + 0.000150 = 0.016740
+        fresh=3 @4 + 2652 @5 + 5 @20 = 0.000012 + 0.013260 + 0.000100 = 0.013372
     READ  call: input=2655, cache_write=0, cached=2652, output=5
-        fresh=3 @5 + 2652 @0.50 + 5 @30 = 0.000015 + 0.001326 + 0.000150 = 0.001491
+        fresh=3 @4 + 2652 @0.40 + 5 @20 = 0.000012 + 0.0010608 + 0.000100 = 0.0011728
     """
     write = compute_cost(
         "gpt-5.6-sol",
@@ -428,10 +428,10 @@ def test_gpt_56_golden_from_real_usage():
         cached_tokens=2652,
         cache_write_tokens=0,
     )
-    assert write == Decimal("0.016740"), f"WRITE got {write!r}"
-    assert read == Decimal("0.001491"), f"READ got {read!r}"
+    assert write == Decimal("0.013372"), f"WRITE got {write!r}"
+    assert read == Decimal("0.0011728"), f"READ got {read!r}"
     # The write turn MUST cost more than billing those tokens as plain input --
-    # this is the 1.25x premium, and guards against silent regression to $5 input.
+    # this is the 1.25x premium, and guards against silent regression to $4 input.
     plain_input = compute_cost(
         "gpt-5.6-sol", prompt_tokens=2655, completion_tokens=5, cached_tokens=0
     )
@@ -442,14 +442,14 @@ def test_gpt_56_golden_from_real_usage():
 def test_gpt_56_alias_snapshot_resolves():
     """A dated gpt-5.6-sol snapshot resolves to the tier rates via the fallback --
     through BOTH the short table (_RATES) and the long table (_LONG_RATES)."""
-    # short context: 200K input (<=272K) -> sol short input $5/M -> $1.00.
+    # short context: 200K input (<=272K) -> sol short input $4/M -> $0.80.
     assert compute_cost("gpt-5.6-sol-2026-07-09", prompt_tokens=200_000) == Decimal(
-        "1.00"
+        "0.80"
     )
     # long context: 1M input (>272K) -> snapshot must also resolve through _LONG_RATES
-    # to sol's long input rate $10/M -> $10.00.
+    # to sol's long input rate $8/M -> $8.00.
     assert compute_cost("gpt-5.6-sol-2026-07-09", prompt_tokens=1_000_000) == Decimal(
-        "10.00"
+        "8.00"
     )
 
 
@@ -488,11 +488,12 @@ def test_cache_write_ignored_for_models_without_write_rate():
 # ---------------------------------------------------------------------------
 def test_golden_measured_turn_gross_9028_cache_write_9025():
     """gpt-5.6-sol, short context: input=9028 (raw), cache_write=9025,
-    cached=0, output=7 -> measured cost was $0.05663125.
+    cached=0, output=7. Token counts are from a live capture; expected cost uses
+    current rates.
 
     fresh = 9028 - 0 - 9025 = 3
-    cost  = 3 @ $5.00/M + 9025 @ $6.25/M + 7 @ $30.00/M
-          = 0.000015 + 0.05640625 + 0.00021 = 0.05663125
+    cost  = 3 @ $4.00/M + 9025 @ $5.00/M + 7 @ $20.00/M
+          = 0.000012 + 0.045125 + 0.00014 = 0.045277
     """
     result = compute_cost(
         "gpt-5.6-sol",
@@ -501,4 +502,4 @@ def test_golden_measured_turn_gross_9028_cache_write_9025():
         cached_tokens=0,
         cache_write_tokens=9_025,
     )
-    assert result == Decimal("0.05663125"), f"got {result!r}"
+    assert result == Decimal("0.045277"), f"got {result!r}"
