@@ -1090,9 +1090,9 @@ class OpenAIProvider:
         )  # Filter to curated model list by default
 
         # Prompt-caching hint parameters (Responses API top-level fields).
-        # All three default to None = "don't send the field, use OpenAI's
-        # model default". Per-call kwargs override the config default — same
-        # pattern as `truncation`.
+        # prompt_cache_retention/prompt_cache_options default to None = "don't
+        # send the field, use OpenAI's model default". Per-call kwargs override
+        # the config default — same pattern as `truncation`.
         #
         # prompt_cache_key: stable per-conversation (or per-tenant+system-prompt)
         #   identifier. OpenAI shards by hash of first ~256 input tokens; setting
@@ -1100,6 +1100,16 @@ class OpenAIProvider:
         #   maximizing cache hit rate. Use this instead of the `user` field for
         #   cache-routing per OpenAI's July 2025 guidance (the `user` field is
         #   retained on the API but is no longer the recommended cache signal).
+        #   UNLIKE the other two hint parameters, this one now has a non-None
+        #   *effective* default: when config never mentions the key at all,
+        #   request-build time (`_default_prompt_cache_key`) fills in the
+        #   Amplifier session_id as a routing hint, because "no key" was
+        #   measured to leave OpenAI's implicit cache best-effort-routed and
+        #   liable to miss under process churn / history rewriting (see
+        #   README "prompt_cache_key" section for the measured evidence and
+        #   the honest scope note -- this is a routing hint, not a guarantee).
+        #   An explicit config value (including `""`, the documented opt-out)
+        #   always wins over that default; see `_prompt_cache_key_is_set`.
         # prompt_cache_retention: "in_memory" (5–10 min) or "24h" (extended
         #   GPU-local KV storage). Defaults to "24h" so caching is stable
         #   across all models, including gpt-5.4 and below where OpenAI's
@@ -1112,8 +1122,18 @@ class OpenAIProvider:
         #   to `prompt_cache_key`. Per-end-user value (not per-deployment), which
         #   is why it is intentionally NOT exposed via ConfigField; set it via
         #   per-call kwargs.
+        # _prompt_cache_key_is_set distinguishes "prompt_cache_key was never
+        # mentioned in config at all" (apply the session-scoped default below)
+        # from "it IS in config, just falsy" -- an explicit `""` or `None`,
+        # both of which are the documented opt-out and must suppress the
+        # field the same way they always have, never silently replaced by
+        # the new default. Config -- including the opt-out -- always wins;
+        # only its total absence lets the default apply.
+        self._prompt_cache_key_is_set = "prompt_cache_key" in self.config
         # Empty strings (e.g. from UI form defaults) are coerced to None so we
-        # don't send empty-string fields to OpenAI.
+        # don't send empty-string fields to OpenAI -- this is also the value
+        # read back for the explicit opt-out once _prompt_cache_key_is_set
+        # is True.
         self.prompt_cache_key: str | None = self.config.get("prompt_cache_key") or None
         # prompt_cache_retention defaults to "24h" so non-gpt-5.5 models get
         # extended GPU-local KV storage instead of OpenAI's per-model
@@ -1262,6 +1282,48 @@ class OpenAIProvider:
         # that only occurs on continuation must still be reported exactly
         # once, not hidden.
         self._extra_params_warned_keys: set[str] = set()
+
+    def _default_prompt_cache_key(self) -> str | None:
+        """Stable per-session fallback for `prompt_cache_key`.
+
+        Called ONLY when the caller never configured `prompt_cache_key` at
+        all (neither a per-call kwarg nor a config value -- see
+        `_prompt_cache_key_is_set`); an explicit config/kwarg value,
+        including the empty-string opt-out, always wins and this method is
+        never consulted in that case.
+
+        Fallback chain: config/per-call value (checked by the caller) >
+        session identity (this method) > None.
+
+        The session identity used is `self.coordinator.session_id` --
+        `ModuleCoordinator` (the Rust-backed coordinator every Amplifier
+        session mounts this provider with) exposes it as a plain string
+        property, sourced from `AmplifierSession.session_id`. That value is:
+
+        - stable across every request in one session, INCLUDING a resumed
+          session in a brand-new process -- `AmplifierSession`/`RustSession`
+          accept an explicit `session_id` on resume and this provider reads
+          it straight through the coordinator each call rather than caching
+          or deriving anything of its own;
+        - distinct per session -- a session that is not explicitly resumed
+          gets a fresh `uuid.uuid4()` at construction time;
+        - opaque and PII-free -- a bare UUID string, never derived from
+          message content.
+
+        When no coordinator is mounted (direct `OpenAIProvider(...)` use
+        outside an Amplifier session is supported and tested -- see
+        test_cache_params.py) or the coordinator exposes no usable
+        `session_id`, there is no session identity reachable at this layer.
+        This returns None in that case -- unhinted routing, the pre-existing
+        behavior -- rather than fabricating a key from message content.
+        """
+        coordinator = self.coordinator
+        if coordinator is None:
+            return None
+        session_id = getattr(coordinator, "session_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        return session_id
 
     def _merge_extra_request_params(self, params: dict[str, Any]) -> None:
         """Merge config `extra_request_params` into *params*, user-wins.
@@ -2251,7 +2313,20 @@ class OpenAIProvider:
         # send". The trailing `or None` mirrors the empty-string coercion in
         # __init__() so that a caller passing `prompt_cache_key=""` (e.g. from
         # a UI form) is treated the same as omitting the field.
-        prompt_cache_key = kwargs.get("prompt_cache_key", self.prompt_cache_key) or None
+        #
+        # prompt_cache_key gets one more fallback step than the other cache
+        # hints: when NEITHER this call nor config ever mentioned the key
+        # (`_prompt_cache_key_is_set` is False), fill in a stable per-session
+        # default instead of leaving the field unhinted -- see
+        # `_default_prompt_cache_key` for the fallback chain, what identity
+        # it uses, and why. An explicit value from either source (including
+        # the "" opt-out) always wins and skips the default entirely.
+        if "prompt_cache_key" in kwargs:
+            prompt_cache_key = kwargs.get("prompt_cache_key") or None
+        elif self._prompt_cache_key_is_set:
+            prompt_cache_key = self.prompt_cache_key
+        else:
+            prompt_cache_key = self._default_prompt_cache_key()
         if prompt_cache_key is not None:
             params["prompt_cache_key"] = prompt_cache_key
 

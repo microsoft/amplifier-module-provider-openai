@@ -79,7 +79,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `raw` | **Amplifier-only** | When `true`, includes the full (redacted) request payload in `llm:request` events. | — | |
 | `timeout` | (client) | Per-request timeout seconds. | — | |
 | `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
-| `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
+| `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. Defaults to the session identity when unset (`""` opts out). **Settings-only** (no ConfigField). | Improves cache hit rate (stochastic — see [Prompt caching](#prompt-caching)). | |
 | `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime. | |
 | `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); `ttl` passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
@@ -201,23 +201,54 @@ An unrecognized value falls back to `"turn"` with a warning.
 
 The provider exposes OpenAI's prompt-caching hint parameters. Defaults:
 `prompt_cache_retention = "24h"` (extended GPU-local KV storage on every
-supported model), `prompt_cache_key` unset, `truncation = null` (the field is
-omitted so the cached prefix is never silently rewritten on overflow).
+supported model), `prompt_cache_key` defaults to the Amplifier session
+identity when reachable and otherwise unset (see below), `truncation = null`
+(the field is omitted so the cached prefix is never silently rewritten on
+overflow).
 
 See also: [OpenAI Cookbook — Prompt Caching 201](https://cookbook.openai.com/examples/prompt_caching_201).
 
 ### `prompt_cache_key` — cache-routing identifier
 
-OpenAI shards Responses API traffic by hashing the first ~256 input tokens. A
-stable `prompt_cache_key` keeps a logical conversation pinned to one machine
-regardless of small prefix drift, and is the recommended cache signal as of
-OpenAI's July 2025 guidance.
+OpenAI's implicit prompt cache is **best-effort and routing-dependent**:
+requests are sharded by hashing the first ~256 input tokens, and a hit
+requires landing on a machine that already holds the matching prefix. Without
+a routing hint, byte-identical requests can still miss under process churn or
+history-rewriting workloads (e.g. compaction re-minting the prefix every few
+turns) and fall back to whatever prefix is most widely replicated — measured
+directly at ~28% of gross input re-billed in one such workload. A stable
+`prompt_cache_key` keeps a logical conversation pinned to one cache shard
+regardless of small prefix drift, and is OpenAI's documented mitigation for
+exactly this failure mode (July 2025 guidance).
+
+**Default (since 2026-09): the Amplifier session_id.** When `prompt_cache_key`
+is not present in config at all, the provider fills in
+`coordinator.session_id` at request-build time — the same identifier that is
+stable across every request in a session, including a resumed session in a
+brand-new process, distinct per session, and opaque (a bare UUID; no message
+content, no PII). This makes the "Single-user agent loop (typical Amplifier)"
+row below the automatic behavior rather than something you have to configure.
+If no coordinator/session is reachable (e.g. using `OpenAIProvider` directly,
+outside an Amplifier session), no default is applied and the field is simply
+omitted — unhinted routing, the pre-existing behavior.
 
 | Deployment shape | Recommended key |
 | --- | --- |
-| Single-user agent loop (typical Amplifier) | conversation/session ID |
-| Multi-tenant with shared system prompt | `f"{tenant_id}:{system_prompt_version}"` |
+| Single-user agent loop (typical Amplifier) | session ID (now automatic — see above) |
+| Multi-tenant with shared system prompt | `f"{tenant_id}:{system_prompt_version}"` (set explicitly via config/kwarg) |
 | Low-volume single-session | leave unset; prefix-hash routing is sufficient |
+
+**Precedence** (unchanged at the top, new at the bottom): per-call kwarg >
+config value > session-identity default > nothing sent. An explicit config
+value always wins over the default, including the documented opt-out —
+`prompt_cache_key: ""` (or `null`) in config sends nothing at all, even when
+a session identity is reachable.
+
+**Honest scope note.** This is a routing *hint*, not a guarantee — OpenAI's
+cache is best-effort even with a key set, so the benefit is stochastic:
+expect improved hit rates under repeated/adjacent traffic, not a deterministic
+cache hit on every request. Treat any specific hit-rate or cost-savings number
+as measured-per-workload, not promised.
 
 ### `prompt_cache_retention` — TTL hint
 
