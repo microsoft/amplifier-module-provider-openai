@@ -10,6 +10,7 @@ __amplifier_module_type__ = "provider"
 
 import asyncio
 import difflib
+import hashlib
 import inspect
 import json
 import logging
@@ -681,10 +682,57 @@ class _RawResponseObject:
         return _RawResponseObject(value) if isinstance(value, dict) else value
 
 
+def _stable_message_id(
+    content_parts: list[dict[str, Any]],
+    status: str,
+    occurrence_index: int = 0,
+) -> str:
+    """Deterministic ``msg_<32hex>`` derived from the item's own serialized bytes.
+
+    ``_convert_messages`` is a deterministic serializer: the same history in
+    must produce the same request out. A ``uuid4()`` minted here broke that --
+    every replayed assistant text message got different bytes on every call,
+    for identical input, making request serialization nondeterministic for a
+    reason unrelated to anything the caller changed.
+
+    This is a correctness property, stated on its own terms. It is also a
+    prerequisite for any prefix cache to ever cover replayed history items,
+    since such a cache can only read back a byte-identical prefix -- but note
+    that on the deployment measured on 2026-09-01 the provider's ``input``
+    items were not being read back by the cache at all (``cache_read``
+    equalled the ``instructions``+``tools`` head exactly, in both the
+    unstable-id and stable-id builds), so making these bytes stable produced
+    **no measured cost or cache change** there (-0.6%, within run-to-run
+    noise). Why byte-identical ``input`` items are not cached is a separate,
+    still-open defect and is not addressed by this function.
+
+    ``occurrence_index`` distinguishes two byte-identical assistant messages
+    that both appear in the SAME serialization pass (e.g. the model produced
+    the exact same text twice in one history) so they still get distinct ids
+    -- it is a count of how many prior occurrences of this exact
+    ``(content, status)`` pair were already seen in this pass, NOT the raw
+    list index. The raw list index is unusable here: compaction rewrites the
+    message list and shifts indices, which would make the same logical
+    message serialize to a different id after every compaction --
+    reintroducing exactly the nondeterminism this function exists to remove.
+    The occurrence count only changes when an EARLIER duplicate is itself
+    dropped (e.g. compacted away), which already changes the serialized bytes
+    at that earlier point regardless.
+    """
+    payload = json.dumps(
+        {"content": content_parts, "status": status, "occurrence": occurrence_index},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "msg_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
 def _build_assistant_message_item(
     content_parts: list[dict[str, Any]],
     message_id: str | None = None,
     status: str = "completed",
+    occurrence_index: int = 0,
 ) -> dict[str, Any]:
     """Serialize assistant content as a spec-compliant Responses API message item.
 
@@ -710,14 +758,23 @@ def _build_assistant_message_item(
     Args:
         content_parts: Assistant output parts, each ``{"type": "output_text",
             "text": ...}``. ``annotations`` is filled in if absent.
-        message_id: Preserved message id when available; a fresh ``msg_<hex>`` is
-            synthesized otherwise (replayed-history ids need only be valid strings,
-            not server-issued references).
+        message_id: Preserved message id when available; a deterministic
+            ``msg_<hex>`` derived from this item's own bytes (see
+            ``_stable_message_id``) is synthesized otherwise, so byte-identical
+            replayed history serializes to a byte-identical id on every call
+            rather than a fresh random one (replayed-history ids need only be
+            valid strings, not server-issued references).
         status: Completion state of the turn being replayed. Defaults to
             ``"completed"``, correct for finished history. Pass ``"incomplete"``
             when replaying a turn that was truncated (e.g. hit max_output_tokens)
             and is being continued -- claiming ``"completed"`` there contradicts
             the request being made.
+        occurrence_index: Count of prior occurrences of this exact
+            ``(content_parts, status)`` pair already emitted in the current
+            serialization pass, used only to derive the synthesized id when
+            ``message_id`` is absent -- lets two byte-identical assistant
+            messages in the same history get distinct (but still stable) ids.
+            Ignored entirely when ``message_id`` is given.
 
     Returns:
         One Responses API assistant message item.
@@ -738,7 +795,7 @@ def _build_assistant_message_item(
             )
     return {
         "type": "message",
-        "id": message_id or f"msg_{uuid.uuid4().hex}",
+        "id": message_id or _stable_message_id(normalized, status, occurrence_index),
         "role": "assistant",
         "status": status,
         "content": normalized,
@@ -1675,9 +1732,15 @@ class OpenAIProvider:
         # The turn is being continued precisely because it was truncated, so it is
         # replayed as "incomplete" -- stamping "completed" would assert the opposite
         # of what this request is asking the model to do.
+        #
+        # occurrence_index=0: this call site emits at most one synthesized
+        # assistant message per continuation build (the just-truncated turn),
+        # so there is never a same-pass duplicate to disambiguate here.
         if assistant_content:
             continuation_input.append(
-                _build_assistant_message_item(assistant_content, status="incomplete")
+                _build_assistant_message_item(
+                    assistant_content, status="incomplete", occurrence_index=0
+                )
             )
 
         return continuation_input
@@ -3275,6 +3338,16 @@ class OpenAIProvider:
         openai_messages = []
         i = 0
 
+        # Occurrence counter for _stable_message_id: how many times an assistant
+        # message with this exact (content, status) pair has already been emitted
+        # in THIS serialization pass. Keyed on the same JSON the id is derived
+        # from, so two byte-identical assistant turns in one history still get
+        # distinct (but request-to-request stable) ids. Never keyed on list
+        # index/position -- compaction rewrites the list and shifts indices,
+        # which would reintroduce the same per-request nondeterminism the
+        # content-derived id exists to remove.
+        _assistant_msg_occurrence: dict[str, int] = defaultdict(int)
+
         # D3: bound how far back reasoning items are replayed inline. One
         # gate, computed once, applied at the single emission site below --
         # both collection sites keep appending to reasoning_items_to_add
@@ -3751,8 +3824,17 @@ class OpenAIProvider:
 
                 # Only add assistant message if there's content
                 if assistant_content:
+                    _occ_key = json.dumps(
+                        {"content": assistant_content, "status": "completed"},
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    )
+                    _occ = _assistant_msg_occurrence[_occ_key]
+                    _assistant_msg_occurrence[_occ_key] = _occ + 1
                     openai_messages.append(
-                        _build_assistant_message_item(assistant_content)
+                        _build_assistant_message_item(
+                            assistant_content, occurrence_index=_occ
+                        )
                     )
 
                 # Add function_call items as TOP-LEVEL entries (after assistant message)
