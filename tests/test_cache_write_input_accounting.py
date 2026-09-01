@@ -19,12 +19,12 @@ which ALREADY contained cache_write. The consumer then added cache_write a
 second time, inflating the displayed "Input" figure and (as a side effect)
 suppressing the displayed cache-hit percentage (cache_read / inflated-total).
 
-Measured on a real turn (gpt-5.6-sol, short context):
+Usage/token evidence captured on a real turn (gpt-5.6-sol, short context):
     raw usage.input_tokens        = 9,028   (fresh=3, cache_read=0, cache_write=9,025)
     usage.input_tokens_details.cached_tokens        = 0
     usage.input_tokens_details.cache_write_tokens   = 9,025
     usage.output_tokens                             = 7
-    measured cost_usd                               = $0.05663125
+    expected cost_usd at current rates              = $0.045277
 
 Before the fix: consumer displayed Input = 9,028 (raw) + 9,025 (cache_write) = 18,053.
 After the fix:  provider emits input_tokens = 9,028 - 9,025 = 3 (fresh + cache_read);
@@ -54,7 +54,7 @@ _CACHE_WRITE_TOKENS = 9_025
 _CACHE_READ_TOKENS = 0
 _OUTPUT_TOKENS = 7
 _MODEL = "gpt-5.6-sol"
-_EXPECTED_COST = Decimal("0.05663125")
+_EXPECTED_COST = Decimal("0.045277")
 
 
 def _make_provider(**config_overrides) -> OpenAIProvider:
@@ -268,10 +268,10 @@ def test_cache_hit_percentage_no_longer_suppressed():
 # cache write on the floor, leaving `input_tokens: 3` with nothing to add it
 # back to: gross input was UNRECOVERABLE from that payload.
 #
-# Measured cold turn (gpt-5.6-sol), reconstructed exactly from its reported
-# cost of $0.283445:
-#     3 @ $5.00/M (fresh) + X @ $6.25/M (write) + 6 @ $30.00/M (out) = 0.283445
-#   solves to X = 45,320 exactly, so raw usage.input_tokens = 45,323.
+# Cold-turn usage/token evidence captured from gpt-5.6-sol. At current rates:
+#     3 @ $4.00/M (fresh) + 45,320 @ $5.00/M (write)
+#       + 6 @ $20.00/M (out) = $0.226732.
+# Therefore raw usage.input_tokens remains 45,323.
 #
 # These tests assert on the ACTUAL EMITTED EVENT, not the Usage object, because
 # the object-level tests above passed while this shipped.
@@ -279,7 +279,7 @@ def test_cache_hit_percentage_no_longer_suppressed():
 _COLD_RAW_INPUT = 45_323
 _COLD_CACHE_WRITE = 45_320
 _COLD_OUTPUT = 6
-_COLD_COST = Decimal("0.283445")
+_COLD_COST = Decimal("0.226732")
 
 
 class _RecordingHooks:

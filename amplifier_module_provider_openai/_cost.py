@@ -1,7 +1,7 @@
 """OpenAI pricing rates and cost computation.
 
-Verification date: 2026-05-11
-Source: https://openai.com/api/pricing
+Verification date: 2026-09-01
+Source: https://developers.openai.com/api/docs/pricing
 
 Only models in the display name registry are included.
 Unknown models return None — DO NOT default to $0.00.
@@ -84,9 +84,11 @@ _SNAPSHOT_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 _RATES: dict[str, dict[str, Decimal]] = {
     # ------------------------------------------------------------------
     # GPT 5.6 family: Sol / Terra / Luna  (GA 2026-07-09)
-    # Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M (short-context, Standard tier).
+    # Sol $4/$20, Terra $2/$12, Luna $0.20/$1.20 per 1M
+    # (input/output, short-context, Standard tier).
     # cache_read = 0.1x input; cache_write = 1.25x input (GPT-5.6 bills writes).
     # Field verified live: usage.input_tokens_details.cache_write_tokens (Responses API).
+    # Sol pricing is promotional through at least 2026-11-21; recheck after that date.
     # Alias "gpt-5.6" -> API echoes "gpt-5.6-sol" in response.model, so keying the
     # canonical tier ids is sufficient; no bare-alias entry required for cost.
     # The rates below are SHORT-context (<=272K input tokens). Requests whose input
@@ -94,22 +96,22 @@ _RATES: dict[str, dict[str, Decimal]] = {
     # whole request at _LONG_RATES (see compute_cost).
     # ------------------------------------------------------------------
     "gpt-5.6-sol": {
-        "input_per_m": Decimal("5.00"),
-        "output_per_m": Decimal("30.00"),
-        "cache_read_per_m": Decimal("0.50"),
-        "cache_write_per_m": Decimal("6.25"),
+        "input_per_m": Decimal("4.00"),
+        "output_per_m": Decimal("20.00"),
+        "cache_read_per_m": Decimal("0.40"),
+        "cache_write_per_m": Decimal("5.00"),
     },
     "gpt-5.6-terra": {
-        "input_per_m": Decimal("2.50"),
-        "output_per_m": Decimal("15.00"),
-        "cache_read_per_m": Decimal("0.25"),
-        "cache_write_per_m": Decimal("3.125"),
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("12.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("2.50"),
     },
     "gpt-5.6-luna": {
-        "input_per_m": Decimal("1.00"),
-        "output_per_m": Decimal("6.00"),
-        "cache_read_per_m": Decimal("0.10"),
-        "cache_write_per_m": Decimal("1.25"),
+        "input_per_m": Decimal("0.20"),
+        "output_per_m": Decimal("1.20"),
+        "cache_read_per_m": Decimal("0.02"),
+        "cache_write_per_m": Decimal("0.25"),
     },
     # ------------------------------------------------------------------
     # GPT 5.5 (DEFAULT)  ($5.00 / $30.00, cache_read $0.50)
@@ -173,28 +175,28 @@ _RATES: dict[str, dict[str, Decimal]] = {
 # for gpt-5.6). Same four keys as _RATES entries.
 # Relative to short-context: input / cached / cache-write are 2x, output is 1.5x.
 # Absolute rates read directly off the pricing page (not derived from multipliers):
-#   sol   input $10.00  cached $1.00  cache-write $12.50  output $45.00
-#   terra input  $5.00  cached $0.50  cache-write  $6.25  output $22.50
-#   luna  input  $2.00  cached $0.20  cache-write  $2.50  output  $9.00
-# Source: https://developers.openai.com/api/docs/pricing (verified 2026-07-15).
+#   sol   input $8.00  cached $0.80  cache-write $10.00  output $30.00
+#   terra input $4.00  cached $0.40  cache-write  $5.00  output $18.00
+#   luna  input $0.40  cached $0.04  cache-write  $0.50  output  $1.80
+# Source: https://developers.openai.com/api/docs/pricing (verified 2026-09-01).
 _LONG_RATES: dict[str, dict[str, Decimal]] = {
     "gpt-5.6-sol": {
-        "input_per_m": Decimal("10.00"),
-        "output_per_m": Decimal("45.00"),
-        "cache_read_per_m": Decimal("1.00"),
-        "cache_write_per_m": Decimal("12.50"),
+        "input_per_m": Decimal("8.00"),
+        "output_per_m": Decimal("30.00"),
+        "cache_read_per_m": Decimal("0.80"),
+        "cache_write_per_m": Decimal("10.00"),
     },
     "gpt-5.6-terra": {
-        "input_per_m": Decimal("5.00"),
-        "output_per_m": Decimal("22.50"),
-        "cache_read_per_m": Decimal("0.50"),
-        "cache_write_per_m": Decimal("6.25"),
+        "input_per_m": Decimal("4.00"),
+        "output_per_m": Decimal("18.00"),
+        "cache_read_per_m": Decimal("0.40"),
+        "cache_write_per_m": Decimal("5.00"),
     },
     "gpt-5.6-luna": {
-        "input_per_m": Decimal("2.00"),
-        "output_per_m": Decimal("9.00"),
-        "cache_read_per_m": Decimal("0.20"),
-        "cache_write_per_m": Decimal("2.50"),
+        "input_per_m": Decimal("0.40"),
+        "output_per_m": Decimal("1.80"),
+        "cache_read_per_m": Decimal("0.04"),
+        "cache_write_per_m": Decimal("0.50"),
     },
 }
 
