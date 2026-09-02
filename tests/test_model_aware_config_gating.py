@@ -536,8 +536,9 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
         | _DEPRECATED_ALIAS_CONFIG_KEYS
         | _INFRASTRUCTURE_CONFIG_KEYS
     )
-    # 31 keys: the 28 the config-surface-V2 survey counted, + 3 added by R0
-    # (prompt_cache_mode, prompt_cache_stable_breakpoint, reasoning_context).
-    # Audited against every `self.config.get(...)` call site in the
-    # constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 31
+    # 34 keys: the 28 the config-surface-V2 survey counted, + 3 added by R0
+    # (prompt_cache_mode, prompt_cache_stable_breakpoint, reasoning_context),
+    # + 3 added by namespace-form deferred tool loading (tool_loading,
+    # tool_namespaces, tool_search_always_loaded). Audited against every
+    # `self.config.get(...)` call site in the constructor and request path.
+    assert len(_CONSUMED_CONFIG_KEYS) == 34
