@@ -464,6 +464,169 @@ def _validate_prompt_cache_options(options: Any) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# R0 -- explicit prompt-cache mode (GPT-5.6 `prompt_cache_breakpoint`)
+#
+# Evidence this is built on (probe P7 / arm A7, gpt-5.6-terra, 3/3 reps,
+# 2026-09-02, capture root
+# `.amplifier/evaluation/treatment-validation/20260902-p7-explicit-bp/`):
+#
+#   * A breakpoint on a byte-CONSTANT `developer` item at `input[0]` writes a
+#     prefix that INCLUDES top-level `instructions` + `tools`: request 1
+#     `cache_write_tokens` = 12,318-12,321 against a head of ~12,328-12,334
+#     (>= 0.999 x head). Request 2, with a DIFFERENT user tail, read back
+#     `cached_tokens` = 12,318-12,321 and wrote 0 on the tail.
+#   * The carrier matters. A breakpoint on an assistant `output_text` block is
+#     accepted with HTTP 200 and silently writes NOTHING. Only `input_text`
+#     blocks on `developer`/`user` items are sanctioned carriers.
+#   * What this does NOT do: explicit breakpoints do NOT survive a shrink.
+#     A write placed at the exact post-compaction retained-prefix boundary
+#     (6,095-6,099 tokens, provably written) still read back 0 after the
+#     shrink. Grow-only holds in explicit mode too. This is head coverage,
+#     NOT a compaction remedy.
+#
+# Cost stance, measured (rig run 20260902-r0-validate, gpt-5.6-terra, same
+# payload, same growing 3-request conversation, per-request cost at published
+# rates): implicit $0.002255 -- explicit with no second breakpoint $0.006326
+# (2.81x) -- explicit + stable breakpoint $0.007458 (3.31x). Explicit mode
+# caches ONLY at breakpoints, so everything after the sentinel is fresh input
+# every request, while implicit covered 10,644 of 10,671 input tokens (99.7%).
+#
+# THIS IS WHY THE WHOLE FEATURE IS DEFAULT-OFF. It exists to remove a footgun
+# (before R0, `prompt_cache_options.mode="explicit"` was dropped at mount
+# because explicit mode with zero breakpoints disables caching entirely, ~10x)
+# and to be the mechanism future breakpoint work builds on -- NOT because it
+# saves money. It does not.
+_PROMPT_CACHE_MODES = frozenset({"implicit", "explicit"})
+DEFAULT_PROMPT_CACHE_MODE = "implicit"
+
+# The sentinel body. BYTE-CONSTANT AND LOAD-BEARING: every byte of it is part
+# of the cached prefix, so editing this string invalidates the sentinel cache
+# entry for every session everywhere, once. Do not template, version-stamp, or
+# personalize it. ~45 tokens.
+PROMPT_CACHE_SENTINEL_TEXT = (
+    "Amplifier prompt-cache sentinel v1 -- byte-identical in every request; "
+    "carries the explicit cache breakpoint covering the system instructions "
+    "and tool definitions. No task content; no response required."
+)
+
+# Sanctioned breakpoint carriers (P7: assistant `output_text` carriers are
+# accepted and silently write nothing).
+_BREAKPOINT_CARRIER_ROLES = frozenset({"user", "developer"})
+
+
+def _validate_prompt_cache_mode(mode: Any) -> str:
+    """Validate the `prompt_cache_mode` config value (fail loud at mount)."""
+    if mode not in _PROMPT_CACHE_MODES:
+        raise kernel_errors.InvalidRequestError(
+            f"prompt_cache_mode must be one of {{'implicit', 'explicit'}}; "
+            f"got {mode!r}."
+        )
+    return mode
+
+
+def _cache_sentinel_item() -> dict[str, Any]:
+    """The byte-constant developer item that carries the head breakpoint.
+
+    Emitted directly into the params `input` array -- NOT routed through
+    `_convert_messages`, which rewrites developer-role messages into
+    `<context_file>`-tagged user messages and would make the sentinel
+    non-constant.
+    """
+    return {
+        "role": "developer",
+        "content": [
+            {
+                "type": "input_text",
+                "text": PROMPT_CACHE_SENTINEL_TEXT,
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            }
+        ],
+    }
+
+
+def _last_stable_breakpoint_index(input_items: list[Any]) -> int | None:
+    """Index of the last sanctioned breakpoint carrier before the dynamic tail.
+
+    "Stable" is approximated provider-locally: the last `user`/`developer`
+    item carrying an `input_text` block that is NOT the final input item.
+    context-simple's `_seq` stable-prefix signal does not cross the provider
+    boundary (kernel `Message` objects carry no `_seq`), so this heuristic
+    stands in for it. In an append-only transcript every prefix through such
+    an item is byte-identical to a prefix of the next request, which is what
+    the cache matches on.
+
+    Index 0 is never returned -- that slot is the sentinel's.
+    """
+    for idx in range(len(input_items) - 2, 0, -1):
+        item = input_items[idx]
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") not in _BREAKPOINT_CARRIER_ROLES:
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(block, dict) and block.get("type") == "input_text"
+            for block in content
+        ):
+            return idx
+    return None
+
+
+def _with_breakpoint(item: dict[str, Any]) -> dict[str, Any]:
+    """Return a COPY of `item` with a breakpoint on its last input_text block.
+
+    Copies rather than mutates: the input array holds converted message dicts
+    that callers may still hold references to.
+    """
+    content = list(item.get("content") or [])
+    target = None
+    for pos in range(len(content) - 1, -1, -1):
+        block = content[pos]
+        if isinstance(block, dict) and block.get("type") == "input_text":
+            target = pos
+            break
+    if target is None:
+        return item
+    marked = dict(content[target])
+    marked["prompt_cache_breakpoint"] = {"mode": "explicit"}
+    content[target] = marked
+    new_item = dict(item)
+    new_item["content"] = content
+    return new_item
+
+
+def _apply_explicit_cache_breakpoints(
+    input_items: Any, stable_breakpoint: bool
+) -> tuple[Any, int]:
+    """Prepend the sentinel and (optionally) mark the last stable item.
+
+    Returns `(new_input, breakpoints_placed)`. At most 2 breakpoints are ever
+    placed -- inside the API's <=4 cache-writes-per-request budget and the
+    <=3 this provider allows itself.
+    """
+    if not isinstance(input_items, list):
+        # Defensive: the Responses API also accepts a bare string input. There
+        # is no item to hang a breakpoint on, so do nothing rather than guess.
+        logger.warning(
+            "[PROVIDER] prompt_cache_mode='explicit': input is %s, not a list "
+            "of items; no breakpoint emitted.",
+            type(input_items).__name__,
+        )
+        return input_items, 0
+
+    new_input = [_cache_sentinel_item(), *input_items]
+    placed = 1
+    if stable_breakpoint:
+        idx = _last_stable_breakpoint_index(new_input)
+        if idx is not None:
+            new_input[idx] = _with_breakpoint(new_input[idx])
+            placed += 1
+    return new_input, placed
+
+
 # text.verbosity (GPT-5.6): controls response length/detail. Opt-in; fail-loud
 # on models that reject it (pre-5.6).
 _TEXT_VERBOSITY_ALLOWED = frozenset({"low", "medium", "high"})
@@ -849,7 +1012,7 @@ def _decode_reasoning_state(
 
 # Every config key this module actually reads -- audited against every
 # `self.config.get(...)` call site in the constructor and the request path.
-# 27 entries. (Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.)
+# 30 entries. (Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.)
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "base_url",
@@ -866,6 +1029,9 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "prompt_cache_key",
         "prompt_cache_retention",
         "prompt_cache_options",
+        "prompt_cache_mode",
+        "prompt_cache_stable_breakpoint",
+        "reasoning_context",
         "safety_identifier",
         "text_verbosity",
         "reasoning_replay_scope",
@@ -900,9 +1066,11 @@ _INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
         "mode which requires true); use extra_request_params to force it."
     ),
     "enable_reasoning_context": (
-        "removed -- reasoning.context is now forwarded whenever you supply it "
-        "in the legacy `reasoning` dict, e.g. "
-        'reasoning = {effort = "high", context = "current_turn"}.'
+        "removed -- reasoning.context is now forwarded whenever you supply "
+        'it. Set the first-class key `reasoning_context = "current_turn"` '
+        "(composes with reasoning_effort), or put it in the legacy "
+        '`reasoning` dict, e.g. reasoning = {effort = "high", '
+        'context = "current_turn"}.'
     ),
     "thinking_budget_tokens": (
         "removed -- extended_thinking still forces high reasoning effort, but "
@@ -1046,6 +1214,24 @@ class OpenAIProvider:
         self.reasoning_effort = _resolve_config_reasoning_effort(
             self.config.get("reasoning_effort"), self.default_model
         )
+        # reasoning.context (GPT-5.6 persisted reasoning): first-class config
+        # key, so `context` no longer has to ride inside the LEGACY `reasoning`
+        # dict -- which the canonical `reasoning_effort` key outranks, silently
+        # dropping the context along with it. Validated at mount.
+        #
+        # Measured (t8p, gpt-5.6-terra, 2026-09-02, capture root
+        # `.amplifier/evaluation/treatment-validation/20260902-t8p-reasoning-context/`):
+        # on our stateless manual-replay path (`store=false`, no chaining,
+        # reasoning items replayed inline in `input`) the API's effective mode
+        # is `all_turns` when the field is absent, and an explicit
+        # `context="current_turn"` IS honored -- response echoes
+        # `reasoning.context="current_turn"`, 200 completed. So there is a real
+        # knob here on exactly the path this provider uses.
+        self.reasoning_context: str | None = (
+            self.config.get("reasoning_context") or None
+        )
+        if self.reasoning_context is not None:
+            _validate_reasoning_context({"context": self.reasoning_context})
         if self.reasoning_effort is not None and self.reasoning is not None:
             logger.warning(
                 "[PROVIDER] Both 'reasoning_effort' and 'reasoning' are set "
@@ -1125,25 +1311,56 @@ class OpenAIProvider:
             "prompt_cache_retention", DEFAULT_PROMPT_CACHE_RETENTION
         )
         self.prompt_cache_retention: str | None = _retention if _retention else None
+        # prompt_cache_mode (R0): "implicit" (default) | "explicit".
+        #   implicit -- the request is BYTE-IDENTICAL to what this provider sent
+        #               before R0 existed. No sentinel, no breakpoints, no
+        #               prompt_cache_options.mode.
+        #   explicit -- inject the byte-constant developer sentinel at input[0]
+        #               carrying prompt_cache_breakpoint, and send
+        #               prompt_cache_options.mode="explicit".
+        # See the R0 evidence block above `_validate_prompt_cache_mode` for what
+        # this does (head coverage, P7/A7 3/3) and does NOT do (survive a shrink).
+        self.prompt_cache_mode: str = _validate_prompt_cache_mode(
+            self.config.get("prompt_cache_mode") or DEFAULT_PROMPT_CACHE_MODE
+        )
+        # Second breakpoint on the last stable history item. Only consulted in
+        # explicit mode. DEFAULTS OFF -- it was measured and it does not work:
+        # rig run 20260902-r0-validate, gpt-5.6-terra, growing 3-request
+        # conversation with a 2,240-token stable span (well clear of the
+        # 1,024-token cacheable minimum). The breakpoint provably WROTE
+        # (2,240 then 2,264 tokens, billed at 1.25x) and the next request read
+        # back 8,420 -- the sentinel prefix, unchanged. Coverage never
+        # extended, at either size tested (~20-70 tok span and 2,240 tok span).
+        # Kept as a knob for future probing, not as a default.
+        self.prompt_cache_stable_breakpoint: bool = _parse_config_bool(
+            "prompt_cache_stable_breakpoint",
+            self.config.get("prompt_cache_stable_breakpoint"),
+            default=False,
+        )
         # prompt_cache_options (GPT-5.6): {"mode": "implicit"|"explicit", "ttl": "30m"}.
-        # `ttl` passes through untouched. `mode: "explicit"` is REJECTED here: this
-        # provider ships no prompt_cache_breakpoint mechanism anywhere, and explicit
-        # mode with zero breakpoints disables prompt caching ENTIRELY -- no reads, no
-        # writes -- turning a ~95% cache-read workload into 100% full-price input
-        # (~10x, live-probed 2026-08-28). Validated once at mount instead of scanning
-        # every request's input array.
+        # `ttl` passes through untouched. `mode: "explicit"` is dropped here UNLESS
+        # `prompt_cache_mode="explicit"` also asked for the breakpoint mechanism:
+        # explicit mode with zero breakpoints disables prompt caching ENTIRELY --
+        # no reads, no writes -- turning a ~95% cache-read workload into 100%
+        # full-price input (~10x, live-probed 2026-08-28). Validated once at mount
+        # instead of scanning every request's input array.
         self.prompt_cache_options: dict | None = (
             self.config.get("prompt_cache_options") or None
         )
         if self.prompt_cache_options is not None:
             _validate_prompt_cache_options(self.prompt_cache_options)
-            if self.prompt_cache_options.get("mode") == "explicit":
+            if (
+                self.prompt_cache_options.get("mode") == "explicit"
+                and self.prompt_cache_mode != "explicit"
+            ):
                 logger.warning(
-                    "[PROVIDER] prompt_cache_options.mode='explicit' is not supported "
-                    "by this provider: no prompt_cache_breakpoint mechanism ships "
-                    "here, and explicit mode with zero breakpoints disables prompt "
-                    "caching entirely (~10x input-cost regression). Dropping 'mode'; "
-                    "implicit caching is used. 'ttl' passes through unchanged."
+                    "[PROVIDER] prompt_cache_options.mode='explicit' without "
+                    "prompt_cache_mode='explicit' would emit zero breakpoints, "
+                    "which disables prompt caching entirely (~10x input-cost "
+                    "regression). Dropping 'mode'; implicit caching is used. "
+                    "'ttl' passes through unchanged. Set "
+                    'prompt_cache_mode = "explicit" to enable the provider\'s '
+                    "sentinel breakpoint instead."
                 )
                 self.prompt_cache_options = {
                     k: v for k, v in self.prompt_cache_options.items() if k != "mode"
@@ -2280,6 +2497,32 @@ class OpenAIProvider:
             _validate_prompt_cache_options(prompt_cache_options)
             params["prompt_cache_options"] = prompt_cache_options
 
+        # R0: explicit prompt-cache mode. Default ("implicit") is a strict
+        # no-op -- this whole block is skipped and the request stays
+        # byte-identical to the pre-R0 shape.
+        prompt_cache_mode = _validate_prompt_cache_mode(
+            kwargs.get("prompt_cache_mode", self.prompt_cache_mode)
+        )
+        if prompt_cache_mode == "explicit":
+            _stable_bp = kwargs.get(
+                "prompt_cache_stable_breakpoint", self.prompt_cache_stable_breakpoint
+            )
+            params["input"], _bp_count = _apply_explicit_cache_breakpoints(
+                params["input"], bool(_stable_bp)
+            )
+            if _bp_count:
+                # mode is what turns explicit caching on server-side; ttl (and
+                # anything else the operator configured) is preserved.
+                _opts = dict(params.get("prompt_cache_options") or {})
+                _opts["mode"] = "explicit"
+                params["prompt_cache_options"] = _opts
+                logger.info(
+                    "[PROVIDER] prompt_cache_mode=explicit: %d breakpoint(s) "
+                    "placed (sentinel at input[0]%s).",
+                    _bp_count,
+                    " + last stable history item" if _bp_count > 1 else "",
+                )
+
         safety_identifier = (
             kwargs.get("safety_identifier", self.safety_identifier) or None
         )
@@ -2326,6 +2569,31 @@ class OpenAIProvider:
             caps_for_auto = get_capabilities(model_name)
             if caps_for_auto.default_reasoning_effort is not None:
                 params["reasoning"] = {"summary": "auto"}
+
+        # reasoning.context from the first-class config key / per-call kwarg.
+        # Applied LAST among the reasoning sites so it composes with EVERY way
+        # a reasoning object gets built (canonical reasoning_effort, legacy
+        # dict, extended_thinking, auto-summary) instead of only the legacy
+        # dict. An explicit `context` inside a caller-supplied reasoning dict
+        # always wins -- this never overwrites it.
+        reasoning_context = (
+            kwargs.get("reasoning_context", self.reasoning_context) or None
+        )
+        if reasoning_context is not None:
+            _validate_reasoning_context({"context": reasoning_context})
+            _reasoning_obj = params.get("reasoning")
+            if isinstance(_reasoning_obj, dict):
+                _reasoning_obj.setdefault("context", reasoning_context)
+            else:
+                # Loud, not silent: a config key that does nothing is exactly
+                # the failure mode `_INERT_CONFIG_KEY_MESSAGES` exists for.
+                logger.warning(
+                    "[PROVIDER] reasoning_context=%r had no effect: this "
+                    "request sends no reasoning parameter (model %s). Set "
+                    "reasoning_effort as well, or drop reasoning_context.",
+                    reasoning_context,
+                    model_name,
+                )
 
         # extra_request_params: the documented escape hatch, merged LAST so
         # it reflects in the emitted `raw` payload below (owner-beware).
