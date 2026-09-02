@@ -11,6 +11,12 @@ METADATA_STATUS = "openai:status"
 METADATA_INCOMPLETE_REASON = "openai:incomplete_reason"
 METADATA_REASONING_ITEMS = "openai:reasoning_items"
 METADATA_CONTINUATION_COUNT = "openai:continuation_count"
+# Hosted `tool_search_call` / `tool_search_output` output items, captured
+# verbatim so they can be replayed into `input` on the next request. Per
+# `TS:854`, dropping a `tool_search_output` item makes every tool it loaded
+# cease to exist for the model AND breaks the cache forward -- so these ride
+# the same provider-state channel the encrypted-reasoning items already use.
+METADATA_TOOL_SEARCH_ITEMS = "openai:tool_search_items"
 
 # Default configuration values
 # gpt-5.6-sol (the GPT-5.6 flagship; alias "gpt-5.6" also resolves to it) is the
