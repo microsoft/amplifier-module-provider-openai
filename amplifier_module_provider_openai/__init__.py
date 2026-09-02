@@ -485,11 +485,18 @@ def _validate_prompt_cache_options(options: Any) -> None:
 #     shrink. Grow-only holds in explicit mode too. This is head coverage,
 #     NOT a compaction remedy.
 #
-# Cost stance: explicit mode caches ONLY at breakpoints. With the sentinel
-# alone, everything after `input[0]` is billed as fresh input on every
-# request -- which is why `prompt_cache_stable_breakpoint` (a second
-# breakpoint on the last stable history item) defaults ON *within* explicit
-# mode, and why explicit mode itself is OFF by default.
+# Cost stance, measured (rig run 20260902-r0-validate, gpt-5.6-terra, same
+# payload, same growing 3-request conversation, per-request cost at published
+# rates): implicit $0.002255 -- explicit with no second breakpoint $0.006326
+# (2.81x) -- explicit + stable breakpoint $0.007458 (3.31x). Explicit mode
+# caches ONLY at breakpoints, so everything after the sentinel is fresh input
+# every request, while implicit covered 10,644 of 10,671 input tokens (99.7%).
+#
+# THIS IS WHY THE WHOLE FEATURE IS DEFAULT-OFF. It exists to remove a footgun
+# (before R0, `prompt_cache_options.mode="explicit"` was dropped at mount
+# because explicit mode with zero breakpoints disables caching entirely, ~10x)
+# and to be the mechanism future breakpoint work builds on -- NOT because it
+# saves money. It does not.
 _PROMPT_CACHE_MODES = frozenset({"implicit", "explicit"})
 DEFAULT_PROMPT_CACHE_MODE = "implicit"
 
@@ -1317,13 +1324,18 @@ class OpenAIProvider:
             self.config.get("prompt_cache_mode") or DEFAULT_PROMPT_CACHE_MODE
         )
         # Second breakpoint on the last stable history item. Only consulted in
-        # explicit mode. Defaults ON *within* explicit mode because explicit
-        # caching happens ONLY at breakpoints: with the sentinel alone, the
-        # whole growing history is billed fresh every request.
+        # explicit mode. DEFAULTS OFF -- it was measured and it does not work:
+        # rig run 20260902-r0-validate, gpt-5.6-terra, growing 3-request
+        # conversation with a 2,240-token stable span (well clear of the
+        # 1,024-token cacheable minimum). The breakpoint provably WROTE
+        # (2,240 then 2,264 tokens, billed at 1.25x) and the next request read
+        # back 8,420 -- the sentinel prefix, unchanged. Coverage never
+        # extended, at either size tested (~20-70 tok span and 2,240 tok span).
+        # Kept as a knob for future probing, not as a default.
         self.prompt_cache_stable_breakpoint: bool = _parse_config_bool(
             "prompt_cache_stable_breakpoint",
             self.config.get("prompt_cache_stable_breakpoint"),
-            default=True,
+            default=False,
         )
         # prompt_cache_options (GPT-5.6): {"mode": "implicit"|"explicit", "ttl": "30m"}.
         # `ttl` passes through untouched. `mode: "explicit"` is dropped here UNLESS

@@ -83,7 +83,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime. | |
 | `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount unless `prompt_cache_mode = "explicit"`** (see [Prompt caching](#prompt-caching)); `ttl` always passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
 | `prompt_cache_mode` | `prompt_cache_options.mode` + `prompt_cache_breakpoint` | `"implicit"` (default) \| `"explicit"`. `explicit` injects the byte-constant sentinel at `input[0]` and turns on explicit caching. **Default is a strict no-op** (byte-identical request). | Small, measured head coverage; NOT a compaction fix. See [Explicit cache mode](#prompt_cache_mode--explicit-cache-breakpoints-r0). | |
-| `prompt_cache_stable_breakpoint` | `prompt_cache_breakpoint` | Second breakpoint on the last stable history item. Default `true`, consulted **only** in explicit mode. | Off = the growing history is billed fresh every request. | |
+| `prompt_cache_stable_breakpoint` | `prompt_cache_breakpoint` | Second breakpoint on the last stable history item. **Default `false` — measured inert** (writes every request, never read back). Consulted only in explicit mode. | On = a 1.25×-rate write per request for no reads. | |
 | `reasoning_context` | `reasoning.context` | `auto`\|`current_turn`\|`all_turns`. First-class key; composes with `reasoning_effort` (the legacy `reasoning` dict does not). | `current_turn` trims rendered reasoning on long loops. | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
@@ -263,8 +263,9 @@ explicit prompt caching:
    `prompt_cache_breakpoint: {"mode": "explicit"}`;
 2. `prompt_cache_options.mode = "explicit"` is sent (any configured `ttl` is
    preserved);
-3. unless `prompt_cache_stable_breakpoint = false`, a **second** breakpoint is
-   placed on the last `user`/`developer` item that is not the final input item.
+3. if `prompt_cache_stable_breakpoint = true` (**default `false`** — see
+   below), a **second** breakpoint is placed on the last `user`/`developer`
+   item that is not the final input item.
 
 At most **2** breakpoints are ever emitted (the API allows ≤4 cache writes per
 request; ≤3 is this provider's self-imposed budget).
@@ -282,10 +283,22 @@ written against a ~12,330-token head — and a following request with a
   boundary (6,095–6,099 tokens, provably written) still read back **0** after
   the shrink. OpenAI's cache is grow-only in explicit mode too.
 - **Explicit caching happens only at breakpoints.** Anything after the last
-  breakpoint is billed as fresh input every request. That is why the stable
-  breakpoint defaults on *within* explicit mode.
-- **Expected value is small.** The head is ≈3–5% of a long run's input cost.
-  This is a head lever, not a workload lever.
+  breakpoint is billed as fresh input every request, while implicit caching
+  covers the whole growing prefix. Measured on the same payload and the same
+  growing 3-request conversation (`gpt-5.6-terra`, per-request cost at
+  published rates): implicit **$0.002255** · explicit **$0.006326 (2.81×)** ·
+  explicit + stable breakpoint **$0.007458 (3.31×)**. Implicit read back
+  10,644 of 10,671 input tokens (99.7%).
+- **The stable breakpoint does not work, and is off by default.** With a
+  2,240-token stable span (well clear of the 1,024-token cacheable minimum) it
+  provably *wrote* 2,240 then 2,264 tokens at the 1.25× write rate, and the
+  next request still read back only the sentinel prefix. Coverage never
+  extended. The knob is kept for probing, not for production.
+- **Expected value is small — and on this evidence it is negative on
+  non-shrinking traffic.** Explicit mode is not a savings feature. It exists so
+  that anyone who *must* run explicit mode gets guaranteed head coverage
+  instead of the ~10× cliff, and as the mechanism future breakpoint work builds
+  on.
 
 The carrier matters and is not negotiable: a breakpoint on an **assistant**
 `output_text` block is accepted with HTTP 200 and silently writes nothing. Only

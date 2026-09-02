@@ -232,7 +232,9 @@ def test_sentinel_is_byte_identical_across_requests_with_different_tails():
 
 def test_stable_breakpoint_lands_on_last_user_item_before_the_tail():
     provider = _make_provider(
-        default_model="gpt-5.6-terra", prompt_cache_mode="explicit"
+        default_model="gpt-5.6-terra",
+        prompt_cache_mode="explicit",
+        prompt_cache_stable_breakpoint=True,
     )
     params = _run(provider, _multiturn_request())
     input_items = params["input"]
@@ -248,7 +250,9 @@ def test_stable_breakpoint_never_lands_on_an_assistant_carrier():
     """P7: a breakpoint on an assistant `output_text` block is accepted with
     HTTP 200 and silently writes NOTHING. Only input_text carriers count."""
     provider = _make_provider(
-        default_model="gpt-5.6-terra", prompt_cache_mode="explicit"
+        default_model="gpt-5.6-terra",
+        prompt_cache_mode="explicit",
+        prompt_cache_stable_breakpoint=True,
     )
     request = ChatRequest(
         messages=[
@@ -263,7 +267,20 @@ def test_stable_breakpoint_never_lands_on_an_assistant_carrier():
         assert item["content"][0]["type"] == "input_text"
 
 
-def test_stable_breakpoint_can_be_disabled():
+def test_stable_breakpoint_is_off_by_default():
+    """MEASURED, not assumed (rig 20260902-r0-validate): the second breakpoint
+    wrote 2,240-2,264 tokens at the 1.25x write rate on every request and the
+    next request still read back only the sentinel prefix. It costs and returns
+    nothing, so it is off unless someone opts in to probe it again."""
+    provider = _make_provider(
+        default_model="gpt-5.6-terra", prompt_cache_mode="explicit"
+    )
+    assert provider.prompt_cache_stable_breakpoint is False
+    params = _run(provider, _multiturn_request())
+    assert _breakpoints(params["input"]) == [(0, 0)]
+
+
+def test_stable_breakpoint_can_be_disabled_explicitly():
     provider = _make_provider(
         default_model="gpt-5.6-terra",
         prompt_cache_mode="explicit",
@@ -278,11 +295,18 @@ def test_stable_breakpoint_accepts_string_bools():
     provider = _make_provider(
         default_model="gpt-5.6-terra",
         prompt_cache_mode="explicit",
+        prompt_cache_stable_breakpoint="true",
+    )
+    assert provider.prompt_cache_stable_breakpoint is True
+    params = _run(provider, _multiturn_request())
+    assert len(_breakpoints(params["input"])) == 2
+
+    off = _make_provider(
+        default_model="gpt-5.6-terra",
+        prompt_cache_mode="explicit",
         prompt_cache_stable_breakpoint="false",
     )
-    assert provider.prompt_cache_stable_breakpoint is False
-    params = _run(provider, _multiturn_request())
-    assert _breakpoints(params["input"]) == [(0, 0)]
+    assert off.prompt_cache_stable_breakpoint is False
 
 
 def test_never_exceeds_the_breakpoint_budget():
@@ -298,6 +322,13 @@ def test_never_exceeds_the_breakpoint_budget():
         messages.append(Message(role="assistant", content=f"a{i}"))
     messages.append(Message(role="user", content="final"))
     params = _run(provider, ChatRequest(messages=messages))
+    assert len(_breakpoints(params["input"])) == 1
+    with_stable = _make_provider(
+        default_model="gpt-5.6-terra",
+        prompt_cache_mode="explicit",
+        prompt_cache_stable_breakpoint=True,
+    )
+    params = _run(with_stable, ChatRequest(messages=messages))
     assert len(_breakpoints(params["input"])) == 2
 
 
