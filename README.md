@@ -391,6 +391,30 @@ Measured on `gpt-5.6-terra` against a 14-tool, 18,458-token head
 - A tool registered **mid-session** rides a developer-role `additional_tools`
   input item at the tail rather than being spliced into the cached tools block.
 
+### Interaction with `prompt_cache_mode: explicit` (R0)
+
+Both features rewrite the params assembly, so their combination is pinned by
+`tests/test_r0_deferred_tools_interaction.py`. With **both off** the request is
+byte-identical to what shipped before either existed (asserted against a literal
+payload plus a sha256, with negative controls proving each flag alone moves the
+bytes). With **both on**:
+
+- Deferred appends `additional_tools` at the tail *before* R0 prepends its
+  sentinel, so the sentinel keeps `input[0]` and the discovered-tools item keeps
+  the tail. Neither displaces the other.
+- **No breakpoint ever lands on the `additional_tools` item.** It is the one
+  input item that grows mid-session; a breakpoint at or behind it would pull a
+  moving payload into the cached prefix.
+- **One behaviour delta worth knowing:** R0's stable-breakpoint heuristic skips
+  the *final* input item as the dynamic tail. In deferred mode the final item is
+  the `additional_tools` item, so the last real history message becomes an
+  eligible carrier and a second breakpoint can fire where R0 alone would place
+  only the sentinel. That placement is correct — the item is pinned to the tail
+  on every subsequent request, so the prefix through that message is
+  byte-identical next request — but it costs one extra cache write (R0's rig:
+  explicit `$0.006326` → explicit + stable breakpoint `$0.007458`). Still inside
+  R0's ≤2-breakpoint budget.
+
 ## Long context
 
 `enable_long_context` (default off) controls the **reported** context window;
