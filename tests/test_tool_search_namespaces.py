@@ -29,6 +29,7 @@ from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._constants import METADATA_TOOL_SEARCH_ITEMS
 from amplifier_module_provider_openai._tool_search import (
+    _WARNED_UNLISTED,
     RESERVED_NAMESPACE_NAMES,
     ToolSearchConfigError,
     normalize_namespaces,
@@ -270,6 +271,7 @@ def test_unlisted_tool_falls_through_flat_and_warns(caplog):
     """Fail OPEN and loudly. A tool that silently vanished into a namespace is
     exactly the class of silent downgrade this provider warns about elsewhere."""
     caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+    _WARNED_UNLISTED.clear()  # the warning is once-per-set per process
     provider = _make_provider(tool_loading="deferred_namespace")
     tools = _run(provider, _request(_tool_specs(ROSTER + (("frobnicate", "?"),))))[
         "tools"
@@ -471,3 +473,57 @@ def test_bad_table_fails_at_provider_construction():
             tool_loading="deferred_namespace",
             tool_namespaces=[{"name": "web", "members": ["web_fetch"]}],
         )
+
+
+def test_the_unlisted_warning_fires_once_per_set_not_per_request(caplog):
+    """A deployment mistake to fix once, not a per-request event."""
+    caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+    _WARNED_UNLISTED.clear()
+    provider = _make_provider(tool_loading="deferred_namespace")
+    roster = ROSTER + (("frobnicate", "?"),)
+    _run(provider, _request(_tool_specs(roster)))
+    _run(provider, _request(_tool_specs(roster)))
+    hits = [r for r in caplog.records if "frobnicate" in r.getMessage()]
+    assert len(hits) == 1
+
+
+def test_function_shaped_apply_patch_is_namespaced_not_unlisted(caplog):
+    """Native apply_patch is a passthrough shape and never reaches grouping; the
+    FUNCTION-shaped fallback must still land in a namespace rather than warning
+    on every request."""
+    caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+    _WARNED_UNLISTED.clear()
+    provider = _make_provider(tool_loading="deferred_namespace")
+    tools = _run(provider, _request(_tool_specs(ROSTER + (("apply_patch", "Patch"),))))[
+        "tools"
+    ]
+    files = next(t for t in tools if t.get("name") == "files")
+    assert "apply_patch" in [m["name"] for m in files["tools"]]
+    assert not any("apply_patch" in r.getMessage() for r in caplog.records)
+
+
+def test_native_tool_shapes_pass_through_untouched():
+    """`{"type": "computer"}` / hosted tool dicts are vendor-owned: never
+    namespaced, never deferred, never reordered relative to each other."""
+    from amplifier_module_provider_openai._tool_search import (
+        DEFAULT_ALWAYS_LOADED,
+        DEFAULT_NAMESPACES,
+        build_namespaced_tools,
+    )
+
+    flat = [
+        {"type": "computer"},
+        {"type": "apply_patch"},
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "Read",
+            "parameters": {},
+        },
+    ]
+    out = build_namespaced_tools(
+        flat, DEFAULT_NAMESPACES, frozenset(DEFAULT_ALWAYS_LOADED)
+    )
+    assert out[0] == {"type": "computer"}
+    assert out[1] == {"type": "apply_patch"}
+    assert out[-1] == {"type": "tool_search"}

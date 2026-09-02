@@ -91,7 +91,20 @@ DEFAULT_NAMESPACES: tuple[dict[str, Any], ...] = (
     {
         "name": "files",
         "description": ("Read, write, edit, search and list files in the workspace."),
-        "members": ("edit_file", "glob", "grep", "read_file", "write_file"),
+        # `apply_patch` is listed here for the FUNCTION-shaped case only. When
+        # the native engine is active the provider emits a bare
+        # `{"type": "apply_patch"}`, which never reaches the grouping step at
+        # all -- native/hosted shapes are passthrough by construction. Listing
+        # it keeps the function-shaped fallback out of the "unlisted tool"
+        # warning path on every request.
+        "members": (
+            "apply_patch",
+            "edit_file",
+            "glob",
+            "grep",
+            "read_file",
+            "write_file",
+        ),
     },
     {
         "name": "internet",
@@ -123,6 +136,9 @@ DEFAULT_ALWAYS_LOADED: tuple[str, ...] = ("bash", "todo")
 HOSTED_TOOL_SEARCH_ITEM_TYPES: frozenset[str] = frozenset(
     {"tool_search_call", "tool_search_output"}
 )
+
+# Unlisted-tool sets already warned about (see build_namespaced_tools).
+_WARNED_UNLISTED: set[tuple[str, ...]] = set()
 
 
 class ToolSearchConfigError(ValueError):
@@ -294,7 +310,11 @@ def build_namespaced_tools(
         )
 
     unlisted = sorted(name for name in by_name if name not in emitted)
-    if unlisted:
+    if unlisted and tuple(unlisted) not in _WARNED_UNLISTED:
+        # Once per distinct unlisted set per process: the condition is a
+        # deployment mistake to fix once, not a per-request event. Warning
+        # every request would bury it in its own noise.
+        _WARNED_UNLISTED.add(tuple(unlisted))
         logger.warning(
             "[PROVIDER] tool_loading=deferred_namespace: %d tool(s) are not in the "
             "namespace table and are being sent flat and undeferred: %s. Add them to "
