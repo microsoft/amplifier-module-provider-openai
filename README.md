@@ -82,6 +82,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
 | `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime. | |
 | `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); `ttl` passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
+| `reasoning_context` | `reasoning.context` | `auto`\|`current_turn`\|`all_turns`. First-class key; composes with `reasoning_effort` (the legacy `reasoning` dict does not). | `current_turn` trims rendered reasoning on long loops. | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
 | `reasoning_replay_scope` | **Amplifier-only** | Bounds inline reasoning replay: `turn` (default) \| `all` \| `none`. | `"all"` grows the payload without bound (~1,200 chars/blob). | |
@@ -106,7 +107,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | --- | --- |
 | `enable_response_chaining` | Removed — the provider is always stateless now (see [Conversation state](#conversation-state)). |
 | `enable_state` | Removed — `store` is managed automatically (false, except background mode which requires true); use `extra_request_params` to force it. |
-| `enable_reasoning_context` | Removed — `reasoning.context` is now forwarded whenever you supply it in the legacy `reasoning` dict, e.g. `reasoning = {effort = "high", context = "current_turn"}`. |
+| `enable_reasoning_context` | Removed — `reasoning.context` is now forwarded whenever you supply it. Set the first-class key `reasoning_context = "current_turn"` (composes with `reasoning_effort`), or put it in the legacy `reasoning` dict, e.g. `reasoning = {effort = "high", context = "current_turn"}`. |
 | `thinking_budget_tokens` | Removed — `extended_thinking` still forces high reasoning effort, but no longer adjusts `max_output_tokens`. Set `max_output_tokens` directly. |
 | `thinking_budget_buffer` | Removed — see `thinking_budget_tokens`. |
 
@@ -161,6 +162,16 @@ Notes:
   `reasoning.mode` (`{effort = "high", mode = "pro"}`) or `reasoning.context`
   (GPT-5.6 persisted reasoning) — both are forwarded ungated for an explicit
   `reasoning` dict; the caller owns the consequences.
+- **For `reasoning.context`, prefer the first-class `reasoning_context` key.**
+  The legacy dict is outranked by `reasoning_effort`, so an operator setting
+  both had their `context` silently dropped. `reasoning_context` composes with
+  whichever path built the reasoning object, and an explicit `context` inside a
+  caller-supplied `reasoning` dict still wins. Measured on this provider's own
+  stateless manual-replay path (`store=false`, reasoning items replayed inline):
+  with no `context` field the API's effective mode is `all_turns`; an explicit
+  `current_turn` is honored and echoed back (t8p, gpt-5.6-terra, 2026-09-02).
+  It has no effect on a request that sends no reasoning parameter at all — the
+  provider logs a warning rather than inventing one.
 
 ## Conversation state
 
