@@ -83,6 +83,21 @@ _SNAPSHOT_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 #       not yet on pricing page; these models return None until rates are added.
 _RATES: dict[str, dict[str, Decimal]] = {
     # ------------------------------------------------------------------
+    # GPT 6 Astra  (rolling out 2026-09-03)
+    # Standard-tier SHORT-context rates (≤272,000 input tokens):
+    #   input $10.00 / cached $1.00 / cache-write $12.50 / output $50.00 per 1M
+    # Source: https://developers.openai.com/api/docs/pricing (verified 2026-09-03)
+    # Source: https://developers.openai.com/api/docs/models/gpt-6-astra.md
+    # Batch/Flex/Fast and regional uplifts are NOT represented here.
+    # Long-context (>272K input) rates are in _LONG_RATES below.
+    # ------------------------------------------------------------------
+    "gpt-6-astra": {
+        "input_per_m": Decimal("10.00"),
+        "output_per_m": Decimal("50.00"),
+        "cache_read_per_m": Decimal("1.00"),
+        "cache_write_per_m": Decimal("12.50"),
+    },
+    # ------------------------------------------------------------------
     # GPT 5.6 family: Sol / Terra / Luna  (GA 2026-07-09)
     # Sol $4/$20, Terra $2/$12, Luna $0.20/$1.20 per 1M
     # (input/output, short-context, Standard tier).
@@ -170,9 +185,16 @@ _RATES: dict[str, dict[str, Decimal]] = {
 }
 
 
-# _LONG_RATES: GPT-5.6 long-context rates, applied to the WHOLE request when input
-# tokens exceed the model's ModelCapabilities.long_context_pricing_threshold (272K
-# for gpt-5.6). Same four keys as _RATES entries.
+# _LONG_RATES: long-context rates, applied to the WHOLE request when input
+# tokens exceed the model's ModelCapabilities.long_context_pricing_threshold.
+# Same four keys as _RATES entries.
+#
+# GPT-6 Astra long-context (>272K input) Standard-tier rates:
+#   input $20.00 / cached $2.00 / cache-write $25.00 / output $75.00 per 1M
+#   (2x input/cached/write, 1.5x output vs short-context)
+#   Source: https://developers.openai.com/api/docs/pricing (verified 2026-09-03)
+#
+# GPT-5.6 long-context rates:
 # Relative to short-context: input / cached / cache-write are 2x, output is 1.5x.
 # Absolute rates read directly off the pricing page (not derived from multipliers):
 #   sol   input $8.00  cached $0.80  cache-write $10.00  output $30.00
@@ -180,6 +202,14 @@ _RATES: dict[str, dict[str, Decimal]] = {
 #   luna  input $0.40  cached $0.04  cache-write  $0.50  output  $1.80
 # Source: https://developers.openai.com/api/docs/pricing (verified 2026-09-01).
 _LONG_RATES: dict[str, dict[str, Decimal]] = {
+    # GPT-6 Astra long-context (>272K input tokens) Standard-tier rates.
+    # Source: https://developers.openai.com/api/docs/pricing (verified 2026-09-03)
+    "gpt-6-astra": {
+        "input_per_m": Decimal("20.00"),
+        "output_per_m": Decimal("75.00"),
+        "cache_read_per_m": Decimal("2.00"),
+        "cache_write_per_m": Decimal("25.00"),
+    },
     "gpt-5.6-sol": {
         "input_per_m": Decimal("8.00"),
         "output_per_m": Decimal("30.00"),
