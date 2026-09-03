@@ -208,11 +208,10 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
 # "none" means no reasoning field is sent is PRESERVED: this guard only fires
 # when an explicit effort value is supplied to the request.
 _GPT_6_ASTRA_ALLOWED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-_GPT_6_ASTRA_REJECTED_EFFORTS = frozenset({"none", "minimal"})
 
 
 def _validate_gpt_6_astra_effort(model_id: str, reasoning_param: Any) -> None:
-    """Reject gpt-6-astra requests with effort='none' or effort='minimal'.
+    """Validate the final gpt-6-astra reasoning effort.
 
     GPT-6 Astra does not support reasoning.effort='none' or 'minimal'
     (https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md).
@@ -226,10 +225,9 @@ def _validate_gpt_6_astra_effort(model_id: str, reasoning_param: Any) -> None:
     resolves to None) never reaches this guard.
 
     Runs once per request inside _build_params(). No-op for any model that does
-    not match 'gpt-6-astra' (so dated snapshots like 'gpt-6-astra-2026-09-03'
-    are also covered via startswith).
+    not exactly match 'gpt-6-astra'.
     """
-    if not (model_id == "gpt-6-astra" or model_id.startswith("gpt-6-astra-")):
+    if model_id != "gpt-6-astra":
         return
     if reasoning_param is None:
         return
@@ -237,20 +235,23 @@ def _validate_gpt_6_astra_effort(model_id: str, reasoning_param: Any) -> None:
         effort = reasoning_param.get("effort")
     else:
         effort = reasoning_param
-    if effort is None or effort not in _GPT_6_ASTRA_REJECTED_EFFORTS:
+    if effort is None or effort in _GPT_6_ASTRA_ALLOWED_EFFORTS:
         return
+    migration = (
+        "Migration: use 'low' for lightweight tasks, or omit reasoning_effort "
+        "entirely to let the model choose. "
+        if effort in {"none", "minimal"}
+        else ""
+    )
     raise kernel_errors.InvalidRequestError(
         f"Model {model_id!r} does not support reasoning.effort={effort!r}. "
-        f"GPT-6 Astra rejects 'none' and 'minimal' "
-        f"(https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md). "
-        f"Migration: use 'low' for lightweight tasks, or omit reasoning_effort "
-        f"entirely to let the model choose. "
+        f"{migration}"
         f"Supported efforts: {sorted(_GPT_6_ASTRA_ALLOWED_EFFORTS)}."
     )
 
 
 def _validate_gpt_6_astra_unsupported_params(
-    model_id: str, params: dict[str, Any], kwargs: dict[str, Any]
+    model_id: str, params: dict[str, Any]
 ) -> None:
     """Reject gpt-6-astra requests that include unsupported sampling/logprob fields.
 
@@ -263,26 +264,28 @@ def _validate_gpt_6_astra_unsupported_params(
     message.output_text.logprobs from include."
 
     Raises kernel_errors.InvalidRequestError with a migration hint for each
-    unsupported field found. Checks params (the built Responses API dict) and
-    kwargs (per-call overrides) to catch both config-level and per-call usage.
-    No-op for any model that is not gpt-6-astra.
+    unsupported field found. Checks the final Responses API payload after
+    extra_request_params have been merged. No-op for other models.
     """
-    if not (model_id == "gpt-6-astra" or model_id.startswith("gpt-6-astra-")):
+    if model_id != "gpt-6-astra":
         return
 
     # Fields rejected by the Responses API for gpt-6-astra.
-    rejected_fields = ("temperature", "top_p", "top_logprobs")
+    rejected_fields = ("temperature", "top_p", "top_logprobs", "logprobs")
     for field in rejected_fields:
-        if field in params or field in kwargs:
+        if params.get(field) is None:
+            params.pop(field, None)
+            continue
+        if field in params:
             raise kernel_errors.InvalidRequestError(
                 f"Model {model_id!r} does not support the '{field}' parameter. "
-                f"GPT-6 Astra rejects temperature, top_p, and top_logprobs "
+                f"GPT-6 Astra rejects temperature, top_p, top_logprobs, and logprobs "
                 f"(https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md). "
                 f"Remove '{field}' from your request or provider config."
             )
 
     # Check for message.output_text.logprobs in the include list.
-    include = params.get("include") or kwargs.get("include") or []
+    include = params.get("include") or []
     if "message.output_text.logprobs" in include:
         raise kernel_errors.InvalidRequestError(
             f"Model {model_id!r} does not support 'message.output_text.logprobs' "
@@ -291,6 +294,15 @@ def _validate_gpt_6_astra_unsupported_params(
             f"(https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md). "
             f"Remove 'message.output_text.logprobs' from your include list."
         )
+
+
+def _prepare_gpt_6_astra_params(model_id: str, params: dict[str, Any]) -> None:
+    """Normalize and validate the final Astra request payload in place."""
+    if model_id != "gpt-6-astra":
+        return
+    params.pop("prompt_cache_retention", None)
+    _validate_gpt_6_astra_effort(model_id, params.get("reasoning"))
+    _validate_gpt_6_astra_unsupported_params(model_id, params)
 
 
 # Full vocabulary of reasoning.effort values any curated model accepts.
@@ -348,9 +360,7 @@ def _resolve_config_reasoning_effort(value: Any, model_id: str) -> str | None:
     # Note: 'none' is already handled above (returns None), so this guard only
     # catches 'minimal' at config-mount time. The per-request guard
     # _validate_gpt_6_astra_effort() catches runtime 'none'/'minimal' values.
-    if (model_id == "gpt-6-astra" or model_id.startswith("gpt-6-astra-")) and (
-        normalized in _GPT_6_ASTRA_REJECTED_EFFORTS
-    ):
+    if model_id == "gpt-6-astra" and normalized not in _GPT_6_ASTRA_ALLOWED_EFFORTS:
         raise ValueError(
             f"Config 'reasoning_effort'={value!r} is not accepted by model "
             f"{model_id!r}: gpt-6-astra rejects 'none' and 'minimal'. "
@@ -1536,15 +1546,9 @@ class OpenAIProvider:
                     required=False,
                     default="false",
                     requires_model=True,  # NEW -- needed for show_when to see default_model
-                    # Matches models with modelled long rates (_LONG_RATES, _cost.py).
-                    # gpt-5.6-sol/-terra/-luna: show_when "contains:gpt-5.6" covers these.
-                    # gpt-6-astra: also has long rates (2x at >272K), but show_when is
-                    # AND-only with one predicate per key, so it cannot express an OR.
-                    # gpt-6-astra can use enable_long_context via direct config
-                    # (settings.yaml / bundle config); the wizard just won't prompt for it.
-                    # gpt-5.5 has NO threshold (total no-op); gpt-5.4*/-mini/-nano have a
-                    # threshold but no long rates (cost-neutral) -- neither belongs here.
-                    show_when={"default_model": "contains:gpt-5.6"},
+                    # The current curated catalog's modeled long-rate families are
+                    # GPT-5.6 and GPT-6 Astra; both are matched by this UI predicate.
+                    show_when={"default_model": "contains:6"},
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
                 # ConfigField. It is a per-end-user signal, not a per-deployment
@@ -1683,7 +1687,7 @@ class OpenAIProvider:
             # Filter to GPT-5+ series models or deep research models
             if not (
                 model_id.startswith("gpt-5")
-                or model_id.startswith("gpt-6")
+                or model_id == "gpt-6-astra"
                 or is_deep_research
             ):
                 continue
@@ -2269,7 +2273,6 @@ class OpenAIProvider:
         if reasoning_param is None:
             reasoning_param = self.reasoning
         _validate_gpt_5_5_pro_effort(model_name, reasoning_param)
-        _validate_gpt_6_astra_effort(model_name, reasoning_param)
         _validate_reasoning_mode(reasoning_param)
         _validate_reasoning_context(reasoning_param)
         if reasoning_param:
@@ -2392,7 +2395,7 @@ class OpenAIProvider:
         # DEFAULT_PROMPT_CACHE_RETENTION="24h" which would otherwise be sent).
         # Source: https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md
         # "Replace prompt_cache_retention with prompt_cache_options.ttl set to '30m'."
-        if model_name == "gpt-6-astra" or model_name.startswith("gpt-6-astra-"):
+        if model_name == "gpt-6-astra":
             prompt_cache_retention = None
         else:
             # Drop retention values the model is known to reject. No-op unless
@@ -2444,7 +2447,8 @@ class OpenAIProvider:
             if "reasoning" not in params:
                 params["reasoning"] = {
                     "effort": kwargs.get("reasoning_effort")
-                    or self.config.get("reasoning_effort", "high"),
+                    or self.reasoning_effort
+                    or "high",
                     "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
                 }
             logger.info(
@@ -2489,15 +2493,10 @@ class OpenAIProvider:
                     model_name,
                 )
 
-        # gpt-6-astra: reject unsupported sampling/logprob fields before SDK call.
-        # Checked after all params are built (including extra_request_params candidates)
-        # so that per-call kwargs and config-sourced fields are both caught.
-        # Source: https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md
-        _validate_gpt_6_astra_unsupported_params(model_name, params, kwargs)
-
         # extra_request_params: the documented escape hatch, merged LAST so
         # it reflects in the emitted `raw` payload below (owner-beware).
         self._merge_extra_request_params(params)
+        _prepare_gpt_6_astra_params(params["model"], params)
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3247,6 +3246,7 @@ class OpenAIProvider:
                 # issues, not just the first. Merged last here too, for the
                 # same reason and with the same owner-beware semantics.
                 self._merge_extra_request_params(continue_params)
+                _prepare_gpt_6_astra_params(params["model"], continue_params)
 
                 # Make continuation call
                 try:
@@ -4631,6 +4631,9 @@ class OpenAIProvider:
         # request: the provider is stateless-only.
         if hasattr(response, "id"):
             metadata[METADATA_RESPONSE_ID] = response.id
+
+        if model := getattr(response, "model", None):
+            metadata["model"] = model
 
         # Status (completed/incomplete)
         if hasattr(response, "status"):

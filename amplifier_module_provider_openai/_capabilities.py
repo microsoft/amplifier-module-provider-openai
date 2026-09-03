@@ -252,7 +252,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
     # - supports_in_memory_retention=False: gpt-6-astra uses prompt_cache_options.ttl,
     #   not the legacy prompt_cache_retention field; the provider must not send
     #   prompt_cache_retention for Astra at all (see _capabilities_gpt6_astra_no_retention).
-    if model_id == "gpt-6-astra" or model_id.startswith("gpt-6-astra-"):
+    if model_id == "gpt-6-astra":
         return ModelCapabilities(
             family="gpt-6-astra",
             context_window=922_000,  # max input tokens (Amplifier compaction budget)
@@ -264,7 +264,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
             capability_tags=_GPT5_TAGS,
             long_context_pricing_threshold=272_000,
             supports_in_memory_retention=False,  # prompt_cache_retention not sent for Astra
-            supports_native_apply_patch=True,   # verified: apply_patch in supported tools list
+            supports_native_apply_patch=True,  # verified: apply_patch in supported tools list
             supports_native_computer_use=True,  # verified: computer_use in supported tools list
         )
 

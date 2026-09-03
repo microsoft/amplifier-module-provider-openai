@@ -142,14 +142,14 @@ class TestGPT6AstraCapabilities:
     def test_capability_tags_include_tools_reasoning_streaming_vision(self):
         caps = get_capabilities("gpt-6-astra")
         for tag in ("tools", "reasoning", "streaming", "vision"):
-            assert tag in caps.capability_tags, f"Expected tag {tag!r} in {caps.capability_tags}"
+            assert tag in caps.capability_tags, (
+                f"Expected tag {tag!r} in {caps.capability_tags}"
+            )
 
-    def test_dated_snapshot_resolves(self):
-        """A dated snapshot id (what the API echoes in response.model) resolves correctly."""
+    def test_unpublished_dated_snapshot_is_unknown(self):
+        """Do not infer capabilities for unpublished Astra snapshots."""
         caps = get_capabilities("gpt-6-astra-2026-09-03")
-        assert caps.family == "gpt-6-astra"
-        assert caps.context_window == 922_000
-        assert caps.supports_in_memory_retention is False
+        assert caps.family == "unknown"
 
     def test_does_not_affect_gpt_5_family(self):
         """Adding gpt-6-astra must not disturb gpt-5.6 or gpt-5.5 capabilities."""
@@ -187,6 +187,27 @@ class TestGPT6AstraDisplayAndDefault:
     def test_default_provider_uses_gpt_5_6_sol(self):
         provider = OpenAIProvider(api_key="test-key")
         assert provider.default_model == "gpt-5.6-sol"
+
+    def test_model_catalog_includes_only_exact_astra_id(self):
+        provider = _astra_provider()
+        provider.client.models.list = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    SimpleNamespace(id="gpt-6-astra"),
+                    SimpleNamespace(id="gpt-6-astra-2026-09-03"),
+                    SimpleNamespace(id="gpt-6-future"),
+                ]
+            )
+        )
+        models = asyncio.run(provider.list_models())
+        assert [model.id for model in models] == ["gpt-6-astra"]
+
+    def test_response_exposes_api_model_metadata(self):
+        provider = _astra_provider()
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        response = asyncio.run(provider.complete(_simple_request()))
+        assert response.metadata
+        assert response.metadata["model"] == "gpt-6-astra"
 
     def test_astra_provider_uses_gpt_6_astra(self):
         provider = _astra_provider()
@@ -286,10 +307,9 @@ class TestGPT6AstraCost:
             completion_tokens=100_000,
         )
         # 400K > 272K → long rates: $20/M input, $75/M output
-        expected = (
-            Decimal(400000) * Decimal(20) / Decimal(1000000)
-            + Decimal(100000) * Decimal(75) / Decimal(1000000)
-        )
+        expected = Decimal(400000) * Decimal(20) / Decimal(1000000) + Decimal(
+            100000
+        ) * Decimal(75) / Decimal(1000000)
         assert cost == expected
 
     def test_long_cached_input_rate(self):
@@ -353,12 +373,9 @@ class TestGPT6AstraCost:
         # All 100K cached → $1/M = $0.10
         assert cost_all_cached == Decimal(100000) * Decimal(1) / Decimal(1000000)
 
-    def test_dated_snapshot_resolves_to_astra_rates(self):
-        """A dated snapshot id falls back to the 'gpt-6-astra' family alias."""
-        # Use short-context (≤272K) to confirm short rate applies
-        cost = compute_cost("gpt-6-astra-2026-09-03", prompt_tokens=100_000)
-        # Short rate: $10/M × 0.1M = $1.00
-        assert cost == Decimal("1.00")
+    def test_unpublished_dated_snapshot_has_no_rates(self):
+        """Do not infer pricing for an unpublished Astra snapshot."""
+        assert compute_cost("gpt-6-astra-2026-09-03", prompt_tokens=100_000) is None
 
     def test_existing_gpt_5_6_sol_rates_unchanged(self):
         """Adding Astra rates must not disturb gpt-5.6-sol pricing (short-context)."""
@@ -395,6 +412,15 @@ class TestGPT6AstraLongContextReporting:
         info = provider.get_info()
         assert info.defaults["context_window"] == 922_000
 
+    def test_wizard_exposes_long_context_for_astra(self):
+        provider = _astra_provider()
+        field = next(
+            field
+            for field in provider.get_info().config_fields
+            if field.id == "enable_long_context"
+        )
+        assert field.show_when == {"default_model": "contains:6"}
+
 
 # ---------------------------------------------------------------------------
 # 6. Supported and rejected reasoning efforts
@@ -410,9 +436,7 @@ class TestGPT6AstraReasoningEfforts:
         provider = _astra_provider()
         provider.client.responses.create = AsyncMock(return_value=DummyResponse())
         # Must not raise
-        asyncio.run(
-            provider.complete(_simple_request(), reasoning={"effort": effort})
-        )
+        asyncio.run(provider.complete(_simple_request(), reasoning={"effort": effort}))
 
     @pytest.mark.parametrize("effort", ["none", "minimal"])
     def test_rejected_efforts_raise_invalid_request(self, effort):
@@ -428,6 +452,15 @@ class TestGPT6AstraReasoningEfforts:
         assert effort in msg
         # Must include migration hint
         assert "low" in msg.lower() or "migration" in msg.lower()
+
+    def test_unknown_effort_is_rejected_before_sdk_call(self):
+        provider = _astra_provider()
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            asyncio.run(
+                provider.complete(_simple_request(), reasoning={"effort": "bogus"})
+            )
+        provider.client.responses.create.assert_not_awaited()
 
     def test_omitted_reasoning_does_not_raise(self):
         """Omitting reasoning entirely must not raise (model uses its own default)."""
@@ -456,6 +489,12 @@ class TestGPT6AstraReasoningEfforts:
         provider.client.responses.create = AsyncMock(return_value=DummyResponse())
         asyncio.run(provider.complete(_simple_request()))  # must not raise
 
+    def test_extended_thinking_does_not_emit_selector_none(self):
+        provider = _astra_provider(reasoning_effort="none")
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        asyncio.run(provider.complete(_simple_request(), extended_thinking=True))
+        assert _captured_params(provider)["reasoning"]["effort"] == "high"
+
     def test_explicit_none_effort_string_in_reasoning_dict_raises(self):
         """An explicit reasoning={'effort': 'none'} dict DOES raise for Astra."""
         provider = _astra_provider()
@@ -482,18 +521,21 @@ class TestGPT6AstraReasoningEfforts:
 class TestGPT6AstraUnsupportedParams:
     """Verify that unsupported sampling/logprob fields are rejected for Astra."""
 
-    @pytest.mark.parametrize("field", ["temperature", "top_p", "top_logprobs"])
-    def test_rejected_params_raise_via_kwargs(self, field):
-        """Unsupported params passed as per-call kwargs must raise InvalidRequestError."""
+    def test_temperature_kwarg_is_rejected(self):
         provider = _astra_provider()
         provider.client.responses.create = AsyncMock(return_value=DummyResponse())
         with pytest.raises(kernel_errors.InvalidRequestError) as exc_info:
-            asyncio.run(
-                provider.complete(_simple_request(), **{field: 0.5})
-            )
+            asyncio.run(provider.complete(_simple_request(), temperature=0.5))
         msg = str(exc_info.value)
-        assert field in msg
+        assert "temperature" in msg
         assert "gpt-6-astra" in msg
+
+    @pytest.mark.parametrize("field", ["top_p", "top_logprobs"])
+    def test_unmodeled_kwargs_are_not_emitted(self, field):
+        provider = _astra_provider()
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        asyncio.run(provider.complete(_simple_request(), **{field: 0.5}))
+        assert field not in _captured_params(provider)
 
     def test_temperature_rejected_via_request(self):
         """temperature on the ChatRequest must also be rejected for Astra."""
@@ -520,6 +562,39 @@ class TestGPT6AstraUnsupportedParams:
             )
         msg = str(exc_info.value)
         assert "message.output_text.logprobs" in msg
+
+    def test_logprobs_include_from_extra_request_params_is_rejected(self):
+        provider = _astra_provider(
+            extra_request_params={
+                "include": ["message.output_text.logprobs"],
+            }
+        )
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            asyncio.run(provider.complete(_simple_request()))
+        provider.client.responses.create.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("temperature", 0.7),
+            ("top_p", 0.9),
+            ("top_logprobs", 5),
+            ("logprobs", True),
+        ],
+    )
+    def test_rejected_extra_request_params_are_validated(self, field, value):
+        provider = _astra_provider(extra_request_params={field: value})
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            asyncio.run(provider.complete(_simple_request()))
+        provider.client.responses.create.assert_not_awaited()
+
+    def test_none_extra_request_param_is_not_emitted(self):
+        provider = _astra_provider(extra_request_params={"top_p": None})
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        asyncio.run(provider.complete(_simple_request()))
+        assert "top_p" not in _captured_params(provider)
 
     def test_non_astra_temperature_not_rejected(self):
         """temperature must NOT be rejected for older models."""
@@ -571,11 +646,48 @@ class TestGPT6AstraCacheBehavior:
         """Per-call kwarg prompt_cache_retention must also be suppressed for Astra."""
         provider = _astra_provider()
         provider.client.responses.create = AsyncMock(return_value=DummyResponse())
-        asyncio.run(
-            provider.complete(_simple_request(), prompt_cache_retention="24h")
-        )
+        asyncio.run(provider.complete(_simple_request(), prompt_cache_retention="24h"))
         params = _captured_params(provider)
         assert "prompt_cache_retention" not in params
+
+    def test_extra_request_retention_not_sent_for_astra(self):
+        provider = _astra_provider(
+            extra_request_params={"prompt_cache_retention": "24h"}
+        )
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        asyncio.run(provider.complete(_simple_request()))
+        assert "prompt_cache_retention" not in _captured_params(provider)
+
+    def test_extra_request_reasoning_is_validated(self):
+        provider = _astra_provider(
+            extra_request_params={"reasoning": {"effort": "bogus"}}
+        )
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            asyncio.run(provider.complete(_simple_request()))
+        provider.client.responses.create.assert_not_awaited()
+
+    def test_extra_model_override_to_astra_uses_astra_guards(self):
+        provider = _make_provider(
+            default_model="gpt-5.6-sol",
+            extra_request_params={"model": "gpt-6-astra"},
+        )
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        asyncio.run(provider.complete(_simple_request()))
+        params = _captured_params(provider)
+        assert params["model"] == "gpt-6-astra"
+        assert "prompt_cache_retention" not in params
+
+    def test_extra_model_override_from_astra_uses_final_model_guards(self):
+        provider = _astra_provider(
+            temperature=0.7,
+            extra_request_params={"model": "gpt-5.6-sol"},
+        )
+        provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+        asyncio.run(provider.complete(_simple_request()))
+        params = _captured_params(provider)
+        assert params["model"] == "gpt-5.6-sol"
+        assert params["temperature"] == 0.7
 
     def test_ttl_30m_forwarded_via_prompt_cache_options(self):
         """prompt_cache_options={'ttl': '30m'} must be forwarded verbatim for Astra."""
@@ -629,7 +741,11 @@ class TestGPT6AstraFunctionTools:
 
         provider = OpenAIProvider(
             api_key="test-key",
-            config={"max_retries": 0, "use_streaming": False, "default_model": "gpt-6-astra"},
+            config={
+                "max_retries": 0,
+                "use_streaming": False,
+                "default_model": "gpt-6-astra",
+            },
             coordinator=coordinator,
         )
         provider.client.responses.create = AsyncMock(return_value=DummyResponse())
@@ -692,9 +808,7 @@ class TestGPT6AstraEncryptedReasoning:
         must be in the API call params."""
         provider = _astra_provider()
         provider.client.responses.create = AsyncMock(return_value=DummyResponse())
-        asyncio.run(
-            provider.complete(_simple_request(), reasoning={"effort": "high"})
-        )
+        asyncio.run(provider.complete(_simple_request(), reasoning={"effort": "high"}))
         params = _captured_params(provider)
         assert "include" in params
         assert "reasoning.encrypted_content" in params["include"]
@@ -703,9 +817,7 @@ class TestGPT6AstraEncryptedReasoning:
         """The include list must NOT contain message.output_text.logprobs for Astra."""
         provider = _astra_provider()
         provider.client.responses.create = AsyncMock(return_value=DummyResponse())
-        asyncio.run(
-            provider.complete(_simple_request(), reasoning={"effort": "high"})
-        )
+        asyncio.run(provider.complete(_simple_request(), reasoning={"effort": "high"}))
         params = _captured_params(provider)
         include = params.get("include", [])
         assert "message.output_text.logprobs" not in include

@@ -259,6 +259,8 @@ def _find_rates(
     m = _SNAPSHOT_RE.match(model)
     if m is None:
         return None
+    if m.group("base") == "gpt-6-astra":
+        return None
     return table.get(m.group("base"))
 
 
