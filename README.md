@@ -81,9 +81,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
 | `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
 | `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime. | |
-| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount unless `prompt_cache_mode = "explicit"`** (see [Prompt caching](#prompt-caching)); `ttl` always passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
-| `prompt_cache_mode` | `prompt_cache_options.mode` + `prompt_cache_breakpoint` | `"implicit"` (default) \| `"explicit"`. `explicit` injects the byte-constant sentinel at `input[0]` and turns on explicit caching. **Default is a strict no-op** (byte-identical request). | Small, measured head coverage; NOT a compaction fix. See [Explicit cache mode](#prompt_cache_mode--explicit-cache-breakpoints-r0). | |
-| `prompt_cache_stable_breakpoint` | `prompt_cache_breakpoint` | Second breakpoint on the last stable history item. **Default `false` — measured inert** (writes every request, never read back). Consulted only in explicit mode. | On = a 1.25×-rate write per request for no reads. | |
+| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); `ttl` passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
 | `reasoning_context` | `reasoning.context` | `auto`\|`current_turn`\|`all_turns`. First-class key; composes with `reasoning_effort` (the legacy `reasoning` dict does not). | `current_turn` trims rendered reasoning on long loops. | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
@@ -95,9 +93,6 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `max_retries` / `min_retry_delay` / `max_retry_delay` / `retry_jitter` | (retry) | Shared retry-with-backoff configuration. | — | |
 | `max_concurrent_requests` | **Amplifier-only** | Process-wide in-flight concurrency gate (default 5; 0 disables). | — | |
 | `extra_request_params` | **Amplifier-only (escape hatch)** | Arbitrary Responses API params, merged LAST, user wins. Own the consequences. Round-tripped by app-cli config tooling. | Depends on what you set. | |
-| `tool_loading` | `tools` (shape) | `static` (default) \| `deferred_namespace`. See [Deferred tool loading](#deferred-tool-loading-tool_loading). | Non-default rebuilds the prompt cache once, and the model must *search* for a deferred tool. | |
-| `tool_namespaces` | `tools` (shape) | Namespace grouping table for `deferred_namespace`. Defaults to the shipped table. | `web`/`browser`/`python`/`computer` are reserved by OpenAI and refused at mount. | |
-| `tool_search_always_loaded` | `tools` (shape) | Tools never deferred (default `["bash", "todo"]`). | Empty list saves ~792 more head tokens but forces a search for every tool. | |
 
 **Deprecated aliases** (still work, warn once, will be removed):
 
@@ -243,77 +238,19 @@ OpenAI's July 2025 guidance.
 | `"in_memory"` | 5–10 min in-process cache. Rejected by gpt-5.5/5.6 (auto-dropped to `"24h"` with a warning). |
 | `null` | Field omitted; OpenAI picks the per-model default. |
 
-### `prompt_cache_options` — explicit-mode dropped unless breakpoints are on
+### `prompt_cache_options` — explicit-mode dropped at mount
 
-`prompt_cache_options` is `{mode, ttl}`. **`mode: "explicit"` is dropped at
-mount unless `prompt_cache_mode = "explicit"` also asked for the breakpoint
-mechanism** (the `ttl` key always passes through unchanged): explicit mode with
-zero breakpoints disables prompt caching **entirely** — no reads, no writes —
-turning a ~95% cache-read workload into 100% full-price input (~10× regression,
-live-probed 2026-08-28).
+`prompt_cache_options` is `{mode, ttl}`. **`mode: "explicit"` is rejected at
+mount** and downgraded to implicit with a one-time warning (the `ttl` key
+passes through unchanged): this provider ships no `prompt_cache_breakpoint`
+mechanism anywhere, and explicit mode with zero breakpoints disables prompt
+caching **entirely** — no reads, no writes — turning a ~95% cache-read workload
+into 100% full-price input (~10× regression, live-probed 2026-08-28).
 
 > Residual gap, by design: a caller passing
 > `prompt_cache_options={"mode": "explicit"}` via **per-call kwargs** bypasses
 > mount validation and reaches the wire. This is consistent with the provider's
 > stance on explicit caller overrides — the caller owns the consequences.
-
-### `prompt_cache_mode` — explicit cache breakpoints (R0)
-
-`prompt_cache_mode = "explicit"` (default `"implicit"`) turns on GPT-5.6
-explicit prompt caching:
-
-1. a **byte-constant `developer` item is injected at `input[0]`** carrying
-   `prompt_cache_breakpoint: {"mode": "explicit"}`;
-2. `prompt_cache_options.mode = "explicit"` is sent (any configured `ttl` is
-   preserved);
-3. if `prompt_cache_stable_breakpoint = true` (**default `false`** — see
-   below), a **second** breakpoint is placed on the last `user`/`developer`
-   item that is not the final input item.
-
-At most **2** breakpoints are ever emitted (the API allows ≤4 cache writes per
-request; ≤3 is this provider's self-imposed budget).
-
-**What it buys, measured** (probe P7 arm A7, `gpt-5.6-terra`, 3/3 reps,
-2026-09-02): a breakpoint on the constant `input[0]` sentinel writes a prefix
-that includes top-level `instructions` **and** `tools` — 12,318–12,321 tokens
-written against a ~12,330-token head — and a following request with a
-**different** user tail read back the same count and wrote 0 on the tail.
-
-**What it does NOT buy** — three honest limits:
-
-- **It is not a compaction remedy.** The same probe's pre-registered gate
-  failed: a breakpoint written at the exact post-compaction retained-prefix
-  boundary (6,095–6,099 tokens, provably written) still read back **0** after
-  the shrink. OpenAI's cache is grow-only in explicit mode too.
-- **Explicit caching happens only at breakpoints.** Anything after the last
-  breakpoint is billed as fresh input every request, while implicit caching
-  covers the whole growing prefix. Measured on the same payload and the same
-  growing 3-request conversation (`gpt-5.6-terra`, per-request cost at
-  published rates): implicit **$0.002255** · explicit **$0.006326 (2.81×)** ·
-  explicit + stable breakpoint **$0.007458 (3.31×)**. Implicit read back
-  10,644 of 10,671 input tokens (99.7%).
-- **The stable breakpoint does not work, and is off by default.** With a
-  2,240-token stable span (well clear of the 1,024-token cacheable minimum) it
-  provably *wrote* 2,240 then 2,264 tokens at the 1.25× write rate, and the
-  next request still read back only the sentinel prefix. Coverage never
-  extended. The knob is kept for probing, not for production.
-- **Expected value is small — and on this evidence it is negative on
-  non-shrinking traffic.** Explicit mode is not a savings feature. It exists so
-  that anyone who *must* run explicit mode gets guaranteed head coverage
-  instead of the ~10× cliff, and as the mechanism future breakpoint work builds
-  on.
-
-The carrier matters and is not negotiable: a breakpoint on an **assistant**
-`output_text` block is accepted with HTTP 200 and silently writes nothing. Only
-`input_text` blocks on `user`/`developer` items are used.
-
-`PROMPT_CACHE_SENTINEL_TEXT` is load-bearing: every byte is part of the cached
-prefix, so editing it cold-starts the sentinel entry for every session, once.
-
-> "Last stable history item" is approximated provider-locally (last
-> `user`/`developer` `input_text` item that is not the tail).
-> context-simple's `_seq` stable-prefix signal does not cross the provider
-> boundary — kernel `Message` objects carry no `_seq`.
 
 ### `extra_request_params`
 
@@ -333,87 +270,6 @@ provider-computed key — so it overrides anything the provider set, deliberatel
 ```toml
 config = { extra_request_params = { store = true, seed = 42 } }
 ```
-
-## Deferred tool loading (`tool_loading`)
-
-**Off by default, and the default is byte-identical to every prior release.**
-`tool_loading: static` (the default, and what you get when the key is absent)
-takes the same code path it always did; the deferred branch is only reachable
-when the flag is set explicitly. `tests/test_tool_search_namespaces.py` pins the
-default `tools` array by value *and* by sha256 over its serialized bytes.
-
-`tool_loading: deferred_namespace` groups the tool roster into namespaces with
-`defer_loading: true` and adds `{"type": "tool_search"}`, so the model sees only
-namespace names and descriptions up front and pulls in the full definitions when
-it needs them. Discovered tools are appended at the **end** of the context
-window, which is why this shrinks the pinned head without rewriting it.
-
-```yaml
-config:
-  tool_loading: deferred_namespace
-  # optional -- defaults to the shipped table
-  tool_namespaces:
-    - name: files
-      description: Read, write, edit, search and list files in the workspace.
-      members: [apply_patch, edit_file, glob, grep, read_file, write_file]
-    - name: shell
-      description: Run shell commands and manage a task checklist.
-      members: [bash, todo]
-  tool_search_always_loaded: [bash, todo]
-```
-
-Measured on `gpt-5.6-terra` against a 14-tool, 18,458-token head
-(`tool_choice: "none"`, so the block cost is exact):
-
-| mode | tool-block tokens | head saving |
-|---|---:|---:|
-| `static` | 8,677 | — |
-| `deferred_namespace` (default hedge) | 1,925 | **6,752 (36.6% of head)** |
-| `deferred_namespace`, `tool_search_always_loaded: []` | 1,133 | 7,544 (40.9%) |
-
-### Things to know before turning it on
-
-- **OpenAI only, by construction.** Everything happens below the `ChatRequest`
-  seam. No other provider can observe the feature existing — which matters,
-  because editing the tools array is a full cache rebuild on Anthropic.
-- **Turning it on costs one cold cache rebuild**, since the tools block changes.
-  One-time, not recurring.
-- **The model can substitute a visible tool for a deferred one.** Measured 1 in
-  20 turns: asked to read a file, the model reached for always-loaded `bash`
-  instead of searching for `read_file`. Deferring `bash` too removed it in 10/10
-  retries, at the cost of a search round-trip on nearly every session.
-- **Loading is per-NAMESPACE, not per-tool.** Asking for one member loads all of
-  them, so grouping granularity *is* the cost model.
-- **`web`, `browser`, `python` and `computer` are reserved** namespace names and
-  return HTTP 400. The table validator refuses them at mount.
-- **`tool_choice` is forced to `"auto"`** in this mode: forcing a tool the model
-  has not discovered yet has no defined behaviour.
-- A tool registered **mid-session** rides a developer-role `additional_tools`
-  input item at the tail rather than being spliced into the cached tools block.
-
-### Interaction with `prompt_cache_mode: explicit` (R0)
-
-Both features rewrite the params assembly, so their combination is pinned by
-`tests/test_r0_deferred_tools_interaction.py`. With **both off** the request is
-byte-identical to what shipped before either existed (asserted against a literal
-payload plus a sha256, with negative controls proving each flag alone moves the
-bytes). With **both on**:
-
-- Deferred appends `additional_tools` at the tail *before* R0 prepends its
-  sentinel, so the sentinel keeps `input[0]` and the discovered-tools item keeps
-  the tail. Neither displaces the other.
-- **No breakpoint ever lands on the `additional_tools` item.** It is the one
-  input item that grows mid-session; a breakpoint at or behind it would pull a
-  moving payload into the cached prefix.
-- **One behaviour delta worth knowing:** R0's stable-breakpoint heuristic skips
-  the *final* input item as the dynamic tail. In deferred mode the final item is
-  the `additional_tools` item, so the last real history message becomes an
-  eligible carrier and a second breakpoint can fire where R0 alone would place
-  only the sentinel. That placement is correct — the item is pinned to the tail
-  on every subsequent request, so the prefix through that message is
-  byte-identical next request — but it costs one extra cache write (R0's rig:
-  explicit `$0.006326` → explicit + stable breakpoint `$0.007458`). Still inside
-  R0's ≤2-breakpoint budget.
 
 ## Long context
 
@@ -541,7 +397,6 @@ The provider populates `ChatResponse.metadata` with OpenAI-specific state:
 | `openai:incomplete_reason` | `str` | `"max_output_tokens"` or `"content_filter"`. |
 | `openai:reasoning_items` | `list[str]` | Reasoning item ids (`rs_*`) for state preservation. |
 | `openai:continuation_count` | `int` | Number of auto-continuations performed (if > 0). |
-| `openai:tool_search_items` | `list[dict]` | Hosted `tool_search_call` / `tool_search_output` items, replayed verbatim into `input` on the next request. Dropping them makes every discovered tool cease to exist for the model **and** breaks the cache forward. |
 
 All keys use the `openai:` prefix to prevent collisions with other providers.
 
