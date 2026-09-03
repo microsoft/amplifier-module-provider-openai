@@ -5,9 +5,8 @@ chain (the wizard offered `prompt_cache_retention: in_memory` for every
 model, including gpt-5.6, which the request path then silently drops on
 every session):
 
-1. `prompt_cache_retention`, `text_verbosity`, and `enable_reasoning_context`
-   are now gated via `requires_model` + `show_when`, so the wizard only
-   offers values a model actually supports.
+1. Model-aware fields use `requires_model` and `show_when`; long-context is
+   offered for the current GPT-5.6 and GPT-6 Astra long-rate families.
 2. The `_drop_unsupported_in_memory_retention` warning leads with omission
    as the recommended remedy, and names `prompt_cache_options.ttl` as the
    gpt-5.6-specific replacement mechanism.
@@ -113,15 +112,12 @@ def _field_as_dict(field) -> dict[str, Any]:
 
 
 class TestConfigFieldGatingMetadata:
-    """enable_long_context now carries requires_model=True and a show_when
-    gating it to gpt-5.6-family models (X1 decision). text_verbosity and
-    prompt_cache_retention are no longer ConfigFields at all (config-surface
-    V2 reduced the wizard to 4 fields) -- see test_wizard_surface.py."""
+    """enable_long_context remains gated to modeled long-rate families."""
 
-    def test_enable_long_context_requires_model_and_shows_only_for_5_6(self):
+    def test_enable_long_context_is_available_for_astra(self):
         field = _field(_make_provider(), "enable_long_context")
         assert field.requires_model is True
-        assert field.show_when == {"default_model": "contains:gpt-5.6"}
+        assert field.show_when == {"default_model": "contains:6"}
 
     def test_untouched_fields_keep_no_gating(self):
         """Do-NOT-touch scope check: reasoning_effort keeps its existing
@@ -139,13 +135,21 @@ class TestConfigFieldGatingMetadata:
 
 
 class TestShowWhenConsumerSimulation:
-    """Drive enable_long_context through the real wizard predicate logic
-    (`_should_show_field`) for representative models, mirroring how
-    amplifier_app_cli.provider_config_utils.configure_provider evaluates
-    post-model-selection fields."""
+    """The wizard exposes long-context opt-in for GPT-5.6 and Astra."""
 
-    GPT_5_6_MODELS = ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
-    NON_5_6_MODELS = ("gpt-5.4", "gpt-5.5", "gpt-5.5-pro", "gpt-4o", "gpt-5-mini")
+    LONG_RATE_MODELS = (
+        "gpt-6-astra",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    )
+    OTHER_MODELS = (
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5-mini",
+    )
 
     def _gated_fields(self, provider: OpenAIProvider) -> dict[str, dict[str, Any]]:
         info = provider.get_info()
@@ -155,16 +159,16 @@ class TestShowWhenConsumerSimulation:
             if f.id in ("enable_long_context",)
         }
 
-    def test_enable_long_context_shown_only_for_5_6_tiers(self):
+    def test_enable_long_context_is_visible_for_supported_selection(self):
         fields = self._gated_fields(_make_provider())
-        for model in self.GPT_5_6_MODELS:
+        for model in self.LONG_RATE_MODELS:
             assert (
                 _should_show_field(
                     fields["enable_long_context"], {"default_model": model}
                 )
                 is True
             ), f"enable_long_context should be shown for {model}"
-        for model in self.NON_5_6_MODELS:
+        for model in self.OTHER_MODELS:
             assert (
                 _should_show_field(
                     fields["enable_long_context"], {"default_model": model}

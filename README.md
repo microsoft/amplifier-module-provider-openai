@@ -29,6 +29,7 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 
 ## Supported Models
 
+- `gpt-6-astra` — GPT-6 Astra. OpenAI's most capable model (rolling out 2026-09-03 via Trusted Access Program; Plus/Pro/Business/Enterprise API access following). **Not the default** — `gpt-5.6-sol` remains the default. See [GPT-6 Astra](#gpt-6-astra) below.
 - `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
 - `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
@@ -294,7 +295,94 @@ it does not map to an API parameter.
   number).
 
 The `enable_long_context` ConfigField is gated (`show_when`) to gpt-5.6-family
-models — the only models where the flag carries a cost consequence.
+models in the wizard. GPT-6 Astra also has long-context pricing (>272K → 2×
+rates) and supports `enable_long_context` via direct config (settings.yaml /
+bundle config block); the wizard does not prompt for it because `show_when` is
+AND-only with one predicate.
+
+## GPT-6 Astra
+
+> **Availability:** Rolling out 2026-09-03 via Trusted Access Program (enterprise). Plus/Pro/Business/Enterprise API access following.
+> **Sources:** [Announcement](https://openai.com/index/gpt-6-astra/), [Model reference](https://developers.openai.com/api/docs/models/gpt-6-astra.md), [Model guide](https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md), [Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching), [Pricing](https://developers.openai.com/api/docs/pricing)
+
+`gpt-6-astra` is OpenAI's most capable model, built for complex reasoning, coding, computer use, research, and document creation. The default model remains `gpt-5.6-sol`.
+
+### Limits
+
+| Parameter | Value |
+| --- | --- |
+| API model ID | `gpt-6-astra` |
+| Display name | GPT 6 Astra |
+| Amplifier input/compaction budget | 922,000 tokens |
+| Maximum output tokens | 128,000 tokens |
+| Total context capacity | 1,050,000 tokens |
+| Long-pricing threshold | 272,000 input tokens |
+| Knowledge cutoff | Apr 30, 2026 |
+
+### Modalities
+
+- **Input:** text, image
+- **Output:** text only
+
+### Capabilities
+
+Verified supported: text and image input, text output, Responses API tool/function calling, reasoning, streaming, Structured Outputs, prompt caching, `apply_patch` tool, computer use.
+
+Not supported: Realtime, Assistants, fine-tuning, embeddings, legacy Completions, Chat Completions tool calling.
+
+### Reasoning efforts
+
+Supported: `low`, `medium`, `high`, `xhigh`, `max`.
+
+**Rejected pre-flight:** `none` and `minimal` — the provider raises `InvalidRequestError` before the SDK call with a migration hint. Use `low` for lightweight tasks, or omit `reasoning_effort` entirely to let the model choose.
+
+Note: The provider convention where an omitted or selector `none` means "send no reasoning field at all" is preserved. Only an explicitly supplied `none` or `minimal` is rejected.
+
+### Unsupported request parameters
+
+The following parameters are rejected by GPT-6 Astra and produce a local `InvalidRequestError` before the SDK call:
+
+- `temperature`
+- `top_p`
+- `top_logprobs`
+- `message.output_text.logprobs` in the `include` list
+
+Older-model behavior is unchanged — these parameters continue to work for models that support them.
+
+### Prompt caching
+
+GPT-6 Astra uses `prompt_cache_options.ttl` for cache lifetime control. The legacy `prompt_cache_retention` field is **not sent** for Astra — including the provider's default `"24h"` value. Use `prompt_cache_options = {"ttl": "30m"}` to set cache lifetime.
+
+The `prompt_cache_options.mode = "explicit"` safety guard is preserved: if set at mount time, the `mode` key is stripped with a warning (same behavior as gpt-5.6).
+
+### Cost accounting (Standard tier)
+
+All rates are USD per million tokens, Standard tier only. Batch/Flex/Fast and regional uplifts are not represented.
+
+| Context | Input | Cached input | Cache write | Output |
+| --- | --- | --- | --- | --- |
+| ≤ 272,000 tokens | $10.00 | $1.00 | $12.50 | $50.00 |
+| > 272,000 tokens | $20.00 | $2.00 | $25.00 | $75.00 |
+
+- The threshold is measured on **input tokens only**. Exactly 272,000 is short-context; > 272,000 re-rates the **entire request** (input, output, cached, and cache-write tokens) at long rates.
+- Cache writes are billed at 1.25× the uncached input rate (same as gpt-5.6).
+- Reasoning tokens are output tokens.
+- `enable_long_context` works via direct config (settings.yaml / bundle config block). The wizard does not prompt for it for gpt-6-astra.
+
+### Intentionally deferred Astra features
+
+The following features are not implemented in this initial integration and are intentionally deferred:
+
+- Async tool calling (`async: true` on function/custom tools)
+- Mid-turn steering (WebSocket Responses transport)
+- `configuration_update` input items (change reasoning effort mid-conversation)
+- WebSocket Responses transport
+- Deferred tool loading / tool search
+- Batch/Flex/Fast-aware runtime cost selection
+- Regional pricing (10% uplift for EU data residency)
+- Azure OpenAI deployment claims
+
+These are recorded as deferred rather than advertised as partial support.
 
 ## Debugging (`raw`)
 
