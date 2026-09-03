@@ -81,10 +81,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
 | `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
 | `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime. | |
-| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount unless `prompt_cache_mode = "explicit"`** (see [Prompt caching](#prompt-caching)); `ttl` always passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
-| `prompt_cache_mode` | `prompt_cache_options.mode` + `prompt_cache_breakpoint` | `"implicit"` (default) \| `"explicit"`. `explicit` injects the byte-constant sentinel at `input[0]` and turns on explicit caching. **Default is a strict no-op** (byte-identical request). | Small, measured head coverage; NOT a compaction fix. See [Explicit cache mode](#prompt_cache_mode--explicit-cache-breakpoints-r0). | |
-| `prompt_cache_stable_breakpoint` | `prompt_cache_breakpoint` | Second breakpoint on the last stable history item. **Default `false` — measured inert** (writes every request, never read back). Consulted only in explicit mode. | On = a 1.25×-rate write per request for no reads. | |
-| `reasoning_context` | `reasoning.context` | `auto`\|`current_turn`\|`all_turns`. First-class key; composes with `reasoning_effort` (the legacy `reasoning` dict does not). | `current_turn` trims rendered reasoning on long loops. | |
+| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); `ttl` passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
 | `reasoning_replay_scope` | **Amplifier-only** | Bounds inline reasoning replay: `turn` (default) \| `all` \| `none`. | `"all"` grows the payload without bound (~1,200 chars/blob). | |
@@ -109,7 +106,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | --- | --- |
 | `enable_response_chaining` | Removed — the provider is always stateless now (see [Conversation state](#conversation-state)). |
 | `enable_state` | Removed — `store` is managed automatically (false, except background mode which requires true); use `extra_request_params` to force it. |
-| `enable_reasoning_context` | Removed — `reasoning.context` is now forwarded whenever you supply it. Set the first-class key `reasoning_context = "current_turn"` (composes with `reasoning_effort`), or put it in the legacy `reasoning` dict, e.g. `reasoning = {effort = "high", context = "current_turn"}`. |
+| `enable_reasoning_context` | Removed — `reasoning.context` is now forwarded whenever you supply it in the legacy `reasoning` dict, e.g. `reasoning = {effort = "high", context = "current_turn"}`. |
 | `thinking_budget_tokens` | Removed — `extended_thinking` still forces high reasoning effort, but no longer adjusts `max_output_tokens`. Set `max_output_tokens` directly. |
 | `thinking_budget_buffer` | Removed — see `thinking_budget_tokens`. |
 
@@ -164,16 +161,6 @@ Notes:
   `reasoning.mode` (`{effort = "high", mode = "pro"}`) or `reasoning.context`
   (GPT-5.6 persisted reasoning) — both are forwarded ungated for an explicit
   `reasoning` dict; the caller owns the consequences.
-- **For `reasoning.context`, prefer the first-class `reasoning_context` key.**
-  The legacy dict is outranked by `reasoning_effort`, so an operator setting
-  both had their `context` silently dropped. `reasoning_context` composes with
-  whichever path built the reasoning object, and an explicit `context` inside a
-  caller-supplied `reasoning` dict still wins. Measured on this provider's own
-  stateless manual-replay path (`store=false`, reasoning items replayed inline):
-  with no `context` field the API's effective mode is `all_turns`; an explicit
-  `current_turn` is honored and echoed back (t8p, gpt-5.6-terra, 2026-09-02).
-  It has no effect on a request that sends no reasoning parameter at all — the
-  provider logs a warning rather than inventing one.
 
 ## Conversation state
 
@@ -240,77 +227,19 @@ OpenAI's July 2025 guidance.
 | `"in_memory"` | 5–10 min in-process cache. Rejected by gpt-5.5/5.6 (auto-dropped to `"24h"` with a warning). |
 | `null` | Field omitted; OpenAI picks the per-model default. |
 
-### `prompt_cache_options` — explicit-mode dropped unless breakpoints are on
+### `prompt_cache_options` — explicit-mode dropped at mount
 
-`prompt_cache_options` is `{mode, ttl}`. **`mode: "explicit"` is dropped at
-mount unless `prompt_cache_mode = "explicit"` also asked for the breakpoint
-mechanism** (the `ttl` key always passes through unchanged): explicit mode with
-zero breakpoints disables prompt caching **entirely** — no reads, no writes —
-turning a ~95% cache-read workload into 100% full-price input (~10× regression,
-live-probed 2026-08-28).
+`prompt_cache_options` is `{mode, ttl}`. **`mode: "explicit"` is rejected at
+mount** and downgraded to implicit with a one-time warning (the `ttl` key
+passes through unchanged): this provider ships no `prompt_cache_breakpoint`
+mechanism anywhere, and explicit mode with zero breakpoints disables prompt
+caching **entirely** — no reads, no writes — turning a ~95% cache-read workload
+into 100% full-price input (~10× regression, live-probed 2026-08-28).
 
 > Residual gap, by design: a caller passing
 > `prompt_cache_options={"mode": "explicit"}` via **per-call kwargs** bypasses
 > mount validation and reaches the wire. This is consistent with the provider's
 > stance on explicit caller overrides — the caller owns the consequences.
-
-### `prompt_cache_mode` — explicit cache breakpoints (R0)
-
-`prompt_cache_mode = "explicit"` (default `"implicit"`) turns on GPT-5.6
-explicit prompt caching:
-
-1. a **byte-constant `developer` item is injected at `input[0]`** carrying
-   `prompt_cache_breakpoint: {"mode": "explicit"}`;
-2. `prompt_cache_options.mode = "explicit"` is sent (any configured `ttl` is
-   preserved);
-3. if `prompt_cache_stable_breakpoint = true` (**default `false`** — see
-   below), a **second** breakpoint is placed on the last `user`/`developer`
-   item that is not the final input item.
-
-At most **2** breakpoints are ever emitted (the API allows ≤4 cache writes per
-request; ≤3 is this provider's self-imposed budget).
-
-**What it buys, measured** (probe P7 arm A7, `gpt-5.6-terra`, 3/3 reps,
-2026-09-02): a breakpoint on the constant `input[0]` sentinel writes a prefix
-that includes top-level `instructions` **and** `tools` — 12,318–12,321 tokens
-written against a ~12,330-token head — and a following request with a
-**different** user tail read back the same count and wrote 0 on the tail.
-
-**What it does NOT buy** — three honest limits:
-
-- **It is not a compaction remedy.** The same probe's pre-registered gate
-  failed: a breakpoint written at the exact post-compaction retained-prefix
-  boundary (6,095–6,099 tokens, provably written) still read back **0** after
-  the shrink. OpenAI's cache is grow-only in explicit mode too.
-- **Explicit caching happens only at breakpoints.** Anything after the last
-  breakpoint is billed as fresh input every request, while implicit caching
-  covers the whole growing prefix. Measured on the same payload and the same
-  growing 3-request conversation (`gpt-5.6-terra`, per-request cost at
-  published rates): implicit **$0.002255** · explicit **$0.006326 (2.81×)** ·
-  explicit + stable breakpoint **$0.007458 (3.31×)**. Implicit read back
-  10,644 of 10,671 input tokens (99.7%).
-- **The stable breakpoint does not work, and is off by default.** With a
-  2,240-token stable span (well clear of the 1,024-token cacheable minimum) it
-  provably *wrote* 2,240 then 2,264 tokens at the 1.25× write rate, and the
-  next request still read back only the sentinel prefix. Coverage never
-  extended. The knob is kept for probing, not for production.
-- **Expected value is small — and on this evidence it is negative on
-  non-shrinking traffic.** Explicit mode is not a savings feature. It exists so
-  that anyone who *must* run explicit mode gets guaranteed head coverage
-  instead of the ~10× cliff, and as the mechanism future breakpoint work builds
-  on.
-
-The carrier matters and is not negotiable: a breakpoint on an **assistant**
-`output_text` block is accepted with HTTP 200 and silently writes nothing. Only
-`input_text` blocks on `user`/`developer` items are used.
-
-`PROMPT_CACHE_SENTINEL_TEXT` is load-bearing: every byte is part of the cached
-prefix, so editing it cold-starts the sentinel entry for every session, once.
-
-> "Last stable history item" is approximated provider-locally (last
-> `user`/`developer` `input_text` item that is not the tail).
-> context-simple's `_seq` stable-prefix signal does not cross the provider
-> boundary — kernel `Message` objects carry no `_seq`.
 
 ### `extra_request_params`
 
