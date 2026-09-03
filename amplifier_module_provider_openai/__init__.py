@@ -57,7 +57,6 @@ from ._constants import (
     METADATA_REASONING_ITEMS,
     METADATA_RESPONSE_ID,
     METADATA_STATUS,
-    METADATA_TOOL_SEARCH_ITEMS,
     NATIVE_TOOL_TYPES,
 )
 from ._cost import compute_cost
@@ -68,15 +67,6 @@ from ._response_handling import (
     extract_reasoning_text,
     merge_discarded_usage,
     parse_function_call_block,
-)
-from ._tool_search import (
-    TOOL_LOADING_DEFERRED_NAMESPACE,
-    DEFAULT_ALWAYS_LOADED,
-    build_additional_tools_item,
-    build_namespaced_tools,
-    extract_hosted_tool_search_items,
-    normalize_namespaces,
-    validate_tool_loading,
 )
 
 logger = logging.getLogger(__name__)
@@ -1056,9 +1046,6 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "retry_jitter",
         "max_concurrent_requests",
         "extra_request_params",
-        "tool_loading",
-        "tool_namespaces",
-        "tool_search_always_loaded",
     }
 )
 
@@ -1384,40 +1371,6 @@ class OpenAIProvider:
         # text.verbosity (GPT-5.6): "low" | "medium" | "high". Wrapped into the
         # Responses API `text` object at request time. None = do not send.
         self.text_verbosity: str | None = self.config.get("text_verbosity") or None
-
-        # tool_loading (OPENAI-ONLY): "static" (default) | "deferred_namespace".
-        #
-        # "static" is the shipped behaviour and MUST stay byte-identical: the
-        # deferred branch is reached only when the flag is explicitly set, so a
-        # default-config request produces the exact same `tools` array it
-        # produced before this feature existed. tests/test_tool_search_namespaces.py
-        # asserts that byte-identity rather than assuming it.
-        #
-        # "deferred_namespace" groups the roster into namespaces with
-        # `defer_loading: true` and adds `{"type": "tool_search"}`. There is
-        # deliberately no "flat" mode -- see _tool_search.py for the measured
-        # 1,270-vs-7,573-token reason.
-        self.tool_loading: str = validate_tool_loading(self.config.get("tool_loading"))
-        self.tool_namespaces = normalize_namespaces(self.config.get("tool_namespaces"))
-        _always = self.config.get("tool_search_always_loaded")
-        self.tool_search_always_loaded: frozenset[str] = frozenset(
-            DEFAULT_ALWAYS_LOADED if _always is None else (str(t) for t in _always)
-        )
-        # Roster snapshot for the mid-session case. A provider instance is
-        # mounted per session, so this is session-scoped state by construction.
-        # None until the first deferred request assembles a tools block.
-        self._tool_search_roster: frozenset[str] | None = None
-        self._tool_search_extra: dict[str, dict[str, Any]] = {}
-        # Set by _convert_tools_from_request, consumed in the same request
-        # assembly a few lines later. None whenever there is nothing to append.
-        self._pending_additional_tools_item: dict[str, Any] | None = None
-        if self.tool_loading == TOOL_LOADING_DEFERRED_NAMESPACE:
-            logger.info(
-                "[PROVIDER] tool_loading=deferred_namespace (OpenAI-only). "
-                "Namespaces: %s. Always-loaded: %s.",
-                ", ".join(ns["name"] for ns in self.tool_namespaces),
-                ", ".join(sorted(self.tool_search_always_loaded)) or "(none)",
-            )
 
         # D2: how much prior reasoning to replay inline on stateless requests.
         #   "turn" (default) -- assistant turns since the last user message. Preserves
@@ -2498,25 +2451,6 @@ class OpenAIProvider:
             params["tools"] = self._convert_tools_from_request(tools_list, model_name)
             # Add tool-related parameters per Responses API spec
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
-            if self.tool_loading == TOOL_LOADING_DEFERRED_NAMESPACE:
-                # `tool_choice` semantics against a DEFERRED tool are unprobed
-                # (probe `bub` break 1: only "none" and "auto" were exercised).
-                # Forcing a tool the model has not discovered yet has no defined
-                # behaviour, so pin "auto" and say so rather than sending an
-                # untested combination into a live session.
-                if params["tool_choice"] != "auto":
-                    logger.warning(
-                        "[PROVIDER] tool_loading=deferred_namespace forces "
-                        "tool_choice='auto' (requested %r): forcing a tool that "
-                        "has not been discovered yet is unspecified.",
-                        params["tool_choice"],
-                    )
-                    params["tool_choice"] = "auto"
-                # Mid-session tools ride an `additional_tools` INPUT item at the
-                # tail -- an append, never an edit of the `tools` block.
-                _extra_item = self._pending_additional_tools_item
-                if _extra_item is not None and isinstance(params.get("input"), list):
-                    params["input"] = [*params["input"], _extra_item]
             params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
             # max_tool_calls limits how many tool calls the model can make
             # Important for deep research to prevent excessive searching that consumes token budget
@@ -4156,20 +4090,6 @@ class OpenAIProvider:
                     for reasoning_item in reasoning_items_to_add:
                         openai_messages.append(reasoning_item)
 
-                # Hosted tool-search items, replayed VERBATIM and in wire order
-                # (reasoning -> tool_search_call -> tool_search_output ->
-                # function_call, as measured on the wire). These are not model
-                # output; they are the record of which tools got loaded. Drop
-                # them and, per `TS:854`, those tools cease to exist for the
-                # model AND the cache breaks forward -- so unlike reasoning
-                # replay they are NOT gated by reasoning_replay_scope. The API
-                # accepts them as input items on the round trip (measured,
-                # probe `bub` G2: 99.98% of the prior input stayed cached).
-                if metadata:
-                    for _ts_item in metadata.get(METADATA_TOOL_SEARCH_ITEMS) or []:
-                        if isinstance(_ts_item, dict):
-                            openai_messages.append(dict(_ts_item))
-
                 # Only add assistant message if there's content
                 if assistant_content:
                     _occ_key = json.dumps(
@@ -4404,89 +4324,7 @@ class OpenAIProvider:
                     }
                 )
 
-        # tool_loading == "static" (the default) returns here, byte-identical to
-        # the shipped behaviour. The deferred branch is strictly downstream of
-        # the same conversion, so the two paths cannot drift apart.
-        if self.tool_loading != TOOL_LOADING_DEFERRED_NAMESPACE:
-            return openai_tools
-
-        block, extra_item = self._assemble_deferred_tools(openai_tools)
-        self._pending_additional_tools_item = extra_item
-        return block
-
-    def _assemble_deferred_tools(
-        self, flat_tools: list[dict[str, Any]]
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-        """Split a flat tool list into (namespaced tools block, additional_tools item).
-
-        The whole point of this lever is that discovery must be an APPEND, never
-        an edit of the pinned head. That applies to our own roster too: once the
-        `tools` block has been assembled for a session, a tool registered
-        mid-session (a mode contributing tools, a skill activating one) must NOT
-        be spliced into that block -- `12v` measured that a 2.1% byte change to
-        the tools array zeroes the cache outright. It goes into a developer-role
-        `additional_tools` INPUT item instead (`TS:870-890`), which lands in the
-        `input` array and leaves the head untouched.
-
-        The item is emitted at the input tail on every subsequent request. That
-        keeps it monotone: everything before it is an unchanged prefix, so the
-        cache is preserved and only the tail region is re-written. `TS:893`'s
-        contract is about not letting the item drift EARLIER (which would change
-        which tools the model saw at a given point); pinning it to the tail
-        never does that.
-
-        A tool that DISAPPEARS from the roster is the one case that does force a
-        block rebuild, and it is taken deliberately: continuing to advertise a
-        tool the loop can no longer dispatch would let the model call something
-        that does not exist. Correctness beats one cold cache rebuild, and the
-        rebuild is logged by name.
-        """
-        present = {
-            t["name"]
-            for t in flat_tools
-            if isinstance(t, dict) and t.get("type") == "function" and "name" in t
-        }
-
-        if self._tool_search_roster is None:
-            self._tool_search_roster = frozenset(present)
-        elif not self._tool_search_roster <= present:
-            missing = sorted(self._tool_search_roster - present)
-            logger.warning(
-                "[PROVIDER] tool_loading=deferred_namespace: %d tool(s) left the "
-                "roster mid-session (%s). Rebuilding the tools block, which costs "
-                "one cold prompt-cache rebuild -- taken deliberately so the model "
-                "is never offered a tool the loop cannot dispatch.",
-                len(missing),
-                ", ".join(missing),
-            )
-            self._tool_search_roster = frozenset(present)
-            self._tool_search_extra.clear()
-
-        roster = self._tool_search_roster
-        in_block = [
-            t
-            for t in flat_tools
-            if not (
-                isinstance(t, dict)
-                and t.get("type") == "function"
-                and t.get("name") not in roster
-            )
-        ]
-        for t in flat_tools:
-            if (
-                isinstance(t, dict)
-                and t.get("type") == "function"
-                and t.get("name") not in roster
-            ):
-                self._tool_search_extra.setdefault(t["name"], t)
-
-        block = build_namespaced_tools(
-            in_block, self.tool_namespaces, self.tool_search_always_loaded
-        )
-        extra_item = build_additional_tools_item(
-            [self._tool_search_extra[n] for n in sorted(self._tool_search_extra)]
-        )
-        return block, extra_item
+        return openai_tools
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
         """Convert OpenAI response to ChatResponse format.
@@ -4912,13 +4750,6 @@ class OpenAIProvider:
         # Reasoning item IDs (for explicit passing if needed)
         if reasoning_item_ids:
             metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
-
-        # Hosted tool-search items -- see _tool_search.extract_hosted_tool_search_items.
-        _tool_search_items = extract_hosted_tool_search_items(
-            list(getattr(response, "output", None) or [])
-        )
-        if _tool_search_items:
-            metadata[METADATA_TOOL_SEARCH_ITEMS] = _tool_search_items
 
         # DEBUG: Log what we're returning
         logger.info(

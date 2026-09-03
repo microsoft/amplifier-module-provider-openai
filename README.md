@@ -95,9 +95,6 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `max_retries` / `min_retry_delay` / `max_retry_delay` / `retry_jitter` | (retry) | Shared retry-with-backoff configuration. | — | |
 | `max_concurrent_requests` | **Amplifier-only** | Process-wide in-flight concurrency gate (default 5; 0 disables). | — | |
 | `extra_request_params` | **Amplifier-only (escape hatch)** | Arbitrary Responses API params, merged LAST, user wins. Own the consequences. Round-tripped by app-cli config tooling. | Depends on what you set. | |
-| `tool_loading` | `tools` (shape) | `static` (default) \| `deferred_namespace`. See [Deferred tool loading](#deferred-tool-loading-tool_loading). | Non-default rebuilds the prompt cache once, and the model must *search* for a deferred tool. | |
-| `tool_namespaces` | `tools` (shape) | Namespace grouping table for `deferred_namespace`. Defaults to the shipped table. | `web`/`browser`/`python`/`computer` are reserved by OpenAI and refused at mount. | |
-| `tool_search_always_loaded` | `tools` (shape) | Tools never deferred (default `["bash", "todo"]`). | Empty list saves ~792 more head tokens but forces a search for every tool. | |
 
 **Deprecated aliases** (still work, warn once, will be removed):
 
@@ -334,87 +331,6 @@ provider-computed key — so it overrides anything the provider set, deliberatel
 config = { extra_request_params = { store = true, seed = 42 } }
 ```
 
-## Deferred tool loading (`tool_loading`)
-
-**Off by default, and the default is byte-identical to every prior release.**
-`tool_loading: static` (the default, and what you get when the key is absent)
-takes the same code path it always did; the deferred branch is only reachable
-when the flag is set explicitly. `tests/test_tool_search_namespaces.py` pins the
-default `tools` array by value *and* by sha256 over its serialized bytes.
-
-`tool_loading: deferred_namespace` groups the tool roster into namespaces with
-`defer_loading: true` and adds `{"type": "tool_search"}`, so the model sees only
-namespace names and descriptions up front and pulls in the full definitions when
-it needs them. Discovered tools are appended at the **end** of the context
-window, which is why this shrinks the pinned head without rewriting it.
-
-```yaml
-config:
-  tool_loading: deferred_namespace
-  # optional -- defaults to the shipped table
-  tool_namespaces:
-    - name: files
-      description: Read, write, edit, search and list files in the workspace.
-      members: [apply_patch, edit_file, glob, grep, read_file, write_file]
-    - name: shell
-      description: Run shell commands and manage a task checklist.
-      members: [bash, todo]
-  tool_search_always_loaded: [bash, todo]
-```
-
-Measured on `gpt-5.6-terra` against a 14-tool, 18,458-token head
-(`tool_choice: "none"`, so the block cost is exact):
-
-| mode | tool-block tokens | head saving |
-|---|---:|---:|
-| `static` | 8,677 | — |
-| `deferred_namespace` (default hedge) | 1,925 | **6,752 (36.6% of head)** |
-| `deferred_namespace`, `tool_search_always_loaded: []` | 1,133 | 7,544 (40.9%) |
-
-### Things to know before turning it on
-
-- **OpenAI only, by construction.** Everything happens below the `ChatRequest`
-  seam. No other provider can observe the feature existing — which matters,
-  because editing the tools array is a full cache rebuild on Anthropic.
-- **Turning it on costs one cold cache rebuild**, since the tools block changes.
-  One-time, not recurring.
-- **The model can substitute a visible tool for a deferred one.** Measured 1 in
-  20 turns: asked to read a file, the model reached for always-loaded `bash`
-  instead of searching for `read_file`. Deferring `bash` too removed it in 10/10
-  retries, at the cost of a search round-trip on nearly every session.
-- **Loading is per-NAMESPACE, not per-tool.** Asking for one member loads all of
-  them, so grouping granularity *is* the cost model.
-- **`web`, `browser`, `python` and `computer` are reserved** namespace names and
-  return HTTP 400. The table validator refuses them at mount.
-- **`tool_choice` is forced to `"auto"`** in this mode: forcing a tool the model
-  has not discovered yet has no defined behaviour.
-- A tool registered **mid-session** rides a developer-role `additional_tools`
-  input item at the tail rather than being spliced into the cached tools block.
-
-### Interaction with `prompt_cache_mode: explicit` (R0)
-
-Both features rewrite the params assembly, so their combination is pinned by
-`tests/test_r0_deferred_tools_interaction.py`. With **both off** the request is
-byte-identical to what shipped before either existed (asserted against a literal
-payload plus a sha256, with negative controls proving each flag alone moves the
-bytes). With **both on**:
-
-- Deferred appends `additional_tools` at the tail *before* R0 prepends its
-  sentinel, so the sentinel keeps `input[0]` and the discovered-tools item keeps
-  the tail. Neither displaces the other.
-- **No breakpoint ever lands on the `additional_tools` item.** It is the one
-  input item that grows mid-session; a breakpoint at or behind it would pull a
-  moving payload into the cached prefix.
-- **One behaviour delta worth knowing:** R0's stable-breakpoint heuristic skips
-  the *final* input item as the dynamic tail. In deferred mode the final item is
-  the `additional_tools` item, so the last real history message becomes an
-  eligible carrier and a second breakpoint can fire where R0 alone would place
-  only the sentinel. That placement is correct — the item is pinned to the tail
-  on every subsequent request, so the prefix through that message is
-  byte-identical next request — but it costs one extra cache write (R0's rig:
-  explicit `$0.006326` → explicit + stable breakpoint `$0.007458`). Still inside
-  R0's ≤2-breakpoint budget.
-
 ## Long context
 
 `enable_long_context` (default off) controls the **reported** context window;
@@ -541,7 +457,6 @@ The provider populates `ChatResponse.metadata` with OpenAI-specific state:
 | `openai:incomplete_reason` | `str` | `"max_output_tokens"` or `"content_filter"`. |
 | `openai:reasoning_items` | `list[str]` | Reasoning item ids (`rs_*`) for state preservation. |
 | `openai:continuation_count` | `int` | Number of auto-continuations performed (if > 0). |
-| `openai:tool_search_items` | `list[dict]` | Hosted `tool_search_call` / `tool_search_output` items, replayed verbatim into `input` on the next request. Dropping them makes every discovered tool cease to exist for the model **and** breaks the cache forward. |
 
 All keys use the `openai:` prefix to prevent collisions with other providers.
 

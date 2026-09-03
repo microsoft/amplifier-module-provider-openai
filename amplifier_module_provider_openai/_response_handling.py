@@ -26,8 +26,6 @@ from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
-from ._constants import METADATA_TOOL_SEARCH_ITEMS
-from ._tool_search import extract_hosted_tool_search_items
 
 logger = logging.getLogger(__name__)
 
@@ -573,16 +571,6 @@ def convert_response_with_accumulated_output(
     # Reasoning item IDs (for explicit passing if needed)
     if reasoning_item_ids:
         metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
-
-    # Hosted tool-search items. The two `if block_type not in {"tool_call",
-    # "function_call"}: continue` guards above drop these from content_blocks by
-    # design -- they are not model output, they are loaded-tool bookkeeping. But
-    # dropping them from the ROUND TRIP is a different thing entirely: per
-    # `TS:854` the tools they loaded then cease to exist and the cache breaks
-    # forward, so capture them verbatim for replay.
-    _tool_search_items = extract_hosted_tool_search_items(accumulated_output)
-    if _tool_search_items:
-        metadata[METADATA_TOOL_SEARCH_ITEMS] = _tool_search_items
 
     # Continuation count (for debugging/metrics)
     if continuation_count > 0:
