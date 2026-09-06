@@ -48,6 +48,12 @@ DEFAULT_BACKGROUND_TIMEOUT = (
     1800.0  # 30 minutes for background requests (deep research can be slow)
 )
 
+# Ceiling on how long close() waits for the HTTP client to shut down.
+# An httpx transport with a wedged connection can leave AsyncOpenAI.close()
+# pending indefinitely; without a bound, that hangs session cleanup for the
+# whole process. See OpenAIProvider.close().
+DEFAULT_CLOSE_TIMEOUT = 5.0  # seconds
+
 # Native tool types that should be passed through to OpenAI without conversion
 # These are OpenAI-hosted tools, not user-defined function tools
 #
