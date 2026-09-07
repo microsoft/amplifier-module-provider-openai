@@ -2,6 +2,7 @@
 
 **Work item:** `model_performance-v5co` (project `model_performance`)
 **Repo:** `microsoft/amplifier-module-provider-openai`, branch `lane/v5co-tool-search-provider-build`, from `main` @ `f104e6c`
+**Draft PR:** <https://github.com/microsoft/amplifier-module-provider-openai/pull/86> — **do not merge from the PR; the manager verifies and merges.**
 **Outcome branch:** **A — RESOLVED.** Every deliverable is DONE. Nothing was recorded NOT-POSSIBLE; the cap never bound.
 **Spend:** **$0.010574 of the $10 authority** (0.11%). Residue $9.989426.
 
