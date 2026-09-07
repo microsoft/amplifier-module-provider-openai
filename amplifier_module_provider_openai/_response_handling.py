@@ -26,6 +26,10 @@ from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
+from ._constants import METADATA_TOOL_CALL_NAMESPACES
+from ._constants import METADATA_TOOL_SEARCH_ITEMS
+from ._tool_search import extract_function_call_namespaces
+from ._tool_search import extract_hosted_tool_search_items
 
 logger = logging.getLogger(__name__)
 
@@ -571,6 +575,26 @@ def convert_response_with_accumulated_output(
     # Reasoning item IDs (for explicit passing if needed)
     if reasoning_item_ids:
         metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
+
+    # BREAK 3 -- hosted tool-search items.
+    # The two `if block_type not in {"tool_call", "function_call"}: continue`
+    # guards above drop these from content_blocks BY DESIGN -- they are not
+    # model output, they are loaded-tool bookkeeping. But dropping them from
+    # the ROUND TRIP is a different thing entirely: per `TS:854` the tools
+    # they loaded then cease to exist and the cache breaks forward, silently.
+    # Capture verbatim for replay. Deliberately NOT gated on tool_search.mode:
+    # a response carrying hosted items must round-trip them whatever this
+    # process's config says, or a resumed session loses its loaded set.
+    tool_search_items = extract_hosted_tool_search_items(accumulated_output)
+    if tool_search_items:
+        metadata[METADATA_TOOL_SEARCH_ITEMS] = tool_search_items
+
+    # BREAK 6 -- the namespace a `function_call` was issued from. Replaying a
+    # namespaced call without it is HTTP 400 (measured on the wire); see
+    # _tool_search.extract_function_call_namespaces.
+    call_namespaces = extract_function_call_namespaces(accumulated_output)
+    if call_namespaces:
+        metadata[METADATA_TOOL_CALL_NAMESPACES] = call_namespaces
 
     # Continuation count (for debugging/metrics)
     if continuation_count > 0:

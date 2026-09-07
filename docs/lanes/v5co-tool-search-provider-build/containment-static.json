@@ -1,0 +1,110 @@
+{
+  "check": "G5a / G5b' Anthropic containment, POST-implementation",
+  "lane": "v5co-tool-search-provider-build",
+  "spend_usd": 0.0,
+  "provider_openai_head": "320157b0484e66d49e26df594432fcfc80538a87",
+  "seam_grep": {
+    "amplifier-module-loop-streaming": {
+      "hits": 0,
+      "sample": [],
+      "expected": "0 (above/beside the seam)",
+      "ok": true
+    },
+    "amplifier-core": {
+      "hits": 0,
+      "sample": [],
+      "expected": "0 (above/beside the seam)",
+      "ok": true
+    },
+    "amplifier-module-provider-anthropic": {
+      "hits": 0,
+      "sample": [],
+      "expected": "0 (above/beside the seam)",
+      "ok": true
+    },
+    "amplifier-module-provider-openai": {
+      "hits": 169,
+      "sample": [
+        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:74:from ._tool_search import (",
+        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:81:    extract_hosted_tool_search_items,",
+        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:84:    validate_tool_search_mode,"
+      ],
+      "expected": "non-zero (this is the deliverable)",
+      "ok": true
+    }
+  },
+  "arms": {
+    "off": {
+      "tools_sha256": "cea1c7d9015febaec1c9ad14872ab071884a4671f97249e8641f97a60b3203be",
+      "breakpoint_used": true,
+      "cache_control_indices": [
+        12
+      ],
+      "cache_control_count": 1,
+      "n_tools": 13,
+      "g5b_prime": {
+        "exactly_one_tools_breakpoint": true,
+        "actually_placed": true,
+        "on_the_last_function_tool": true,
+        "at_most_four_blocks_total": true,
+        "PASS": true,
+        "indices": [
+          12
+        ]
+      }
+    },
+    "namespaced": {
+      "tools_sha256": "cea1c7d9015febaec1c9ad14872ab071884a4671f97249e8641f97a60b3203be",
+      "breakpoint_used": true,
+      "cache_control_indices": [
+        12
+      ],
+      "cache_control_count": 1,
+      "n_tools": 13,
+      "g5b_prime": {
+        "exactly_one_tools_breakpoint": true,
+        "actually_placed": true,
+        "on_the_last_function_tool": true,
+        "at_most_four_blocks_total": true,
+        "PASS": true,
+        "indices": [
+          12
+        ]
+      }
+    },
+    "NEGATIVE_CONTROL_upstream_grouping": {
+      "tools_sha256": "2921b40e402f23f2f572309e5d54e4800ce0ffc7781e4eec228a7b0996eb5590",
+      "breakpoint_used": true,
+      "cache_control_indices": [
+        12
+      ],
+      "cache_control_count": 1,
+      "n_tools": 13
+    }
+  },
+  "openai_side": {
+    "off_sha256": "20b81fbbb490b084b741842cf9cbc390a4e5193c035cf8a371aaf63f3a63f7e1",
+    "namespaced_sha256": "81d24359ff120bb5e36b2b1e26b280cd38c9e3607fd31854188d25b5c02d9c91",
+    "n_tools_off": 13,
+    "n_entries_namespaced": 6,
+    "tool_search_entry_last": true
+  },
+  "G5a_byte_identity": true,
+  "G5a_matches_bub_published": true,
+  "G5b_breakpoint_identity": true,
+  "G5b_prime_PASS": true,
+  "negative_control_fires": true,
+  "negative_control_matches_bub_published": true,
+  "openai_side_actually_moved": true,
+  "seam_grep_ok": true,
+  "gates": [
+    "G5a_byte_identity",
+    "G5a_matches_bub_published",
+    "G5b_prime_PASS",
+    "negative_control_fires",
+    "negative_control_matches_bub_published",
+    "openai_side_actually_moved",
+    "seam_grep_ok"
+  ],
+  "verdict": "PASS"
+}

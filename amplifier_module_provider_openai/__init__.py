@@ -58,6 +58,8 @@ from ._constants import (
     METADATA_REASONING_ITEMS,
     METADATA_RESPONSE_ID,
     METADATA_STATUS,
+    METADATA_TOOL_CALL_NAMESPACES,
+    METADATA_TOOL_SEARCH_ITEMS,
     NATIVE_TOOL_TYPES,
 )
 from ._cost import compute_cost
@@ -68,6 +70,18 @@ from ._response_handling import (
     extract_reasoning_text,
     merge_discarded_usage,
     parse_function_call_block,
+)
+from ._tool_search import (
+    DEFAULT_ALWAYS_LOADED,
+    TOOL_SEARCH_MODE_NAMESPACED,
+    ToolSearchConfigError,
+    build_additional_tools_item,
+    build_namespaced_tools,
+    extract_function_call_namespaces,
+    extract_hosted_tool_search_items,
+    namespace_for_member,
+    normalize_namespaces,
+    validate_tool_search_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -883,6 +897,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "max_concurrent_requests",
         "extra_request_params",
         "close_timeout",
+        "tool_search",
     }
 )
 
@@ -1177,6 +1192,56 @@ class OpenAIProvider:
         # text.verbosity (GPT-5.6): "low" | "medium" | "high". Wrapped into the
         # Responses API `text` object at request time. None = do not send.
         self.text_verbosity: str | None = self.config.get("text_verbosity") or None
+
+        # tool_search (OPENAI-ONLY). DESIGN.md w3 §2.2(a):
+        #
+        #   tool_search:
+        #     mode: off | namespaced     # default off
+        #     namespaces: [{name, description, members}, ...]
+        #     always_loaded: [bash, todo]
+        #
+        # "off" is the shipped behaviour and MUST stay byte-identical: the
+        # namespaced branch is reached only when the flag is explicitly set, so
+        # a default-config request produces the exact same `tools` array it
+        # produced before this feature existed.
+        # tests/test_tool_search_namespaces.py asserts that byte-identity by
+        # value AND by sha256 rather than assuming it.
+        #
+        # "namespaced" groups the roster into namespaces with
+        # `defer_loading: true` and adds `{"type": "tool_search"}`. There is
+        # deliberately no "flat" mode -- see _tool_search.py for the measured
+        # 1,270-vs-7,573-token reason.
+        _tool_search_cfg = self.config.get("tool_search") or {}
+        if not isinstance(_tool_search_cfg, dict):
+            raise ToolSearchConfigError(
+                "tool_search must be a mapping with a 'mode' key "
+                f"(off | namespaced); got {type(_tool_search_cfg).__name__}."
+            )
+        self.tool_search_mode: str = validate_tool_search_mode(
+            _tool_search_cfg.get("mode")
+        )
+        self.tool_search_namespaces = normalize_namespaces(
+            _tool_search_cfg.get("namespaces")
+        )
+        _always = _tool_search_cfg.get("always_loaded")
+        self.tool_search_always_loaded: frozenset[str] = frozenset(
+            DEFAULT_ALWAYS_LOADED if _always is None else (str(t) for t in _always)
+        )
+        # Roster snapshot for the mid-session case. A provider instance is
+        # mounted per session, so this is session-scoped state by construction.
+        # None until the first namespaced request assembles a tools block.
+        self._tool_search_roster: frozenset[str] | None = None
+        self._tool_search_extra: dict[str, dict[str, Any]] = {}
+        # Set by _convert_tools_from_request, consumed in the same request
+        # assembly a few lines later. None whenever there is nothing to append.
+        self._pending_additional_tools_item: dict[str, Any] | None = None
+        if self.tool_search_mode == TOOL_SEARCH_MODE_NAMESPACED:
+            logger.info(
+                "[PROVIDER] tool_search.mode=namespaced (OpenAI-only). "
+                "Namespaces: %s. Always-loaded: %s.",
+                ", ".join(ns["name"] for ns in self.tool_search_namespaces),
+                ", ".join(sorted(self.tool_search_always_loaded)) or "(none)",
+            )
 
         # D2: how much prior reasoning to replay inline on stateless requests.
         #   "turn" (default) -- assistant turns since the last user message. Preserves
@@ -2264,6 +2329,25 @@ class OpenAIProvider:
             params["tools"] = self._convert_tools_from_request(tools_list, model_name)
             # Add tool-related parameters per Responses API spec
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
+            if self.tool_search_mode == TOOL_SEARCH_MODE_NAMESPACED:
+                # BREAK 1. `tool_choice` semantics against a DEFERRED tool are
+                # unprobed (`bub` exercised only "none" and "auto"). Forcing a
+                # tool the model has not discovered yet has no defined
+                # behaviour, so pin "auto" and SAY SO rather than sending an
+                # untested combination into a live session.
+                if params["tool_choice"] != "auto":
+                    logger.warning(
+                        "[PROVIDER] tool_search.mode=namespaced forces "
+                        "tool_choice='auto' (requested %r): forcing a tool that "
+                        "has not been discovered yet is unspecified.",
+                        params["tool_choice"],
+                    )
+                    params["tool_choice"] = "auto"
+                # Mid-session tools ride an `additional_tools` INPUT item at the
+                # tail -- an append, never an edit of the `tools` block.
+                _extra_item = self._pending_additional_tools_item
+                if _extra_item is not None and isinstance(params.get("input"), list):
+                    params["input"] = [*params["input"], _extra_item]
             params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
             # max_tool_calls limits how many tool calls the model can make
             # Important for deep research to prevent excessive searching that consumes token budget
@@ -3877,6 +3961,21 @@ class OpenAIProvider:
                     for reasoning_item in reasoning_items_to_add:
                         openai_messages.append(reasoning_item)
 
+                # BREAK 3, second half -- hosted tool-search items replayed
+                # VERBATIM and in wire order (reasoning -> tool_search_call ->
+                # tool_search_output -> function_call, as measured on the wire).
+                # These are not model output; they are the record of WHICH
+                # tools got loaded. Drop them and, per `TS:854`, those tools
+                # cease to exist for the model AND the cache breaks forward --
+                # so unlike reasoning replay they are NOT gated by
+                # reasoning_replay_scope, and not gated on tool_search.mode
+                # either. The API accepts them back as input items on the round
+                # trip (measured, probe `bub` G2).
+                if metadata:
+                    for _ts_item in metadata.get(METADATA_TOOL_SEARCH_ITEMS) or []:
+                        if isinstance(_ts_item, dict):
+                            openai_messages.append(dict(_ts_item))
+
                 # Only add assistant message if there's content
                 if assistant_content:
                     _occ_key = json.dumps(
@@ -3894,7 +3993,31 @@ class OpenAIProvider:
 
                 # Add function_call items as TOP-LEVEL entries (after assistant message)
                 # Per OpenAI Responses API: function_call items are separate from message content
+                #
+                # BREAK 6, second half -- MEASURED ON THE WIRE, NOT PREDICTED.
+                # A `function_call` the model emitted from inside a namespace
+                # must be round-tripped WITH its `namespace` field or the next
+                # request is HTTP 400: "Missing namespace for function_call
+                # 'glob'. It does not exist in the default namespace."
+                # `ToolCall` has no namespace field, so the value comes from the
+                # captured metadata; the configured table is the fallback for
+                # the case metadata cannot cover (compaction dropped the
+                # carrying message -- break 5 -- or the transcript predates
+                # this fix). Stamped at the single emission site so every
+                # branch that built a function_call item is covered.
+                _ns_map = (metadata or {}).get(METADATA_TOOL_CALL_NAMESPACES) or {}
                 for fc_item in function_call_items:
+                    if isinstance(fc_item, dict) and not fc_item.get("namespace"):
+                        _ns = _ns_map.get(fc_item.get("call_id"))
+                        if not _ns and self.tool_search_mode == (
+                            TOOL_SEARCH_MODE_NAMESPACED
+                        ):
+                            _ns = namespace_for_member(
+                                str(fc_item.get("name") or ""),
+                                self.tool_search_namespaces,
+                            )
+                        if _ns:
+                            fc_item["namespace"] = _ns
                     openai_messages.append(fc_item)
 
                 i += 1
@@ -4111,7 +4234,89 @@ class OpenAIProvider:
                     }
                 )
 
-        return openai_tools
+        # tool_search.mode == "off" (the default) returns here, byte-identical
+        # to the shipped behaviour. The namespaced branch is strictly
+        # downstream of the same conversion, so the two paths cannot drift.
+        if self.tool_search_mode != TOOL_SEARCH_MODE_NAMESPACED:
+            return openai_tools
+
+        block, extra_item = self._assemble_deferred_tools(openai_tools)
+        self._pending_additional_tools_item = extra_item
+        return block
+
+    def _assemble_deferred_tools(
+        self, flat_tools: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Split a flat tool list into (namespaced tools block, additional_tools item).
+
+        The whole point of this lever is that discovery must be an APPEND, never
+        an edit of the pinned head. That applies to our own roster too: once the
+        `tools` block has been assembled for a session, a tool registered
+        mid-session (a mode contributing tools, a skill activating one) must NOT
+        be spliced into that block -- `12v` measured that a 2.1% byte change to
+        the tools array zeroes the cache outright. It goes into a developer-role
+        `additional_tools` INPUT item instead (`TS:870-890`), which lands in the
+        `input` array and leaves the head untouched.
+
+        The item is emitted at the input tail on every subsequent request. That
+        keeps it monotone: everything before it is an unchanged prefix, so the
+        cache is preserved and only the tail region is re-written. `TS:893`'s
+        contract is about not letting the item drift EARLIER (which would change
+        which tools the model saw at a given point); pinning it to the tail
+        never does that.
+
+        A tool that DISAPPEARS from the roster is the one case that does force a
+        block rebuild, and it is taken deliberately: continuing to advertise a
+        tool the loop can no longer dispatch would let the model call something
+        that does not exist. Correctness beats one cold cache rebuild, and the
+        rebuild is logged by name.
+        """
+        present = {
+            t["name"]
+            for t in flat_tools
+            if isinstance(t, dict) and t.get("type") == "function" and "name" in t
+        }
+
+        if self._tool_search_roster is None:
+            self._tool_search_roster = frozenset(present)
+        elif not self._tool_search_roster <= present:
+            missing = sorted(self._tool_search_roster - present)
+            logger.warning(
+                "[PROVIDER] tool_search.mode=namespaced: %d tool(s) left the "
+                "roster mid-session (%s). Rebuilding the tools block, which costs "
+                "one cold prompt-cache rebuild -- taken deliberately so the model "
+                "is never offered a tool the loop cannot dispatch.",
+                len(missing),
+                ", ".join(missing),
+            )
+            self._tool_search_roster = frozenset(present)
+            self._tool_search_extra.clear()
+
+        roster = self._tool_search_roster
+        in_block = [
+            t
+            for t in flat_tools
+            if not (
+                isinstance(t, dict)
+                and t.get("type") == "function"
+                and t.get("name") not in roster
+            )
+        ]
+        for t in flat_tools:
+            if (
+                isinstance(t, dict)
+                and t.get("type") == "function"
+                and t.get("name") not in roster
+            ):
+                self._tool_search_extra.setdefault(t["name"], t)
+
+        block = build_namespaced_tools(
+            in_block, self.tool_search_namespaces, self.tool_search_always_loaded
+        )
+        extra_item = build_additional_tools_item(
+            [self._tool_search_extra[n] for n in sorted(self._tool_search_extra)]
+        )
+        return block, extra_item
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
         """Convert OpenAI response to ChatResponse format.
@@ -4537,6 +4742,19 @@ class OpenAIProvider:
         # Reasoning item IDs (for explicit passing if needed)
         if reasoning_item_ids:
             metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
+
+        # BREAK 3 -- hosted tool-search items. See
+        # _tool_search.extract_hosted_tool_search_items and the twin capture in
+        # _response_handling.convert_response_with_accumulated_output.
+        _output_items = list(getattr(response, "output", None) or [])
+        tool_search_items = extract_hosted_tool_search_items(_output_items)
+        if tool_search_items:
+            metadata[METADATA_TOOL_SEARCH_ITEMS] = tool_search_items
+        # BREAK 6 -- the namespace a function_call was issued from. Required on
+        # the round trip; see extract_function_call_namespaces.
+        call_namespaces = extract_function_call_namespaces(_output_items)
+        if call_namespaces:
+            metadata[METADATA_TOOL_CALL_NAMESPACES] = call_namespaces
 
         # DEBUG: Log what we're returning
         logger.info(
