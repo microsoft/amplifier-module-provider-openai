@@ -1,0 +1,67 @@
+--- a/amplifier_module_context_simple/__init__.py
++++ b/amplifier_module_context_simple/__init__.py
+@@ -29,6 +29,42 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# BREAK 5 -- messages carrying LOADED-TOOL STATE are un-droppable.
++#
++# A provider may record, on a message's metadata, which tools the model
++# dynamically loaded during that turn (OpenAI's hosted tool search does this via
++# `openai:tool_search_items`). That record is not decoration -- per the vendored
++# tool-search guide `TS:854`:
++#
++#   "Tools that were not listed as part of this array will not be available to
++#    the model ... changing the loaded tool set will break the model's cache
++#    from that point forward."
++#
++# So dropping such a message during compaction costs TWICE: (a) every tool it
++# loaded silently ceases to exist for the model, which it discovers by failing
++# to call one, and (b) the prompt cache breaks forward from that point -- and
++# OpenAI's cache is grow-only, so a break is a full cold rebuild, not a dip.
++#
++# The ladder has no other concept of an un-droppable item, so this is a named
++# protected set rather than a role check. It is deliberately keyed on METADATA,
++# not on a provider name: a second provider adding the same kind of state adds
++# a key here and needs no other change. Truncation and stubbing already rebuild
++# messages with `{**msg, ...}`, so they preserve metadata and need no change --
++# only REMOVAL had to learn this.
++LOADED_TOOL_STATE_METADATA_KEYS: frozenset[str] = frozenset(
++    {
++        "openai:tool_search_items",
++    }
++)
++
++
++def _carries_loaded_tool_state(msg: dict[str, Any]) -> bool:
++    """True if removing this message would silently unload tools (TS:854)."""
++    meta = msg.get("metadata") or {}
++    if not isinstance(meta, dict):
++        return False
++    return any(meta.get(key) for key in LOADED_TOOL_STATE_METADATA_KEYS)
++
+ 
+ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
+     """
+@@ -1166,6 +1202,21 @@
+             if msg.get("role") == "system":
+                 protected_indices.add(i)
+ 
++        # BREAK 5 -- never remove a message carrying loaded-tool state.
++        # Protecting it here also protects it from the tool-pair cascade below,
++        # which consults this same set. See LOADED_TOOL_STATE_METADATA_KEYS.
++        loaded_tool_state_indices = {
++            i for i, msg in enumerate(messages) if _carries_loaded_tool_state(msg)
++        }
++        if loaded_tool_state_indices:
++            protected_indices |= loaded_tool_state_indices
++            logger.debug(
++                "[CONTEXT] protecting %d message(s) carrying loaded-tool state "
++                "from removal (TS:854: dropping them unloads tools and breaks "
++                "the prompt cache forward)",
++                len(loaded_tool_state_indices),
++            )
++
+         # First user message is stubbable at extreme pressure (Level 8), but never fully removed
+         # (It's excluded from removal_candidates via user_message_indices, but can be stubbed)
+         # We don't add it to protected_indices so it can be stubbed at Level 8

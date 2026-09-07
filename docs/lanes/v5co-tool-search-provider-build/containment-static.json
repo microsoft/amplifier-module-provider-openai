@@ -2,7 +2,7 @@
   "check": "G5a / G5b' Anthropic containment, POST-implementation",
   "lane": "v5co-tool-search-provider-build",
   "spend_usd": 0.0,
-  "provider_openai_head": "95b784d7d920e74193176c268ec6aece6c90f0eb",
+  "provider_openai_head": "320157b0484e66d49e26df594432fcfc80538a87",
   "seam_grep": {
     "amplifier-module-loop-streaming": {
       "hits": 0,
@@ -23,11 +23,11 @@
       "ok": true
     },
     "amplifier-module-provider-openai": {
-      "hits": 145,
+      "hits": 169,
       "sample": [
-        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:73:from ._tool_search import (",
-        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:79:    extract_hosted_tool_search_items,",
-        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:81:    validate_tool_search_mode,"
+        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:74:from ._tool_search import (",
+        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:81:    extract_hosted_tool_search_items,",
+        "amplifier-module-provider-openai/amplifier_module_provider_openai/__init__.py:84:    validate_tool_search_mode,"
       ],
       "expected": "non-zero (this is the deliverable)",
       "ok": true
