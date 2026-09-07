@@ -536,12 +536,14 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
         | _DEPRECATED_ALIAS_CONFIG_KEYS
         | _INFRASTRUCTURE_CONFIG_KEYS
     )
-    # 30 keys: the 28 the config-surface-V2 survey counted (32 - 5 removed
+    # 31 keys: the 28 the config-surface-V2 survey counted (32 - 5 removed
     # [enable_state, enable_reasoning_context, enable_response_chaining,
     # thinking_budget_tokens, thinking_budget_buffer] + 1 added
     # [extra_request_params]), + 1 added by the reasoning.context gate fix
     # (reasoning_context), + 1 added by the bounded-close fix
     # (close_timeout -- the ceiling close() puts on the HTTP client's
-    # shutdown). Audited against every `self.config.get(...)` call site in
-    # the constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 30
+    # shutdown), + 1 added by deferred tool loading (tool_search -- ONE
+    # key holding the whole {mode, namespaces, always_loaded} mapping, so
+    # the surface grows by one entry, not three). Audited against every
+    # `self.config.get(...)` call site in the constructor and request path.
+    assert len(_CONSUMED_CONFIG_KEYS) == 31
