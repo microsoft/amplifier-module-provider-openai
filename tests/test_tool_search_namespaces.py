@@ -27,6 +27,9 @@ import pytest
 from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
 from amplifier_module_provider_openai import OpenAIProvider
+from amplifier_module_provider_openai._constants import (
+    METADATA_TOOL_CALL_NAMESPACES,
+)
 from amplifier_module_provider_openai._tool_search import (
     _WARNED_UNLISTED,
     RESERVED_NAMESPACE_NAMES,
@@ -403,6 +406,91 @@ def test_namespaced_function_call_name_stays_unqualified():
     response = asyncio.run(provider.complete(_request()))
     assert response.tool_calls is not None
     assert [tc.name for tc in response.tool_calls] == ["glob"]
+
+
+# --- BREAK 6, second half: the namespace must survive the ROUND TRIP -------
+#
+# MEASURED ON THE WIRE by this lane's smoke run (gpt-5.6-terra, 2026-09-06),
+# NOT predicted by DESIGN.md. Replaying a namespaced `function_call` without
+# its `namespace` field is a hard HTTP 400:
+#
+#   Missing namespace for function_call 'glob'. It does not exist in the
+#   default namespace. Round-trip the model's function_call item with its
+#   namespace field included.        [param: input[3].namespace]
+#
+# The design asserted only the DISPATCH half ("pass `name` through unchanged"),
+# which is necessary and not sufficient. See
+# docs/lanes/v5co-tool-search-provider-build/smoke-tool-search.json.
+
+
+def _assistant_turn(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": "find files"},
+        {
+            "role": "assistant",
+            "content": [],
+            "tool_calls": [{"id": "call_Ejwv", "name": "glob", "arguments": {}}],
+            "metadata": metadata or {},
+        },
+    ]
+
+
+def _replayed_function_calls(provider, metadata) -> list[dict[str, Any]]:
+    converted = provider._convert_messages(_assistant_turn(metadata))
+    return [
+        i
+        for i in converted
+        if isinstance(i, dict) and i.get("type") == "function_call"
+    ]
+
+
+def test_function_call_namespace_is_captured_into_metadata():
+    provider = _make_provider(tool_search={"mode": "namespaced"})
+    provider.client.responses.create = AsyncMock(
+        return_value=DummyResponse(output=list(_HOSTED_OUTPUT))
+    )
+    response = asyncio.run(provider.complete(_request()))
+    assert (response.metadata or {}).get(METADATA_TOOL_CALL_NAMESPACES) == {
+        "call_Ejwv": "files"
+    }
+
+
+def test_replayed_function_call_carries_the_captured_namespace():
+    """Without this the next request is HTTP 400. Measured, not assumed."""
+    provider = _make_provider(tool_search={"mode": "namespaced"})
+    calls = _replayed_function_calls(
+        provider, {METADATA_TOOL_CALL_NAMESPACES: {"call_Ejwv": "files"}}
+    )
+    assert [c.get("namespace") for c in calls] == ["files"]
+    # The name itself stays unqualified -- both halves at once.
+    assert [c.get("name") for c in calls] == ["glob"]
+
+
+def test_namespace_falls_back_to_the_table_when_metadata_was_lost():
+    """Compaction may drop the message that carried the metadata (break 5).
+
+    The configured table is deterministic and is the same one that produced
+    the tools block, so deriving the namespace from it is exact -- not a guess.
+    """
+    provider = _make_provider(tool_search={"mode": "namespaced"})
+    calls = _replayed_function_calls(provider, metadata=None)
+    assert [c.get("namespace") for c in calls] == ["files"]
+
+
+def test_off_mode_never_stamps_a_namespace():
+    """Default byte-identity: `off` must not acquire a field it never had."""
+    provider = _make_provider()
+    calls = _replayed_function_calls(provider, metadata=None)
+    assert calls and all("namespace" not in c for c in calls)
+
+
+def test_off_mode_still_replays_a_namespace_it_was_handed():
+    """A session that ENABLED the mode earlier must still round-trip cleanly."""
+    provider = _make_provider()
+    calls = _replayed_function_calls(
+        provider, {METADATA_TOOL_CALL_NAMESPACES: {"call_Ejwv": "files"}}
+    )
+    assert [c.get("namespace") for c in calls] == ["files"]
 
 
 # ---------------------------------------------------------------------------

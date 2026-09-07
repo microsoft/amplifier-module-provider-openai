@@ -413,3 +413,54 @@ def extract_hosted_tool_search_items(output_items: list[Any]) -> list[dict[str, 
             {k: v for k, v in as_dict.items() if v is not None or k == "call_id"}
         )
     return captured
+
+
+def extract_function_call_namespaces(output_items: list[Any]) -> dict[str, str]:
+    """Collect `{call_id: namespace}` for namespaced `function_call` items.
+
+    `TS:391-397` shows a namespaced `function_call` carrying BOTH
+    ``"name": "list_open_orders"`` and ``"namespace": "crm"``. The design read
+    that as a dispatch concern only -- keep `name` unqualified so
+    ``tools.get(tool_call.name)`` still resolves -- and concluded nothing else
+    was needed.
+
+    That is half the contract. MEASURED ON THE WIRE (this lane, 2026-09-06,
+    gpt-5.6-terra): replaying the call on the next turn WITHOUT its namespace
+    is a hard **HTTP 400**::
+
+        Missing namespace for function_call 'glob'. It does not exist in the
+        default namespace. Round-trip the model's function_call item with its
+        namespace field included.   [param: input[3].namespace]
+
+    So the namespace must survive the round trip too, and `ToolCall` has no
+    field for it -- it rides the provider-state metadata channel instead,
+    exactly as the hosted tool-search items do.
+    """
+    namespaces: dict[str, str] = {}
+    for item in output_items:
+        if _item_type(item) != "function_call":
+            continue
+        as_dict = _to_plain_dict(item)
+        if not as_dict:
+            continue
+        call_id = as_dict.get("call_id") or as_dict.get("id")
+        namespace = as_dict.get("namespace")
+        if call_id and isinstance(namespace, str) and namespace:
+            namespaces[str(call_id)] = namespace
+    return namespaces
+
+
+def namespace_for_member(
+    tool_name: str, namespaces: tuple[dict[str, Any], ...]
+) -> str | None:
+    """Which namespace this provider PUT a tool in, per the configured table.
+
+    The fallback for the case captured metadata cannot cover: compaction is
+    allowed to drop the assistant message that carried it (break 5), and a
+    session resumed from an older transcript has no such metadata at all.
+    Deterministic -- the table is the same one that produced the tools block.
+    """
+    for ns in namespaces:
+        if tool_name in ns["members"]:
+            return str(ns["name"])
+    return None

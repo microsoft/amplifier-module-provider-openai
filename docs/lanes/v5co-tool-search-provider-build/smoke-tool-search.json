@@ -1,0 +1,95 @@
+{
+  "smoke": "hosted tool_search pair survives one turn, accepted back as input",
+  "model": "gpt-5.6-terra",
+  "started_at": "2026-09-07T01:03:20.939499+00:00",
+  "turns": [
+    {
+      "turn": 1,
+      "request": {
+        "tool_choice_on_the_wire": "auto",
+        "tool_choice_requested": "required",
+        "n_tool_entries": 6,
+        "entry_types": [
+          "namespace",
+          "namespace",
+          "namespace",
+          "namespace",
+          "namespace",
+          "tool_search"
+        ],
+        "namespace_names": [
+          "delegation",
+          "files",
+          "internet",
+          "knowledge",
+          "shell"
+        ],
+        "tool_search_entry_present": true
+      },
+      "response": {
+        "captured_item_types": [
+          "tool_search_call",
+          "tool_search_output"
+        ],
+        "captured_call_ids": [
+          null,
+          null
+        ],
+        "captured_execution": [
+          "server",
+          "server"
+        ],
+        "loaded_tool_names": [
+          "files"
+        ],
+        "tool_call_names": [
+          "glob"
+        ],
+        "usage": {
+          "input_tokens": 851,
+          "output_tokens": 50,
+          "total_tokens": 901
+        }
+      }
+    },
+    {
+      "turn": 2,
+      "request": {
+        "replayed_item_types": [
+          "tool_search_call",
+          "tool_search_output"
+        ],
+        "n_input_items": 6,
+        "replayed_function_calls": [
+          {
+            "name": "glob",
+            "namespace": "files"
+          }
+        ]
+      },
+      "response": {
+        "http_ok": true,
+        "usage": {
+          "input_tokens": 887,
+          "output_tokens": 5,
+          "total_tokens": 892
+        },
+        "text": "OK"
+      }
+    }
+  ],
+  "checks": {
+    "break1_tool_choice_forced_auto": true,
+    "namespaced_block_emitted": true,
+    "tool_search_entry_last": true,
+    "break3_pair_captured": true,
+    "break6_hosted_call_id_is_null": true,
+    "break6_function_call_name_unqualified": true,
+    "break3_pair_re_emitted_as_input": true,
+    "break3_re_emission_is_verbatim": true,
+    "break3_api_accepted_the_pair_back": true,
+    "break6_namespace_round_tripped_on_function_call": true
+  },
+  "verdict": "PASS",
+  "finished_at": "2026-09-07T01:03:24.059170+00:00"
+}

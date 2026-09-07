@@ -58,6 +58,7 @@ from ._constants import (
     METADATA_REASONING_ITEMS,
     METADATA_RESPONSE_ID,
     METADATA_STATUS,
+    METADATA_TOOL_CALL_NAMESPACES,
     METADATA_TOOL_SEARCH_ITEMS,
     NATIVE_TOOL_TYPES,
 )
@@ -76,7 +77,9 @@ from ._tool_search import (
     ToolSearchConfigError,
     build_additional_tools_item,
     build_namespaced_tools,
+    extract_function_call_namespaces,
     extract_hosted_tool_search_items,
+    namespace_for_member,
     normalize_namespaces,
     validate_tool_search_mode,
 )
@@ -3990,7 +3993,31 @@ class OpenAIProvider:
 
                 # Add function_call items as TOP-LEVEL entries (after assistant message)
                 # Per OpenAI Responses API: function_call items are separate from message content
+                #
+                # BREAK 6, second half -- MEASURED ON THE WIRE, NOT PREDICTED.
+                # A `function_call` the model emitted from inside a namespace
+                # must be round-tripped WITH its `namespace` field or the next
+                # request is HTTP 400: "Missing namespace for function_call
+                # 'glob'. It does not exist in the default namespace."
+                # `ToolCall` has no namespace field, so the value comes from the
+                # captured metadata; the configured table is the fallback for
+                # the case metadata cannot cover (compaction dropped the
+                # carrying message -- break 5 -- or the transcript predates
+                # this fix). Stamped at the single emission site so every
+                # branch that built a function_call item is covered.
+                _ns_map = (metadata or {}).get(METADATA_TOOL_CALL_NAMESPACES) or {}
                 for fc_item in function_call_items:
+                    if isinstance(fc_item, dict) and not fc_item.get("namespace"):
+                        _ns = _ns_map.get(fc_item.get("call_id"))
+                        if not _ns and self.tool_search_mode == (
+                            TOOL_SEARCH_MODE_NAMESPACED
+                        ):
+                            _ns = namespace_for_member(
+                                str(fc_item.get("name") or ""),
+                                self.tool_search_namespaces,
+                            )
+                        if _ns:
+                            fc_item["namespace"] = _ns
                     openai_messages.append(fc_item)
 
                 i += 1
@@ -4719,11 +4746,15 @@ class OpenAIProvider:
         # BREAK 3 -- hosted tool-search items. See
         # _tool_search.extract_hosted_tool_search_items and the twin capture in
         # _response_handling.convert_response_with_accumulated_output.
-        tool_search_items = extract_hosted_tool_search_items(
-            list(getattr(response, "output", None) or [])
-        )
+        _output_items = list(getattr(response, "output", None) or [])
+        tool_search_items = extract_hosted_tool_search_items(_output_items)
         if tool_search_items:
             metadata[METADATA_TOOL_SEARCH_ITEMS] = tool_search_items
+        # BREAK 6 -- the namespace a function_call was issued from. Required on
+        # the round trip; see extract_function_call_namespaces.
+        call_namespaces = extract_function_call_namespaces(_output_items)
+        if call_namespaces:
+            metadata[METADATA_TOOL_CALL_NAMESPACES] = call_namespaces
 
         # DEBUG: Log what we're returning
         logger.info(

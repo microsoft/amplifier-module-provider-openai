@@ -17,6 +17,14 @@ METADATA_CONTINUATION_COUNT = "openai:continuation_count"
 # cease to exist for the model AND breaks the cache forward -- so these ride
 # the same provider-state channel the encrypted-reasoning items already use.
 METADATA_TOOL_SEARCH_ITEMS = "openai:tool_search_items"
+# {call_id: namespace} for `function_call` items the model emitted from inside
+# a namespace. MEASURED ON THE WIRE 2026-09-06: replaying such a call WITHOUT
+# its namespace is HTTP 400 -- "Missing namespace for function_call 'glob'. It
+# does not exist in the default namespace. Round-trip the model's function_call
+# item with its namespace field included." The design assumed passing `name`
+# through unchanged was sufficient; it is sufficient for DISPATCH and not for
+# the ROUND TRIP.
+METADATA_TOOL_CALL_NAMESPACES = "openai:tool_call_namespaces"
 
 # Default configuration values
 # gpt-5.6-sol (the GPT-5.6 flagship; alias "gpt-5.6" also resolves to it) is the
