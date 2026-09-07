@@ -238,7 +238,36 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
     - 5.4+ (or unknown sub-version): 1.05M context, reasoning, no explicit effort, 272K pricing threshold
     - 5.3: 400K context, reasoning, no explicit effort
     - 5.2 and below: 200K context, reasoning, implicit effort
+
+    gpt-6-astra is handled as a named model before family detection.
     """
+    # gpt-6-astra: named-model entry, not version-gated.
+    # Source: https://developers.openai.com/api/docs/models/gpt-6-astra.md (verified 2026-09-03)
+    # - 1,050,000 total context; 922,000 max input; 128,000 max output
+    # - 272,000 long-pricing threshold (same boundary as gpt-5.4/5.6)
+    # - reasoning.effort: low/medium/high/xhigh/max (none/minimal rejected pre-flight)
+    # - Verified capabilities: text+image input, text output, Responses API tool calling,
+    #   reasoning, streaming, Structured Outputs, prompt caching, apply_patch, computer use
+    # - Caching: prompt_cache_options.ttl only; prompt_cache_retention NOT supported
+    # - supports_in_memory_retention=False: gpt-6-astra uses prompt_cache_options.ttl,
+    #   not the legacy prompt_cache_retention field; the provider must not send
+    #   prompt_cache_retention for Astra at all (see _capabilities_gpt6_astra_no_retention).
+    if model_id == "gpt-6-astra":
+        return ModelCapabilities(
+            family="gpt-6-astra",
+            context_window=922_000,  # max input tokens (Amplifier compaction budget)
+            max_output_tokens=128_000,
+            supports_reasoning=True,
+            default_reasoning_effort=None,
+            supports_vision=True,
+            supports_streaming=True,
+            capability_tags=_GPT5_TAGS,
+            long_context_pricing_threshold=272_000,
+            supports_in_memory_retention=False,  # prompt_cache_retention not sent for Astra
+            supports_native_apply_patch=True,  # verified: apply_patch in supported tools list
+            supports_native_computer_use=True,  # verified: computer_use in supported tools list
+        )
+
     family = _detect_family(model_id)
 
     if family == "deep-research":
