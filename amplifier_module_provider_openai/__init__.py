@@ -2436,6 +2436,15 @@ class OpenAIProvider:
         prompt_cache_retention = (
             kwargs.get("prompt_cache_retention", self.prompt_cache_retention) or None
         )
+        # Astra does not accept the legacy field. Omit only the provider's
+        # implicit 24h default; explicit config and per-call values continue
+        # through the final Astra normalizer for its targeted warning.
+        if (
+            model_name == "gpt-6-astra"
+            and "prompt_cache_retention" not in self.config
+            and "prompt_cache_retention" not in kwargs
+        ):
+            prompt_cache_retention = None
         # Drop retention values the model is known to reject. No-op unless
         # the value is set AND the capability flag is False -- today only
         # `supports_in_memory_retention=False` (gpt-5.5) actually fires.
