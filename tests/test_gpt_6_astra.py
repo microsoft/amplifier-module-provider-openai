@@ -190,6 +190,44 @@ def test_astra_none_selector_omits_reasoning() -> None:
     assert "reasoning" not in provider.client.responses.create.call_args.kwargs
 
 
+@pytest.mark.parametrize("use_streaming", [False, True])
+@pytest.mark.parametrize(
+    ("config", "expected_options"),
+    [
+        ({}, None),
+        ({"prompt_cache_options": {"ttl": "30m"}}, {"ttl": "30m"}),
+    ],
+    ids=["default_only", "ttl_only"],
+)
+def test_astra_implicit_default_retention_is_neither_sent_nor_warned(
+    config: dict[str, object],
+    expected_options: dict[str, str] | None,
+    use_streaming: bool,
+    caplog,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+    provider = _provider(use_streaming=use_streaming, **config)
+    if use_streaming:
+        provider.client.responses.stream = MagicMock(
+            return_value=_StreamContext(_CompletedStream(_response()))
+        )
+    else:
+        provider.client.responses.create = AsyncMock(return_value=_response())
+
+    asyncio.run(provider.complete(_request()))
+
+    call = (
+        provider.client.responses.stream.call_args
+        if use_streaming
+        else provider.client.responses.create.call_args
+    )
+    assert "prompt_cache_retention" not in call.kwargs
+    assert call.kwargs.get("prompt_cache_options") == expected_options
+    assert not [
+        record for record in caplog.records if "prompt_cache_retention" in record.message
+    ]
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -209,19 +247,93 @@ def test_astra_rejects_invalid_per_call_fields_before_sdk(kwargs: dict) -> None:
     provider.client.responses.create.assert_not_awaited()
 
 
-def test_astra_cache_migrates_legacy_retention_to_omission_once(caplog) -> None:
+@pytest.mark.parametrize(
+    ("config", "kwargs"),
+    [
+        ({"prompt_cache_retention": "24h"}, {}),
+        ({}, {"prompt_cache_retention": "24h"}),
+        ({"extra_request_params": {"prompt_cache_retention": "24h"}}, {}),
+    ],
+    ids=["config", "per_call", "final_extra"],
+)
+def test_astra_explicit_legacy_retention_is_omitted_and_warned_once_across_requests(
+    config: dict[str, object], kwargs: dict[str, object], caplog
+) -> None:
     caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
-    provider = _provider(prompt_cache_retention="24h")
-    provider.client.responses.create = AsyncMock(return_value=_response())
+    provider = _provider(**config)
+    provider.client.responses.create = AsyncMock(
+        side_effect=[_response(status="incomplete"), _response(), _response()]
+    )
 
-    asyncio.run(provider.complete(_request()))
-    asyncio.run(provider.complete(_request()))
+    asyncio.run(provider.complete(_request(), **kwargs))
+    asyncio.run(provider.complete(_request(), **kwargs))
 
     calls = provider.client.responses.create.call_args_list
+    assert len(calls) == 3
     assert all("prompt_cache_retention" not in call.kwargs for call in calls)
-    warnings = [r for r in caplog.records if "prompt_cache_retention" in r.message]
+    warnings = [
+        record
+        for record in caplog.records
+        if "Dropping prompt_cache_retention" in record.message
+    ]
     assert len(warnings) == 1
     assert "prompt_cache_options.ttl" in warnings[0].message
+
+
+@pytest.mark.parametrize(
+    ("config", "kwargs"),
+    [
+        ({"prompt_cache_retention": None}, {}),
+        ({"prompt_cache_retention": ""}, {}),
+        ({"prompt_cache_retention": "24h"}, {"prompt_cache_retention": None}),
+        ({"prompt_cache_retention": "24h"}, {"prompt_cache_retention": ""}),
+    ],
+    ids=["config_null", "config_empty", "per_call_null", "per_call_empty"],
+)
+def test_astra_null_or_empty_retention_opts_out(
+    config: dict[str, object], kwargs: dict[str, object], caplog
+) -> None:
+    caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+    provider = _provider(**config)
+    provider.client.responses.create = AsyncMock(return_value=_response())
+
+    asyncio.run(provider.complete(_request(), **kwargs))
+
+    assert "prompt_cache_retention" not in provider.client.responses.create.call_args.kwargs
+    assert not [
+        record for record in caplog.records if "prompt_cache_retention" in record.message
+    ]
+
+
+@pytest.mark.parametrize(
+    ("default_model", "request_model", "expected_retention"),
+    [
+        ("gpt-5.4", "gpt-6-astra", None),
+        ("gpt-6-astra", "gpt-5.4", "24h"),
+        ("gpt-6-astra-2099-01-01", None, "24h"),
+    ],
+    ids=["override_to_astra", "override_from_astra", "nearby_model"],
+)
+def test_astra_implicit_retention_gating_uses_effective_exact_model(
+    default_model: str,
+    request_model: str | None,
+    expected_retention: str | None,
+    caplog,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+    provider = _provider(default_model=default_model)
+    provider.client.responses.create = AsyncMock(return_value=_response())
+    kwargs = {"model": request_model} if request_model is not None else {}
+
+    asyncio.run(provider.complete(_request(), **kwargs))
+
+    assert (
+        provider.client.responses.create.call_args.kwargs.get("prompt_cache_retention")
+        == expected_retention
+    )
+    assert not [
+        record for record in caplog.records if "prompt_cache_retention" in record.message
+    ]
 
 
 def test_astra_drops_legacy_retention_reintroduced_by_final_extra_merge() -> None:
