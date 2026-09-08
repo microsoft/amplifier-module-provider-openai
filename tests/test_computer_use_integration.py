@@ -162,7 +162,8 @@ class TestWireBodyComputerDeclaration:
     hitting."""
 
     @pytest.mark.asyncio
-    async def test_computer_tool_reaches_client_create_call_bare(self) -> None:
+    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-6-astra"])
+    async def test_computer_tool_reaches_client_create_call_bare(self, model: str) -> None:
         """End-to-end through provider.complete(): capture the exact kwargs
         passed to the OpenAI client for a computer-tool request and assert
         on the serialized "tools" wire value directly.
@@ -220,7 +221,7 @@ class TestWireBodyComputerDeclaration:
         provider._client = fake_client
 
         request = ChatRequest(
-            model="gpt-5.6-sol",
+            model=model,
             messages=[Message(role="user", content="take a screenshot")],
             tools=[tool_spec],
         )

@@ -19,6 +19,7 @@ every session):
 import asyncio
 import difflib
 import logging
+import re
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -76,7 +77,7 @@ def _should_show_field(field: dict[str, Any], collected_config: dict[str, Any]) 
     this package does not depend on amplifier-app-cli; kept in lockstep
     with the predicate vocabulary verified against that module's source
     during this change (contains / not_contains / startswith /
-    not_startswith / exact, all case-insensitive).
+    not_startswith / matches / exact, all case-insensitive).
     """
     show_when = field.get("show_when")
     if not show_when:
@@ -84,7 +85,13 @@ def _should_show_field(field: dict[str, Any], collected_config: dict[str, Any]) 
     for key, expected_value in show_when.items():
         actual_value = str(collected_config.get(key, "")).lower()
         expected_str = str(expected_value).lower()
-        if expected_str.startswith("not_contains:"):
+        if expected_str.startswith("matches:"):
+            try:
+                if re.search(str(expected_value)[8:], actual_value, re.IGNORECASE) is None:
+                    return False
+            except re.error:
+                return False
+        elif expected_str.startswith("not_contains:"):
             if expected_str[13:] in actual_value:
                 return False
         elif expected_str.startswith("contains:"):
@@ -118,10 +125,12 @@ class TestConfigFieldGatingMetadata:
     prompt_cache_retention are no longer ConfigFields at all (config-surface
     V2 reduced the wizard to 4 fields) -- see test_wizard_surface.py."""
 
-    def test_enable_long_context_requires_model_and_shows_only_for_5_6(self):
+    def test_enable_long_context_requires_model_and_shows_for_5_6_and_astra(self):
         field = _field(_make_provider(), "enable_long_context")
         assert field.requires_model is True
-        assert field.show_when == {"default_model": "contains:gpt-5.6"}
+        assert field.show_when == {
+            "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-astra)$"
+        }
 
     def test_untouched_fields_keep_no_gating(self):
         """Do-NOT-touch scope check: reasoning_effort keeps its existing
@@ -144,7 +153,13 @@ class TestShowWhenConsumerSimulation:
     amplifier_app_cli.provider_config_utils.configure_provider evaluates
     post-model-selection fields."""
 
-    GPT_5_6_MODELS = ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+    GPT_5_6_MODELS = (
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-6-astra",
+    )
     NON_5_6_MODELS = ("gpt-5.4", "gpt-5.5", "gpt-5.5-pro", "gpt-4o", "gpt-5-mini")
 
     def _gated_fields(self, provider: OpenAIProvider) -> dict[str, dict[str, Any]]:
