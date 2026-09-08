@@ -29,6 +29,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 from pydantic import ValidationError
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -84,6 +85,33 @@ class TestNativeToolTypes:
 
 
 class TestConvertToolsFromRequestComputer:
+    def test_native_computer_serialization_seam_returns_a_fresh_bare_spec(self) -> None:
+        provider = _make_provider()
+
+        first = provider.get_native_computer_tool_spec()
+        second = provider.get_native_computer_tool_spec()
+
+        assert first == {"type": "computer"}
+        assert second == {"type": "computer"}
+        assert first is not second
+
+    def test_native_computer_tool_spec_uses_serialization_seam(self) -> None:
+        provider = _make_provider()
+        provider.get_native_computer_tool_spec = MagicMock(
+            return_value={"type": "computer"}
+        )
+        tool_spec = ToolSpec(
+            name="computer",
+            description="Control the computer",
+            parameters={"type": "object", "properties": {}},
+        )
+        tool_spec.type = "computer"
+
+        assert provider._convert_tools_from_request([tool_spec]) == [
+            {"type": "computer"}
+        ]
+        provider.get_native_computer_tool_spec.assert_called_once_with()
+
     def test_native_computer_sends_bare_type_only(self) -> None:
         """The computer tool must be declared as exactly {"type": "computer"} --
         no name, description, or parameters leaked onto the wire."""
@@ -250,6 +278,146 @@ class TestWireBodyComputerDeclaration:
         assert wire_tools == [{"type": "computer"}], (
             f"expected the bare native declaration on the wire, got: {wire_tools!r}"
         )
+
+
+class TestWireToolChoice:
+    """Assert tool choice at the captured OpenAI client boundary."""
+
+    @staticmethod
+    def _request(tool_choice: str | dict[str, Any] | None = None) -> ChatRequest:
+        computer = ToolSpec(
+            name="computer",
+            description="Control the computer",
+            parameters={"type": "object", "properties": {}},
+        )
+        computer.type = "computer"
+        return ChatRequest(
+            model="gpt-5.4",
+            messages=[Message(role="user", content="take a screenshot")],
+            tools=[computer],
+            tool_choice=tool_choice,
+        )
+
+    @staticmethod
+    async def _capture(
+        provider: OpenAIProvider, request: ChatRequest, **kwargs: Any
+    ) -> dict[str, Any]:
+        captured_params: dict[str, Any] = {}
+
+        class CapturedAndAborted(Exception):
+            pass
+
+        async def fake_create(**params: Any) -> Any:
+            captured_params.update(params)
+            raise CapturedAndAborted()
+
+        fake_client = MagicMock()
+        fake_client.responses.create = AsyncMock(side_effect=fake_create)
+        fake_client.responses.with_raw_response.create = AsyncMock(
+            side_effect=fake_create
+        )
+        provider._client = fake_client
+
+        with pytest.raises(Exception) as exc_info:
+            await provider.complete(request, **kwargs)
+
+        cause: BaseException | None = exc_info.value
+        while cause is not None and not isinstance(cause, CapturedAndAborted):
+            cause = cause.__cause__
+        assert isinstance(cause, CapturedAndAborted)
+        return captured_params
+
+    @pytest.mark.asyncio
+    async def test_request_none_reaches_client_with_bare_computer_tool(self) -> None:
+        params = await self._capture(
+            _make_provider(use_streaming=False, max_retries=0), self._request("none")
+        )
+
+        assert params["tools"] == [{"type": "computer"}]
+        assert params["tool_choice"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_explicit_kwargs_tool_choice_overrides_request_dict(self) -> None:
+        explicit_choice = {"type": "function", "name": "other_tool"}
+        params = await self._capture(
+            _make_provider(use_streaming=False, max_retries=0),
+            self._request("none"),
+            tool_choice=explicit_choice,
+        )
+
+        assert params["tool_choice"] == explicit_choice
+
+    @pytest.mark.asyncio
+    async def test_unset_tool_choice_defaults_to_auto(self) -> None:
+        params = await self._capture(
+            _make_provider(use_streaming=False, max_retries=0), self._request()
+        )
+
+        assert params["tool_choice"] == "auto"
+
+    @pytest.mark.asyncio
+    async def test_request_wire_dict_is_preserved_verbatim(self) -> None:
+        wire_choice = {
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "function", "name": "computer"}],
+        }
+        params = await self._capture(
+            _make_provider(use_streaming=False, max_retries=0),
+            self._request(wire_choice),
+        )
+
+        assert params["tool_choice"] == wire_choice
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("choice", ["none", "auto"])
+    async def test_namespaced_mode_preserves_portable_choice(
+        self, choice: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("WARNING", logger="amplifier_module_provider_openai")
+        params = await self._capture(
+            _make_provider(
+                use_streaming=False,
+                max_retries=0,
+                tool_search={"mode": "namespaced"},
+            ),
+            self._request(choice),
+        )
+
+        assert params["tool_choice"] == choice
+        assert not any(
+            "tool_search.mode=namespaced forces" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_namespaced_mode_still_forces_directed_choice_to_auto(self) -> None:
+        params = await self._capture(
+            _make_provider(
+                use_streaming=False,
+                max_retries=0,
+                tool_search={"mode": "namespaced"},
+            ),
+            self._request("required"),
+        )
+
+        assert params["tool_choice"] == "auto"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("choice", [{"type": "function", "name": "other"}, None])
+    async def test_namespaced_mode_handles_dict_and_none_tool_choice(
+        self, choice: dict[str, str] | None
+    ) -> None:
+        params = await self._capture(
+            _make_provider(
+                use_streaming=False,
+                max_retries=0,
+                tool_search={"mode": "namespaced"},
+            ),
+            self._request(choice),
+        )
+
+        assert params["tool_choice"] == "auto"
 
 
 # --- Test _convert_to_chat_response (computer_call parsing, from real fixtures) ---
