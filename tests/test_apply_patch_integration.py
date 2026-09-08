@@ -6,16 +6,16 @@ Tests the three localized changes:
 3. _convert_messages: emits apply_patch_call_output for native tool results
 """
 
-# pyright: reportAttributeAccessIssue=false
-
 from __future__ import annotations
 
+# pyright: reportAttributeAccessIssue=false
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._constants import NATIVE_TOOL_TYPES
-
 
 # --- Fixtures ---
 
@@ -125,14 +125,14 @@ class TestConvertToolsFromRequestModelGating:
         assert len(func_tools) == 1
         assert func_tools[0]["name"] == "apply_patch"
 
-    def test_native_apply_patch_sent_for_supporting_model(self) -> None:
-        """gpt-5.1 is confirmed to support native apply_patch — the native
-        shape must still be sent for models known to support it."""
-        provider = _make_provider(default_model="gpt-5.1")
+    @pytest.mark.parametrize("model", ["gpt-5.1", "gpt-6-astra"])
+    def test_native_apply_patch_sent_for_supporting_model(self, model: str) -> None:
+        """Supporting models retain the native apply_patch wire declaration."""
+        provider = _make_provider(default_model=model)
         provider._apply_patch_native = True
 
         tool_spec = _make_apply_patch_tool_spec()
-        result = provider._convert_tools_from_request([tool_spec], "gpt-5.1")
+        result = provider._convert_tools_from_request([tool_spec], model)
 
         native_tools = [t for t in result if t.get("type") == "apply_patch"]
         assert len(native_tools) == 1

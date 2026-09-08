@@ -9,6 +9,7 @@ __all__ = ["OpenAIProvider", "mount"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import copy
 import difflib
 import hashlib
 import inspect
@@ -183,6 +184,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 # Catching disallowed values pre-flight gives callers a clear error instead of
 # an opaque API HTTP 400.
 _GPT_5_5_PRO_ALLOWED_EFFORTS = frozenset({"medium", "high", "xhigh"})
+_GPT_6_ASTRA_ALLOWED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
 def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
@@ -214,6 +216,42 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
         f"Set reasoning.effort to one of the allowed values "
         f"or omit it to use the model default."
     )
+
+
+def _validate_gpt_6_astra_params(params: dict[str, Any]) -> None:
+    """Reject documented-invalid fields from a final Astra wire payload."""
+    if params.get("model") != "gpt-6-astra":
+        return
+
+    reasoning = params.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
+    if effort is not None and effort not in _GPT_6_ASTRA_ALLOWED_EFFORTS:
+        raise kernel_errors.InvalidRequestError(
+            f"Model 'gpt-6-astra' does not support reasoning.effort={effort!r}. "
+            "Use 'low' for lightweight tasks, or omit reasoning.effort. "
+            f"Supported efforts: {sorted(_GPT_6_ASTRA_ALLOWED_EFFORTS)}."
+        )
+
+    for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
+        if field in params and params[field] is not None:
+            raise kernel_errors.InvalidRequestError(
+                f"Model 'gpt-6-astra' does not support {field!r}; remove it from "
+                "the request or extra_request_params."
+            )
+        params.pop(field, None)
+
+    include = params.get("include")
+    if isinstance(include, (list, tuple)) and "message.output_text.logprobs" in include:
+        raise kernel_errors.InvalidRequestError(
+            "Model 'gpt-6-astra' does not support "
+            "'message.output_text.logprobs' in include."
+        )
+
+    options = params.get("prompt_cache_options")
+    if isinstance(options, dict) and options.get("ttl") not in (None, "30m"):
+        raise kernel_errors.InvalidRequestError(
+            "Model 'gpt-6-astra' supports only prompt_cache_options.ttl='30m'."
+        )
 
 
 # Full vocabulary of reasoning.effort values any curated model accepts.
@@ -695,6 +733,10 @@ class _RawResponseObject:
     def get(self, key: str, default: Any = None) -> Any:
         value = self._data.get(key, default)
         return _RawResponseObject(value) if isinstance(value, dict) else value
+
+    def model_dump(self) -> dict[str, Any]:
+        """Return the original JSON shape expected by raw event emission."""
+        return copy.deepcopy(self._data)
 
 
 def _stable_message_id(
@@ -1357,6 +1399,21 @@ class OpenAIProvider:
         # that only occurs on continuation must still be reported exactly
         # once, not hidden.
         self._extra_params_warned_keys: set[str] = set()
+        self._astra_legacy_retention_warned = False
+
+    def _prepare_astra_params(self, params: dict[str, Any]) -> None:
+        """Apply Astra's final-wire compatibility rules after extras merge."""
+        if params.get("model") != "gpt-6-astra":
+            return
+        legacy_retention = params.pop("prompt_cache_retention", None)
+        if legacy_retention is not None and not self._astra_legacy_retention_warned:
+            self._astra_legacy_retention_warned = True
+            logger.warning(
+                "[PROVIDER] Dropping prompt_cache_retention=%r for gpt-6-astra; "
+                "it is unsupported. Use prompt_cache_options.ttl='30m' instead.",
+                legacy_retention,
+            )
+        _validate_gpt_6_astra_params(params)
 
     def _merge_extra_request_params(self, params: dict[str, Any]) -> None:
         """Merge config `extra_request_params` into *params*, user-wins.
@@ -1514,7 +1571,9 @@ class OpenAIProvider:
                     # predicate per key, so a three-way set is not
                     # expressible; this is the single expressible predicate
                     # that matches the models where the flag has a real cost.
-                    show_when={"default_model": "contains:gpt-5.6"},
+                    show_when={
+                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-astra)$"
+                    },
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
                 # ConfigField. It is a per-end-user signal, not a per-deployment
@@ -1653,7 +1712,7 @@ class OpenAIProvider:
             # Filter to GPT-5+ series models or deep research models
             if not (
                 model_id.startswith("gpt-5")
-                or model_id.startswith("gpt-6")
+                or model_id == "gpt-6-astra"
                 or is_deep_research
             ):
                 continue
@@ -1710,6 +1769,7 @@ class OpenAIProvider:
         """
         # Known display name mappings
         display_names = {
+            "gpt-6-astra": "GPT 6 Astra",
             "gpt-5.6": "GPT 5.6",
             "gpt-5.6-sol": "GPT 5.6 Sol",
             "gpt-5.6-terra": "GPT 5.6 Terra",
@@ -2245,9 +2305,13 @@ class OpenAIProvider:
             if isinstance(reasoning_param, dict):
                 # Dict format: use as-is, but apply defaults for missing keys
                 params["reasoning"] = {
-                    "effort": reasoning_param.get("effort", "medium"),
                     "summary": reasoning_param.get("summary", self.reasoning_summary),
                 }
+                effort = reasoning_param.get("effort")
+                if effort is not None:
+                    params["reasoning"]["effort"] = effort
+                elif model_name != "gpt-6-astra":
+                    params["reasoning"]["effort"] = "medium"
                 # reasoning.mode: "pro" (GPT-5.6) enables extended internal reasoning.
                 # Only forwarded when the caller sets it, so pre-5.6 models are
                 # unaffected; verified live 2026-07-14 (mode in {standard, pro}).
@@ -2377,9 +2441,10 @@ class OpenAIProvider:
         # `supports_in_memory_retention=False` (gpt-5.5) actually fires.
         # The mirror-image `supports_24h_retention` gate was removed: proven
         # dormant (defaults True, no branch anywhere ever set it False).
-        prompt_cache_retention = _drop_unsupported_in_memory_retention(
-            model_name, prompt_cache_retention
-        )
+        if model_name != "gpt-6-astra":
+            prompt_cache_retention = _drop_unsupported_in_memory_retention(
+                model_name, prompt_cache_retention
+            )
         if prompt_cache_retention is not None:
             params["prompt_cache_retention"] = prompt_cache_retention
 
@@ -2469,6 +2534,7 @@ class OpenAIProvider:
         # extra_request_params: the documented escape hatch, merged LAST so
         # it reflects in the emitted `raw` payload below (owner-beware).
         self._merge_extra_request_params(params)
+        self._prepare_astra_params(params)
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -2497,6 +2563,19 @@ class OpenAIProvider:
         # Mutable container for rate-limit headers captured inside _do_complete.
         # Using a list-of-one so the nonlocal assignment works across retries.
         captured_rate_limit_info: dict[str, Any] = {}
+        # A streaming `response.failed` terminal contains a vendor response that
+        # may already have billable usage, even though the SDK subsequently
+        # raises and retry_with_backoff retries. Record only those explicit
+        # terminal failures: network exceptions provide no server evidence, and
+        # completed/incomplete responses are recorded when returned so they
+        # cannot be counted twice from both SSE and get_final_response().
+        failed_stream_responses: list[Any] = []
+        failed_stream_response_ids: set[int] = set()
+
+        def _record_failed_stream_response(response: Any) -> None:
+            if response is not None and id(response) not in failed_stream_response_ids:
+                failed_stream_response_ids.add(id(response))
+                failed_stream_responses.append(response)
 
         # Per-request streaming override (does NOT mutate self.use_streaming).
         # Callers like session-namer pass metadata={"stream": False} to force
@@ -2549,7 +2628,7 @@ class OpenAIProvider:
                     # so a legitimate non-completed terminal (`response.incomplete`
                     # from max_output_tokens / content filtering) makes it raise
                     # "Didn't receive a `response.completed` event". We capture the
-                    # response here so we can recover it. See amplifier-support#339.
+                                        # response here so we can recover it. See amplifier-support#339.
                     final_response = None
                     hooks_available = bool(
                         self.coordinator and hasattr(self.coordinator, "hooks")
@@ -2569,14 +2648,18 @@ class OpenAIProvider:
                                         # non-`completed` terminal (`response.incomplete`)
                                         # can be recovered below. This runs on the
                                         # event-emitting path (the standard streaming
-                                        # case); `response.failed` is deliberately not
-                                        # captured so genuine failures still raise.
+                                        # case). A failed response is recorded only for
+                                        # later usage accounting; it is never recovered.
                                         if et in (
                                             "response.completed",
                                             "response.incomplete",
                                         ):
                                             final_response = getattr(
                                                 event, "response", None
+                                            )
+                                        elif et == "response.failed":
+                                            _record_failed_stream_response(
+                                                getattr(event, "response", None)
                                             )
 
                                         if et == "response.output_item.added":
@@ -2656,6 +2739,22 @@ class OpenAIProvider:
                                                         "block_type": block_types[idx],
                                                     },
                                                 )
+                                elif hasattr(stream, "__aiter__"):
+                                    # The SDK still needs its terminal SSE events
+                                    # consumed when no coordinator is mounted. Keep
+                                    # their accounting/recovery semantics identical
+                                    # without emitting stream UI events.
+                                    async for event in stream:
+                                        et = event.type
+                                        if et in (
+                                            "response.completed",
+                                            "response.incomplete",
+                                        ):
+                                            final_response = getattr(event, "response", None)
+                                        elif et == "response.failed":
+                                            _record_failed_stream_response(
+                                                getattr(event, "response", None)
+                                            )
 
                                 try:
                                     response = await stream.get_final_response()
@@ -3046,10 +3145,7 @@ class OpenAIProvider:
             final_response = response
             continuation_count = 0
             truncation_retry_done = False
-            # Usage objects from attempts whose output was discarded (the
-            # truncation-retry policy). Discarded attempts are still BILLED —
-            # their usage must be folded into the reported totals.
-            discarded_usages: list[Any] = []
+            billed_responses: list[Any] = [*failed_stream_responses, response]
 
             while (
                 hasattr(final_response, "status")
@@ -3098,16 +3194,12 @@ class OpenAIProvider:
                                 },
                             )
                         params["max_output_tokens"] = cap_tokens
-                        # The truncated attempt's output is discarded, but its
-                        # tokens (full input pass + up to the previous budget
-                        # of output, including reasoning) were BILLED. Track
-                        # its usage so the final report includes it.
-                        discarded_usages.append(getattr(final_response, "usage", None))
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
                             self._create_response(params),
                             timeout=self.timeout,
                         )
+                        billed_responses.append(final_response)
                         elapsed_ms += int((time.time() - retry_start) * 1000)
                         # Nothing was executed from the truncated attempt;
                         # replace the accumulated output wholesale.
@@ -3218,6 +3310,7 @@ class OpenAIProvider:
                 # issues, not just the first. Merged last here too, for the
                 # same reason and with the same owner-beware semantics.
                 self._merge_extra_request_params(continue_params)
+                self._prepare_astra_params(continue_params)
 
                 # Make continuation call
                 try:
@@ -3226,6 +3319,7 @@ class OpenAIProvider:
                         self._create_response(continue_params),
                         timeout=self.timeout,
                     )
+                    billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
                     elapsed_ms += continue_elapsed
 
@@ -3262,52 +3356,47 @@ class OpenAIProvider:
                 # Use existing conversion for normal (non-continued) responses
                 chat_response = self._convert_to_chat_response(response)
 
-            # Fold the usage of discarded truncation attempts into the report.
-            # The discarded attempt burned a full input pass plus up to the
-            # previous output budget (including reasoning tokens) — all billed;
-            # without this the final report covers only the kept response.
-            if discarded_usages and chat_response.usage is not None:
+            # Every preceding attempt was billed, including incomplete
+            # continuations and truncation retries whose output was discarded.
+            # Merge raw vendor usage through the same normalization used by
+            # the final response so cache writes remain counted exactly once.
+            preceding_usages = [
+                getattr(billed_response, "usage", None)
+                for billed_response in billed_responses[:-1]
+            ]
+            if preceding_usages and chat_response.usage is not None:
                 chat_response.usage = merge_discarded_usage(
-                    chat_response.usage, discarded_usages
+                    chat_response.usage, preceding_usages
                 )
-                extra_cost = None
-                for _discarded in discarded_usages:
-                    if _discarded is None:
-                        continue
-                    # NOTE: this deliberately feeds compute_cost the RAW vendor
-                    # `input_tokens` (which still contains cache_write), NOT the
-                    # contract-normalized value merge_discarded_usage() adds to
-                    # Usage.input_tokens — compute_cost subtracts cached and
-                    # cache_write internally and expects the raw combined total.
-                    # Same asymmetry, same reason, as the kept response's cost
-                    # path above.
-                    _input_details = getattr(_discarded, "input_tokens_details", None)
-                    _cost = compute_cost(
-                        params["model"],
-                        prompt_tokens=getattr(_discarded, "input_tokens", 0) or 0,
-                        completion_tokens=getattr(_discarded, "output_tokens", 0) or 0,
-                        cached_tokens=(getattr(_input_details, "cached_tokens", 0) or 0)
-                        if _input_details
-                        else 0,
-                        cache_write_tokens=(
-                            getattr(_input_details, "cache_write_tokens", 0) or 0
+            if chat_response.usage is not None:
+                attempt_costs: list[Decimal | None] = []
+                for billed_response in billed_responses:
+                    usage_obj = getattr(billed_response, "usage", None)
+                    input_details = getattr(usage_obj, "input_tokens_details", None)
+                    attempt_costs.append(
+                        compute_cost(
+                            getattr(billed_response, "model", ""),
+                            prompt_tokens=getattr(usage_obj, "input_tokens", 0) or 0,
+                            completion_tokens=getattr(usage_obj, "output_tokens", 0) or 0,
+                            cached_tokens=getattr(input_details, "cached_tokens", 0) or 0,
+                            cache_write_tokens=(
+                                getattr(input_details, "cache_write_tokens", 0) or 0
+                            ),
+                            service_tier=getattr(billed_response, "service_tier", None),
                         )
-                        if _input_details
-                        else 0,
+                        if usage_obj is not None
+                        else None
                     )
-                    if _cost is not None:
-                        extra_cost = (extra_cost or Decimal(0)) + _cost
-                if extra_cost is not None:
+                if attempt_costs and all(cost is not None for cost in attempt_costs):
+                    total_cost = sum(attempt_costs, Decimal(0))
                     chat_response.usage = chat_response.usage.model_copy(
-                        update={
-                            "cost_usd": (
-                                getattr(chat_response.usage, "cost_usd", None)
-                                or Decimal(0)
-                            )
-                            + extra_cost
-                        }
+                        update={"cost_usd": total_cost}
                     )
-                    self._add_cost(extra_cost)
+                    self._add_cost(total_cost)
+                else:
+                    chat_response.usage = chat_response.usage.model_copy(
+                        update={"cost_usd": None}
+                    )
 
             # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4704,10 +4793,10 @@ class OpenAIProvider:
                 completion_tokens=_completion_tokens,
                 cached_tokens=_cached_tokens,
                 cache_write_tokens=_cache_write_tokens,
+                service_tier=getattr(response, "service_tier", None),
             )
             if cost is not None:
                 usage = usage.model_copy(update={"cost_usd": cost})
-                self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 

@@ -23,7 +23,7 @@ Notes
 -----
 - O-series: completion_tokens already includes reasoning_tokens (no extra handling needed).
 - Cache-write cost: most OpenAI models have none (writes are free, reads discounted).
-  GPT-5.6 (Sol/Terra/Luna) is the exception -- it bills cache-WRITE tokens at 1.25x the
+  GPT-5.6 (Sol/Terra/Luna) and GPT-6 Astra bill cache-WRITE tokens at 1.25x the
   input rate and reports them as usage.input_tokens_details.cache_write_tokens (Responses API)
   / usage.prompt_tokens_details.cache_write_tokens (Chat Completions). Rate entries that omit
   "cache_write_per_m" bill any write tokens as ordinary input (correct for pre-5.6 models,
@@ -47,7 +47,7 @@ from ._capabilities import get_capabilities
 # Internal constants
 # ---------------------------------------------------------------------------
 
-_PER_M = Decimal("1_000_000")
+_PER_M = Decimal(1_000_000)
 
 # Long-context re-rating threshold. A request whose INPUT (prompt) token count
 # exceeds the model's `long_context_pricing_threshold` bills the ENTIRE request --
@@ -82,6 +82,14 @@ _SNAPSHOT_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 # TODO: gpt-5.3-codex, gpt-5.2, gpt-5.2-pro, gpt-5.1, gpt-5.1-codex, gpt-5-mini
 #       not yet on pricing page; these models return None until rates are added.
 _RATES: dict[str, dict[str, Decimal]] = {
+    # GPT-6 Astra short-context Standard pricing, per 1M tokens.
+    # Source: https://developers.openai.com/api/docs/pricing
+    "gpt-6-astra": {
+        "input_per_m": Decimal("10.00"),
+        "output_per_m": Decimal("50.00"),
+        "cache_read_per_m": Decimal("1.00"),
+        "cache_write_per_m": Decimal("12.50"),
+    },
     # ------------------------------------------------------------------
     # GPT 5.6 family: Sol / Terra / Luna  (GA 2026-07-09)
     # Sol $4/$20, Terra $2/$12, Luna $0.20/$1.20 per 1M
@@ -180,6 +188,13 @@ _RATES: dict[str, dict[str, Decimal]] = {
 #   luna  input $0.40  cached $0.04  cache-write  $0.50  output  $1.80
 # Source: https://developers.openai.com/api/docs/pricing (verified 2026-09-01).
 _LONG_RATES: dict[str, dict[str, Decimal]] = {
+    # GPT-6 Astra long-context (>272K input) Standard pricing, per 1M tokens.
+    "gpt-6-astra": {
+        "input_per_m": Decimal("20.00"),
+        "output_per_m": Decimal("75.00"),
+        "cache_read_per_m": Decimal("2.00"),
+        "cache_write_per_m": Decimal("25.00"),
+    },
     "gpt-5.6-sol": {
         "input_per_m": Decimal("8.00"),
         "output_per_m": Decimal("30.00"),
@@ -229,6 +244,10 @@ def _find_rates(
     m = _SNAPSHOT_RE.match(model)
     if m is None:
         return None
+    # Astra has one documented model ID and no dated snapshots. Do not assign
+    # its current prices to an invented future snapshot.
+    if m.group("base") == "gpt-6-astra":
+        return None
     return table.get(m.group("base"))
 
 
@@ -239,6 +258,7 @@ def compute_cost(
     completion_tokens: int = 0,
     cached_tokens: int = 0,
     cache_write_tokens: int = 0,
+    service_tier: str | None = "default",
 ) -> Decimal | None:
     """Compute the cost of an OpenAI API call in USD.
 
@@ -255,6 +275,10 @@ def compute_cost(
             has that rate. usage.{prompt,input}_tokens_details.cache_write_tokens.
             Models without a cache_write_per_m rate never emit this field and bill
             it as ordinary input.
+        service_tier: Actual response service tier for GPT-6 Astra. Direct
+            callers retain the historic Standard/default estimate. Explicit
+            None or an unpriced tier returns None for Astra rather than
+            fabricating a Standard price.
 
     Returns:
         Decimal cost in USD, or None if the model is not in the pricing table.
@@ -266,6 +290,23 @@ def compute_cost(
     rates = _find_rates(model)
     if rates is None:
         return None
+
+    if model == "gpt-6-astra":
+        if service_tier is None:
+            return None
+        tier = service_tier.lower()
+        if tier == "flex":
+            tier_multiplier = Decimal("0.5")
+        elif tier in {"priority", "fast"}:
+            tier_multiplier = Decimal(2)
+        elif tier == "default":
+            tier_multiplier = Decimal(1)
+        else:
+            return None
+    else:
+        # Preserve legacy-model cost behavior; service tiers are only priced
+        # for Astra in this module.
+        tier_multiplier = Decimal(1)
 
     # Long-context re-rating: when input tokens exceed the model's long-context
     # pricing threshold, the ENTIRE request (input, output, cached, cache-write)
@@ -300,4 +341,4 @@ def compute_cost(
     cost += Decimal(completion_tokens) * rates["output_per_m"] / _PER_M
     if cached_tokens:
         cost += Decimal(cached_tokens) * rates["cache_read_per_m"] / _PER_M
-    return cost
+    return cost * tier_multiplier

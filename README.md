@@ -19,7 +19,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 ## Purpose
 
-Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplifier using the Responses API for enhanced capabilities.
+Provides access to OpenAI's GPT-6, GPT-5, and GPT-4 models as an LLM provider for Amplifier using the Responses API for enhanced capabilities.
 
 ## Contract
 
@@ -29,6 +29,7 @@ Provides access to OpenAI's GPT-5 and GPT-4 models as an LLM provider for Amplif
 
 ## Supported Models
 
+- `gpt-6-astra` - GPT 6 Astra. Reports a 272,000-token input budget by default, or 922,000 with long context enabled (within its 1,050,000-token native total window). Supports a 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` tools.
 - `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
 - `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
@@ -70,8 +71,8 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `api_key` | (auth) | OpenAI API key. Resolved from `OPENAI_API_KEY` if unset. | — | ✅ |
 | `base_url` | (client) | Custom endpoint. `null` = OpenAI default. | — | ✅ |
 | `default_model` | `model` | Model id used when a request doesn't pin one. | — | (picker) |
-| `reasoning_effort` | `reasoning.effort` | Session-default reasoning effort (canonical key). `"none"`/unset sends nothing. | Higher effort = more reasoning tokens, slower, costlier. | ✅ |
-| `enable_long_context` | **Amplifier-only** | Changes the *reported* context window (see [Long context](#long-context)). Does not map to an API param. | **≈2× on gpt-5.6 when input exceeds 272K** — whole-request re-rating. | ✅ |
+| `reasoning_effort` | `reasoning.effort` | Session-default reasoning effort (canonical key). `"none"`/unset sends nothing. Astra accepts only `low`, `medium`, `high`, `xhigh`, or `max` when sent. | Higher effort = more reasoning tokens, slower, costlier. | ✅ |
+| `enable_long_context` | **Amplifier-only** | Changes the *reported* context window (see [Long context](#long-context)). Does not map to an API param. | **≈2× on gpt-5.6/Astra when input exceeds 272K** — whole-request re-rating. | ✅ |
 | `max_output_tokens` | `max_output_tokens` | Output-token budget. `null` = the model capability's max. **Config key is `max_output_tokens`; the per-call kwarg is still `max_tokens`.** | Caps output length. | |
 | `reasoning` | `reasoning` | LEGACY effort alias. Use for the dict form (`{effort=..., mode="pro", context=...}`). `reasoning_effort` wins if both set. | See `reasoning_effort`. | |
 | `reasoning_summary` | `reasoning.summary` | Reasoning verbosity: `auto`\|`concise`\|`detailed`. | `detailed` uses more output tokens. | |
@@ -80,8 +81,8 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `timeout` | (client) | Per-request timeout seconds. | — | |
 | `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
 | `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
-| `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime. | |
-| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); `ttl` passes through. | `explicit` w/ no breakpoints would disable caching (~10×). | |
+| `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. Astra removes this legacy field and warns once; use `prompt_cache_options.ttl: "30m"`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime where supported. | |
+| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); Astra accepts only `ttl: "30m"`. | `explicit` w/ no breakpoints would disable caching (~10×). | |
 | `reasoning_context` | `reasoning.context` | `auto`\|`current_turn`\|`all_turns`. First-class key; composes with `reasoning_effort` (the legacy `reasoning` dict does not). | `current_turn` trims rendered reasoning on long loops. | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
@@ -92,7 +93,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `use_streaming` | (transport) | Chunked HTTP transport (default `true`). Not progressive UI streaming. | — | |
 | `max_retries` / `min_retry_delay` / `max_retry_delay` / `retry_jitter` | (retry) | Shared retry-with-backoff configuration. | — | |
 | `max_concurrent_requests` | **Amplifier-only** | Process-wide in-flight concurrency gate (default 5; 0 disables). | — | |
-| `extra_request_params` | **Amplifier-only (escape hatch)** | Arbitrary Responses API params, merged LAST, user wins. Own the consequences. Round-tripped by app-cli config tooling. | Depends on what you set. | |
+| `extra_request_params` | **Amplifier-only (escape hatch)** | Responses API params override provider defaults; Astra's final compatibility checks still apply. Round-tripped by app-cli config tooling. | Depends on what you set. | |
 | `tool_search` | `tools` (shape) | Mapping: `mode` (`off` default \| `namespaced`), optional `namespaces` table, optional `always_loaded`. See [Deferred tool loading](#deferred-tool-loading-tool_searchmode). | Non-default rebuilds the prompt cache once, and the model must *search* for a deferred tool. | |
 
 **Deprecated aliases** (still work, warn once, will be removed):
@@ -212,9 +213,12 @@ An unrecognized value falls back to `"turn"` with a warning.
 ## Prompt Caching
 
 The provider exposes OpenAI's prompt-caching hint parameters. Defaults:
-`prompt_cache_retention = "24h"` (extended GPU-local KV storage on every
-supported model), `prompt_cache_key` unset, `truncation = null` (the field is
+`prompt_cache_retention = "24h"` (extended GPU-local KV storage where
+supported), `prompt_cache_key` unset, `truncation = null` (the field is
 omitted so the cached prefix is never silently rewritten on overflow).
+
+For Astra, the legacy retention field is always omitted; use
+`prompt_cache_options.ttl: "30m"` instead.
 
 See also: [OpenAI Cookbook — Prompt Caching 201](https://cookbook.openai.com/examples/prompt_caching_201).
 
@@ -259,6 +263,10 @@ The documented escape hatch for Responses API parameters this provider does not
 model (including `store`). It is a dict, **settings-only** (never a
 `ConfigField`), merged into the request params **last** — after every
 provider-computed key — so it overrides anything the provider set, deliberately.
+
+**Astra exception:** final compatibility checks run after this merge. Unsupported
+sampling, log-probability, reasoning-effort, and cache-TTL values fail before the
+SDK call; legacy cache retention is removed.
 
 - **User wins, loudly.** Any provider-computed key it clobbers is named in a
   one-time warning per key per provider instance. You own the consequences: an
@@ -353,22 +361,64 @@ it does not map to an API parameter.
 - The threshold is measured on **INPUT tokens only**, at **272,000**.
 - The boundary is **strict**: exactly 272,000 is short-context; `> 272,000` is
   long.
-- On **gpt-5.6**, exceeding it re-rates the **ENTIRE request** — input, output,
+- On **gpt-5.6 and gpt-6-astra**, exceeding it re-rates the **ENTIRE request** — input, output,
   cached, and cache-write tokens — at long rates. **Whole-request, not
   marginal-on-the-overage.**
 - **Which models actually have the tier:** `gpt-5.6-sol` / `-terra` / `-luna`
-  are the only models with modelled long rates. `gpt-5.4` and variants carry a
+  and `gpt-6-astra` have modelled long rates. `gpt-5.4` and variants carry a
   272K threshold but have **no long rates modelled**, so the flag only changes
   the *reported* window for them. **`gpt-5.5` has no threshold at all** — the
   flag is a no-op there.
 - **What the flag does:** with it off (default), `get_info`/`list_models`
   report the 272K threshold as the context window, so unpinned sessions compact
   against the standard-priced window. With it on, they report the full measured
-  window (900,000 for 5.6 — empirically measured, not the ~1.05M marketing
-  number).
+  input budget (900,000 for 5.6, empirically measured; 922,000 for Astra,
+  reserving 128,000 output tokens from its 1,050,000-token total window).
 
 The `enable_long_context` ConfigField is gated (`show_when`) to gpt-5.6-family
-models — the only models where the flag carries a cost consequence.
+models and the exact `gpt-6-astra` ID, where the flag carries a cost consequence.
+
+## GPT-6 Astra
+
+`gpt-6-astra` is supported only by its documented exact model ID; this module
+does not infer support or pricing for hypothetical snapshots. It sends no
+default `reasoning.effort`. The configured `"none"` selector remains an
+Amplifier omission sentinel; an outgoing `none`, `minimal`, or unknown effort
+is rejected before the SDK call. Unsupported outgoing `temperature`, `top_p`,
+`logprobs`, `top_logprobs`, and `include: ["message.output_text.logprobs"]` are likewise
+rejected after `extra_request_params` has performed its final merge.
+
+Prompt caching uses `prompt_cache_options.ttl: "30m"` (the only documented TTL).
+The legacy `prompt_cache_retention` field is removed from every Astra wire
+payload, including continuation calls. The existing explicit-cache-mode safety
+guard remains: this provider does not create cache breakpoints, so explicit
+mode is dropped rather than disabling caching.
+
+### Context and token estimates
+
+The native total context window is 1,050,000 tokens and maximum output is
+128,000 tokens. `ModelCapabilities.context_window` is the safe input and
+compaction budget: 272,000 by default to avoid long-context pricing, or
+922,000 with `enable_long_context: true`. The boundary is strict: exactly
+272,000 input tokens uses short pricing; 272,001 re-rates the whole request.
+
+Rates are USD per million tokens in fresh input / cached input / cache writes /
+output order. Standard rates are `$10 / $1 / $12.50 / $50`; long-context rates
+are `$20 / $2 / $25 / $75`. Static Batch and Flex rates are half the
+corresponding Standard rates; Fast rates are double. This provider does not
+implement Batch transport.
+
+Runtime Astra accounting uses the actual response `service_tier`: `default` is
+Standard, `flex` is half, and `priority` or `fast` is double. A Fast request
+may return `default` after a downgrade, which is charged at Standard instead.
+Missing or unpriced tiers report no cost rather than a fabricated estimate.
+Reasoning tokens are already included in output tokens; cache reads and writes
+are each subtracted once from gross input. These are token-only estimates:
+hosted-tool fees and regional-processing uplifts are excluded.
+
+The Responses API supports more Astra features than this adapter orchestrates.
+It does not add WebSocket transport or mid-turn steering, async tool-call
+orchestration, multi-agent orchestration, or compaction orchestration.
 
 ## Debugging (`raw`)
 
