@@ -1062,6 +1062,15 @@ class OpenAIProvider:
     # direct use of OpenAIProvider is completely unaffected.
     EXTRA_KNOWN_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset()
 
+    def get_native_computer_tool_spec(self) -> dict[str, str]:
+        """Return the bare Responses API computer declaration for serialization.
+
+        This only describes this provider's supported wire serialization. It
+        does not assert that a particular endpoint or model accepts computer
+        use; the Responses API remains authoritative for that capability.
+        """
+        return {"type": "computer"}
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -2392,14 +2401,19 @@ class OpenAIProvider:
         if tools_list:
             params["tools"] = self._convert_tools_from_request(tools_list, model_name)
             # Add tool-related parameters per Responses API spec
-            params["tool_choice"] = kwargs.get("tool_choice", "auto")
+            if "tool_choice" in kwargs:
+                params["tool_choice"] = kwargs["tool_choice"]
+            elif request.tool_choice is not None:
+                params["tool_choice"] = request.tool_choice
+            else:
+                params["tool_choice"] = "auto"
             if self.tool_search_mode == TOOL_SEARCH_MODE_NAMESPACED:
                 # BREAK 1. `tool_choice` semantics against a DEFERRED tool are
                 # unprobed (`bub` exercised only "none" and "auto"). Forcing a
                 # tool the model has not discovered yet has no defined
                 # behaviour, so pin "auto" and SAY SO rather than sending an
                 # untested combination into a live session.
-                if params["tool_choice"] != "auto":
+                if params["tool_choice"] not in ("auto", "none"):
                     logger.warning(
                         "[PROVIDER] tool_search.mode=namespaced forces "
                         "tool_choice='auto' (requested %r): forcing a tool that "
@@ -4294,7 +4308,7 @@ class OpenAIProvider:
                 # request outright, so this branch discards them by
                 # construction rather than by omission.
                 if getattr(tool, "type", None) == "computer":
-                    openai_tools.append({"type": "computer"})
+                    openai_tools.append(self.get_native_computer_tool_spec())
                     continue
 
                 # Special handling for apply_patch with native engine — but only
