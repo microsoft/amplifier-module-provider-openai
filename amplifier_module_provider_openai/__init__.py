@@ -4327,22 +4327,31 @@ class OpenAIProvider:
                         resolved_model,
                     )
 
+                # Responses normalizes an omitted `strict` field to strict mode,
+                # which rejects otherwise-valid schemas with optional properties.
+                # ToolSpec permits provider-specific extras, so preserve an explicit
+                # bool opt-in/out without adding a core ToolSpec field or modifying
+                # the caller's schema.
+                strict = getattr(tool, "strict", False)
                 openai_tools.append(
                     {
                         "type": "function",
                         "name": tool.name,
                         "description": tool.description or "",
                         "parameters": tool.parameters,
+                        "strict": strict if isinstance(strict, bool) else False,
                     }
                 )
             elif isinstance(tool, dict) and "name" in tool:
                 # Handle dict-format function tool
+                strict = tool.get("strict", False)
                 openai_tools.append(
                     {
                         "type": "function",
                         "name": tool.get("name", ""),
                         "description": tool.get("description", ""),
                         "parameters": tool.get("parameters", {}),
+                        "strict": strict if isinstance(strict, bool) else False,
                     }
                 )
 
