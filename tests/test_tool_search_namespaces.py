@@ -2,11 +2,12 @@
 
 Three things these tests exist to catch, in priority order:
 
-1. **Default byte-identity.** The default (`off`) request must be
-   byte-for-byte what shipped before this feature existed. This is the one
-   assertion that protects every existing deployment, and it is written as a
-   literal expected payload plus a sha256 over the serialized `tools` array so
-   a "harmless" refactor of the emission site cannot slide past it.
+1. **Default off-mode invariant.** The default (`off`) request adds no
+   namespace or deferred-loading behavior beyond standard current tool
+   conversion, including its deliberate `strict: false` function-tool default;
+   native tools remain unchanged. A literal expected payload plus a sha256 over
+   the serialized `tools` array pins that conversion for the function tools
+   covered here.
 2. **The deferred request shape.** Namespaces sorted, members sorted,
    `defer_loading` on everything except the always-loaded set, `tool_search`
    last, native tools untouched, reserved names refused.
@@ -117,35 +118,35 @@ def _canon(obj: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 1. DEFAULT BYTE-IDENTITY -- the guardrail for every existing deployment
+# 1. DEFAULT OFF-MODE INVARIANT -- tool search adds no further changes
 # ---------------------------------------------------------------------------
 
 
 def _expected_off_mode_tools() -> list[dict[str, Any]]:
-    """The flat shape this provider emitted before tool_search existed."""
+    """The standard current function-tool conversion with tool search off."""
     return [
         {
             "type": "function",
             "name": name,
             "description": desc,
             "parameters": {"type": "object", "properties": {}},
+            "strict": False,
         }
         for name, desc in ROSTER
     ]
 
 
-def test_default_config_emits_the_pre_existing_flat_tool_block():
+def test_default_config_emits_the_standard_flat_tool_block():
     params = _run(_make_provider(), _request())
     assert params["tools"] == _expected_off_mode_tools()
 
 
 def test_default_config_tools_sha256_is_pinned():
-    """Pin the serialized bytes, not just the structure.
+    """Pin the standard off-mode serialization, not just the structure.
 
-    A refactor that reorders keys, coerces a None, or adds a "harmless" field
-    would still satisfy a structural assertion while zeroing the prompt cache
-    in production (probe `12v`: a 2.1% byte change dropped cached_tokens from
-    18,387 to 0).
+    A tool-search refactor that reorders keys, coerces a None, or introduces a
+    namespace or deferred-loading field would still satisfy a structural
+    assertion while violating the off-mode invariant.
     """
     params = _run(_make_provider(), _request())
     digest = hashlib.sha256(_canon(params["tools"]).encode()).hexdigest()
@@ -579,6 +580,7 @@ def test_native_tool_shapes_pass_through_untouched():
             "name": "read_file",
             "description": "Read",
             "parameters": {},
+            "strict": False,
         },
     ]
     out = build_namespaced_tools(

@@ -294,6 +294,7 @@ def build_namespaced_tools(
                 "name": tool["name"],
                 "description": tool.get("description", ""),
                 "parameters": tool.get("parameters", {}),
+                "strict": tool["strict"],
             }
             # TS:18 -- defer_loading applies to the functions inside a
             # namespace, not to the namespace object itself.

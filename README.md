@@ -280,13 +280,23 @@ SDK call; legacy cache retention is removed.
 config = { extra_request_params = { store = true, seed = 42 } }
 ```
 
+### Function-tool strictness
+
+Responses normalizes an omitted function-tool `strict` field to strict mode.
+To keep ordinary tool schemas best-effort (including schemas with optional
+properties), this provider sends `strict: false` by default. A `ToolSpec`
+carrying a boolean `strict` extra preserves that explicit raw Responses API
+opt-in/out; the provider does not alter schemas or invent core fields.
+
 ## Deferred tool loading (`tool_search.mode`)
 
-**Off by default, and the default is byte-identical to every prior release.**
-`tool_search.mode: off` (the default, and what you get when the key is absent)
-takes the same code path it always did; the namespaced branch is only reachable
-when the flag is set explicitly. `tests/test_tool_search_namespaces.py` pins the
-default `tools` array by value *and* by sha256 over its serialized bytes.
+**Off by default.** `tool_search.mode: off` (the default, and what you get when
+the key is absent) adds no namespace or deferred-loading behavior beyond the
+standard current tool conversion, including its deliberate `strict: false`
+function-tool default. Native tools remain unchanged. The namespaced branch is
+only reachable when the flag is set explicitly.
+`tests/test_tool_search_namespaces.py` pins the default `tools` array by value
+*and* by sha256 over its serialized bytes.
 
 `tool_search.mode: namespaced` groups the tool roster into namespaces with
 `defer_loading: true` and adds `{"type": "tool_search"}`, so the model sees only
