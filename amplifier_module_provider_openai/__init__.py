@@ -9,6 +9,8 @@ __all__ = ["OpenAIProvider", "mount"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import base64
+import binascii
 import copy
 import difflib
 import hashlib
@@ -20,7 +22,7 @@ import time
 import uuid
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
 import openai
 from amplifier_core import (
@@ -657,6 +659,85 @@ def _extract_computer_screenshot_data_url(tool_content: Any) -> str:
         "base64 PNG string or an image content block "
         f"(got: {type(tool_content).__name__})"
     )
+
+
+def _convert_function_tool_output_content(
+    content: list[Any], model_name: str
+) -> list[dict[str, str]] | None:
+    """Convert canonical text/image tool content to Responses output items.
+
+    Returns ``None`` for legacy list values. A list is rich content only when it
+    contains at least one image block and every block uses the canonical text or
+    base64-image vocabulary.
+    """
+    has_image = any(
+        isinstance(block, dict) and block.get("type") == "image"
+        for block in content
+    )
+    if not has_image:
+        return None
+
+    supports_vision = get_capabilities(model_name).supports_vision
+    output: list[dict[str, str]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise TypeError(
+                "function tool result image content must contain only text or image blocks"
+            )
+
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise TypeError(
+                    "function tool result text block must contain a string 'text' value"
+                )
+            output.append({"type": "input_text", "text": text})
+            continue
+
+        if block_type != "image":
+            raise TypeError(
+                "function tool result image content must contain only text or image blocks"
+            )
+
+        source = block.get("source")
+        if not isinstance(source, dict) or source.get("type") != "base64":
+            raise ValueError(
+                "function tool result image block must use a base64 image source"
+            )
+        media_type = source.get("media_type")
+        data = source.get("data")
+        if not isinstance(media_type, str) or not media_type:
+            raise ValueError(
+                "function tool result image block must contain a non-empty string 'media_type'"
+            )
+        if not isinstance(data, str) or not data:
+            raise ValueError(
+                "function tool result image block must contain non-empty base64 data"
+            )
+        try:
+            base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError(
+                "function tool result image block contains invalid base64 data"
+            ) from None
+
+        if supports_vision:
+            output.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{media_type};base64,{data}",
+                }
+            )
+        else:
+            output.append(
+                {
+                    "type": "input_text",
+                    "text": "[Image omitted: selected model does not support vision.]",
+                }
+            )
+
+    return output
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -2220,7 +2301,9 @@ class OpenAIProvider:
         # Convert to OpenAI Responses API message format. Always the FULL
         # local transcript -- the provider is stateless-only, there is no
         # chain-truncated delta to convert instead.
-        input_messages = self._convert_messages(all_messages_for_conversion)
+        input_messages = self._convert_messages(
+            all_messages_for_conversion, model=model_name
+        )
         logger.info(
             f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
         )
@@ -3570,6 +3653,7 @@ class OpenAIProvider:
         messages: list[dict[str, Any]],
         *,
         reasoning_replay_scope: str | None = None,
+        model: str | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
@@ -3582,12 +3666,14 @@ class OpenAIProvider:
             messages: List of message dicts from ChatRequest
             reasoning_replay_scope: Overrides self.reasoning_replay_scope for
                 this call ("turn" | "all" | "none"). None inherits config.
+            model: Model used for this request. None inherits self.default_model.
 
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
         """
         openai_messages = []
         i = 0
+        model_name = model or self.default_model
 
         # Occurrence counter for _stable_message_id: how many times an assistant
         # message with this exact (content, status) pair has already been emitted
@@ -3646,11 +3732,6 @@ class OpenAIProvider:
                     tool_name = tool_msg.get("tool_name", "unknown")
 
                     if tool_call_id:
-                        output_str = (
-                            tool_content
-                            if isinstance(tool_content, str)
-                            else json.dumps(tool_content)
-                        )
                         # Use computer_call_output (with an image envelope, not
                         # a stringified blob) for native computer calls. This
                         # must be checked before the generic native-call branch
@@ -3673,6 +3754,11 @@ class OpenAIProvider:
                             )
                         # Use apply_patch_call_output for native apply_patch calls
                         elif tool_call_id in self._native_call_ids:
+                            output_str = (
+                                tool_content
+                                if isinstance(tool_content, str)
+                                else json.dumps(tool_content)
+                            )
                             # Determine status: "failed" if content signals error, else "completed"
                             _patch_status = "completed"
                             if (
@@ -3717,11 +3803,27 @@ class OpenAIProvider:
                         else:
                             # Standard function_call_output format
                             # Per OpenAI Responses API spec (see ai_context/openai-api-guide.txt)
+                            rich_output = (
+                                _convert_function_tool_output_content(
+                                    tool_content, model_name
+                                )
+                                if isinstance(tool_content, list)
+                                else None
+                            )
+                            output = (
+                                rich_output
+                                if rich_output is not None
+                                else (
+                                    tool_content
+                                    if isinstance(tool_content, str)
+                                    else json.dumps(tool_content)
+                                )
+                            )
                             openai_messages.append(
                                 {
                                     "type": "function_call_output",
                                     "call_id": tool_call_id,
-                                    "output": output_str,
+                                    "output": output,
                                 }
                             )
                     else:
