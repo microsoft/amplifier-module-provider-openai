@@ -74,9 +74,7 @@ def _tool_message(content: object) -> dict[str, object]:
 
 
 def _function_output(messages: list[dict[str, object]]) -> dict[str, object]:
-    return next(
-        item for item in messages if item.get("type") == "function_call_output"
-    )
+    return next(item for item in messages if item.get("type") == "function_call_output")
 
 
 def _request_with_image_result() -> ChatRequest:
@@ -84,9 +82,7 @@ def _request_with_image_result() -> ChatRequest:
         messages=[
             Message(
                 role="assistant",
-                content=[
-                    ToolCallBlock(id="call_result", name="inspect", input={})
-                ],
+                content=[ToolCallBlock(id="call_result", name="inspect", input={})],
             ),
             Message(
                 role="tool",
@@ -107,7 +103,9 @@ def _request_with_image_result() -> ChatRequest:
     )
 
 
-def test_converter_preserves_rich_function_output_order_and_strips_internal_fields() -> None:
+def test_converter_preserves_rich_function_output_order_and_strips_internal_fields() -> (
+    None
+):
     provider = _provider()
     content = [
         {"type": "text", "text": "before", "visibility": "internal"},

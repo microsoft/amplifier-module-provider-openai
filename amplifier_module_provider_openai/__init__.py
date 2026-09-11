@@ -22,7 +22,7 @@ import time
 import uuid
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar
 
 import openai
 from amplifier_core import (
@@ -671,8 +671,7 @@ def _convert_function_tool_output_content(
     base64-image vocabulary.
     """
     has_image = any(
-        isinstance(block, dict) and block.get("type") == "image"
-        for block in content
+        isinstance(block, dict) and block.get("type") == "image" for block in content
     )
     if not has_image:
         return None
@@ -2734,7 +2733,7 @@ class OpenAIProvider:
                     # so a legitimate non-completed terminal (`response.incomplete`
                     # from max_output_tokens / content filtering) makes it raise
                     # "Didn't receive a `response.completed` event". We capture the
-                                        # response here so we can recover it. See amplifier-support#339.
+                    # response here so we can recover it. See amplifier-support#339.
                     final_response = None
                     hooks_available = bool(
                         self.coordinator and hasattr(self.coordinator, "hooks")
@@ -2856,7 +2855,9 @@ class OpenAIProvider:
                                             "response.completed",
                                             "response.incomplete",
                                         ):
-                                            final_response = getattr(event, "response", None)
+                                            final_response = getattr(
+                                                event, "response", None
+                                            )
                                         elif et == "response.failed":
                                             _record_failed_stream_response(
                                                 getattr(event, "response", None)
@@ -3483,8 +3484,10 @@ class OpenAIProvider:
                         compute_cost(
                             getattr(billed_response, "model", ""),
                             prompt_tokens=getattr(usage_obj, "input_tokens", 0) or 0,
-                            completion_tokens=getattr(usage_obj, "output_tokens", 0) or 0,
-                            cached_tokens=getattr(input_details, "cached_tokens", 0) or 0,
+                            completion_tokens=getattr(usage_obj, "output_tokens", 0)
+                            or 0,
+                            cached_tokens=getattr(input_details, "cached_tokens", 0)
+                            or 0,
                             cache_write_tokens=(
                                 getattr(input_details, "cache_write_tokens", 0) or 0
                             ),
