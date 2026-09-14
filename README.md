@@ -27,6 +27,14 @@ Provides access to OpenAI's GPT-6, GPT-5, and GPT-4 models as an LLM provider fo
 **Mount Point:** `providers`
 **Entry Point:** `amplifier_module_provider_openai:mount`
 
+### Instruction-layout authority
+
+The provider advertises instruction-layout v1 with authority support. Resolved
+instruction records default to `authoritative` when historical metadata omits
+`authority`; both authoritative and advisory positioned records use Responses
+API `developer` items. Marked v1 tool batches are validated before the legacy
+missing-result repair path, so invalid canonical history is rejected unchanged.
+
 ## Supported Models
 
 - `gpt-6-astra` - GPT 6 Astra. Reports a 272,000-token input budget by default, or 922,000 with long context enabled (within its 1,050,000-token native total window). Supports a 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` tools.

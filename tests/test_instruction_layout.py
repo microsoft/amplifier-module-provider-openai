@@ -6,8 +6,8 @@ import asyncio
 import copy
 import importlib
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -44,6 +44,7 @@ def _descriptor(
     target: dict[str, Any] | None = None,
     deferred_origin: bool = False,
     disposition: str = "pending",
+    authority: str | None = "authoritative",
 ) -> dict[str, Any]:
     descriptor: dict[str, Any] = {
         "version": 1,
@@ -52,6 +53,8 @@ def _descriptor(
         "binding": binding,
         "placement": placement,
     }
+    if authority is not None:
+        descriptor["authority"] = authority
     if binding == "fixed":
         descriptor.update(
             entry_id=f"session:test-source:{binding}-{placement}",
@@ -76,6 +79,7 @@ def _instruction(
     target: dict[str, Any] | None = None,
     deferred_origin: bool = False,
     disposition: str = "pending",
+    authority: str | None = "authoritative",
 ) -> Message:
     return Message(
         role="system",
@@ -87,6 +91,7 @@ def _instruction(
                 target=target,
                 deferred_origin=deferred_origin,
                 disposition=disposition,
+                authority=authority,
             )
         },
     )
@@ -101,7 +106,25 @@ def _params(provider: OpenAIProvider) -> dict[str, Any]:
 
 
 def test_provider_advertises_v1_instruction_layout() -> None:
-    assert _provider().instruction_layout_version == 1
+    provider = _provider()
+    assert provider.instruction_layout_version == 1
+    assert provider.instruction_layout_authority_v1 is True
+
+
+def test_authorityless_historical_descriptor_defaults_to_authoritative() -> None:
+    provider = _provider()
+    provider.client.responses.create = AsyncMock(return_value=_Response())
+    request = _request(
+        [
+            _instruction("head", "head", authority=None),
+            _instruction("positioned", "before_human", authority=None),
+            Message(role="user", content="human"),
+        ]
+    )
+
+    asyncio.run(provider.complete(request))
+
+    assert _params(provider)["input"][0]["role"] == "developer"
 
 
 def test_legacy_unmarked_system_and_developer_transforms_are_unchanged() -> None:
@@ -471,6 +494,201 @@ def test_synthetic_fixed_before_human_anchor_fails_before_dispatch() -> None:
     cast(AsyncMock, provider.client.responses.create).assert_not_awaited()
 
 
+@pytest.mark.parametrize("authority", [True, "untrusted"])
+def test_invalid_instruction_authority_fails_before_dispatch(authority: Any) -> None:
+    provider = _provider()
+    provider.client.responses.create = AsyncMock(return_value=_Response())
+    request = _request([_instruction("bad", "head", authority=authority)])
+    original = copy.deepcopy(request.model_dump())
+
+    with pytest.raises(ValueError, match="invalid v1 fields"):
+        asyncio.run(provider.complete(request))
+
+    cast(AsyncMock, provider.client.responses.create).assert_not_awaited()
+    assert request.model_dump() == original
+
+
+def test_every_marked_descriptor_is_validated_before_tool_preflight() -> None:
+    provider = _provider()
+    provider.client.responses.create = AsyncMock(return_value=_Response())
+    request = _request(
+        [
+            _instruction("valid", "head"),
+            _instruction("invalid", "tail", authority="untrusted"),
+            Message(
+                role="assistant",
+                content=[ToolCallBlock(id="missing", name="tool", input={})],
+            ),
+        ]
+    )
+    original = copy.deepcopy(request.model_dump())
+
+    with pytest.raises(ValueError, match="invalid v1 fields"):
+        asyncio.run(provider.complete(request))
+
+    cast(AsyncMock, provider.client.responses.create).assert_not_awaited()
+    assert request.model_dump() == original
+
+
+def test_marked_v1_incomplete_tool_batch_fails_before_legacy_repair() -> None:
+    provider = _provider()
+    provider.client.responses.create = AsyncMock(return_value=_Response())
+    request = _request(
+        [
+            _instruction("head", "head"),
+            Message(
+                role="assistant",
+                content=[ToolCallBlock(id="missing", name="tool", input={})],
+            ),
+            Message(role="user", content="must not be preceded by a repair"),
+        ]
+    )
+    original = copy.deepcopy(request.model_dump())
+
+    with pytest.raises(ValueError, match="splits a tool-call/tool-result batch"):
+        asyncio.run(provider.complete(request))
+
+    cast(AsyncMock, provider.client.responses.create).assert_not_awaited()
+    assert request.model_dump() == original
+
+
+def test_v1_top_level_tool_name_alias_serializes_paired_result_unchanged() -> None:
+    provider = _provider()
+    provider.client.responses.create = AsyncMock(return_value=_Response())
+    request = _request(
+        [
+            _instruction("head", "head"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "tool": "lookup",
+                        "arguments": {"query": "value"},
+                    }
+                ],
+            ),
+            Message(role="tool", content="result", tool_call_id="call-1"),
+        ]
+    )
+    original = copy.deepcopy(request.model_dump())
+
+    asyncio.run(provider.complete(request))
+
+    payload = _params(provider)["input"]
+    assert {"type": "function_call", "call_id": "call-1", "name": "lookup",
+            "arguments": '{"query": "value"}'} in payload
+    assert {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": "result",
+    } in payload
+    assert request.model_dump() == original
+
+
+@pytest.mark.parametrize(
+    ("native_name", "native_input", "expected_type", "expected_output_type"),
+    [
+        (
+            "apply_patch",
+            {"type": "update_file", "path": "file.py", "diff": "@@"},
+            "apply_patch_call",
+            "apply_patch_call_output",
+        ),
+        (
+            "computer",
+            {"actions": [{"type": "click", "x": 1, "y": 2}]},
+            "computer_call",
+            "computer_call_output",
+        ),
+    ],
+)
+def test_v1_hybrid_tool_calls_emit_content_once_and_preserve_native_pairing(
+    native_name: str,
+    native_input: dict[str, Any],
+    expected_type: str,
+    expected_output_type: str,
+) -> None:
+    provider = _provider()
+    provider.client.responses.create = AsyncMock(return_value=_Response())
+    request = _request(
+        [
+            _instruction("head", "head"),
+            Message(
+                role="assistant",
+                content=[
+                    ToolCallBlock(id="ordinary", name="lookup", input={"q": "value"}),
+                    ToolCallBlock(
+                        id="native", name=native_name, input=native_input
+                    ),
+                ],
+                tool_calls=[
+                    {"id": "ordinary", "name": "lookup", "arguments": {"q": "value"}},
+                    {"id": "native", "name": native_name, "arguments": native_input},
+                ],
+            ),
+            Message(role="tool", content="ordinary result", tool_call_id="ordinary"),
+            Message(role="tool", content="native result", tool_call_id="native"),
+        ]
+    )
+    original = copy.deepcopy(request.model_dump())
+
+    asyncio.run(provider.complete(request))
+
+    payload = _params(provider)["input"]
+    ordinary_calls = [
+        item
+        for item in payload
+        if item.get("call_id") == "ordinary"
+        and item.get("type") == "function_call"
+    ]
+    native_calls = [
+        item
+        for item in payload
+        if item.get("call_id") == "native" and item.get("type") == expected_type
+    ]
+    ordinary_outputs = [
+        item
+        for item in payload
+        if item.get("call_id") == "ordinary"
+        and item.get("type") == "function_call_output"
+    ]
+    native_outputs = [
+        item
+        for item in payload
+        if item.get("call_id") == "native"
+        and item.get("type") == expected_output_type
+    ]
+    assert len(ordinary_calls) == len(native_calls) == 1
+    assert len(ordinary_outputs) == len(native_outputs) == 1
+    assert not [
+        item
+        for item in payload
+        if item.get("call_id") == "native" and item.get("type") == "function_call"
+    ]
+    assert request.model_dump() == original
+
+
+def test_private_completion_detects_marked_layout_with_legacy_messages() -> None:
+    provider = _provider()
+    provider.client.responses.create = AsyncMock(return_value=_Response())
+    request = _request(
+        [
+            _instruction("marked head", "head"),
+            Message(role="system", content="legacy head"),
+            Message(role="user", content="human"),
+        ]
+    )
+    original = copy.deepcopy(request.model_dump())
+
+    asyncio.run(provider._complete_chat_request(request))
+
+    params = _params(provider)
+    assert params["instructions"] == "marked head\n\nlegacy head"
+    assert request.model_dump() == original
+
+
 class _ContextCoordinator:
     """Minimal coordinator for the opt-in real context-simple seam."""
 
@@ -566,27 +784,24 @@ async def test_real_context_retained_instruction_lifecycle_and_checkpoint(
         anchor: Any,
         response_text: str,
     ) -> dict[str, Any]:
-        async with assembly.turn(f"turn-{request_id}", anchor):
-            async with assembly.request(
-                {
-                    "turn_id": f"turn-{request_id}",
-                    "request_id": request_id,
-                    "llm_step_id": f"step-{request_id}",
-                    "input_anchor": anchor,
-                    "tail_anchor": None,
-                    "completed_batches": [],
-                },
-                provider,
-            ):
-                view = await context.get_messages_for_request()
-                await provider.complete(
-                    _request([Message(**message) for message in view])
-                )
-                payload = copy.deepcopy(_params(provider))
-                await assembly.accept_response(
-                    request_id, {"role": "assistant", "content": response_text}
-                )
-                return payload
+        async with assembly.turn(f"turn-{request_id}", anchor), assembly.request(
+            {
+                "turn_id": f"turn-{request_id}",
+                "request_id": request_id,
+                "llm_step_id": f"step-{request_id}",
+                "input_anchor": anchor,
+                "tail_anchor": None,
+                "completed_batches": [],
+            },
+            provider,
+        ):
+            view = await context.get_messages_for_request()
+            await provider.complete(_request([Message(**message) for message in view]))
+            payload = copy.deepcopy(_params(provider))
+            await assembly.accept_response(
+                request_id, {"role": "assistant", "content": response_text}
+            )
+            return payload
 
     context = context_module.SimpleContextManager(compaction_notice_enabled=False)
     assembly = attach_assembly(context)

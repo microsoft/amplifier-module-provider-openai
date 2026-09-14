@@ -114,6 +114,7 @@ def _validated_v1_instruction_descriptor(
     base_fields = {"version", "source", "key", "binding", "placement"}
     binding = descriptor.get("binding")
     placement = descriptor.get("placement")
+    authority = descriptor.get("authority", "authoritative")
     if (
         type(descriptor.get("version")) is not int
         or descriptor["version"] != 1
@@ -123,11 +124,16 @@ def _validated_v1_instruction_descriptor(
         or not descriptor["key"]
         or binding not in {"live", "fixed"}
         or placement not in {"head", "before_human", "tail"}
+        or authority not in {"authoritative", "advisory"}
     ):
         raise ValueError("amplifier:instruction descriptor has invalid v1 fields")
 
     if binding == "live":
-        allowed = base_fields | ({"target"} if "target" in descriptor else set())
+        allowed = (
+            base_fields
+            | ({"authority"} if "authority" in descriptor else set())
+            | ({"target"} if "target" in descriptor else set())
+        )
         if set(descriptor) != allowed:
             raise ValueError(
                 "live amplifier:instruction descriptor has an unknown field"
@@ -162,6 +168,8 @@ def _validated_v1_instruction_descriptor(
         "order",
         "disposition",
     }
+    if "authority" in descriptor:
+        fixed_fields.add("authority")
     if descriptor.get("deferred_origin") is True:
         fixed_fields.add("deferred_origin")
     if set(descriptor) != fixed_fields:
@@ -223,6 +231,121 @@ def _validated_v1_instruction_descriptor(
     if not valid_target:
         raise ValueError("fixed amplifier:instruction target does not match placement")
     return descriptor
+
+
+def _v1_tool_call_representation(
+    calls: Any, *, representation: str
+) -> list[dict[str, Any]]:
+    """Validate one canonical v1 tool-call representation without repairing it."""
+    if calls is None:
+        return []
+    if not isinstance(calls, list):
+        raise TypeError(
+            f"v1 instruction layout has malformed {representation} tool calls"
+        )
+
+    validated: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for call in calls:
+        if hasattr(call, "model_dump"):
+            call = call.model_dump()
+        if not isinstance(call, dict):
+            raise TypeError(
+                f"v1 instruction layout has malformed {representation} tool call"
+            )
+        call_id = call.get("id")
+        name = call.get("name") or call.get("tool")
+        if "arguments" in call:
+            arguments = call["arguments"]
+        elif "input" in call:
+            arguments = call["input"]
+        else:
+            raise ValueError(
+                "v1 instruction layout has a tool call without arguments"
+            )
+        if not isinstance(call_id, str) or not call_id:
+            raise ValueError("v1 instruction layout has a tool call without an ID")
+        if not isinstance(name, str) or not name:
+            raise ValueError("v1 instruction layout has a tool call without a name")
+        if not isinstance(arguments, dict):
+            raise TypeError(
+                "v1 instruction layout has a tool call with malformed arguments"
+            )
+        if call_id in seen_ids:
+            raise ValueError("v1 instruction layout has duplicate tool-call IDs")
+        seen_ids.add(call_id)
+        validated.append({"id": call_id, "name": name, "arguments": arguments})
+    return validated
+
+
+def _v1_assistant_tool_calls(message: Message) -> dict[str, str]:
+    """Return reconciled v1 tool call ID/name pairs without changing history."""
+    content = message.content
+    content_calls = (
+        [
+            block.model_dump() if hasattr(block, "model_dump") else block
+            for block in content
+            if (
+                getattr(block, "type", None) == "tool_call"
+                or isinstance(block, dict)
+                and block.get("type") == "tool_call"
+            )
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    top_level = _v1_tool_call_representation(
+        getattr(message, "tool_calls", None), representation="top-level"
+    )
+    blocks = _v1_tool_call_representation(content_calls, representation="content")
+    blocks_by_id = {call["id"]: call for call in blocks}
+    calls: dict[str, str] = {}
+    for call in top_level:
+        block = blocks_by_id.pop(call["id"], None)
+        if block is not None and (
+            block["name"] != call["name"] or block["arguments"] != call["arguments"]
+        ):
+            raise ValueError(
+                "v1 instruction layout has conflicting tool-call representations"
+            )
+        calls[call["id"]] = call["name"]
+    for call in blocks_by_id.values():
+        if call["id"] in calls:
+            raise ValueError("v1 instruction layout has duplicate tool-call IDs")
+        calls[call["id"]] = call["name"]
+    return calls
+
+
+def _validate_v1_tool_sequence(messages: list[Message]) -> None:
+    """Require complete v1 tool batches before any legacy repair can mutate them."""
+    pending: dict[str, str] = {}
+    for message in messages:
+        if message.role == "assistant":
+            if pending:
+                raise ValueError(
+                    "v1 instruction layout has an incomplete tool-result batch"
+                )
+            pending = _v1_assistant_tool_calls(message)
+        elif message.role == "tool":
+            if (
+                not isinstance(message.tool_call_id, str)
+                or message.tool_call_id not in pending
+            ):
+                raise ValueError("v1 instruction layout has an orphaned tool result")
+            if (
+                message.name is not None
+                and message.name != pending[message.tool_call_id]
+            ):
+                raise ValueError(
+                    "v1 instruction layout tool result does not match its call"
+                )
+            pending.pop(message.tool_call_id)
+        elif pending:
+            raise ValueError(
+                "v1 instruction layout splits a tool-call/tool-result batch"
+            )
+    if pending:
+        raise ValueError("v1 instruction layout has missing tool results")
 
 
 def _lower_instruction_layout(
@@ -1235,6 +1358,7 @@ class OpenAIProvider:
     # Context-simple v1 checks this optional declaration before it emits
     # positioned system records.  All lowering remains local to this provider.
     instruction_layout_version = 1
+    instruction_layout_authority_v1 = True
 
     # Extension point for subclasses (e.g. provider-azure-openai, which
     # SUBCLASSES this class and passes its own config straight through the
@@ -2168,6 +2292,20 @@ class OpenAIProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        # A marked v1 history is immutable provider input. Validate every claimed
+        # descriptor and its complete tool batches before the legacy repair path
+        # gets a chance to insert synthetic messages.
+        instruction_descriptors = [
+            _validated_v1_instruction_descriptor(message.model_dump())
+            for message in request.messages
+        ]
+        has_instruction_layout = any(
+            descriptor is not None for descriptor in instruction_descriptors
+        )
+        if has_instruction_layout:
+            _validate_v1_tool_sequence(request.messages)
+            return await self._complete_chat_request(request, **kwargs)
+
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -2356,6 +2494,13 @@ class OpenAIProvider:
         instruction_parts, all_messages_for_conversion = _lower_instruction_layout(
             message_list
         )
+        # The lowering above has validated claimed descriptors. Keep this
+        # request-local flag here too: complete()'s local is not in scope, and
+        # private callers also enter this serializer directly.
+        has_instruction_layout = any(
+            "amplifier:instruction" in (message.metadata or {})
+            for message in message_list
+        )
 
         logger.info(
             f"[PROVIDER] Lowered {len(message_list)} canonical messages into "
@@ -2386,7 +2531,10 @@ class OpenAIProvider:
         # Convert to OpenAI Responses API message format. Always the FULL
         # local transcript -- the provider is stateless-only, there is no
         # chain-truncated delta to convert instead.
-        input_messages = self._convert_messages(all_messages_for_conversion)
+        input_messages = self._convert_messages(
+            all_messages_for_conversion,
+            has_instruction_layout=has_instruction_layout,
+        )
         logger.info(
             f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
         )
@@ -3736,6 +3884,7 @@ class OpenAIProvider:
         messages: list[dict[str, Any]],
         *,
         reasoning_replay_scope: str | None = None,
+        has_instruction_layout: bool = False,
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
@@ -3748,6 +3897,9 @@ class OpenAIProvider:
             messages: List of message dicts from ChatRequest
             reasoning_replay_scope: Overrides self.reasoning_replay_scope for
                 this call ("turn" | "all" | "none"). None inherits config.
+            has_instruction_layout: True only for a marked v1 request. Its
+                validated hybrid tool-call records are emitted once from
+                content blocks, preserving native-call classification.
 
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
@@ -3916,12 +4068,29 @@ class OpenAIProvider:
                 reasoning_items_to_add = []  # Top-level reasoning items (not in message content)
                 function_call_items = []  # function_call items to add as top-level
                 metadata = msg.get("metadata", {})
+                content_tool_call_ids: set[str] = set()
+                if isinstance(content, list):
+                    for block in content:
+                        block_type = (
+                            block.get("type")
+                            if isinstance(block, dict)
+                            else getattr(block, "type", None)
+                        )
+                        block_id = (
+                            block.get("id")
+                            if isinstance(block, dict)
+                            else getattr(block, "id", None)
+                        )
+                        if block_type == "tool_call" and isinstance(block_id, str):
+                            content_tool_call_ids.add(block_id)
 
                 # Handle tool_calls field (from context storage, Anthropic-style)
                 tool_calls_field = msg.get("tool_calls", [])
                 for tc in tool_calls_field:
                     tc_id = tc.get("id") or tc.get("tool_call_id", "")
-                    tc_name = tc.get("name", "")
+                    if has_instruction_layout and tc_id in content_tool_call_ids:
+                        continue
+                    tc_name = tc.get("name") or tc.get("tool", "")
                     tc_args = tc.get("arguments") or tc.get("input", {})
                     if isinstance(tc_args, str):
                         tc_args_str = tc_args
