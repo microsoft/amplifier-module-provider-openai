@@ -1086,6 +1086,16 @@ def _decode_reasoning_state(
     return None, None, None
 
 
+def _uses_all_turns_reasoning_replay_default(model_name: str | None) -> bool:
+    """Whether an unconfigured replay scope follows the GPT-5.6 tier default."""
+    if not isinstance(model_name, str):
+        return False
+    return any(
+        model_name == tier or model_name.startswith(f"{tier}-")
+        for tier in ("gpt-5.6-luna", "gpt-5.6-terra")
+    )
+
+
 # Every config key this module actually reads -- audited against every
 # `self.config.get(...)` call site in the constructor and the request path.
 # 28 entries. (Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.)
@@ -1480,7 +1490,7 @@ class OpenAIProvider:
             )
 
         # D2: how much prior reasoning to replay inline on stateless requests.
-        #   "turn" (default) -- assistant turns since the last user message. Preserves
+        #   "turn" -- assistant turns since the last user message. Preserves
         #                      the in-flight tool loop (README "single turn" guidance)
         #                      at flat cost, independent of conversation length.
         #   "all"            -- every turn's reasoning. Unbounded growth; ~1,200 chars
@@ -1490,7 +1500,9 @@ class OpenAIProvider:
         # Not exposed as a ConfigField -- it is a tuning knob, not a deployment
         # decision, and the wizard is already dense. Same precedent as
         # `safety_identifier`.
-        _scope = self.config.get("reasoning_replay_scope", "turn")
+        _configured_scope = self.config.get("reasoning_replay_scope")
+        self._has_explicit_reasoning_replay_scope = _configured_scope is not None
+        _scope = "turn" if _configured_scope is None else _configured_scope
         if _scope not in ("turn", "all", "none"):
             logger.warning(
                 "[PROVIDER] Unknown reasoning_replay_scope=%r; falling back to 'turn'. "
@@ -2385,8 +2397,13 @@ class OpenAIProvider:
 
         # Convert to OpenAI Responses API message format. Always the FULL
         # local transcript -- the provider is stateless-only, there is no
-        # chain-truncated delta to convert instead.
-        input_messages = self._convert_messages(all_messages_for_conversion)
+        # chain-truncated delta to convert instead. Pass the effective request
+        # model so the GPT-5.6 Luna/Terra default is applied per call.
+        input_messages = self._convert_messages(
+            all_messages_for_conversion,
+            model=model_name,
+            reasoning_replay_scope=kwargs.get("reasoning_replay_scope"),
+        )
         logger.info(
             f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
         )
@@ -3736,6 +3753,7 @@ class OpenAIProvider:
         messages: list[dict[str, Any]],
         *,
         reasoning_replay_scope: str | None = None,
+        model: str | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
@@ -3747,7 +3765,10 @@ class OpenAIProvider:
         Args:
             messages: List of message dicts from ChatRequest
             reasoning_replay_scope: Overrides self.reasoning_replay_scope for
-                this call ("turn" | "all" | "none"). None inherits config.
+                this call ("turn" | "all" | "none"). None inherits the
+                model-aware default.
+            model: Effective request model. None uses self.default_model
+                for direct callers.
 
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
@@ -3769,7 +3790,23 @@ class OpenAIProvider:
         # gate, computed once, applied at the single emission site below --
         # both collection sites keep appending to reasoning_items_to_add
         # unchanged, so the orphan-stripping guard's semantics are untouched.
-        _scope = reasoning_replay_scope or self.reasoning_replay_scope
+        if reasoning_replay_scope is not None:
+            _scope = reasoning_replay_scope
+            if _scope not in ("turn", "all", "none"):
+                logger.warning(
+                    "[PROVIDER] Unknown reasoning_replay_scope=%r; falling back to 'turn'. "
+                    "Valid: turn | all | none.",
+                    _scope,
+                )
+                _scope = "turn"
+        elif self._has_explicit_reasoning_replay_scope:
+            _scope = self.reasoning_replay_scope
+        elif _uses_all_turns_reasoning_replay_default(model or self.default_model):
+            # GPT-5.6 Luna and Terra default to all-turns reasoning replay;
+            # operators retain turn/none/all control through the existing key.
+            _scope = "all"
+        else:
+            _scope = self.reasoning_replay_scope
         if _scope == "all":
             _reasoning_cutoff = -1  # every index qualifies
         elif _scope == "none":
@@ -4060,6 +4097,17 @@ class OpenAIProvider:
                                         if thinking_text
                                         else []
                                     )
+                                    if (
+                                        isinstance(block_content, list)
+                                        and block_content
+                                        and isinstance(block_content[0], dict)
+                                    ):
+                                        stored_content = block_content[0].get("content")
+                                        if stored_content:
+                                            reasoning_item["content"] = stored_content
+                                        stored_status = block_content[0].get("status")
+                                        if stored_status is not None:
+                                            reasoning_item["status"] = stored_status
                                     reasoning_items_to_add.append(reasoning_item)
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
@@ -4186,6 +4234,17 @@ class OpenAIProvider:
                                         if thinking_text
                                         else []
                                     )
+                                    if (
+                                        isinstance(block_content, list)
+                                        and block_content
+                                        and isinstance(block_content[0], dict)
+                                    ):
+                                        stored_content = block_content[0].get("content")
+                                        if stored_content:
+                                            reasoning_item["content"] = stored_content
+                                        stored_status = block_content[0].get("status")
+                                        if stored_status is not None:
+                                            reasoning_item["status"] = stored_status
 
                                     reasoning_items_to_add.append(reasoning_item)
 
@@ -4674,6 +4733,8 @@ class OpenAIProvider:
                     # Extract reasoning ID and encrypted content for state preservation
                     reasoning_id = getattr(block, "id", None)
                     encrypted_content = getattr(block, "encrypted_content", None)
+                    reasoning_content = getattr(block, "content", None)
+                    reasoning_status = getattr(block, "status", None)
 
                     # Track reasoning item ID for metadata (backward compat)
                     if reasoning_id:
@@ -4719,18 +4780,21 @@ class OpenAIProvider:
                         # after resume. A dict survives the same key-dropping without
                         # losing what each surviving value MEANS. See
                         # _decode_reasoning_state for the back-compat reader.
+                        reasoning_state = {
+                            "encrypted_content": encrypted_content,
+                            "id": reasoning_id,
+                            "summary": reasoning_text or None,
+                        }
+                        if reasoning_content:
+                            reasoning_state["content"] = reasoning_content
+                        if reasoning_status is not None:
+                            reasoning_state["status"] = reasoning_status
                         thinking_block = ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[
-                                {
-                                    "encrypted_content": encrypted_content,
-                                    "id": reasoning_id,
-                                    "summary": reasoning_text or None,
-                                }
-                            ],
+                            content=[reasoning_state],
                         )
                         logger.info(
                             f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
@@ -4808,6 +4872,8 @@ class OpenAIProvider:
                     # Extract reasoning ID and encrypted content for state preservation
                     reasoning_id = block.get("id")
                     encrypted_content = block.get("encrypted_content")
+                    reasoning_content = block.get("content")
+                    reasoning_status = block.get("status")
 
                     # Track reasoning item ID for metadata (backward compat)
                     if reasoning_id:
@@ -4851,18 +4917,21 @@ class OpenAIProvider:
                         # after resume. A dict survives the same key-dropping without
                         # losing what each surviving value MEANS. See
                         # _decode_reasoning_state for the back-compat reader.
+                        reasoning_state = {
+                            "encrypted_content": encrypted_content,
+                            "id": reasoning_id,
+                            "summary": reasoning_text or None,
+                        }
+                        if reasoning_content:
+                            reasoning_state["content"] = reasoning_content
+                        if reasoning_status is not None:
+                            reasoning_state["status"] = reasoning_status
                         thinking_block = ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[
-                                {
-                                    "encrypted_content": encrypted_content,
-                                    "id": reasoning_id,
-                                    "summary": reasoning_text or None,
-                                }
-                            ],
+                            content=[reasoning_state],
                         )
                         logger.info(
                             f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "

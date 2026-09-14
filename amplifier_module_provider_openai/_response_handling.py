@@ -357,6 +357,8 @@ def convert_response_with_accumulated_output(
                 # Extract reasoning ID and encrypted content for state preservation
                 reasoning_id = getattr(block, "id", None)
                 encrypted_content = getattr(block, "encrypted_content", None)
+                reasoning_content = getattr(block, "content", None)
+                reasoning_status = getattr(block, "status", None)
 
                 # Track reasoning item ID for metadata (backward compat)
                 if reasoning_id:
@@ -381,19 +383,22 @@ def convert_response_with_accumulated_output(
                     # the back-compat reader (this file has no reader of its
                     # own -- reasoning replay always goes through
                     # amplifier_module_provider_openai._convert_messages).
+                    reasoning_state = {
+                        "encrypted_content": encrypted_content,
+                        "id": reasoning_id,
+                        "summary": reasoning_text or None,
+                    }
+                    if reasoning_content:
+                        reasoning_state["content"] = reasoning_content
+                    if reasoning_status is not None:
+                        reasoning_state["status"] = reasoning_status
                     content_blocks.append(
                         ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[
-                                {
-                                    "encrypted_content": encrypted_content,
-                                    "id": reasoning_id,
-                                    "summary": reasoning_text or None,
-                                }
-                            ],
+                            content=[reasoning_state],
                         )
                     )
                     event_blocks.append(ThinkingContent(text=reasoning_text or ""))
@@ -439,6 +444,8 @@ def convert_response_with_accumulated_output(
                 # Extract reasoning ID and encrypted content for state preservation
                 reasoning_id = block.get("id")
                 encrypted_content = block.get("encrypted_content")
+                reasoning_content = block.get("content")
+                reasoning_status = block.get("status")
 
                 # Track reasoning item ID for metadata (backward compat)
                 if reasoning_id:
@@ -453,19 +460,22 @@ def convert_response_with_accumulated_output(
                     # Named dict, NOT a positional list -- see Change B in
                     # stateless-reset-fix-spec.md (same rationale as the
                     # SDK-object branch above).
+                    reasoning_state = {
+                        "encrypted_content": encrypted_content,
+                        "id": reasoning_id,
+                        "summary": reasoning_text or None,
+                    }
+                    if reasoning_content:
+                        reasoning_state["content"] = reasoning_content
+                    if reasoning_status is not None:
+                        reasoning_state["status"] = reasoning_status
                     content_blocks.append(
                         ThinkingBlock(
                             thinking=reasoning_text
                             or "",  # May be empty when only encrypted_content exists
                             signature=None,
                             visibility="internal",
-                            content=[
-                                {
-                                    "encrypted_content": encrypted_content,
-                                    "id": reasoning_id,
-                                    "summary": reasoning_text or None,
-                                }
-                            ],
+                            content=[reasoning_state],
                         )
                     )
                     event_blocks.append(ThinkingContent(text=reasoning_text or ""))

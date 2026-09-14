@@ -86,7 +86,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `reasoning_context` | `reasoning.context` | `auto`\|`current_turn`\|`all_turns`. First-class key; composes with `reasoning_effort` (the legacy `reasoning` dict does not). | `current_turn` trims rendered reasoning on long loops. | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
-| `reasoning_replay_scope` | **Amplifier-only** | Bounds inline reasoning replay: `turn` (default) \| `all` \| `none`. | `"all"` grows the payload without bound (~1,200 chars/blob). | |
+| `reasoning_replay_scope` | **Amplifier-only** | Bounds inline reasoning replay: `turn` \| `all` \| `none`. Unset defaults to `all` for GPT-5.6 Luna/Terra and `turn` otherwise. | `"all"` grows the payload without bound (~1,200 chars/blob). | |
 | `poll_interval` | (background) | Seconds between background-mode status polls. | — | |
 | `background_timeout` | (background) | Timeout seconds for background (deep-research) requests. | — | |
 | `priority` | **Amplifier-only** | Provider selection priority (lower = higher). | — | |
@@ -186,8 +186,8 @@ input and `store: false`. There is no chaining flag and no chaining code path �
   be retrievable for polling.
 - **Encrypted reasoning replay.** `include: ["reasoning.encrypted_content"]` is
   requested whenever the model will reason; reasoning items are replayed inline,
-  bounded by `reasoning_replay_scope` (default `"turn"` — assistant turns since
-  the last non-ephemeral user message). See
+  bounded by `reasoning_replay_scope` (unset defaults to `"all"` for GPT-5.6
+  Luna/Terra, otherwise `"turn"`). See
   [Reasoning state preservation](#reasoning-state-preservation).
 - **ZDR posture.** With `store: false` on every non-background request and no
   `previous_response_id` anywhere, the ZDR opt-out is now the *default and only*
@@ -204,11 +204,14 @@ probing). This key bounds how far back replay reaches:
 
 | Value | Behavior |
 | --- | --- |
-| `"turn"` (default) | Replay reasoning only for assistant turns since the last non-ephemeral user message — the in-flight tool loop, per OpenAI's "single turn spans multiple API calls" guidance. Flat cost, independent of conversation length. |
+| `"turn"` (default except GPT-5.6 Luna/Terra) | Replay reasoning only for assistant turns since the last non-ephemeral user message — the in-flight tool loop, per OpenAI's "single turn spans multiple API calls" guidance. Flat cost, independent of conversation length. |
 | `"all"` | Replay every turn's reasoning. Unbounded growth. Escape hatch. |
 | `"none"` | No inline reasoning replay. |
 
 An unrecognized value falls back to `"turn"` with a warning.
+When the key is absent, GPT-5.6 Luna and Terra instead use `"all"` to retain
+the Responses API's all-turns reasoning replay behavior; dated and other
+hyphenated variants of those two model IDs follow the same default.
 
 ## Prompt Caching
 

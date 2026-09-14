@@ -21,11 +21,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 from amplifier_core import llm_errors as kernel_errors
-from amplifier_core.message_models import ChatRequest, Message
+from amplifier_core.message_models import ChatRequest, Message, ThinkingBlock
 
 from amplifier_module_provider_openai import (
+    OpenAIChatResponse,
     OpenAIProvider,
     _validate_reasoning_context,
+)
+from amplifier_module_provider_openai._response_handling import (
+    convert_response_with_accumulated_output,
 )
 
 
@@ -292,3 +296,215 @@ def test_config_reasoning_context_forwarded_on_continuation():
     assert len(calls) == 2
     for call in calls:
         assert call.kwargs["reasoning"]["context"] == "current_turn"
+
+
+# ---------------------------------------------------------------------------
+# GPT-5.6 Luna/Terra stateless replay defaults and reasoning-item fidelity
+# ---------------------------------------------------------------------------
+
+
+def _thinking_message(tag: str) -> Message:
+    return Message(
+        role="assistant",
+        content=[
+            ThinkingBlock(
+                thinking=f"summary {tag}",
+                content=[
+                    {
+                        "encrypted_content": f"ENC_{tag}",
+                        "id": f"rs_{tag}",
+                        "summary": f"summary {tag}",
+                    }
+                ],
+            )
+        ],
+    )
+
+
+def _multi_turn_reasoning_request() -> ChatRequest:
+    return ChatRequest(
+        messages=[
+            Message(role="user", content="first human"),
+            _thinking_message("first"),
+            Message(role="user", content="second human"),
+            _thinking_message("second"),
+        ]
+    )
+
+
+def _replayed_reasoning_ids(params: dict[str, Any]) -> list[str]:
+    return [
+        item["id"]
+        for item in params["input"]
+        if item.get("type") == "reasoning"
+    ]
+
+
+@pytest.mark.parametrize(
+    "selected_model",
+    ["gpt-5.6-luna", "gpt-5.6-terra-2026-09-01"],
+)
+def test_effective_per_call_model_selects_luna_or_terra_all_turns(
+    selected_model: str,
+) -> None:
+    request = _multi_turn_reasoning_request()
+
+    older_default = _make_provider(default_model="gpt-5.5")
+    older_default.client.responses.create = AsyncMock(return_value=DummyResponse())
+    asyncio.run(older_default.complete(request, model=selected_model))
+    assert _replayed_reasoning_ids(_captured_params(older_default)) == [
+        "rs_first",
+        "rs_second",
+    ]
+
+
+def test_effective_per_call_model_keeps_older_and_sol_models_turn_scoped() -> None:
+    request = _multi_turn_reasoning_request()
+
+    luna_default = _make_provider(default_model="gpt-5.6-luna")
+    luna_default.client.responses.create = AsyncMock(return_value=DummyResponse())
+    asyncio.run(luna_default.complete(request, model="gpt-5.5"))
+    assert _replayed_reasoning_ids(_captured_params(luna_default)) == ["rs_second"]
+
+    sol_default = _make_provider(default_model="gpt-5.6-sol")
+    sol_default.client.responses.create = AsyncMock(return_value=DummyResponse())
+    asyncio.run(sol_default.complete(request))
+    assert _replayed_reasoning_ids(_captured_params(sol_default)) == ["rs_second"]
+
+
+@pytest.mark.parametrize(
+    ("config_scope", "per_call_scope", "expected"),
+    [
+        (None, None, ["rs_first", "rs_second"]),
+        ("turn", None, ["rs_second"]),
+        ("none", None, []),
+        ("none", "all", ["rs_first", "rs_second"]),
+        ("all", "turn", ["rs_second"]),
+    ],
+)
+def test_explicit_or_per_call_replay_scope_overrides_luna_default(
+    config_scope: str | None, per_call_scope: str | None, expected: list[str]
+) -> None:
+    provider = _make_provider(
+        default_model="gpt-5.6-luna", reasoning_replay_scope=config_scope
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    asyncio.run(
+        provider.complete(
+            _multi_turn_reasoning_request(),
+            **(
+                {"reasoning_replay_scope": per_call_scope}
+                if per_call_scope is not None
+                else {}
+            ),
+        )
+    )
+
+    assert _replayed_reasoning_ids(_captured_params(provider)) == expected
+
+
+def test_invalid_per_call_replay_scope_warns_before_turn_fallback(caplog) -> None:
+    provider = _make_provider(default_model="gpt-5.6-luna")
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    asyncio.run(
+        provider.complete(_multi_turn_reasoning_request(), reasoning_replay_scope="typo")
+    )
+    assert _replayed_reasoning_ids(_captured_params(provider)) == ["rs_second"]
+    assert "Unknown reasoning_replay_scope" in caplog.text
+
+
+def _reasoning_item(*, as_dict: bool) -> Any:
+    item = {
+        "type": "reasoning",
+        "id": "rs_fidelity",
+        "encrypted_content": "ENC_FIDELITY",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "verbatim reasoning"}],
+        "status": "completed",
+        "unrecognized_extra": "must not be persisted",
+    }
+    return item if as_dict else SimpleNamespace(**item)
+
+
+def _response_with_reasoning(*, as_dict: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        output=[_reasoning_item(as_dict=as_dict)],
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        status="completed",
+        id="resp_fidelity",
+    )
+
+
+def _captured_reasoning_state(response: Any) -> dict[str, Any]:
+    thinking = next(
+        block for block in response.content if getattr(block, "type", None) == "thinking"
+    )
+    return thinking.content[0]
+
+
+@pytest.mark.parametrize("as_dict", [False, True], ids=["sdk", "raw_dict"])
+def test_both_response_capture_paths_preserve_reasoning_content_and_status(
+    as_dict: bool,
+) -> None:
+    raw_response = _response_with_reasoning(as_dict=as_dict)
+    provider = _make_provider()
+
+    native_state = _captured_reasoning_state(
+        provider._convert_to_chat_response(raw_response)
+    )
+    accumulated_state = _captured_reasoning_state(
+        convert_response_with_accumulated_output(
+            final_response=raw_response,
+            accumulated_output=list(raw_response.output),
+            continuation_count=0,
+            chat_response_class=OpenAIChatResponse,
+        )
+    )
+    expected = {
+        "encrypted_content": "ENC_FIDELITY",
+        "id": "rs_fidelity",
+        "summary": None,
+        "content": [{"type": "reasoning_text", "text": "verbatim reasoning"}],
+        "status": "completed",
+    }
+    assert native_state == accumulated_state == expected
+
+
+def test_luna_replays_prior_reasoning_content_across_a_new_human_message():
+    provider = _make_provider(
+        default_model="gpt-5.6-luna",
+        reasoning={"effort": "low", "summary": "detailed"},
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    captured = provider._convert_to_chat_response(
+        _response_with_reasoning(as_dict=False)
+    )
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="first human"),
+            Message(role="assistant", content=captured.content),
+            Message(role="user", content="new human"),
+        ]
+    )
+
+    asyncio.run(provider.complete(request))
+
+    params = _captured_params(provider)
+    assert params["store"] is False
+    assert params["reasoning"] == {"effort": "low", "summary": "detailed"}
+    assert "context" not in params["reasoning"]
+    assert [
+        item
+        for item in params["input"]
+        if item.get("type") == "reasoning"
+    ] == [
+        {
+            "type": "reasoning",
+            "id": "rs_fidelity",
+            "encrypted_content": "ENC_FIDELITY",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "verbatim reasoning"}],
+            "status": "completed",
+        }
+    ]
