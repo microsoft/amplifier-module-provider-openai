@@ -34,7 +34,7 @@ from amplifier_core import (
 )
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.events import PROVIDER_RETRY
-from amplifier_core.message_models import ChatRequest, ChatResponse, ToolCall
+from amplifier_core.message_models import ChatRequest, ChatResponse, Message, ToolCall
 from amplifier_core.utils import redact_secrets
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
@@ -86,6 +86,188 @@ from ._tool_search import (
 )
 
 logger = logging.getLogger(__name__)
+
+_INSTRUCTION_METADATA = "amplifier:instruction"
+_INLINE_INSTRUCTION_ROLE = "_amplifier_inline_instruction"
+
+
+def _validated_v1_instruction_descriptor(
+    message: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return a validated v1 instruction descriptor, if ``message`` has one.
+
+    The context module emits this closed metadata shape after it has resolved
+    placement.  Treat a claimed descriptor as an all-or-nothing contract:
+    silently falling back to the legacy all-system hoist would move positioned
+    content and lose its placement semantics.
+    """
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict) or _INSTRUCTION_METADATA not in metadata:
+        return None
+
+    descriptor = metadata[_INSTRUCTION_METADATA]
+    if not isinstance(descriptor, dict):
+        raise TypeError("amplifier:instruction descriptor must be a mapping")
+    if message.get("role") != "system" or not isinstance(message.get("content"), str):
+        raise ValueError("v1 instruction must be a canonical system text message")
+
+    base_fields = {"version", "source", "key", "binding", "placement"}
+    binding = descriptor.get("binding")
+    placement = descriptor.get("placement")
+    if (
+        type(descriptor.get("version")) is not int
+        or descriptor["version"] != 1
+        or not isinstance(descriptor.get("source"), str)
+        or not descriptor["source"]
+        or not isinstance(descriptor.get("key"), str)
+        or not descriptor["key"]
+        or binding not in {"live", "fixed"}
+        or placement not in {"head", "before_human", "tail"}
+    ):
+        raise ValueError("amplifier:instruction descriptor has invalid v1 fields")
+
+    if binding == "live":
+        allowed = base_fields | ({"target"} if "target" in descriptor else set())
+        if set(descriptor) != allowed:
+            raise ValueError(
+                "live amplifier:instruction descriptor has an unknown field"
+            )
+        target = descriptor.get("target")
+        if placement != "tail" and target is not None:
+            raise ValueError("only live tail instructions may declare a target")
+        simple_tail_target = (
+            isinstance(target, dict)
+            and set(target) == {"after_message_id"}
+            and isinstance(target.get("after_message_id"), str)
+            and bool(target["after_message_id"])
+        )
+        event_tail_target = (
+            isinstance(target, dict)
+            and set(target) == {"turn_id", "step_id", "after_message_id", "batch_id"}
+            and all(
+                isinstance(target.get(key), str) and target[key]
+                for key in ("turn_id", "step_id", "after_message_id")
+            )
+            and (target.get("batch_id") is None or isinstance(target["batch_id"], str))
+        )
+        if target is not None and not (simple_tail_target or event_tail_target):
+            raise ValueError("live amplifier:instruction tail target is invalid")
+        return descriptor
+
+    fixed_fields = base_fields | {
+        "entry_id",
+        "event_key",
+        "session_id",
+        "target",
+        "order",
+        "disposition",
+    }
+    if descriptor.get("deferred_origin") is True:
+        fixed_fields.add("deferred_origin")
+    if set(descriptor) != fixed_fields:
+        raise ValueError("fixed amplifier:instruction descriptor has an unknown field")
+    if (
+        not all(
+            isinstance(descriptor.get(key), str) and descriptor[key]
+            for key in ("entry_id", "event_key", "session_id")
+        )
+        or type(descriptor.get("order")) is not int
+        or descriptor["order"] <= 0
+        # Retained entries remain in the rendered history after their first
+        # successful delivery.  Context marks those entries ``delivered``;
+        # they retain their already-resolved placement until terminal
+        # retention/pruning removes them.  Terminal dispositions must never
+        # reach an SDK payload.
+        or descriptor.get("disposition") not in {"pending", "delivered"}
+    ):
+        raise ValueError("fixed amplifier:instruction descriptor has invalid fields")
+    if "deferred_origin" in descriptor and (
+        descriptor["deferred_origin"] is not True
+        or placement not in {"head", "before_human"}
+    ):
+        raise ValueError("fixed amplifier:instruction deferred origin is invalid")
+
+    target = descriptor["target"]
+    if placement == "head":
+        valid_target = (
+            isinstance(target, dict)
+            and set(target) == {"kind", "session_id"}
+            and target.get("kind") == "conversation_head"
+            and target.get("session_id") == descriptor["session_id"]
+        )
+    elif placement == "before_human":
+        input_anchor_fields = {"input_id", "message_id", "origin"}
+        valid_target = (
+            isinstance(target, dict)
+            and (
+                set(target) == input_anchor_fields
+                or set(target) == input_anchor_fields | {"version"}
+            )
+            and all(
+                isinstance(target.get(key), str) and target[key]
+                for key in ("input_id", "message_id")
+            )
+            and target.get("origin") in {"human", "delegation"}
+            and (
+                "version" not in target
+                or (type(target["version"]) is int and target["version"] == 1)
+            )
+        )
+    else:
+        valid_target = (
+            isinstance(target, dict)
+            and set(target) == {"after_message_id"}
+            and isinstance(target.get("after_message_id"), str)
+            and bool(target["after_message_id"])
+        )
+    if not valid_target:
+        raise ValueError("fixed amplifier:instruction target does not match placement")
+    return descriptor
+
+
+def _lower_instruction_layout(
+    messages: list[Message],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Separate global instructions from positioned v1 system records.
+
+    The returned conversion list is a private copy.  It never changes the
+    canonical Message objects supplied by context.
+    """
+    instructions: list[str] = []
+    developer_messages: list[dict[str, Any]] = []
+    conversation: list[dict[str, Any]] = []
+
+    for message in messages:
+        raw_message = message.model_dump()
+        role = raw_message["role"]
+        descriptor = _validated_v1_instruction_descriptor(raw_message)
+        if descriptor is not None:
+            if descriptor["placement"] == "head":
+                instructions.append(raw_message["content"])
+            else:
+                # This private role is converted directly to a Responses API
+                # developer item below.  It is deliberately not a user role:
+                # positioned machine content must not start a reasoning turn.
+                conversation.append(
+                    {
+                        "role": _INLINE_INSTRUCTION_ROLE,
+                        "content": raw_message["content"],
+                    }
+                )
+        elif role == "system":
+            # Preserve the legacy transform exactly, including its historical
+            # non-string behavior.  V1 descriptors above are text-only and
+            # fail loudly instead of taking this lossy path.
+            instructions.append(
+                raw_message["content"] if isinstance(raw_message["content"], str) else ""
+            )
+        elif role == "developer":
+            developer_messages.append(raw_message)
+        elif role in {"user", "assistant", "tool"}:
+            conversation.append(raw_message)
+
+    return instructions, [*developer_messages, *conversation]
+
 
 # ---------------------------------------------------------------------------
 # Process-wide concurrency gate
@@ -1050,6 +1232,9 @@ class OpenAIProvider:
 
     name = "openai"
     api_label = "OpenAI"
+    # Context-simple v1 checks this optional declaration before it emits
+    # positioned system records.  All lowering remains local to this provider.
+    instruction_layout_version = 1
 
     # Extension point for subclasses (e.g. provider-azure-openai, which
     # SUBCLASSES this class and passes its own config straight through the
@@ -2168,38 +2353,19 @@ class OpenAIProvider:
         logger.info(f"[PROVIDER] Message roles: {[m.role for m in request.messages]}")
 
         message_list = list(request.messages)
-
-        # Separate messages by role
-        system_msgs = [m for m in message_list if m.role == "system"]
-        developer_msgs = [m for m in message_list if m.role == "developer"]
-        conversation = [
-            m for m in message_list if m.role in ("user", "assistant", "tool")
-        ]
+        instruction_parts, all_messages_for_conversion = _lower_instruction_layout(
+            message_list
+        )
 
         logger.info(
-            f"[PROVIDER] Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
+            f"[PROVIDER] Lowered {len(message_list)} canonical messages into "
+            f"{len(instruction_parts)} global instructions and "
+            f"{len(all_messages_for_conversion)} input messages"
         )
 
-        # Combine system messages as instructions
-        instructions = (
-            "\n\n".join(
-                m.content if isinstance(m.content, str) else "" for m in system_msgs
-            )
-            if system_msgs
-            else None
-        )
-
-        # Convert all messages (developer + conversation) to Responses API format
-        # Developer messages become XML-wrapped user messages, tools are batched
-        all_messages_for_conversion = []
-
-        # Add developer messages first
-        for dev_msg in developer_msgs:
-            all_messages_for_conversion.append(dev_msg.model_dump())
-
-        # Add conversation messages
-        for conv_msg in conversation:
-            all_messages_for_conversion.append(conv_msg.model_dump())
+        # The Responses API `instructions` parameter is global.  Only legacy
+        # system messages and already-resolved v1 head records may enter it.
+        instructions = "\n\n".join(instruction_parts) if instruction_parts else None
 
         model_name = kwargs.get("model", self.default_model)
 
@@ -4134,7 +4300,20 @@ class OpenAIProvider:
 
                 i += 1
 
-            # Handle developer messages as XML-wrapped user messages
+            # Positioned v1 system records use a native developer input item.
+            # Unlike legacy developer messages, this is neither XML-wrapped
+            # nor user-role input, so it remains a machine carrier rather than
+            # a human/reasoning-turn boundary.
+            elif role == _INLINE_INSTRUCTION_ROLE:
+                openai_messages.append(
+                    {
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": content}],
+                    }
+                )
+                i += 1
+
+            # Handle legacy developer messages as XML-wrapped user messages
             elif role == "developer":
                 wrapped = f"<context_file>\n{content}\n</context_file>"
                 openai_messages.append(
