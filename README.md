@@ -80,9 +80,9 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `raw` | **Amplifier-only** | When `true`, includes the full (redacted) request payload in `llm:request` events. | — | |
 | `timeout` | (client) | Per-request timeout seconds. | — | |
 | `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
-| `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
+| `prompt_cache_key` | `prompt_cache_key` | Optional cache-accounting identifier on GPT-5.6 and later; routing hint on earlier models. **Settings-only** (no ConfigField). | Separates cache accounting; does not pin a machine or guarantee a hit. | |
 | `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. Astra removes this legacy field and warns once; use `prompt_cache_options.ttl: "30m"`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime where supported. | |
-| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); Astra accepts only `ttl: "30m"`. | `explicit` w/ no breakpoints would disable caching (~10×). | |
+| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. Configured `mode: "explicit"` is removed at mount for all defaults; `ttl` is retained. Luna/Terra automatically mark eligible function results alongside implicit caching (see [Prompt caching](#prompt-caching)). Astra accepts only `ttl: "30m"`. | Per-call `explicit` with no eligible or caller-marked breakpoint disables caching. | |
 | `reasoning_context` | `reasoning.context` | `auto`\|`current_turn`\|`all_turns`. First-class key; composes with `reasoning_effort` (the legacy `reasoning` dict does not). | `current_turn` trims rendered reasoning on long loops. | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
@@ -225,18 +225,17 @@ For Astra, the legacy retention field is always omitted; use
 
 See also: [OpenAI Cookbook — Prompt Caching 201](https://cookbook.openai.com/examples/prompt_caching_201).
 
-### `prompt_cache_key` — cache-routing identifier
+### `prompt_cache_key` — accounting and earlier-model routing
 
-OpenAI shards Responses API traffic by hashing the first ~256 input tokens. A
-stable `prompt_cache_key` keeps a logical conversation pinned to one machine
-regardless of small prefix drift, and is the recommended cache signal as of
-OpenAI's July 2025 guidance.
+On GPT-5.6 and later, OpenAI handles cache routing automatically. Use an
+optional stable key to separate cache accounting for customers, users, or
+workspaces; it is not needed to optimize routing on these models.
 
-| Deployment shape | Recommended key |
-| --- | --- |
-| Single-user agent loop (typical Amplifier) | conversation/session ID |
-| Multi-tenant with shared system prompt | `f"{tenant_id}:{system_prompt_version}"` |
-| Low-volume single-session | leave unset; prefix-hash routing is sufficient |
+On earlier models, a stable key can improve routing for requests that share a
+reusable prefix. A key does not pin requests to one machine, compensate for
+changed prefix content, or guarantee a cache hit.
+
+https://platform.openai.com/docs/guides/prompt-caching
 
 ### `prompt_cache_retention` — TTL hint
 
@@ -246,19 +245,39 @@ OpenAI's July 2025 guidance.
 | `"in_memory"` | 5–10 min in-process cache. Rejected by gpt-5.5/5.6 (auto-dropped to `"24h"` with a warning). |
 | `null` | Field omitted; OpenAI picks the per-model default. |
 
-### `prompt_cache_options` — explicit-mode dropped at mount
+### `prompt_cache_options` — explicit function-result boundaries
 
-`prompt_cache_options` is `{mode, ttl}`. **`mode: "explicit"` is rejected at
-mount** and downgraded to implicit with a one-time warning (the `ttl` key
-passes through unchanged): this provider ships no `prompt_cache_breakpoint`
-mechanism anywhere, and explicit mode with zero breakpoints disables prompt
-caching **entirely** — no reads, no writes — turning a ~95% cache-read workload
-into 100% full-price input (~10× regression, live-probed 2026-08-28).
+`prompt_cache_options` is `{mode, ttl}`. For `gpt-5.6-luna`,
+`gpt-5.6-terra`, and their hyphenated variants, the provider automatically adds
+an explicit `prompt_cache_breakpoint` immediately after every
+`function_call_output` tool result. A string result becomes a single
+`input_text` block with the original text and marker; for a structured result,
+the last `input_text` block whose `text` is a string receives the marker.
+Existing caller markers are retained verbatim. Native tool outputs, non-text
+blocks, instructions, roles, reasoning, and assistant output are unchanged.
 
-> Residual gap, by design: a caller passing
-> `prompt_cache_options={"mode": "explicit"}` via **per-call kwargs** bypasses
-> mount validation and reaches the wire. This is consistent with the provider's
-> stance on explicit caller overrides — the caller owns the consequences.
+This follows the documented placement after each tool result:
+https://platform.openai.com/docs/guides/prompt-caching. Automatic markers are
+intentionally limited to Luna/Terra. The session-wide guard is unchanged:
+configured `mode: "explicit"` is removed at mount with a one-time warning while
+preserving `ttl`, because even capable models can receive requests with no tool
+results. Implicit caching remains enabled alongside the automatic markers.
+Per-call explicit options continue to pass through as an intentional caller
+override.
+
+> **Explicit mode needs a boundary.** On a request with no eligible text tool
+> result and no caller-supplied marker, `mode: "explicit"` disables prompt
+> caching rather than falling back to implicit mode. The provider does not
+> invent an anchor or silently change a per-call override.
+
+For GPT-5.6 and later, `prompt_cache_options.ttl: "30m"` is the documented
+minimum cache lifetime and the API default. This patch leaves the provider's
+legacy `prompt_cache_retention` default unchanged; set it to `null` to omit
+that legacy field when using the model-specific TTL option.
+
+A cached prefix is not the same as a byte-identical prefix. Breakpoints define
+cache boundaries but do not guarantee a hit after compaction or other changes
+to the effective prompt.
 
 ### `extra_request_params`
 
@@ -404,8 +423,8 @@ rejected after `extra_request_params` has performed its final merge.
 Prompt caching uses `prompt_cache_options.ttl: "30m"` (the only documented TTL).
 The legacy `prompt_cache_retention` field is removed from every Astra wire
 payload, including continuation calls. The existing explicit-cache-mode safety
-guard remains: this provider does not create cache breakpoints, so explicit
-mode is dropped rather than disabling caching.
+guard remains for Astra: automatic function-result breakpoints are limited to
+GPT-5.6 Luna/Terra, so explicit mode is dropped rather than disabling caching.
 
 ### Context and token estimates
 

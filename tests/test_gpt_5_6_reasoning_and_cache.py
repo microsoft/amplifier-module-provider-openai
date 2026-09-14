@@ -6,19 +6,14 @@ Shapes verified live against gpt-5.6-sol on 2026-07-14:
   COEXISTS with prompt_cache_retention (both are echoed together -- it is NOT a
   replacement/deprecation of prompt_cache_retention).
 
-Also covers the D2 guardrail (spec section 2.4): a live probe on 2026-08-28
-confirmed that `prompt_cache_options.mode == "explicit"` with zero
-`prompt_cache_breakpoint` markers in `input` disables prompt caching entirely
-(cache_write_tokens == 0 AND cached_tokens == 0 on every request). Since this
-provider never attaches breakpoints, an operator setting explicit mode today
-silently converts a ~95% cache-read workload into 100% full-price input. The
-guardrail is now validated ONCE AT MOUNT (not scanned per-request): mode is
-downgraded to implicit and a warning fires exactly once per provider
-instance. A caller who bypasses this via per-call kwargs owns the
-consequences (same stance as the other explicit-override escape hatches).
+Also covers the explicit-mode guardrail: explicit caching with no
+`prompt_cache_breakpoint` markers disables prompt caching. Luna and Terra
+automatically mark eligible function results; unsupported default models retain
+the existing mount-time downgrade and warning.
 """
 
 import asyncio
+import copy
 import logging
 from types import SimpleNamespace
 from typing import Any, cast
@@ -55,6 +50,36 @@ class DummyResponse:
         self.usage = SimpleNamespace(input_tokens=1, output_tokens=1)
         self.status = "completed"
         self.id = "resp_test"
+
+
+class DummyStream:
+    def __init__(self, response: DummyResponse):
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    def __aiter__(self):
+        async def events():
+            yield SimpleNamespace(type="response.completed", response=self.response)
+
+        return events()
+
+    async def get_final_response(self):
+        return self.response
+
+
+class CapturingStreamFactory:
+    def __init__(self, response: DummyResponse):
+        self.response = response
+        self.params: dict[str, Any] | None = None
+
+    def __call__(self, **params):
+        self.params = params
+        return DummyStream(self.response)
 
 
 def _captured_params(provider: OpenAIProvider) -> Any:
@@ -196,11 +221,231 @@ def test_prompt_cache_options_forwarded_on_continuation():
 
 
 # ---------------------------------------------------------------------------
+# Luna/Terra function-output cache breakpoints
+# ---------------------------------------------------------------------------
+
+
+def test_tool_output_breakpoint_helper_preserves_input_and_marks_last_text_block():
+    """Only supported function outputs are copied and marked."""
+    from amplifier_module_provider_openai import _add_tool_output_cache_breakpoints
+
+    original_items = [
+        {"role": "developer", "content": [{"type": "input_text", "text": "global"}]},
+        {"type": "reasoning", "encrypted_content": "opaque"},
+        {
+            "type": "function_call_output",
+            "call_id": "string",
+            "output": "Unicode: café\n",
+        },
+        {"type": "function_call_output", "call_id": "empty", "output": ""},
+        {
+            "type": "function_call_output",
+            "call_id": "mixed",
+            "output": [
+                {"type": "input_text", "text": "earlier"},
+                {"type": "output_text", "text": "leave unchanged"},
+                {"type": "input_text", "text": "last"},
+            ],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "caller-marker",
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": "caller owns this",
+                    "prompt_cache_breakpoint": None,
+                }
+            ],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "nontext",
+            "output": [{"type": "output_text", "text": "not an input anchor"}],
+        },
+        {"type": "message", "content": [{"type": "output_text", "text": "answer"}]},
+    ]
+    original = copy.deepcopy(original_items)
+
+    marked = _add_tool_output_cache_breakpoints(original_items)
+
+    assert original_items == original
+    assert marked is not original_items
+    assert marked[0] is original_items[0]
+    assert marked[1] is original_items[1]
+    assert marked[7] is original_items[7]
+    assert marked[2]["output"] == [
+        {
+            "type": "input_text",
+            "text": "Unicode: café\n",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }
+    ]
+    assert marked[3]["output"][0]["text"] == ""
+    assert marked[3]["output"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert "prompt_cache_breakpoint" not in marked[4]["output"][0]
+    assert marked[4]["output"][1] == {"type": "output_text", "text": "leave unchanged"}
+    assert marked[4]["output"][2]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert marked[5] is original_items[5]
+    assert marked[5]["output"][0]["prompt_cache_breakpoint"] is None
+    assert marked[6] is original_items[6]
+    unchanged = [original_items[5], original_items[6]]
+    assert _add_tool_output_cache_breakpoints(unchanged) is unchanged
+
+
+def test_tool_output_breakpoint_helper_marks_every_historical_function_result():
+    from amplifier_module_provider_openai import _add_tool_output_cache_breakpoints
+
+    items = [
+        {"type": "function_call_output", "call_id": str(index), "output": f"result {index}"}
+        for index in range(7)
+    ]
+
+    marked = _add_tool_output_cache_breakpoints(items)
+
+    assert [
+        item["output"][0]["prompt_cache_breakpoint"] for item in marked
+    ] == [{"mode": "explicit"}] * 7
+
+
+def test_tool_output_breakpoint_model_predicate_is_luna_terra_only():
+    from amplifier_module_provider_openai import _supports_tool_output_cache_breakpoints
+
+    assert _supports_tool_output_cache_breakpoints("gpt-5.6-luna")
+    assert _supports_tool_output_cache_breakpoints("gpt-5.6-luna-2026-09-01")
+    assert _supports_tool_output_cache_breakpoints("gpt-5.6-terra")
+    assert _supports_tool_output_cache_breakpoints("gpt-5.6-terra-preview")
+    assert not _supports_tool_output_cache_breakpoints("gpt-5.6-sol")
+    assert not _supports_tool_output_cache_breakpoints("gpt-5.5")
+    assert not _supports_tool_output_cache_breakpoints("unrecognized-model")
+
+
+@pytest.mark.parametrize(
+    ("default_model", "request_model", "expected_marked"),
+    [
+        ("gpt-5.6-sol", "gpt-5.6-terra", True),
+        ("gpt-5.6-luna", "gpt-5.6-sol", False),
+        ("gpt-5.6-luna", "gpt-5.5", False),
+        ("gpt-5.6-luna", "unrecognized-model", False),
+    ],
+)
+def test_tool_output_breakpoints_use_effective_per_call_model(
+    default_model, request_model, expected_marked
+):
+    source_input = [{"type": "function_call_output", "call_id": "call", "output": "result"}]
+    provider = _make_provider(
+        default_model=default_model, extra_request_params={"input": source_input}
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    asyncio.run(provider.complete(_simple_request(), model=request_model))
+
+    captured_input = _captured_params(provider)["input"]
+    output = captured_input[0]["output"]
+    assert (isinstance(output, list)) is expected_marked
+    if not expected_marked:
+        assert captured_input == source_input
+    assert source_input[0]["output"] == "result"
+
+
+def test_tool_output_breakpoints_honor_extra_request_param_model_and_input():
+    supplied_input = [{"type": "function_call_output", "call_id": "call", "output": "result"}]
+    provider = _make_provider(
+        default_model="gpt-5.6-sol",
+        extra_request_params={"model": "gpt-5.6-terra", "input": supplied_input},
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    asyncio.run(provider.complete(_simple_request(), model="gpt-5.6-luna"))
+
+    params = _captured_params(provider)
+    assert params["model"] == "gpt-5.6-terra"
+    assert params["input"][0]["output"][0]["prompt_cache_breakpoint"] == {
+        "mode": "explicit"
+    }
+    assert supplied_input[0]["output"] == "result"
+
+
+def test_tool_output_breakpoints_reach_streaming_sdk_params():
+    source_input = [{"type": "function_call_output", "call_id": "call", "output": "result"}]
+    provider = OpenAIProvider(
+        api_key="[REDACTED:SECRET]",
+        config={
+            "max_retries": 0,
+            "use_streaming": True,
+            "default_model": "gpt-5.6-luna",
+            "extra_request_params": {"input": source_input},
+        },
+    )
+    stream = CapturingStreamFactory(DummyResponse())
+    provider._client = SimpleNamespace(responses=SimpleNamespace(stream=stream))
+
+    asyncio.run(provider.complete(_simple_request()))
+
+    assert stream.params is not None
+    assert stream.params["input"][0]["output"][0]["prompt_cache_breakpoint"] == {
+        "mode": "explicit"
+    }
+
+
+def test_tool_output_breakpoints_are_idempotent_on_continuation():
+    source_input = [{"type": "function_call_output", "call_id": "call", "output": "result"}]
+    provider = _make_provider(
+        default_model="gpt-5.6-luna", extra_request_params={"input": source_input}
+    )
+    incomplete_resp = SimpleNamespace(
+        status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
+    )
+    provider.client.responses.create = AsyncMock(
+        side_effect=[incomplete_resp, DummyResponse()]
+    )
+
+    asyncio.run(provider.complete(_simple_request()))
+
+    calls = provider.client.responses.create.call_args_list
+    assert len(calls) == 2
+    for call in calls:
+        output = call.kwargs["input"][0]["output"]
+        assert output == [
+            {
+                "type": "input_text",
+                "text": "result",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            }
+        ]
+
+
+# ---------------------------------------------------------------------------
 # D2 guardrail: explicit mode with zero prompt_cache_breakpoint markers
 # (spec section 2.4 -- https://github.com/microsoft/amplifier-module-provider-openai)
 # ---------------------------------------------------------------------------
 
 _GUARD_LOGGER = "amplifier_module_provider_openai"
+
+
+@pytest.mark.parametrize("effective_model", ["gpt-5.6-terra", "gpt-5.6-sol"])
+def test_session_explicit_guard_remains_safe_without_tool_results(caplog, effective_model):
+    caplog.set_level(logging.WARNING, logger=_GUARD_LOGGER)
+    provider = _make_provider(
+        default_model="gpt-5.6-terra",
+        prompt_cache_options={"mode": "explicit", "ttl": "30m"},
+    )
+
+    assert provider.prompt_cache_options == {"ttl": "30m"}
+    assert any(
+        "disables prompt caching entirely" in record.message for record in caplog.records
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    asyncio.run(provider.complete(_simple_request(), model=effective_model))
+    assert _captured_params(provider)["prompt_cache_options"] == {"ttl": "30m"}
+
+
+def test_non_string_structured_tool_text_is_unchanged():
+    from amplifier_module_provider_openai import _add_tool_output_cache_breakpoints
+
+    items = [{"type": "function_call_output", "call_id": "call",
+              "output": [{"type": "input_text", "text": ["not a string"]}]}]
+    assert _add_tool_output_cache_breakpoints(items) == items
 
 
 def test_explicit_mode_no_breakpoints_downgraded_and_warns_at_mount(caplog):
