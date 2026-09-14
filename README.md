@@ -243,19 +243,21 @@ OpenAI's July 2025 guidance.
 | `"in_memory"` | 5–10 min in-process cache. Rejected by gpt-5.5/5.6 (auto-dropped to `"24h"` with a warning). |
 | `null` | Field omitted; OpenAI picks the per-model default. |
 
-### `prompt_cache_options` — explicit-mode dropped at mount
+### `prompt_cache_options` — tool-result boundaries alongside implicit caching
 
-`prompt_cache_options` is `{mode, ttl}`. **`mode: "explicit"` is rejected at
-mount** and downgraded to implicit with a one-time warning (the `ttl` key
-passes through unchanged): this provider ships no `prompt_cache_breakpoint`
-mechanism anywhere, and explicit mode with zero breakpoints disables prompt
-caching **entirely** — no reads, no writes — turning a ~95% cache-read workload
-into 100% full-price input (~10× regression, live-probed 2026-08-28).
+For `gpt-5.6-luna`, `gpt-5.6-terra` and their hyphenated variants, the provider
+adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
+result. A string output becomes an `input_text` block with identical text;
+structured outputs receive the marker on their last string-valued `input_text`
+block. Existing markers and non-text blocks are preserved. Instructions, roles,
+reasoning and native tool outputs are not rewritten.
 
-> Residual gap, by design: a caller passing
-> `prompt_cache_options={"mode": "explicit"}` via **per-call kwargs** bypasses
-> mount validation and reaches the wire. This is consistent with the provider's
-> stance on explicit caller overrides — the caller owns the consequences.
+Implicit caching, cache keys and TTL defaults are unchanged. Configured
+`mode: "explicit"` is still removed at mount with a warning, preserving `ttl`:
+requests without eligible results may have no boundary, and explicit-only
+caching without a boundary disables caching entirely. Per-call explicit
+options remain intentional caller overrides. Boundaries permit reuse; they do
+not guarantee cache hits after compaction or other prompt changes.
 
 ### `extra_request_params`
 
@@ -267,6 +269,11 @@ provider-computed key — so it overrides anything the provider set, deliberatel
 **Astra exception:** final compatibility checks run after this merge. Unsupported
 sampling, log-probability, reasoning-effort, and cache-TTL values fail before the
 SDK call; legacy cache retention is removed.
+
+**Luna/Terra cache exception:** after the final merge, automatic tool-result
+boundaries also apply to caller-supplied `input`, using the effective `model`.
+This can change a string output's wire representation to a block list while
+preserving its text. Caller-owned objects and existing markers are not mutated.
 
 - **User wins, loudly.** Any provider-computed key it clobbers is named in a
   one-time warning per key per provider instance. You own the consequences: an

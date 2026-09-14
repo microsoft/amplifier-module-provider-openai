@@ -999,6 +999,53 @@ _KNOWN_CONFIG_KEYS: frozenset[str] = (
 )
 
 
+def _supports_tool_output_cache_breakpoints(model: str) -> bool:
+    """Whether *model* supports automatic function-output cache breakpoints."""
+    if not isinstance(model, str):
+        return False
+    return any(
+        model == tier or model.startswith(f"{tier}-")
+        for tier in ("gpt-5.6-luna", "gpt-5.6-terra")
+    )
+
+
+def _add_tool_output_cache_breakpoints(input_items: list[Any]) -> list[Any]:
+    """Mark each eligible function result without mutating caller-owned input."""
+    updated_items: list[Any] | None = None
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+        output = item.get("output")
+        if isinstance(output, str):
+            updated_item = dict(item)
+            updated_item["output"] = [
+                {"type": "input_text", "text": output,
+                 "prompt_cache_breakpoint": {"mode": "explicit"}}
+            ]
+        elif isinstance(output, list):
+            supported_index = next(
+                (i for i in range(len(output) - 1, -1, -1)
+                 if isinstance(output[i], dict)
+                 and output[i].get("type") == "input_text"
+                 and isinstance(output[i].get("text"), str)),
+                None,
+            )
+            if supported_index is None or "prompt_cache_breakpoint" in output[supported_index]:
+                continue
+            updated_output = list(output)
+            updated_block = dict(updated_output[supported_index])
+            updated_block["prompt_cache_breakpoint"] = {"mode": "explicit"}
+            updated_output[supported_index] = updated_block
+            updated_item = dict(item)
+            updated_item["output"] = updated_output
+        else:
+            continue
+        if updated_items is None:
+            updated_items = list(input_items)
+        updated_items[index] = updated_item
+    return input_items if updated_items is None else updated_items
+
+
 def _warn_unknown_config_keys(
     config: dict[str, Any], extra_known_keys: frozenset[str] = frozenset()
 ) -> None:
@@ -1215,12 +1262,9 @@ class OpenAIProvider:
         )
         self.prompt_cache_retention: str | None = _retention if _retention else None
         # prompt_cache_options (GPT-5.6): {"mode": "implicit"|"explicit", "ttl": "30m"}.
-        # `ttl` passes through untouched. `mode: "explicit"` is REJECTED here: this
-        # provider ships no prompt_cache_breakpoint mechanism anywhere, and explicit
-        # mode with zero breakpoints disables prompt caching ENTIRELY -- no reads, no
-        # writes -- turning a ~95% cache-read workload into 100% full-price input
-        # (~10x, live-probed 2026-08-28). Validated once at mount instead of scanning
-        # every request's input array.
+        # Keep implicit caching for requests without eligible tool results.
+        # Automatic Luna/Terra boundaries do not make explicit-only caching safe
+        # session-wide. Per-call overrides remain the caller's responsibility.
         self.prompt_cache_options: dict | None = (
             self.config.get("prompt_cache_options") or None
         )
@@ -1228,9 +1272,9 @@ class OpenAIProvider:
             _validate_prompt_cache_options(self.prompt_cache_options)
             if self.prompt_cache_options.get("mode") == "explicit":
                 logger.warning(
-                    "[PROVIDER] prompt_cache_options.mode='explicit' is not supported "
-                    "by this provider: no prompt_cache_breakpoint mechanism ships "
-                    "here, and explicit mode with zero breakpoints disables prompt "
+                    "[PROVIDER] Configured prompt_cache_options.mode='explicit' "
+                    "cannot guarantee a breakpoint on every request. Explicit mode "
+                    "with zero breakpoints disables prompt "
                     "caching entirely (~10x input-cost regression). Dropping 'mode'; "
                     "implicit caching is used. 'ttl' passes through unchanged."
                 )
@@ -2558,6 +2602,10 @@ class OpenAIProvider:
         # it reflects in the emitted `raw` payload below (owner-beware).
         self._merge_extra_request_params(params)
         self._prepare_astra_params(params)
+        if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
+            params.get("input"), list
+        ):
+            params["input"] = _add_tool_output_cache_breakpoints(params["input"])
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3334,6 +3382,12 @@ class OpenAIProvider:
                 # same reason and with the same owner-beware semantics.
                 self._merge_extra_request_params(continue_params)
                 self._prepare_astra_params(continue_params)
+                if _supports_tool_output_cache_breakpoints(
+                    continue_params.get("model")
+                ) and isinstance(continue_params.get("input"), list):
+                    continue_params["input"] = _add_tool_output_cache_breakpoints(
+                        continue_params["input"]
+                    )
 
                 # Make continuation call
                 try:

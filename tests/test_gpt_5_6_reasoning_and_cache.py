@@ -9,9 +9,9 @@ Shapes verified live against gpt-5.6-sol on 2026-07-14:
 Also covers the D2 guardrail (spec section 2.4): a live probe on 2026-08-28
 confirmed that `prompt_cache_options.mode == "explicit"` with zero
 `prompt_cache_breakpoint` markers in `input` disables prompt caching entirely
-(cache_write_tokens == 0 AND cached_tokens == 0 on every request). Since this
-provider never attaches breakpoints, an operator setting explicit mode today
-silently converts a ~95% cache-read workload into 100% full-price input. The
+(cache_write_tokens == 0 AND cached_tokens == 0 on every request). Even with
+automatic Luna/Terra tool-result boundaries, some requests have no eligible
+results. Session-wide explicit-only mode can therefore disable caching. The
 guardrail is now validated ONCE AT MOUNT (not scanned per-request): mode is
 downgraded to implicit and a warning fires exactly once per provider
 instance. A caller who bypasses this via per-call kwargs owns the
@@ -19,6 +19,7 @@ consequences (same stance as the other explicit-override escape hatches).
 """
 
 import asyncio
+import copy
 import logging
 from types import SimpleNamespace
 from typing import Any, cast
@@ -60,6 +61,85 @@ class DummyResponse:
 def _captured_params(provider: OpenAIProvider) -> Any:
     mock = cast(AsyncMock, provider.client.responses.create)
     return mock.call_args.kwargs
+
+
+@pytest.mark.parametrize("model,marked", [
+    ("gpt-5.6-luna", True), ("gpt-5.6-terra-preview", True),
+    ("unrecognized-model", False), ("gpt-5.6-sol", False),
+])
+def test_effective_model_and_caller_input_cache_contract(model, marked):
+    """Final normalization applies to overrides but never mutates their objects."""
+    supplied = [{"type": "function_call_output", "call_id": "c", "output": "café\n"}]
+    before = copy.deepcopy(supplied)
+    provider = _make_provider(
+        default_model="gpt-5.6-luna",
+        extra_request_params={"model": model, "input": supplied},
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    asyncio.run(provider.complete(_simple_request(), model="gpt-5.6-terra"))
+    params = _captured_params(provider)
+    assert params["model"] == model
+    assert supplied == before
+    output = params["input"][0]["output"]
+    assert isinstance(output, list) is marked
+    if marked:
+        assert output == [{"type": "input_text", "text": "café\n",
+                           "prompt_cache_breakpoint": {"mode": "explicit"}}]
+    else:
+        assert output == "café\n"
+
+
+def test_cache_boundaries_copy_only_eligible_blocks_and_are_idempotent():
+    from amplifier_module_provider_openai import _add_tool_output_cache_breakpoints
+
+    items = [
+        {"type": "reasoning", "encrypted_content": "opaque"},
+        {"type": "function_call_output", "call_id": "a", "output": ""},
+        {"type": "function_call_output", "call_id": "b", "output": [
+            {"type": "input_text", "text": "earlier"},
+            {"type": "input_image", "image_url": "synthetic"},
+            {"type": "input_text", "text": "last"},
+        ]},
+        {"type": "function_call_output", "call_id": "c", "output": [
+            {"type": "input_text", "text": "caller", "prompt_cache_breakpoint": None}
+        ]},
+        {"type": "function_call_output", "call_id": "d", "output": [
+            {"type": "input_text", "text": ["not supported"]}
+        ]},
+    ]
+    before = copy.deepcopy(items)
+    result = _add_tool_output_cache_breakpoints(items)
+    assert items == before
+    assert result[0] is items[0]
+    assert result[1]["output"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert "prompt_cache_breakpoint" not in result[2]["output"][0]
+    assert result[2]["output"][1] is items[2]["output"][1]
+    assert result[2]["output"][2]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert result[3] is items[3]
+    assert result[4] is items[4]
+    assert _add_tool_output_cache_breakpoints(result) is result
+
+
+def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged():
+    supplied = [{"type": "function_call_output", "call_id": str(i), "output": f"result-{i}"}
+                for i in range(7)]
+    provider = _make_provider(
+        default_model="gpt-5.6-terra", extra_request_params={"input": supplied},
+    )
+    incomplete = SimpleNamespace(
+        status="incomplete", id="incomplete", output=[], incomplete_details=None,
+    )
+    provider.client.responses.create = AsyncMock(side_effect=[incomplete, DummyResponse()])
+    asyncio.run(provider.complete(_simple_request()))
+    calls = provider.client.responses.create.call_args_list
+    assert len(calls) == 2
+    for call in calls:
+        assert [item["output"][0]["prompt_cache_breakpoint"] for item in call.kwargs["input"]] == [
+            {"mode": "explicit"}
+        ] * 7
+        assert call.kwargs.get("prompt_cache_options") is None
+        assert call.kwargs["prompt_cache_retention"] == provider.prompt_cache_retention
+    assert all(isinstance(item["output"], str) for item in supplied)
 
 
 # ---------------------------------------------------------------------------
