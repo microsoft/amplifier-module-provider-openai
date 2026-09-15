@@ -12,8 +12,7 @@ import pytest
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
-from amplifier_module_provider_openai import OpenAIProvider
-from amplifier_module_provider_openai import _tool_search
+from amplifier_module_provider_openai import OpenAIProvider, _tool_search
 
 
 def _provider(**config):
@@ -69,6 +68,31 @@ def test_preflight_uses_complete_assembled_payload_and_full_output_reserve():
     assert budget["estimated_input_tokens"] == provider._serialized_input_bytes(params)
     assert budget["input_limit_tokens"] == 128_000 - 1_000 - 4_096
     assert budget["context_token_budget"] == 123
+    assert budget["max_output_tokens"] == 1_000
+
+
+def test_request_output_cap_overrides_extra_request_params() -> None:
+    provider = _provider(
+        default_model="gpt-5-mini",
+        extra_request_params={"max_output_tokens": 64_000},
+    )
+    request = _request("hello", output=1_000)
+
+    assert provider._budget_params(request)["max_output_tokens"] == 1_000
+
+
+def test_dispatch_keeps_request_output_cap_over_extra_request_params() -> None:
+    provider = _provider(
+        default_model="gpt-5-mini",
+        extra_request_params={"max_output_tokens": 64_000},
+    )
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create = AsyncMock(return_value=response)
+
+    asyncio.run(provider.complete(_request("hello", output=1_000)))
+
+    assert provider.client.responses.create.call_args.kwargs["max_output_tokens"] == 1_000
 
 
 def test_preflight_assembly_matches_nonstream_sdk_payload():

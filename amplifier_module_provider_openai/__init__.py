@@ -1825,6 +1825,11 @@ class OpenAIProvider:
                     )
 
             self._merge_extra_request_params(params)
+            # A request-level cap is an explicit caller safety boundary. Keep
+            # it authoritative over provider-wide extra params so a degraded
+            # context request cannot silently regain its original reserve.
+            if request.max_output_tokens is not None:
+                params["max_output_tokens"] = request.max_output_tokens
             self._prepare_astra_params(params)
             if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
                 params.get("input"), list
@@ -1925,6 +1930,9 @@ class OpenAIProvider:
         return {
             "estimated_input_tokens": max(0, int(estimated)),
             "input_limit_tokens": int(allowance),
+            # Additive data for callers that can safely reduce only output
+            # reservation before asking a context manager to omit more input.
+            "max_output_tokens": int(params["max_output_tokens"]),
             "context_token_budget": max(0, int(target)),
         }
 
