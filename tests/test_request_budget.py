@@ -276,6 +276,25 @@ def test_final_guard_uses_same_growth_bound_and_has_scalar_attribution():
         provider._guard_assembled_params(params)
 
 
+def test_uncalibrated_oversize_bootstrap_estimate_dispatches_and_calibrates():
+    provider = _provider(default_model="gpt-5-mini")
+    request = _request("x" * 130_000, output=1_000)
+    params = provider._budget_params(request)
+    estimate, _ = provider._estimated_input_tokens(params)
+
+    assert estimate > provider._budget_input_limit(params)
+    assert provider._budget_calibration == {}
+
+    response = _response(100_000)
+    response.output = []
+    provider.client.responses.create = AsyncMock(return_value=response)
+
+    asyncio.run(provider.complete(request))
+
+    assert provider.client.responses.create.await_count == 1
+    assert "gpt-5-mini" in provider._budget_calibration
+
+
 def test_low_level_direct_dispatch_uses_the_local_guard():
     provider = _provider(default_model="gpt-5-mini")
     params = provider._budget_params(_request())
