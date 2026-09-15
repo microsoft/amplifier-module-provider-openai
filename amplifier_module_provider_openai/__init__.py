@@ -21,7 +21,7 @@ import time
 import uuid
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar
 
 import openai
 from amplifier_core import (
@@ -535,7 +535,10 @@ def _validate_text_verbosity(verbosity: Any) -> None:
 
 
 def _drop_unsupported_in_memory_retention(
-    model_id: str, retention: str | None
+    model_id: str,
+    retention: str | None,
+    *,
+    warning: Callable[..., None] = logger.warning,
 ) -> str | None:
     """Return *retention* unless it would be rejected by the model.
 
@@ -577,7 +580,7 @@ def _drop_unsupported_in_memory_retention(
             "model's own default), or pass '24h' for the legacy-compatible "
             "alternative."
         )
-    logger.warning(
+    warning(
         "[PROVIDER] Dropping prompt_cache_retention='in_memory' for model %r: "
         "model does not support 'in_memory' retention. %s",
         model_id,
@@ -1465,7 +1468,8 @@ class OpenAIProvider:
         legacy_retention = params.pop("prompt_cache_retention", None)
         if legacy_retention is not None and not self._astra_legacy_retention_warned:
             self._astra_legacy_retention_warned = True
-            logger.warning(
+            self._assembly_log(
+                "warning",
                 "[PROVIDER] Dropping prompt_cache_retention=%r for gpt-6-astra; "
                 "it is unsupported. Use prompt_cache_options.ttl='30m' instead.",
                 legacy_retention,
@@ -1494,7 +1498,8 @@ class OpenAIProvider:
         )
         if clobbered:
             self._extra_params_warned_keys.update(clobbered)
-            logger.warning(
+            self._assembly_log(
+                "warning",
                 "[PROVIDER] extra_request_params overrides provider-computed "
                 "request parameter(s): %s. This is intentional and supported -- "
                 "you own the consequences (a rejected value surfaces as an API "
@@ -1502,6 +1507,20 @@ class OpenAIProvider:
                 ", ".join(clobbered),
             )
         params.update(self.extra_request_params)
+
+    def _assembly_log(self, level: str, message: str, *args: Any) -> None:
+        """Record assembly diagnostics when planning; otherwise log immediately."""
+        records = getattr(self, "_assembly_log_records", None)
+        if records is None:
+            getattr(logger, level)(message, *args)
+        else:
+            records.append((level, message, args))
+
+    @staticmethod
+    def _emit_assembly_logs(records: list[tuple[str, str, tuple[Any, ...]]]) -> None:
+        """Emit diagnostics recorded by a completed live assembly transaction."""
+        for level, message, args in records:
+            getattr(logger, level)(message, *args)
 
     @staticmethod
     def _serialized_input_bytes(params: dict[str, Any]) -> int:
@@ -1577,13 +1596,14 @@ class OpenAIProvider:
             f"input_bytes={input_bytes}, tools={tools_count}, tools_bytes={tools_bytes}"
         )
 
-    def _budget_params(self, request: ChatRequest, **kwargs: Any) -> dict[str, Any]:
-        """Assemble a side-effect-free equivalent of complete()'s wire payload.
+    def _assemble_initial_responses_params_stateful(
+        self, request: ChatRequest, *, restore_state: bool, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Assemble initial Responses params against this isolated state snapshot.
 
-        The live request path still owns warnings and tool-search state changes.
-        Budget inspection snapshots that state before conversion and restores it
-        afterwards, so it cannot consume a pending tool item, mark native calls,
-        or emit an extra-parameter/Astra warning.
+        Callers that need a pure assembly transaction provide an isolated provider
+        copy and set ``restore_state=False``. The retained stateful mode exists
+        only for compatibility with direct internal callers during this refactor.
         """
         saved_state = (
             self._pending_additional_tools_item,
@@ -1705,6 +1725,13 @@ class OpenAIProvider:
                     self.tool_search_mode == TOOL_SEARCH_MODE_NAMESPACED
                     and params["tool_choice"] not in ("auto", "none")
                 ):
+                    self._assembly_log(
+                        "warning",
+                        "[PROVIDER] tool_search.mode=namespaced forces "
+                        "tool_choice='auto' (requested %r): forcing a tool that "
+                        "has not been discovered yet is unspecified.",
+                        params["tool_choice"],
+                    )
                     params["tool_choice"] = "auto"
                 extra_item = self._pending_additional_tools_item
                 if (
@@ -1730,7 +1757,9 @@ class OpenAIProvider:
             ):
                 retention = None
             if model_name != "gpt-6-astra":
-                retention = _drop_unsupported_in_memory_retention(model_name, retention)
+                retention = _drop_unsupported_in_memory_retention(
+                    model_name, retention, warning=self._assembly_log
+                )
             if retention is not None:
                 params["prompt_cache_retention"] = retention
             if options := kwargs.get(
@@ -1760,27 +1789,89 @@ class OpenAIProvider:
                 _validate_reasoning_context({"context": context})
                 if isinstance(params.get("reasoning"), dict):
                     params["reasoning"].setdefault("context", context)
+                else:
+                    self._assembly_log(
+                        "warning",
+                        "[PROVIDER] reasoning_context=%r had no effect: this "
+                        "request sends no reasoning parameter (model %s). Set "
+                        "reasoning_effort as well, or drop reasoning_context.",
+                        context,
+                        model_name,
+                    )
 
-            params.update(self.extra_request_params)
-            if params.get("model") == "gpt-6-astra":
-                params.pop("prompt_cache_retention", None)
-                _validate_gpt_6_astra_params(params)
+            self._merge_extra_request_params(params)
+            self._prepare_astra_params(params)
             if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
                 params.get("input"), list
             ):
                 params["input"] = _add_tool_output_cache_breakpoints(params["input"])
             return copy.deepcopy(params)
         finally:
-            (
-                self._pending_additional_tools_item,
-                self._tool_search_roster,
-                self._tool_search_extra,
-                self._apply_patch_native,
-                self._native_call_ids,
-                self._native_call_types,
-                self._extra_params_warned_keys,
-                self._astra_legacy_retention_warned,
-            ) = saved_state
+            if restore_state:
+                (
+                    self._pending_additional_tools_item,
+                    self._tool_search_roster,
+                    self._tool_search_extra,
+                    self._apply_patch_native,
+                    self._native_call_ids,
+                    self._native_call_types,
+                    self._extra_params_warned_keys,
+                    self._astra_legacy_retention_warned,
+                ) = saved_state
+
+    def _assemble_initial_responses_params(
+        self, request: ChatRequest, **kwargs: Any
+    ) -> tuple[dict[str, Any], dict[str, Any], list[tuple[str, str, tuple[Any, ...]]]]:
+        """Purely plan the initial ChatRequest-to-Responses wire payload.
+
+        The mutable conversion state is copied into a short-lived planner. Its
+        prospective state and deferred diagnostics are returned separately, so
+        preflight neither mutates this provider nor emits assembly warnings.
+        The live path commits both only after successful planning.
+        """
+        planner = copy.copy(self)
+        planner._pending_additional_tools_item = copy.deepcopy(
+            self._pending_additional_tools_item
+        )
+        planner._tool_search_roster = self._tool_search_roster
+        planner._tool_search_extra = copy.deepcopy(self._tool_search_extra)
+        planner._apply_patch_native = self._apply_patch_native
+        planner._native_call_ids = set(self._native_call_ids)
+        planner._native_call_types = dict(self._native_call_types)
+        planner._extra_params_warned_keys = set(self._extra_params_warned_keys)
+        planner._astra_legacy_retention_warned = self._astra_legacy_retention_warned
+        planner._assembly_log_records: list[tuple[str, str, tuple[Any, ...]]] = []
+
+        params = planner._assemble_initial_responses_params_stateful(
+            request, restore_state=False, **kwargs
+        )
+        state = {
+            "pending_additional_tools_item": planner._pending_additional_tools_item,
+            "tool_search_roster": planner._tool_search_roster,
+            "tool_search_extra": planner._tool_search_extra,
+            "apply_patch_native": planner._apply_patch_native,
+            "native_call_ids": planner._native_call_ids,
+            "native_call_types": planner._native_call_types,
+            "extra_params_warned_keys": planner._extra_params_warned_keys,
+            "astra_legacy_retention_warned": planner._astra_legacy_retention_warned,
+        }
+        return params, state, planner._assembly_log_records
+
+    def _commit_initial_assembly_state(self, state: dict[str, Any]) -> None:
+        """Commit the state produced by a successful live assembly transaction."""
+        self._pending_additional_tools_item = state["pending_additional_tools_item"]
+        self._tool_search_roster = state["tool_search_roster"]
+        self._tool_search_extra = state["tool_search_extra"]
+        self._apply_patch_native = state["apply_patch_native"]
+        self._native_call_ids = state["native_call_ids"]
+        self._native_call_types = state["native_call_types"]
+        self._extra_params_warned_keys = state["extra_params_warned_keys"]
+        self._astra_legacy_retention_warned = state["astra_legacy_retention_warned"]
+
+    def _budget_params(self, request: ChatRequest, **kwargs: Any) -> dict[str, Any]:
+        """Return the shared, side-effect-free initial Responses payload."""
+        params, _, _ = self._assemble_initial_responses_params(request, **kwargs)
+        return params
 
     def request_budget(
         self, request: ChatRequest, *, context_estimate: int, **kwargs: Any
@@ -2563,406 +2654,22 @@ class OpenAIProvider:
         )
         logger.info(f"[PROVIDER] Message roles: {[m.role for m in request.messages]}")
 
+        params, assembly_state, assembly_logs = self._assemble_initial_responses_params(
+            request, **kwargs
+        )
+
         message_list = list(request.messages)
+        instructions = params.get("instructions")
+        background_mode = bool(params.get("background"))
+        tools_list = params.get("tools", [])
 
-        # Separate messages by role
-        system_msgs = [m for m in message_list if m.role == "system"]
-        developer_msgs = [m for m in message_list if m.role == "developer"]
-        conversation = [
-            m for m in message_list if m.role in ("user", "assistant", "tool")
-        ]
-
-        logger.info(
-            f"[PROVIDER] Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
-        )
-
-        # Combine system messages as instructions
-        instructions = (
-            "\n\n".join(
-                m.content if isinstance(m.content, str) else "" for m in system_msgs
-            )
-            if system_msgs
-            else None
-        )
-
-        # Convert all messages (developer + conversation) to Responses API format
-        # Developer messages become XML-wrapped user messages, tools are batched
-        all_messages_for_conversion = []
-
-        # Add developer messages first
-        for dev_msg in developer_msgs:
-            all_messages_for_conversion.append(dev_msg.model_dump())
-
-        # Add conversation messages
-        for conv_msg in conversation:
-            all_messages_for_conversion.append(conv_msg.model_dump())
-
-        model_name = kwargs.get("model", self.default_model)
-
-        # Check for background mode (used for deep research and long-running requests)
-        # Background mode requires store=True per OpenAI API requirements
-        background_mode = kwargs.get("background", False)
-
-        # Auto-enable background mode for deep research models
-        if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
-            ("o3-deep-research", "o4-mini-deep-research")
-        ):
-            # Deep research models should use background mode by default
-            background_mode = kwargs.get("background", True)
-            logger.info(
-                f"[PROVIDER] Deep research model detected: {model_name}, background={background_mode}"
-            )
-
-        # Convert to OpenAI Responses API message format. Always the FULL
-        # local transcript -- the provider is stateless-only, there is no
-        # chain-truncated delta to convert instead.
-        input_messages = self._convert_messages(all_messages_for_conversion)
-        logger.info(
-            f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
-        )
-
-        # Prepare request parameters per Responses API spec
-        params = {
-            "model": model_name,
-            "input": input_messages,  # Array of message objects, not text string
-        }
-        # Amplifier is always stateless: store=false, full input, turn-scoped
-        # reasoning replay. Background mode is the ONE exception -- the API
-        # requires the response to be retrievable for polling, so it forces
-        # store=true per-request. Operators who genuinely need server-side
-        # retention set it via extra_request_params and own the consequences
-        # (see README "Conversation state").
-        params["store"] = bool(background_mode)
-
-        if instructions:
-            params["instructions"] = instructions
-
-        if request.max_output_tokens:
-            params["max_output_tokens"] = request.max_output_tokens
-        else:
-            # P5: default the output budget to the MODEL's capability limit
-            # instead of a fixed 4096 (mirrors provider-anthropic). A 4096
-            # cap silently truncated large tool calls (a >4K-token write_file
-            # can never complete) while the Anthropic provider ran at its
-            # model cap — both a live session-killer (P4 trigger) and a
-            # cross-provider parity confound. Explicit request/kwargs/config
-            # values still win; DEFAULT_MAX_TOKENS is only the fallback when
-            # capability data is absent.
-            max_tokens = kwargs.get("max_tokens", self.max_output_tokens)
-            if max_tokens is None:
-                caps = get_capabilities(params["model"])
-                max_tokens = caps.max_output_tokens or DEFAULT_MAX_TOKENS
-            params["max_output_tokens"] = max_tokens
-
-        if request.temperature is not None:
-            params["temperature"] = request.temperature
-        elif temperature := kwargs.get("temperature", self.temperature):
-            params["temperature"] = temperature
-
-        # Phase 2: Reasoning parameter precedence chain
-        # kwargs["reasoning"] > kwargs["reasoning_effort"] > request.reasoning_effort
-        #   > config "reasoning_effort" (canonical) > config "reasoning" (legacy) > None
-        #
-        # An explicit kwargs["reasoning"]/request.reasoning dict is a deliberate
-        # provider-specific override and is forwarded ungated below -- the caller
-        # owns the consequences. Every other path here builds `reasoning` from a
-        # portable effort field (kwargs["reasoning_effort"], request.reasoning_effort,
-        # or config "reasoning_effort") and is capability-gated: a model that can't
-        # reason gets a loud no-op instead of a mid-session API 400.
-        reasoning_param = kwargs.get("reasoning", getattr(request, "reasoning", None))
-        if reasoning_param is None:
-            effort_hint = kwargs.get("reasoning_effort") or request.reasoning_effort
-            if effort_hint:
-                if get_capabilities(model_name).supports_reasoning:
-                    reasoning_param = {
-                        "effort": effort_hint,
-                        "summary": self.reasoning_summary,
-                    }
-                else:
-                    logger.warning(
-                        "[PROVIDER] Ignoring 'reasoning_effort'=%r: "
-                        "model %s does not support reasoning.",
-                        effort_hint,
-                        model_name,
-                    )
-        if reasoning_param is None and self.reasoning_effort is not None:
-            # Canonical config key (validated/normalized at mount; "none" and
-            # absence resolve to None so this path never fires for them).
-            if get_capabilities(model_name).supports_reasoning:
-                reasoning_param = {
-                    "effort": self.reasoning_effort,
-                    "summary": self.reasoning_summary,
-                }
-            else:
-                logger.warning(
-                    "[PROVIDER] Ignoring config 'reasoning_effort'=%r: "
-                    "model %s does not support reasoning.",
-                    self.reasoning_effort,
-                    model_name,
-                )
-        if reasoning_param is None:
-            reasoning_param = self.reasoning
-        _validate_gpt_5_5_pro_effort(model_name, reasoning_param)
-        _validate_reasoning_mode(reasoning_param)
-        _validate_reasoning_context(reasoning_param)
-        if reasoning_param:
-            # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
-            if isinstance(reasoning_param, dict):
-                # Dict format: use as-is, but apply defaults for missing keys
-                params["reasoning"] = {
-                    "summary": reasoning_param.get("summary", self.reasoning_summary),
-                }
-                effort = reasoning_param.get("effort")
-                if effort is not None:
-                    params["reasoning"]["effort"] = effort
-                elif model_name != "gpt-6-astra":
-                    params["reasoning"]["effort"] = "medium"
-                # reasoning.mode: "pro" (GPT-5.6) enables extended internal reasoning.
-                # Only forwarded when the caller sets it, so pre-5.6 models are
-                # unaffected; verified live 2026-07-14 (mode in {standard, pro}).
-                _reasoning_mode = reasoning_param.get("mode")
-                if _reasoning_mode is not None:
-                    params["reasoning"]["mode"] = _reasoning_mode
-                # reasoning.context (GPT-5.6 persisted reasoning): forwarded
-                # UNGATED whenever the caller supplies it in an explicit
-                # `reasoning` dict -- an explicit reasoning dict is a
-                # deliberate provider-specific override (same stance as
-                # `mode` above); the caller owns the consequences.
-                # `_validate_reasoning_context` above already rejected any
-                # value the API would reject.
-                _reasoning_context = reasoning_param.get("context")
-                if _reasoning_context is not None:
-                    params["reasoning"]["context"] = _reasoning_context
-            else:
-                # String format: use as effort level with default summary
-                params["reasoning"] = {
-                    "effort": reasoning_param,
-                    "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
-                }
-            logger.info(f"[PROVIDER] Setting reasoning: {params['reasoning']}")
-
-        # Request encrypted_content when model supports reasoning (regardless of effort level).
-        # Reasoning-capable models CAN produce reasoning tokens even with effort=none.
-        # Without include=[reasoning.encrypted_content], reasoning token content is lost
-        # when store=false (Amplifier's default), causing orphaned reasoning references.
-        # Exception: explicit effort="none" suppresses include (caller opted out of reasoning).
-        #
-        # A5 (probe P1, pre-registered in the reasoning-continuity-fix spec):
-        # requesting include=["reasoning.encrypted_content"] does NOT bust
-        # the prompt-cache prefix -- `include` only changes the *response*
-        # shape returned by the server, not the *request* prefix caching
-        # keys on. Verified live on gpt-5.6-luna: per-hop cached_tokens
-        # differed by 0-4 tokens out of ~1,500-1,600 (R2-R4, ~96%
-        # cache_read share in both arms) between an arm requesting include
-        # and an otherwise-identical arm that omitted it -- see
-        # probes/p1_include_chained_probe.py /
-        # probes/_p1_include_probe_results.json ("verdict": "PASS").
-        # So ciphertext capture is UNCONDITIONAL: request it whenever the
-        # model will reason. This lets every reset/resume path replay
-        # reasoning regardless of what produced it -- the provider is
-        # stateless-only, so encrypted_content is the only durable handle
-        # on reasoning state across turns.
-        if True:
-            caps = get_capabilities(model_name)
-            active_effort: str | None = None
-            if "reasoning" in params:
-                r = params["reasoning"]
-                active_effort = r.get("effort") if isinstance(r, dict) else r
-            # Explicit effort (including "none") overrides the capability-based default.
-            # If the caller explicitly opts out of reasoning, respect that choice.
-            if active_effort is not None:
-                model_will_reason = active_effort != "none"
-            else:
-                model_will_reason = caps.supports_reasoning
-            if model_will_reason:
-                params["include"] = kwargs.get(
-                    "include", ["reasoning.encrypted_content"]
-                )
-                logger.debug(
-                    "[PROVIDER] Requesting encrypted_content (stateless path, model will reason: %s, effort=%s)",
-                    model_name,
-                    active_effort or caps.default_reasoning_effort,
-                )
-
-        # Add tools if provided (from request or kwargs)
-        # Native tools (web_search_preview, file_search, code_interpreter) can be passed via kwargs["tools"]
-        tools_list = list(request.tools) if request.tools else []
-        native_tools = kwargs.get("tools", [])
-        logger.info(
-            f"[PROVIDER] Tools from request: {len(list(request.tools) if request.tools else [])}, native_tools from kwargs: {native_tools}"
-        )
-        if native_tools:
-            tools_list.extend(native_tools)
-
-        if tools_list:
-            params["tools"] = self._convert_tools_from_request(tools_list, model_name)
-            # Add tool-related parameters per Responses API spec
-            if "tool_choice" in kwargs:
-                params["tool_choice"] = kwargs["tool_choice"]
-            elif request.tool_choice is not None:
-                params["tool_choice"] = request.tool_choice
-            else:
-                params["tool_choice"] = "auto"
-            if self.tool_search_mode == TOOL_SEARCH_MODE_NAMESPACED:
-                # BREAK 1. `tool_choice` semantics against a DEFERRED tool are
-                # unprobed (`bub` exercised only "none" and "auto"). Forcing a
-                # tool the model has not discovered yet has no defined
-                # behaviour, so pin "auto" and SAY SO rather than sending an
-                # untested combination into a live session.
-                if params["tool_choice"] not in ("auto", "none"):
-                    logger.warning(
-                        "[PROVIDER] tool_search.mode=namespaced forces "
-                        "tool_choice='auto' (requested %r): forcing a tool that "
-                        "has not been discovered yet is unspecified.",
-                        params["tool_choice"],
-                    )
-                    params["tool_choice"] = "auto"
-                # Mid-session tools ride an `additional_tools` INPUT item at the
-                # tail -- an append, never an edit of the `tools` block.
-                _extra_item = self._pending_additional_tools_item
-                if _extra_item is not None and isinstance(params.get("input"), list):
-                    params["input"] = [*params["input"], _extra_item]
-            params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
-            # max_tool_calls limits how many tool calls the model can make
-            # Important for deep research to prevent excessive searching that consumes token budget
-            if max_tool_calls := kwargs.get("max_tool_calls"):
-                params["max_tool_calls"] = max_tool_calls
-
-        # Truncation parameter — default None (omit) for cache-prefix
-        # stability; per-call kwarg overrides the config default.
-        truncation = kwargs.get("truncation", self.truncation)
-        if truncation:
-            params["truncation"] = truncation
-
-        # Prompt-caching hint parameters (Responses API top-level fields).
-        # Per-call kwargs override the config default; None / "" means "do not
-        # send". The trailing `or None` mirrors the empty-string coercion in
-        # __init__() so that a caller passing `prompt_cache_key=""` (e.g. from
-        # a UI form) is treated the same as omitting the field.
-        prompt_cache_key = kwargs.get("prompt_cache_key", self.prompt_cache_key) or None
-        if prompt_cache_key is not None:
-            params["prompt_cache_key"] = prompt_cache_key
-
-        prompt_cache_retention = (
-            kwargs.get("prompt_cache_retention", self.prompt_cache_retention) or None
-        )
-        # Astra does not accept the legacy field. Omit only the provider's
-        # implicit 24h default; explicit config and per-call values continue
-        # through the final Astra normalizer for its targeted warning.
-        if (
-            model_name == "gpt-6-astra"
-            and "prompt_cache_retention" not in self.config
-            and "prompt_cache_retention" not in kwargs
-        ):
-            prompt_cache_retention = None
-        # Drop retention values the model is known to reject. No-op unless
-        # the value is set AND the capability flag is False -- today only
-        # `supports_in_memory_retention=False` (gpt-5.5) actually fires.
-        # The mirror-image `supports_24h_retention` gate was removed: proven
-        # dormant (defaults True, no branch anywhere ever set it False).
-        if model_name != "gpt-6-astra":
-            prompt_cache_retention = _drop_unsupported_in_memory_retention(
-                model_name, prompt_cache_retention
-            )
-        if prompt_cache_retention is not None:
-            params["prompt_cache_retention"] = prompt_cache_retention
-
-        # prompt_cache_options (GPT-5.6): explicit prompt-cache control that COEXISTS
-        # with prompt_cache_retention (verified live 2026-07-14 -- both are echoed
-        # together; it is NOT a replacement). Forwarded verbatim after a mode-enum
-        # pre-flight check; the API validates ttl (currently only "30m").
-        prompt_cache_options = (
-            kwargs.get("prompt_cache_options", self.prompt_cache_options) or None
-        )
-        if prompt_cache_options is not None:
-            _validate_prompt_cache_options(prompt_cache_options)
-            params["prompt_cache_options"] = prompt_cache_options
-
-        safety_identifier = (
-            kwargs.get("safety_identifier", self.safety_identifier) or None
-        )
-        if safety_identifier is not None:
-            params["safety_identifier"] = safety_identifier
-
-        # text.verbosity (GPT-5.6): opt-in response-length control. Guard against
-        # clobbering any pre-existing `text` object (there is none today, but be
-        # defensive -- mirrors the safety_identifier passthrough pattern).
-        text_verbosity = kwargs.get("text_verbosity", self.text_verbosity) or None
-        if text_verbosity is not None:
-            _validate_text_verbosity(text_verbosity)
-            params.setdefault("text", {})["verbosity"] = text_verbosity
-
-        # Add background mode parameter for long-running requests (deep research)
-        if background_mode:
-            params["background"] = True
-
-        logger.info(
-            f"[PROVIDER] {self.api_label} API call - model: {params['model']}, has_instructions: {bool(instructions)}, tools: {len(tools_list)}, background={background_mode}"
-        )
-
-        thinking_enabled = bool(kwargs.get("extended_thinking"))
-        if thinking_enabled:
-            if "reasoning" not in params:
-                params["reasoning"] = {
-                    "effort": kwargs.get("reasoning_effort")
-                    or self.config.get("reasoning_effort", "high"),
-                    "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
-                }
-            logger.info(
-                "[PROVIDER] Extended thinking enabled (effort=%s)",
-                params["reasoning"]["effort"],
-            )
-
-        # Auto-enable reasoning summary for models that reason by default.
-        # Without this, models like gpt-5.2-codex return encrypted_content but no
-        # summary text, making reasoning invisible for observability/debugging.
-        # Placed AFTER extended_thinking so it doesn't interfere with effort-based reasoning.
-        # Only applies to models with a non-None default_reasoning_effort (o-series, gpt-5.2
-        # and below). GPT-5.4+ has default_reasoning_effort=None — it doesn't reason by
-        # default, so no reasoning param should be sent unless explicitly requested.
-        if self._model_may_reason(model_name) and "reasoning" not in params:
-            caps_for_auto = get_capabilities(model_name)
-            if caps_for_auto.default_reasoning_effort is not None:
-                params["reasoning"] = {"summary": "auto"}
-
-        # reasoning.context from the first-class config key / per-call kwarg.
-        # Applied LAST among the reasoning sites so it composes with EVERY way
-        # a reasoning object gets built (canonical reasoning_effort, legacy
-        # dict, extended_thinking, auto-summary) instead of only the legacy
-        # dict. An explicit `context` inside a caller-supplied reasoning dict
-        # always wins -- this never overwrites it.
-        reasoning_context = (
-            kwargs.get("reasoning_context", self.reasoning_context) or None
-        )
-        if reasoning_context is not None:
-            _validate_reasoning_context({"context": reasoning_context})
-            _reasoning_obj = params.get("reasoning")
-            if isinstance(_reasoning_obj, dict):
-                _reasoning_obj.setdefault("context", reasoning_context)
-            else:
-                # Loud, not silent: a config key that does nothing is exactly
-                # the failure mode `_INERT_CONFIG_KEY_MESSAGES` exists for.
-                logger.warning(
-                    "[PROVIDER] reasoning_context=%r had no effect: this "
-                    "request sends no reasoning parameter (model %s). Set "
-                    "reasoning_effort as well, or drop reasoning_context.",
-                    reasoning_context,
-                    model_name,
-                )
-
-        # extra_request_params: the documented escape hatch, merged LAST so
-        # it reflects in the emitted `raw` payload below (owner-beware).
-        self._merge_extra_request_params(params)
-        self._prepare_astra_params(params)
-        if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
-            params.get("input"), list
-        ):
-            params["input"] = _add_tool_output_cache_breakpoints(params["input"])
 
         # Guard the complete, final wire payload before emitting llm:request.
         # `_create_response` repeats this guard for direct continuation and
         # truncation-retry dispatches; stream() bypasses that helper.
         self._guard_assembled_params(params)
+        self._commit_initial_assembly_state(assembly_state)
+        self._emit_assembly_logs(assembly_logs)
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4143,7 +3850,8 @@ class OpenAIProvider:
                             )
                     else:
                         # Fallback for messages without tool_call_id (legacy/compacted messages)
-                        logger.warning(
+                        self._assembly_log(
+                            "warning",
                             f"Tool result missing tool_call_id for '{tool_name}', using text fallback. "
                             "This may reduce model accuracy for multi-tool scenarios."
                         )
@@ -4464,7 +4172,8 @@ class OpenAIProvider:
                         )
                     ]
                     if len(kept) != len(reasoning_items_to_add):
-                        logger.warning(
+                        self._assembly_log(
+                            "warning",
                             "[PROVIDER] Reasoning IDs in metadata but encrypted_content unavailable. "
                             "Stripping %d orphaned reasoning reference(s) to prevent API errors. "
                             "Ensure include=[reasoning.encrypted_content] is requested for store=false.",
@@ -4479,7 +4188,8 @@ class OpenAIProvider:
                 if reasoning_items_to_add:
                     # Observability: the live capture wave could not confirm the
                     # resolved cutoff from captures alone -- this closes that gap.
-                    logger.debug(
+                    self._assembly_log(
+                        "debug",
                         "[PROVIDER] reasoning replay gate: msg_idx=%d cutoff=%d candidates=%d emit=%s",
                         i,
                         _reasoning_cutoff,
@@ -4591,7 +4301,8 @@ class OpenAIProvider:
                                         }
                                     )
                                 else:
-                                    logger.warning(
+                                    self._assembly_log(
+                                        "warning",
                                         f"Unsupported image source type: {source.get('type')}"
                                     )
 
@@ -4610,7 +4321,7 @@ class OpenAIProvider:
                 i += 1
             else:
                 # Unknown role - skip
-                logger.warning(f"Unknown message role: {role}")
+                self._assembly_log("warning", f"Unknown message role: {role}")
                 i += 1
 
         # P4 wire-path invariant: every function_call item replayed into the
@@ -4642,7 +4353,8 @@ class OpenAIProvider:
                 and item.get("call_id")
                 and item["call_id"] not in output_call_ids
             ):
-                logger.warning(
+                self._assembly_log(
+                    "warning",
                     "[PROVIDER] Orphaned function_call %s (%s) reached the wire "
                     "path with no paired output; synthesizing an error output "
                     "to keep the request valid.",
@@ -4738,7 +4450,8 @@ class OpenAIProvider:
                     if get_capabilities(resolved_model).supports_native_apply_patch:
                         openai_tools.append({"type": "apply_patch"})
                         continue
-                    logger.info(
+                    self._assembly_log(
+                        "info",
                         "[PROVIDER] Model %s does not support native apply_patch; "
                         "falling back to function-tool mode for this request.",
                         resolved_model,
@@ -4819,7 +4532,8 @@ class OpenAIProvider:
             self._tool_search_roster = frozenset(present)
         elif not self._tool_search_roster <= present:
             missing = sorted(self._tool_search_roster - present)
-            logger.warning(
+            self._assembly_log(
+                "warning",
                 "[PROVIDER] tool_search.mode=namespaced: %d tool(s) left the "
                 "roster mid-session (%s). Rebuilding the tools block, which costs "
                 "one cold prompt-cache rebuild -- taken deliberately so the model "
