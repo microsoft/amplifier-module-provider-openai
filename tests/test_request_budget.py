@@ -10,9 +10,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from amplifier_core import llm_errors as kernel_errors
-from amplifier_core.message_models import ChatRequest, Message
+from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
 from amplifier_module_provider_openai import OpenAIProvider
+from amplifier_module_provider_openai import _tool_search
 
 
 def _provider(**config):
@@ -89,6 +90,24 @@ def test_preflight_assembly_matches_nonstream_sdk_payload():
     assert provider.client.responses.create.call_args.kwargs == expected
 
 
+def test_negative_output_reserve_cannot_enlarge_the_input_allowance():
+    provider = _provider(default_model="gpt-5.6-terra", enable_long_context=True)
+    provider.client.responses.create = AsyncMock()
+    request = _request("x" * 1_000_000)
+
+    with pytest.raises(kernel_errors.ContextLengthError, match="nonnegative integer"):
+        asyncio.run(provider.complete(request, max_tokens=-1_000_000))
+
+    provider.client.responses.create.assert_not_called()
+
+
+def test_omitted_direct_output_cap_reserves_model_maximum_without_mutation():
+    provider = _provider(default_model="gpt-5.6-terra", enable_long_context=True)
+    params = {"model": "gpt-5.6-terra", "input": []}
+    assert provider._budget_input_limit(params) == 900_000 - 128_000 - 4_096
+    assert "max_output_tokens" not in params
+
+
 def test_preflight_assembly_matches_streaming_sdk_payload_and_final_usage():
     provider = _provider(default_model="gpt-5-mini", use_streaming=True)
     request = _request("hello")
@@ -127,6 +146,36 @@ def test_preflight_has_no_request_mutation_events_or_calibration_side_effects():
         provider._native_call_types,
         provider._budget_calibration,
     ) == state_before
+
+
+def test_namespace_preflight_defers_warning_until_accepted_dispatch(monkeypatch, caplog):
+    monkeypatch.setattr(_tool_search, "_WARNED_UNLISTED", set())
+    provider = _provider(
+        default_model="gpt-5.6-terra",
+        enable_long_context=True,
+        tool_search={"mode": "namespaced"},
+    )
+    request = ChatRequest(
+        messages=[Message(role="user", content="hello")],
+        tools=[
+            ToolSpec(
+                name="budget_unlisted_probe",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+    )
+    caplog.clear()
+    provider.request_budget(request, context_estimate=10)
+    provider.request_budget(request, context_estimate=10)
+    assert _tool_search._WARNED_UNLISTED == set()
+    assert not any("namespace table" in record.message for record in caplog.records)
+
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create = AsyncMock(return_value=response)
+    asyncio.run(provider.complete(request))
+    assert ("budget_unlisted_probe",) in _tool_search._WARNED_UNLISTED
+    assert sum("namespace table" in record.message for record in caplog.records) == 1
 
 
 def test_matched_raw_usage_calibration_ignores_cache_fields_and_is_model_scoped():
@@ -184,7 +233,6 @@ def test_calibration_grows_conservatively_but_smaller_payload_uses_rate():
 def test_oversize_returns_a_strictly_smaller_positive_context_target():
     provider = _provider(default_model="gpt-5-mini")
     request = _request("x" * 8_000)
-    params = provider._budget_params(request)
     provider._budget_calibration["gpt-5-mini"] = (100.0, 1, 100)
 
     budget = provider.request_budget(request, context_estimate=100_000)

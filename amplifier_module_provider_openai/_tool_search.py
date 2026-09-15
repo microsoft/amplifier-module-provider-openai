@@ -243,6 +243,8 @@ def build_namespaced_tools(
     flat_tools: list[dict[str, Any]],
     namespaces: tuple[dict[str, Any], ...],
     always_loaded: frozenset[str],
+    *,
+    deferred_warnings: list[tuple[str, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     """Regroup an already-converted flat OpenAI tool list into the namespace form.
 
@@ -259,6 +261,8 @@ def build_namespaced_tools(
     function tool and is logged at WARNING. Failing open is deliberate: a tool
     that silently vanished into a namespace would be exactly the class of
     silent downgrade this provider already warns about elsewhere.
+    A request planner can collect warning sets without consuming the process-wide
+    warning registry; the live caller emits them after accepting its request.
     """
     by_name: dict[str, dict[str, Any]] = {}
     native_passthrough: list[dict[str, Any]] = []
@@ -314,18 +318,11 @@ def build_namespaced_tools(
         )
 
     unlisted = sorted(name for name in by_name if name not in emitted)
-    if unlisted and tuple(unlisted) not in _WARNED_UNLISTED:
-        # Once per distinct unlisted set per process: the condition is a
-        # deployment mistake to fix once, not a per-request event. Warning
-        # every request would bury it in its own noise.
-        _WARNED_UNLISTED.add(tuple(unlisted))
-        logger.warning(
-            "[PROVIDER] tool_search.mode=namespaced: %d tool(s) are not in the "
-            "namespace table and are being sent flat and undeferred: %s. Add them to "
-            "`tool_search.namespaces` to include them in the deferred block.",
-            len(unlisted),
-            ", ".join(unlisted),
-        )
+    if unlisted:
+        if deferred_warnings is None:
+            warn_unlisted_tools(tuple(unlisted))
+        else:
+            deferred_warnings.append(tuple(unlisted))
 
     result: list[dict[str, Any]] = list(native_passthrough)
     result.extend(namespace_items)
@@ -333,6 +330,20 @@ def build_namespaced_tools(
     # TS:9-12 -- the tool_search entry is what activates the whole mechanism.
     result.append({"type": "tool_search"})
     return result
+
+
+def warn_unlisted_tools(unlisted: tuple[str, ...]) -> None:
+    """Emit a deferred namespace warning once per distinct set per process."""
+    if not unlisted or unlisted in _WARNED_UNLISTED:
+        return
+    _WARNED_UNLISTED.add(unlisted)
+    logger.warning(
+        "[PROVIDER] tool_search.mode=namespaced: %d tool(s) are not in the "
+        "namespace table and are being sent flat and undeferred: %s. Add them to "
+        "`tool_search.namespaces` to include them in the deferred block.",
+        len(unlisted),
+        ", ".join(unlisted),
+    )
 
 
 def build_additional_tools_item(

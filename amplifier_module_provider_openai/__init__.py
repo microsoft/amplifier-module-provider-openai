@@ -84,6 +84,7 @@ from ._tool_search import (
     namespace_for_member,
     normalize_namespaces,
     validate_tool_search_mode,
+    warn_unlisted_tools,
 )
 
 logger = logging.getLogger(__name__)
@@ -1552,10 +1553,14 @@ class OpenAIProvider:
             if self.enable_long_context
             else (caps.long_context_pricing_threshold or caps.context_window)
         )
-        output = params.get("max_output_tokens")
-        if isinstance(output, bool) or not isinstance(output, int):
+        # Direct SDK callers may omit an output cap. Reserve the model's full
+        # advertised output capability without changing their wire parameters.
+        output = params.get(
+            "max_output_tokens", caps.max_output_tokens or DEFAULT_MAX_TOKENS
+        )
+        if isinstance(output, bool) or not isinstance(output, int) or output < 0:
             raise kernel_errors.ContextLengthError(
-                "OpenAI request budget cannot determine max_output_tokens.",
+                "OpenAI request budget requires a nonnegative integer max_output_tokens.",
                 provider=self.name,
             )
         allowance = advertised - output - 4096
@@ -1667,12 +1672,28 @@ class OpenAIProvider:
                 effort = kwargs.get("reasoning_effort") or request.reasoning_effort
                 if effort and get_capabilities(model_name).supports_reasoning:
                     reasoning = {"effort": effort, "summary": self.reasoning_summary}
+                elif effort:
+                    self._assembly_log(
+                        "warning",
+                        "[PROVIDER] Ignoring 'reasoning_effort'=%r: "
+                        "model %s does not support reasoning.",
+                        effort,
+                        model_name,
+                    )
             if reasoning is None and self.reasoning_effort is not None:
                 if get_capabilities(model_name).supports_reasoning:
                     reasoning = {
                         "effort": self.reasoning_effort,
                         "summary": self.reasoning_summary,
                     }
+                else:
+                    self._assembly_log(
+                        "warning",
+                        "[PROVIDER] Ignoring config 'reasoning_effort'=%r: "
+                        "model %s does not support reasoning.",
+                        self.reasoning_effort,
+                        model_name,
+                    )
             if reasoning is None:
                 reasoning = self.reasoning
             _validate_gpt_5_5_pro_effort(model_name, reasoning)
@@ -1758,7 +1779,11 @@ class OpenAIProvider:
                 retention = None
             if model_name != "gpt-6-astra":
                 retention = _drop_unsupported_in_memory_retention(
-                    model_name, retention, warning=self._assembly_log
+                    model_name,
+                    retention,
+                    warning=lambda message, *args: self._assembly_log(
+                        "warning", message, *args
+                    ),
                 )
             if retention is not None:
                 params["prompt_cache_retention"] = retention
@@ -1841,6 +1866,7 @@ class OpenAIProvider:
         planner._extra_params_warned_keys = set(self._extra_params_warned_keys)
         planner._astra_legacy_retention_warned = self._astra_legacy_retention_warned
         planner._assembly_log_records: list[tuple[str, str, tuple[Any, ...]]] = []
+        planner._deferred_namespace_warnings: list[tuple[str, ...]] = []
 
         params = planner._assemble_initial_responses_params_stateful(
             request, restore_state=False, **kwargs
@@ -1854,6 +1880,7 @@ class OpenAIProvider:
             "native_call_types": planner._native_call_types,
             "extra_params_warned_keys": planner._extra_params_warned_keys,
             "astra_legacy_retention_warned": planner._astra_legacy_retention_warned,
+            "namespace_warnings": planner._deferred_namespace_warnings,
         }
         return params, state, planner._assembly_log_records
 
@@ -1867,6 +1894,8 @@ class OpenAIProvider:
         self._native_call_types = state["native_call_types"]
         self._extra_params_warned_keys = state["extra_params_warned_keys"]
         self._astra_legacy_retention_warned = state["astra_legacy_retention_warned"]
+        for unlisted in state["namespace_warnings"]:
+            warn_unlisted_tools(unlisted)
 
     def _budget_params(self, request: ChatRequest, **kwargs: Any) -> dict[str, Any]:
         """Return the shared, side-effect-free initial Responses payload."""
@@ -2661,8 +2690,6 @@ class OpenAIProvider:
         message_list = list(request.messages)
         instructions = params.get("instructions")
         background_mode = bool(params.get("background"))
-        tools_list = params.get("tools", [])
-
 
         # Guard the complete, final wire payload before emitting llm:request.
         # `_create_response` repeats this guard for direct continuation and
@@ -4403,7 +4430,8 @@ class OpenAIProvider:
         # Lazy detection of native apply_patch engine via coordinator capability.
         # Once detected, the flag persists — no repeated lookups.
         if not self._apply_patch_native:
-            engine = self.coordinator.get_capability("apply_patch.engine")
+            get_capability = getattr(self.coordinator, "get_capability", None)
+            engine = get_capability("apply_patch.engine") if callable(get_capability) else None
             if engine == "native":
                 self._apply_patch_native = True
 
@@ -4563,7 +4591,10 @@ class OpenAIProvider:
                 self._tool_search_extra.setdefault(t["name"], t)
 
         block = build_namespaced_tools(
-            in_block, self.tool_search_namespaces, self.tool_search_always_loaded
+            in_block,
+            self.tool_search_namespaces,
+            self.tool_search_always_loaded,
+            deferred_warnings=getattr(self, "_deferred_namespace_warnings", None),
         )
         extra_item = build_additional_tools_item(
             [self._tool_search_extra[n] for n in sorted(self._tool_search_extra)]
