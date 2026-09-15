@@ -15,6 +15,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -1453,6 +1454,9 @@ class OpenAIProvider:
         # once, not hidden.
         self._extra_params_warned_keys: set[str] = set()
         self._astra_legacy_retention_warned = False
+        # Per-model scalar-only observations: (max raw-token/byte ratio,
+        # serialized bytes, raw gross input tokens). Never retain a prompt.
+        self._budget_calibration: dict[str, tuple[float, int, int]] = {}
 
     def _prepare_astra_params(self, params: dict[str, Any]) -> None:
         """Apply Astra's final-wire compatibility rules after extras merge."""
@@ -1498,6 +1502,353 @@ class OpenAIProvider:
                 ", ".join(clobbered),
             )
         params.update(self.extra_request_params)
+
+    @staticmethod
+    def _serialized_input_bytes(params: dict[str, Any]) -> int:
+        """Return a stable byte count for a fully assembled Responses payload."""
+        try:
+            return len(
+                json.dumps(
+                    params, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError) as exc:
+            raise kernel_errors.InvalidRequestError(
+                "OpenAI request budget could not serialize the assembled request "
+                f"({type(exc).__name__}); refusing an unchecked SDK dispatch.",
+                provider="openai",
+            ) from exc
+
+    def _budget_input_limit(self, params: dict[str, Any]) -> int:
+        """Return the model-specific input allowance for *params*."""
+        model = params.get("model")
+        if not isinstance(model, str) or not model:
+            raise kernel_errors.ContextLengthError(
+                "OpenAI request budget cannot determine an assembled model.",
+                provider=self.name,
+            )
+        caps = get_capabilities(model)
+        advertised = (
+            caps.context_window
+            if self.enable_long_context
+            else (caps.long_context_pricing_threshold or caps.context_window)
+        )
+        output = params.get("max_output_tokens")
+        if isinstance(output, bool) or not isinstance(output, int):
+            raise kernel_errors.ContextLengthError(
+                "OpenAI request budget cannot determine max_output_tokens.",
+                provider=self.name,
+            )
+        allowance = advertised - output - 4096
+        if allowance <= 0:
+            raise kernel_errors.ContextLengthError(
+                "OpenAI request has no input allowance after its output reserve "
+                f"(model={model}, context={advertised}, output={output}).",
+                provider=self.name,
+            )
+        return allowance
+
+    def _estimated_input_tokens(self, params: dict[str, Any]) -> tuple[int, int]:
+        """Return (estimated input tokens, serialized UTF-8 bytes) for *params*."""
+        serialized_bytes = self._serialized_input_bytes(params)
+        model = params.get("model")
+        observation = self._budget_calibration.get(model)
+        if observation is None:
+            return serialized_bytes, serialized_bytes
+        ratio, previous_bytes, previous_gross = observation
+        estimated = math.ceil(serialized_bytes * max(ratio, 0.25) * 1.10)
+        if serialized_bytes > previous_bytes:
+            estimated = max(
+                estimated, previous_gross + (serialized_bytes - previous_bytes)
+            )
+        return estimated, serialized_bytes
+
+    def _budget_attribution(self, params: dict[str, Any]) -> str:
+        """Describe scalar component sizes without retaining or exposing payload text."""
+        input_items = params.get("input")
+        tools = params.get("tools")
+        instruction_bytes = len(str(params.get("instructions", "")).encode("utf-8"))
+        input_bytes = self._serialized_input_bytes({"input": input_items})
+        tools_bytes = self._serialized_input_bytes({"tools": tools})
+        input_count = len(input_items) if isinstance(input_items, list) else 1
+        tools_count = len(tools) if isinstance(tools, list) else 0
+        return (
+            f"instruction_bytes={instruction_bytes}, input_items={input_count}, "
+            f"input_bytes={input_bytes}, tools={tools_count}, tools_bytes={tools_bytes}"
+        )
+
+    def _budget_params(self, request: ChatRequest, **kwargs: Any) -> dict[str, Any]:
+        """Assemble a side-effect-free equivalent of complete()'s wire payload.
+
+        The live request path still owns warnings and tool-search state changes.
+        Budget inspection snapshots that state before conversion and restores it
+        afterwards, so it cannot consume a pending tool item, mark native calls,
+        or emit an extra-parameter/Astra warning.
+        """
+        saved_state = (
+            self._pending_additional_tools_item,
+            self._tool_search_roster,
+            copy.deepcopy(self._tool_search_extra),
+            self._apply_patch_native,
+            set(self._native_call_ids),
+            dict(self._native_call_types),
+            set(self._extra_params_warned_keys),
+            self._astra_legacy_retention_warned,
+        )
+        try:
+            message_list = list(request.messages)
+            system_msgs = [m for m in message_list if m.role == "system"]
+            developer_msgs = [m for m in message_list if m.role == "developer"]
+            conversation = [
+                m for m in message_list if m.role in ("user", "assistant", "tool")
+            ]
+            instructions = (
+                "\n\n".join(
+                    m.content if isinstance(m.content, str) else "" for m in system_msgs
+                )
+                if system_msgs
+                else None
+            )
+            messages = [
+                *(m.model_dump() for m in developer_msgs),
+                *(m.model_dump() for m in conversation),
+            ]
+            model_name = kwargs.get("model", self.default_model)
+            background_mode = kwargs.get("background", False)
+            if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
+                ("o3-deep-research", "o4-mini-deep-research")
+            ):
+                background_mode = kwargs.get("background", True)
+
+            params: dict[str, Any] = {
+                "model": model_name,
+                "input": self._convert_messages(messages),
+                "store": bool(background_mode),
+            }
+            if instructions:
+                params["instructions"] = instructions
+            if request.max_output_tokens:
+                params["max_output_tokens"] = request.max_output_tokens
+            else:
+                max_tokens = kwargs.get("max_tokens", self.max_output_tokens)
+                if max_tokens is None:
+                    max_tokens = (
+                        get_capabilities(model_name).max_output_tokens
+                        or DEFAULT_MAX_TOKENS
+                    )
+                params["max_output_tokens"] = max_tokens
+            if request.temperature is not None:
+                params["temperature"] = request.temperature
+            elif temperature := kwargs.get("temperature", self.temperature):
+                params["temperature"] = temperature
+
+            reasoning = kwargs.get("reasoning", getattr(request, "reasoning", None))
+            if reasoning is None:
+                effort = kwargs.get("reasoning_effort") or request.reasoning_effort
+                if effort and get_capabilities(model_name).supports_reasoning:
+                    reasoning = {"effort": effort, "summary": self.reasoning_summary}
+            if reasoning is None and self.reasoning_effort is not None:
+                if get_capabilities(model_name).supports_reasoning:
+                    reasoning = {
+                        "effort": self.reasoning_effort,
+                        "summary": self.reasoning_summary,
+                    }
+            if reasoning is None:
+                reasoning = self.reasoning
+            _validate_gpt_5_5_pro_effort(model_name, reasoning)
+            _validate_reasoning_mode(reasoning)
+            _validate_reasoning_context(reasoning)
+            if reasoning:
+                if isinstance(reasoning, dict):
+                    params["reasoning"] = {
+                        "summary": reasoning.get("summary", self.reasoning_summary)
+                    }
+                    effort = reasoning.get("effort")
+                    if effort is not None:
+                        params["reasoning"]["effort"] = effort
+                    elif model_name != "gpt-6-astra":
+                        params["reasoning"]["effort"] = "medium"
+                    for key in ("mode", "context"):
+                        if reasoning.get(key) is not None:
+                            params["reasoning"][key] = reasoning[key]
+                else:
+                    params["reasoning"] = {
+                        "effort": reasoning,
+                        "summary": self.reasoning_summary,
+                    }
+
+            caps = get_capabilities(model_name)
+            active_effort = (
+                params.get("reasoning", {}).get("effort")
+                if isinstance(params.get("reasoning"), dict)
+                else None
+            )
+            if (
+                active_effort != "none"
+                and (active_effort is not None or caps.supports_reasoning)
+            ):
+                params["include"] = kwargs.get(
+                    "include", ["reasoning.encrypted_content"]
+                )
+
+            tools = list(request.tools) if request.tools else []
+            native_tools = kwargs.get("tools", [])
+            if native_tools:
+                tools.extend(native_tools)
+            if tools:
+                params["tools"] = self._convert_tools_from_request(tools, model_name)
+                params["tool_choice"] = kwargs.get(
+                    "tool_choice",
+                    request.tool_choice if request.tool_choice is not None else "auto",
+                )
+                if (
+                    self.tool_search_mode == TOOL_SEARCH_MODE_NAMESPACED
+                    and params["tool_choice"] not in ("auto", "none")
+                ):
+                    params["tool_choice"] = "auto"
+                extra_item = self._pending_additional_tools_item
+                if (
+                    self.tool_search_mode == TOOL_SEARCH_MODE_NAMESPACED
+                    and extra_item is not None
+                ):
+                    params["input"] = [*params["input"], extra_item]
+                params["parallel_tool_calls"] = kwargs.get("parallel_tool_calls", True)
+                if max_tool_calls := kwargs.get("max_tool_calls"):
+                    params["max_tool_calls"] = max_tool_calls
+
+            if truncation := kwargs.get("truncation", self.truncation):
+                params["truncation"] = truncation
+            if value := kwargs.get("prompt_cache_key", self.prompt_cache_key):
+                params["prompt_cache_key"] = value
+            retention = kwargs.get(
+                "prompt_cache_retention", self.prompt_cache_retention
+            ) or None
+            if (
+                model_name == "gpt-6-astra"
+                and "prompt_cache_retention" not in self.config
+                and "prompt_cache_retention" not in kwargs
+            ):
+                retention = None
+            if model_name != "gpt-6-astra":
+                retention = _drop_unsupported_in_memory_retention(model_name, retention)
+            if retention is not None:
+                params["prompt_cache_retention"] = retention
+            if options := kwargs.get(
+                "prompt_cache_options", self.prompt_cache_options
+            ):
+                _validate_prompt_cache_options(options)
+                params["prompt_cache_options"] = options
+            if safety_identifier := kwargs.get(
+                "safety_identifier", self.safety_identifier
+            ):
+                params["safety_identifier"] = safety_identifier
+            if verbosity := kwargs.get("text_verbosity", self.text_verbosity):
+                _validate_text_verbosity(verbosity)
+                params["text"] = {"verbosity": verbosity}
+            if background_mode:
+                params["background"] = True
+            if kwargs.get("extended_thinking") and "reasoning" not in params:
+                params["reasoning"] = {
+                    "effort": kwargs.get("reasoning_effort")
+                    or self.config.get("reasoning_effort", "high"),
+                    "summary": self.reasoning_summary,
+                }
+            if self._model_may_reason(model_name) and "reasoning" not in params:
+                if get_capabilities(model_name).default_reasoning_effort is not None:
+                    params["reasoning"] = {"summary": "auto"}
+            if context := kwargs.get("reasoning_context", self.reasoning_context):
+                _validate_reasoning_context({"context": context})
+                if isinstance(params.get("reasoning"), dict):
+                    params["reasoning"].setdefault("context", context)
+
+            params.update(self.extra_request_params)
+            if params.get("model") == "gpt-6-astra":
+                params.pop("prompt_cache_retention", None)
+                _validate_gpt_6_astra_params(params)
+            if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
+                params.get("input"), list
+            ):
+                params["input"] = _add_tool_output_cache_breakpoints(params["input"])
+            return copy.deepcopy(params)
+        finally:
+            (
+                self._pending_additional_tools_item,
+                self._tool_search_roster,
+                self._tool_search_extra,
+                self._apply_patch_native,
+                self._native_call_ids,
+                self._native_call_types,
+                self._extra_params_warned_keys,
+                self._astra_legacy_retention_warned,
+            ) = saved_state
+
+    def request_budget(
+        self, request: ChatRequest, *, context_estimate: int, **kwargs: Any
+    ) -> dict[str, int]:
+        """Estimate the assembled request without emitting, dispatching, or mutating."""
+        if isinstance(context_estimate, bool) or not isinstance(context_estimate, int):
+            raise ValueError("context_estimate must be a nonnegative integer")
+        if context_estimate < 0:
+            raise ValueError("context_estimate must be a nonnegative integer")
+        params = self._budget_params(request, **kwargs)
+        estimated, _ = self._estimated_input_tokens(params)
+        allowance = self._budget_input_limit(params)
+        if estimated <= allowance:
+            target = context_estimate
+        elif context_estimate <= 0:
+            target = 0
+        else:
+            target = min(
+                context_estimate - 1,
+                max(1, math.floor(context_estimate * allowance / estimated) - 1),
+            )
+        return {
+            "estimated_input_tokens": max(0, int(estimated)),
+            "input_limit_tokens": int(allowance),
+            "context_token_budget": max(0, int(target)),
+        }
+
+    def _guard_assembled_params(self, params: dict[str, Any]) -> None:
+        """Fail before an SDK dispatch when the actual assembled payload is too large."""
+        estimate, serialized_bytes = self._estimated_input_tokens(params)
+        model = params.get("model")
+        allowance = self._budget_input_limit(params)
+        if estimate > allowance:
+            raise kernel_errors.ContextLengthError(
+                "OpenAI request exceeds the local input allowance before dispatch "
+                f"(model={model}, estimated_input_tokens={estimate}, "
+                f"input_limit_tokens={allowance}, serialized_bytes={serialized_bytes}, "
+                f"{self._budget_attribution(params)}).",
+                provider=self.name,
+            )
+
+    def _record_budget_calibration(self, params: dict[str, Any], response: Any) -> None:
+        """Learn only valid raw Responses gross input usage for the dispatched params."""
+        if getattr(response, "status", None) != "completed":
+            return
+        usage = getattr(response, "usage", None)
+        raw_input = getattr(usage, "input_tokens", None)
+        if (
+            isinstance(raw_input, bool)
+            or not isinstance(raw_input, int)
+            or raw_input <= 0
+        ):
+            return
+        serialized_bytes = self._serialized_input_bytes(params)
+        if serialized_bytes <= 0:
+            return
+        model = params.get("model")
+        if not isinstance(model, str) or not model:
+            return
+        ratio = raw_input / serialized_bytes
+        previous = self._budget_calibration.get(model)
+        if previous is not None:
+            ratio = max(previous[0], ratio)
+        self._budget_calibration[model] = (
+            ratio,
+            serialized_bytes,
+            int(raw_input),
+        )
 
     @property
     def client(self) -> AsyncOpenAI:
@@ -2163,6 +2514,7 @@ class OpenAIProvider:
         shape, a `RuntimeError` is raised with the original `ValidationError`
         preserved as its cause -- never a silently empty/partial response.
         """
+        self._guard_assembled_params(params)
         if not _params_declare_computer_tool(params):
             return await self.client.responses.create(**params)
 
@@ -2606,6 +2958,11 @@ class OpenAIProvider:
             params.get("input"), list
         ):
             params["input"] = _add_tool_output_cache_breakpoints(params["input"])
+
+        # Guard the complete, final wire payload before emitting llm:request.
+        # `_create_response` repeats this guard for direct continuation and
+        # truncation-retry dispatches; stream() bypasses that helper.
+        self._guard_assembled_params(params)
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3136,6 +3493,7 @@ class OpenAIProvider:
                 self._retry_config,
                 on_retry=_on_retry,
             )
+            self._record_budget_calibration(params, response)
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -3206,6 +3564,7 @@ class OpenAIProvider:
                     if hasattr(response, "error") and response.error:
                         error_msg = f"{error_msg}: {response.error}"
                     raise RuntimeError(error_msg)
+                self._record_budget_calibration(params, response)
 
             # Handle incomplete responses via auto-continuation
             # OpenAI Responses API may return status="incomplete" with reason like "max_output_tokens"
@@ -3270,6 +3629,7 @@ class OpenAIProvider:
                             self._create_response(params),
                             timeout=self.timeout,
                         )
+                        self._record_budget_calibration(params, final_response)
                         billed_responses.append(final_response)
                         elapsed_ms += int((time.time() - retry_start) * 1000)
                         # Nothing was executed from the truncated attempt;
@@ -3396,6 +3756,7 @@ class OpenAIProvider:
                         self._create_response(continue_params),
                         timeout=self.timeout,
                     )
+                    self._record_budget_calibration(continue_params, final_response)
                     billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
                     elapsed_ms += continue_elapsed
@@ -3405,6 +3766,8 @@ class OpenAIProvider:
                         accumulated_output.extend(final_response.output)
 
                 except Exception as e:
+                    if isinstance(e, kernel_errors.ContextLengthError):
+                        raise
                     logger.error(
                         f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
                         f"Returning partial response from {continuation_count} continuation(s)"
