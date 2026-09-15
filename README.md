@@ -527,6 +527,15 @@ transcript, so there is nothing a retry could shrink. A `context_length_exceeded
 **immediately** — no retry. Compaction is the context manager's job, driven by
 its own token threshold at request-build time.
 
+Before each SDK dispatch, the provider also applies a local, serialized-payload
+estimate. A fresh provider starts conservatively at one estimated token per UTF-8
+payload byte, so an initial long request or resumed session can have less usable
+capacity than a provider with matched response usage. Successful Responses API
+usage calibrates a model-local byte rate; it does not retain prompts and does not
+turn the bootstrap estimate into a permanent high-water limit. This is an
+operational guard, not an authoritative native-token tokenizer or a guarantee of
+the service's context limit.
+
 ### Metadata Keys
 
 The provider populates `ChatResponse.metadata` with OpenAI-specific state:
