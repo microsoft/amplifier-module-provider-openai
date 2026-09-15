@@ -1941,7 +1941,7 @@ class OpenAIProvider:
         estimate, serialized_bytes = self._estimated_input_tokens(params)
         model = params.get("model")
         allowance = self._budget_input_limit(params)
-        if estimate > allowance:
+        if self._budget_calibration.get(model) is not None and estimate > allowance:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request exceeds the local input allowance before dispatch "
                 f"(model={model}, estimated_input_tokens={estimate}, "
