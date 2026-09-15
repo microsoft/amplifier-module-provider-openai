@@ -1461,6 +1461,10 @@ class OpenAIProvider:
         # Per-model scalar-only observations: (max raw-token/byte ratio,
         # serialized bytes, raw gross input tokens). Never retain a prompt.
         self._budget_calibration: dict[str, tuple[float, int, int]] = {}
+        # Models for which this provider has already warned that a cold,
+        # oversized request will be sent for authoritative API validation.
+        # This stays in-memory and is bounded to one scalar model id per model.
+        self._budget_uncalibrated_warned_models: set[str] = set()
 
     def _prepare_astra_params(self, params: dict[str, Any]) -> None:
         """Apply Astra's final-wire compatibility rules after extras merge."""
@@ -1572,9 +1576,12 @@ class OpenAIProvider:
             )
         return allowance
 
-    def _estimated_input_tokens(self, params: dict[str, Any]) -> tuple[int, int]:
+    def _estimated_input_tokens(
+        self, params: dict[str, Any], *, serialized_bytes: int | None = None
+    ) -> tuple[int, int]:
         """Return (estimated input tokens, serialized UTF-8 bytes) for *params*."""
-        serialized_bytes = self._serialized_input_bytes(params)
+        if serialized_bytes is None:
+            serialized_bytes = self._serialized_input_bytes(params)
         model = params.get("model")
         observation = self._budget_calibration.get(model)
         if observation is None:
@@ -1909,15 +1916,21 @@ class OpenAIProvider:
 
     def request_budget(
         self, request: ChatRequest, *, context_estimate: int, **kwargs: Any
-    ) -> dict[str, int]:
+    ) -> dict[str, int] | None:
         """Estimate the assembled request without emitting, dispatching, or mutating."""
         if isinstance(context_estimate, bool) or not isinstance(context_estimate, int):
             raise ValueError("context_estimate must be a nonnegative integer")
         if context_estimate < 0:
             raise ValueError("context_estimate must be a nonnegative integer")
         params = self._budget_params(request, **kwargs)
-        estimated, _ = self._estimated_input_tokens(params)
+        serialized_bytes = self._serialized_input_bytes(params)
         allowance = self._budget_input_limit(params)
+        estimated, _ = self._estimated_input_tokens(
+            params, serialized_bytes=serialized_bytes
+        )
+        model = params["model"]
+        if self._budget_calibration.get(model) is None and estimated > allowance:
+            return None
         if estimated <= allowance:
             target = context_estimate
         elif context_estimate <= 0:
@@ -1938,10 +1951,15 @@ class OpenAIProvider:
 
     def _guard_assembled_params(self, params: dict[str, Any]) -> None:
         """Fail before an SDK dispatch when the actual assembled payload is too large."""
-        estimate, serialized_bytes = self._estimated_input_tokens(params)
+        serialized_bytes = self._serialized_input_bytes(params)
         model = params.get("model")
         allowance = self._budget_input_limit(params)
-        if self._budget_calibration.get(model) is not None and estimate > allowance:
+        estimate, _ = self._estimated_input_tokens(
+            params, serialized_bytes=serialized_bytes
+        )
+        if estimate <= allowance:
+            return
+        if self._budget_calibration.get(model) is not None:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request exceeds the local input allowance before dispatch "
                 f"(model={model}, estimated_input_tokens={estimate}, "
@@ -1949,6 +1967,16 @@ class OpenAIProvider:
                 f"{self._budget_attribution(params)}).",
                 provider=self.name,
             )
+        if model not in self._budget_uncalibrated_warned_models:
+            logger.warning(
+                "[PROVIDER] Local budget estimate is uncalibrated; sending request "
+                "for API validation and API may reject it "
+                "(model=%s, serialized_bytes=%s, input_limit_tokens=%s).",
+                model,
+                serialized_bytes,
+                allowance,
+            )
+            self._budget_uncalibrated_warned_models.add(model)
 
     def _record_budget_calibration(self, params: dict[str, Any], response: Any) -> None:
         """Learn only valid raw Responses gross input usage for the dispatched params."""

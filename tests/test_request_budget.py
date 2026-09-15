@@ -71,6 +71,24 @@ def test_preflight_uses_complete_assembled_payload_and_full_output_reserve():
     assert budget["max_output_tokens"] == 1_000
 
 
+def test_cold_oversize_preflight_returns_none_without_state_or_log_side_effects(caplog):
+    provider = _provider(default_model="gpt-5-mini")
+    request = _request("cold-preflight-private-content-" * 5_000, output=1_000)
+    state_before = (
+        dict(provider._budget_calibration),
+        set(provider._budget_uncalibrated_warned_models),
+    )
+
+    caplog.clear()
+    assert provider.request_budget(request, context_estimate=100_000) is None
+
+    assert (
+        provider._budget_calibration,
+        provider._budget_uncalibrated_warned_models,
+    ) == state_before
+    assert not caplog.records
+
+
 def test_request_output_cap_overrides_extra_request_params() -> None:
     provider = _provider(
         default_model="gpt-5-mini",
@@ -276,23 +294,130 @@ def test_final_guard_uses_same_growth_bound_and_has_scalar_attribution():
         provider._guard_assembled_params(params)
 
 
-def test_uncalibrated_oversize_bootstrap_estimate_dispatches_and_calibrates():
-    provider = _provider(default_model="gpt-5-mini")
-    request = _request("x" * 130_000, output=1_000)
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_cold_oversize_dispatches_once_warns_once_and_calibrates(use_streaming, caplog):
+    private_content = "cold-dispatch-private-content-" * 5_000
+    provider = _provider(
+        default_model="gpt-5-mini",
+        use_streaming=use_streaming,
+        extra_request_params={"max_output_tokens": 64_000},
+    )
+    request = _request(private_content, output=1_000)
     params = provider._budget_params(request)
-    estimate, _ = provider._estimated_input_tokens(params)
-
-    assert estimate > provider._budget_input_limit(params)
-    assert provider._budget_calibration == {}
-
     response = _response(100_000)
     response.output = []
-    provider.client.responses.create = AsyncMock(return_value=response)
+    if use_streaming:
+        provider.client.responses.stream = MagicMock(
+            return_value=_StreamContext(response)
+        )
+    else:
+        provider.client.responses.create = AsyncMock(return_value=response)
 
+    caplog.clear()
     asyncio.run(provider.complete(request))
 
-    assert provider.client.responses.create.await_count == 1
+    sdk_call = (
+        provider.client.responses.stream
+        if use_streaming
+        else provider.client.responses.create
+    )
+    assert sdk_call.call_count == 1
+    assert sdk_call.call_args.kwargs["max_output_tokens"] == 1_000
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Local budget estimate is uncalibrated" in record.getMessage()
+    ]
+    expected_warning = (
+        "[PROVIDER] Local budget estimate is uncalibrated; sending request for API "
+        "validation and API may reject it "
+        f"(model=gpt-5-mini, serialized_bytes={provider._serialized_input_bytes(params)}, "
+        f"input_limit_tokens={provider._budget_input_limit(params)})."
+    )
+    assert len(warnings) == 1
+    assert warnings == [expected_warning]
+    assert private_content not in warnings[0]
     assert "gpt-5-mini" in provider._budget_calibration
+
+
+def test_cold_oversize_repeat_without_usage_warns_once_per_model(caplog):
+    provider = _provider(default_model="gpt-5-mini")
+    response = _response(0)
+    response.output = []
+    provider.client.responses.create = AsyncMock(return_value=response)
+    request = _request("cold-repeat-private-content-" * 5_000, output=1_000)
+
+    caplog.clear()
+    asyncio.run(provider.complete(request))
+    asyncio.run(provider.complete(request))
+
+    assert provider.client.responses.create.await_count == 2
+    assert provider._budget_calibration == {}
+    assert (
+        sum(
+            "Local budget estimate is uncalibrated" in record.getMessage()
+            for record in caplog.records
+        )
+        == 1
+    )
+
+
+def test_cold_oversize_warning_is_isolated_by_model(caplog):
+    provider = _provider(default_model="gpt-5-mini")
+    response = _response(0)
+    response.output = []
+    provider.client.responses.create = AsyncMock(return_value=response)
+    request = _request("cold-model-private-content-" * 5_000, output=1_000)
+
+    caplog.clear()
+    asyncio.run(provider.complete(request))
+    asyncio.run(provider.complete(request, model="gpt-5-mini-2025-08-07"))
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Local budget estimate is uncalibrated" in record.getMessage()
+    ]
+    assert provider.client.responses.create.await_count == 2
+    assert len(warnings) == 2
+    assert any("model=gpt-5-mini" in message for message in warnings)
+    assert any("model=gpt-5-mini-2025-08-07" in message for message in warnings)
+
+
+def test_calibrated_oversize_rejects_before_sdk_dispatch():
+    provider = _provider(default_model="gpt-5-mini")
+    provider._budget_calibration["gpt-5-mini"] = (100.0, 1, 100)
+    provider.client.responses.create = AsyncMock()
+
+    with pytest.raises(kernel_errors.ContextLengthError):
+        asyncio.run(
+            provider.complete(_request("calibrated-overflow-" * 5_000, output=1_000))
+        )
+
+    provider.client.responses.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        (
+            {"extra_request_params": {"metadata": {"nonserializable": object()}}},
+            kernel_errors.InvalidRequestError,
+        ),
+        (
+            {"extra_request_params": {"max_output_tokens": "not-an-integer"}},
+            kernel_errors.ContextLengthError,
+        ),
+        ({"extra_request_params": {"model": ""}}, kernel_errors.ContextLengthError),
+    ],
+)
+def test_preflight_rejects_invalid_serialization_output_or_model_locally(config, error):
+    provider = _provider(default_model="gpt-5-mini", **config)
+
+    with pytest.raises(error):
+        provider.request_budget(_request(), context_estimate=1)
+
+    assert provider._budget_uncalibrated_warned_models == set()
 
 
 def test_low_level_direct_dispatch_uses_the_local_guard():
