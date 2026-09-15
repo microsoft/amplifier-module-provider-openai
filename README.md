@@ -536,6 +536,16 @@ turn the bootstrap estimate into a permanent high-water limit. This is an
 operational guard, not an authoritative native-token tokenizer or a guarantee of
 the service's context limit.
 
+`request_budget` returns a concrete budget while that estimate is within its
+allowance. For an uncalibrated model whose serialized-byte bootstrap exceeds the
+allowance, it returns `None`: the local estimate cannot establish either a fit or
+an overflow. A compatible context-management loop must accept `None`, and a
+producer must be released only after its consumer has accepted that result. The
+provider validates the final payload, then sends that cold request for
+authoritative API validation and warns once per model. The API can still reject
+the actual request for context overflow; this behavior never discards protected
+input to make the request fit.
+
 ### Metadata Keys
 
 The provider populates `ChatResponse.metadata` with OpenAI-specific state:
