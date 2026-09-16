@@ -546,6 +546,43 @@ authoritative API validation and warns once per model. The API can still reject
 the actual request for context overflow; this behavior never discards protected
 input to make the request fit.
 
+### Native Responses input counts
+
+For a direct `OpenAIProvider` on the effective standard
+`https://api.openai.com/v1` route, `request_budget` uses the SDK's
+`responses.input_tokens.count` operation for a native input measurement. Its
+result is reported as:
+
+```python
+measurement = {
+    "kind": "provider_count",
+    "source": "official.operation",
+    "input_tokens": C,
+}
+```
+
+`C` is input-only. It is compared with the provider's input allowance, which
+already reserves the selected output cap and the safety reserve; neither is
+subtracted from `C`. The counter receives the finalized countable Responses
+projection: model, instructions, input/history (including native replay), tools,
+tool choice, parallel-tool setting, reasoning, text format, and truncation.
+Create-only response settings are not sent to the counter.
+
+The measurement is unavailable rather than approximate when the SDK helper is
+missing or fails, the response is malformed, an unknown finalized input option
+cannot be projected, or the provider is a subclass/custom/Azure/proxy route.
+Those cases preserve the established synchronous, estimate-based
+`request_budget` behavior where it was previously available; they do not
+advertise `request_budget:provider_count`.
+
+There is no count cache. A Context/Loop measured preflight calls the counter once
+for its frozen candidate and the provider calls it again immediately before the
+matching generation dispatch: **two count requests per dispatched measured
+attempt**. A direct generation has **one** final-dispatch count request. The
+preflight does not mutate provider state or emit completion events. A successful
+final count overrides a stale serialized-byte calibration; an over-allowance
+count blocks generation before its SDK create/stream request.
+
 ### Metadata Keys
 
 The provider populates `ChatResponse.metadata` with OpenAI-specific state:

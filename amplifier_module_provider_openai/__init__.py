@@ -20,8 +20,10 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, Callable, ClassVar
+from urllib.parse import urlparse
 
 import openai
 from amplifier_core import (
@@ -1113,6 +1115,48 @@ class OpenAIProvider:
     # did-you-mean suggestion drawn from the merged set). Empty by default:
     # direct use of OpenAIProvider is completely unaffected.
     EXTRA_KNOWN_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset()
+    _COUNT_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "conversation",
+            "input",
+            "instructions",
+            "model",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "reasoning",
+            "text",
+            "tool_choice",
+            "tools",
+            "truncation",
+        }
+    )
+    # These finalized create fields are not accepted by
+    # responses.input_tokens.count, but do not change the input the model
+    # tokenizes. `max_output_tokens` is reserved separately by
+    # _budget_input_limit(). Any other field fails closed in
+    # _native_count_params().
+    _COUNT_IGNORED_CREATE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "background",
+            "include",
+            "max_output_tokens",
+            "max_tool_calls",
+            "metadata",
+            "moderation",
+            "prompt_cache_key",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+            "safety_identifier",
+            "service_tier",
+            "store",
+            "stream",
+            "stream_options",
+            "temperature",
+            "top_logprobs",
+            "top_p",
+            "user",
+        }
+    )
 
     def get_native_computer_tool_spec(self) -> dict[str, str]:
         """Return the bare Responses API computer declaration for serialization.
@@ -1608,6 +1652,133 @@ class OpenAIProvider:
             f"input_bytes={input_bytes}, tools={tools_count}, tools_bytes={tools_bytes}"
         )
 
+    @staticmethod
+    def _merge_request_options(
+        request_options: Mapping[str, Any] | None, kwargs: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Merge Loop options beneath direct legacy keyword overrides."""
+        if request_options is not None and not isinstance(request_options, Mapping):
+            raise ValueError("request_options must be a mapping or None")
+        merged = dict(request_options or {})
+        merged.update(kwargs)
+        return merged
+
+    def _uses_standard_openai_endpoint(self) -> bool:
+        """Whether this exact base-provider instance uses api.openai.com/v1."""
+        # Subclasses commonly adapt Azure and proxy routes. They must opt into
+        # their own proven counter rather than inheriting this API claim.
+        if type(self) is not OpenAIProvider:
+            return False
+
+        endpoint: Any = self.base_url or os.environ.get("OPENAI_BASE_URL")
+        if endpoint is None and self._client is not None:
+            endpoint = getattr(self._client, "base_url", None)
+        if endpoint is None:
+            return True
+        parsed = urlparse(str(endpoint))
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "api.openai.com"
+            and parsed.port in (None, 443)
+            and parsed.path.rstrip("/") == "/v1"
+        )
+
+    def _provider_count_available(self) -> bool:
+        """Return whether this instance can honestly advertise native counting."""
+        if not self._uses_standard_openai_endpoint():
+            return False
+        if self._client is None:
+            # The pinned package declares the helper. Do not instantiate a
+            # client just to advertise an optional capability.
+            return True
+        input_tokens = getattr(getattr(self._client, "responses", None), "input_tokens", None)
+        return callable(getattr(input_tokens, "count", None))
+
+    def _native_count_params(self, params: dict[str, Any]) -> dict[str, Any] | None:
+        """Project a finalized Responses payload onto the SDK count contract.
+
+        The counter accepts only its documented input-shaping fields. Unknown
+        finalized fields therefore return unavailable rather than silently
+        measuring a smaller request than generation will receive.
+        """
+        unsupported = set(params) - self._COUNT_FIELDS - self._COUNT_IGNORED_CREATE_FIELDS
+        if unsupported:
+            return None
+        return {key: copy.deepcopy(params[key]) for key in self._COUNT_FIELDS if key in params}
+
+    async def _native_input_token_count(self, params: dict[str, Any]) -> int | None:
+        """Return a validated native count, or unavailable without side effects."""
+        if not self._provider_count_available():
+            return None
+        count_params = self._native_count_params(params)
+        if count_params is None:
+            return None
+        # A budget probe must not initialize or otherwise mutate the live
+        # generation client. When it has not been created yet, use and close a
+        # short-lived equivalent SDK client for this one official operation.
+        count_client = self._client
+        temporary_client = count_client is None
+        if count_client is None:
+            count_client = AsyncOpenAI(api_key=self._api_key, base_url=self.base_url)
+        counter = getattr(
+            getattr(getattr(count_client, "responses", None), "input_tokens", None),
+            "count",
+            None,
+        )
+        if not callable(counter):
+            if temporary_client:
+                await count_client.close()
+            return None
+        try:
+            result = await counter(**count_params)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A preflight failure is unavailable, not an invented count. The
+            # existing final local guard remains the fallback for dispatch.
+            return None
+        finally:
+            if temporary_client:
+                await count_client.close()
+        input_tokens = getattr(result, "input_tokens", None)
+        if (
+            isinstance(input_tokens, bool)
+            or not isinstance(input_tokens, int)
+            or input_tokens < 0
+        ):
+            return None
+        return input_tokens
+
+    def _budget_decision(
+        self,
+        params: dict[str, Any],
+        *,
+        context_estimate: int,
+        estimated_input_tokens: int,
+        measurement: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the established budget envelope from one validated count."""
+        allowance = self._budget_input_limit(params)
+        estimated = max(0, int(estimated_input_tokens))
+        if estimated <= allowance:
+            target = context_estimate
+        elif context_estimate <= 0:
+            target = 0
+        else:
+            target = min(
+                context_estimate - 1,
+                max(1, math.floor(context_estimate * allowance / estimated) - 1),
+            )
+        decision: dict[str, Any] = {
+            "estimated_input_tokens": estimated,
+            "input_limit_tokens": int(allowance),
+            "max_output_tokens": int(params["max_output_tokens"]),
+            "context_token_budget": target,
+        }
+        if measurement is not None:
+            decision["measurement"] = measurement
+        return decision
+
     def _assemble_initial_responses_params_stateful(
         self, request: ChatRequest, *, restore_state: bool, **kwargs: Any
     ) -> dict[str, Any]:
@@ -1915,14 +2086,41 @@ class OpenAIProvider:
         return params
 
     def request_budget(
-        self, request: ChatRequest, *, context_estimate: int, **kwargs: Any
-    ) -> dict[str, int] | None:
+        self,
+        request: ChatRequest,
+        *,
+        context_estimate: int,
+        request_options: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
         """Estimate the assembled request without emitting, dispatching, or mutating."""
         if isinstance(context_estimate, bool) or not isinstance(context_estimate, int):
             raise ValueError("context_estimate must be a nonnegative integer")
         if context_estimate < 0:
             raise ValueError("context_estimate must be a nonnegative integer")
-        params = self._budget_params(request, **kwargs)
+        params = self._budget_params(
+            request, **self._merge_request_options(request_options, kwargs)
+        )
+
+        if self._provider_count_available():
+
+            async def native_decision() -> dict[str, Any] | None:
+                count = await self._native_input_token_count(params)
+                if count is None:
+                    return None
+                return self._budget_decision(
+                    params,
+                    context_estimate=context_estimate,
+                    estimated_input_tokens=count,
+                    measurement={
+                        "kind": "provider_count",
+                        "source": "official.operation",
+                        "input_tokens": count,
+                    },
+                )
+
+            return native_decision()
+
         serialized_bytes = self._serialized_input_bytes(params)
         allowance = self._budget_input_limit(params)
         estimated, _ = self._estimated_input_tokens(
@@ -1949,11 +2147,23 @@ class OpenAIProvider:
             "context_token_budget": max(0, int(target)),
         }
 
-    def _guard_assembled_params(self, params: dict[str, Any]) -> None:
+    def _guard_assembled_params(
+        self, params: dict[str, Any], *, native_input_tokens: int | None = None
+    ) -> None:
         """Fail before an SDK dispatch when the actual assembled payload is too large."""
         serialized_bytes = self._serialized_input_bytes(params)
         model = params.get("model")
         allowance = self._budget_input_limit(params)
+        if native_input_tokens is not None:
+            if native_input_tokens <= allowance:
+                return
+            raise kernel_errors.ContextLengthError(
+                "OpenAI request exceeds the native input allowance before dispatch "
+                f"(model={model}, input_tokens={native_input_tokens}, "
+                f"input_limit_tokens={allowance}, "
+                f"{self._budget_attribution(params)}).",
+                provider=self.name,
+            )
         estimate, _ = self._estimated_input_tokens(
             params, serialized_bytes=serialized_bytes
         )
@@ -1977,6 +2187,14 @@ class OpenAIProvider:
                 allowance,
             )
             self._budget_uncalibrated_warned_models.add(model)
+
+    async def _guard_assembled_params_with_provider_count(
+        self, params: dict[str, Any]
+    ) -> int | None:
+        """Apply the final-dispatch guard using a fresh native count when possible."""
+        native_input_tokens = await self._native_input_token_count(params)
+        self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
+        return native_input_tokens
 
     def _record_budget_calibration(self, params: dict[str, Any], response: Any) -> None:
         """Learn only valid raw Responses gross input usage for the dispatched params."""
@@ -2072,11 +2290,14 @@ class OpenAIProvider:
             reported_context = (
                 caps.long_context_pricing_threshold or caps.context_window
             )
+        provider_capabilities = ["streaming", "tools", "reasoning", "batch", "json_mode"]
+        if self._provider_count_available():
+            provider_capabilities.append("request_budget:provider_count")
         return ProviderInfo(
             id="openai",
             display_name="OpenAI",
             credential_env_vars=["OPENAI_API_KEY"],
-            capabilities=["streaming", "tools", "reasoning", "batch", "json_mode"],
+            capabilities=provider_capabilities,
             defaults={
                 "model": self.default_model,
                 "max_tokens": 16384,
@@ -2524,7 +2745,13 @@ class OpenAIProvider:
             name=tool_name,
         )
 
-    async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
+    async def complete(
+        self,
+        request: ChatRequest,
+        *,
+        request_options: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
         """Generate completion using Responses API.
 
         Args:
@@ -2534,6 +2761,8 @@ class OpenAIProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        kwargs = self._merge_request_options(request_options, kwargs)
+
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -2636,7 +2865,9 @@ class OpenAIProvider:
             return []
         return response.tool_calls
 
-    async def _create_response(self, params: dict[str, Any]) -> Any:
+    async def _create_response(
+        self, params: dict[str, Any], *, native_input_tokens: int | None = None
+    ) -> Any:
         """Call `client.responses.create(**params)`.
 
         For computer-use requests, parses from the raw JSON body instead of
@@ -2670,7 +2901,10 @@ class OpenAIProvider:
         shape, a `RuntimeError` is raised with the original `ValidationError`
         preserved as its cause -- never a silently empty/partial response.
         """
-        self._guard_assembled_params(params)
+        if native_input_tokens is None:
+            native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
+        else:
+            self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         if not _params_declare_computer_tool(params):
             return await self.client.responses.create(**params)
 
@@ -2730,7 +2964,7 @@ class OpenAIProvider:
         # Guard the complete, final wire payload before emitting llm:request.
         # `_create_response` repeats this guard for direct continuation and
         # truncation-retry dispatches; stream() bypasses that helper.
-        self._guard_assembled_params(params)
+        native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
         self._commit_initial_assembly_state(assembly_state)
         self._emit_assembly_logs(assembly_logs)
 
@@ -3006,7 +3240,9 @@ class OpenAIProvider:
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
                     return await asyncio.wait_for(
-                        self._create_response(params),
+                        self._create_response(
+                            params, native_input_tokens=native_input_tokens
+                        ),
                         timeout=effective_timeout,
                     )
             except openai.RateLimitError as e:

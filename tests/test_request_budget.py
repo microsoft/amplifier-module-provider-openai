@@ -17,7 +17,13 @@ from amplifier_module_provider_openai import OpenAIProvider, _tool_search
 
 def _provider(**config):
     return OpenAIProvider(
-        api_key="test-key", config={"use_streaming": False, "max_retries": 0, **config}
+        api_key="test-key",
+        config={
+            "use_streaming": False,
+            "max_retries": 0,
+            "base_url": "https://test.openai.invalid/v1",
+            **config,
+        },
     )
 
 
@@ -54,6 +60,252 @@ class _StreamContext:
 
     async def get_final_response(self):
         return self.response
+
+
+def _native_provider(*, input_tokens=10, **config):
+    counter = AsyncMock(return_value=SimpleNamespace(input_tokens=input_tokens))
+    responses = SimpleNamespace(
+        input_tokens=SimpleNamespace(count=counter),
+        create=AsyncMock(),
+        stream=MagicMock(),
+    )
+    provider = OpenAIProvider(
+        api_key="test-key",
+        client=SimpleNamespace(
+            base_url="https://api.openai.com/v1/",
+            responses=responses,
+        ),
+        config={"use_streaming": False, "max_retries": 0, **config},
+    )
+    return provider, counter
+
+
+def _count_projection(params):
+    return {
+        key: params[key]
+        for key in OpenAIProvider._COUNT_FIELDS
+        if key in params
+    }
+
+
+def test_native_count_returns_official_measurement_for_the_finalized_projection():
+    provider, counter = _native_provider(default_model="gpt-5-mini")
+    request = ChatRequest(
+        messages=[
+            Message(role="system", content="be concise"),
+            Message(role="user", content="hello"),
+        ],
+        tools=[
+            ToolSpec(
+                name="weather",
+                description="get weather",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+        max_output_tokens=1_000,
+    )
+
+    decision = asyncio.run(
+        provider.request_budget(
+            request,
+            context_estimate=123,
+            request_options={"temperature": 0.1, "reasoning_effort": "low"},
+            temperature=0.2,
+        )
+    )
+    expected = provider._budget_params(
+        request, temperature=0.2, reasoning_effort="low"
+    )
+
+    assert decision["estimated_input_tokens"] == 10
+    assert decision["context_token_budget"] == 123
+    assert decision["measurement"] == {
+        "kind": "provider_count",
+        "source": "official.operation",
+        "input_tokens": 10,
+    }
+    assert "request_budget:provider_count" in provider.get_info().capabilities
+    assert counter.call_args.kwargs == _count_projection(expected)
+    assert "max_output_tokens" not in counter.call_args.kwargs
+    assert "store" not in counter.call_args.kwargs
+    assert "request_options" not in counter.call_args.kwargs
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_native_count_and_generation_share_final_assembly_for_both_dispatch_paths(
+    use_streaming,
+):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini", use_streaming=use_streaming
+    )
+    request = _request("hello", system="be concise", output=1_000)
+    response = _response(10)
+    response.output = []
+    expected = provider._budget_params(
+        request,
+        temperature=0.2,
+        reasoning_effort="low",
+        tools=[{"type": "web_search_preview"}],
+    )
+    if use_streaming:
+        provider.client.responses.stream.return_value = _StreamContext(response)
+    else:
+        provider.client.responses.create.return_value = response
+
+    asyncio.run(
+        provider.complete(
+            request,
+            request_options={"temperature": 0.1, "reasoning_effort": "low"},
+            temperature=0.2,
+            tools=[{"type": "web_search_preview"}],
+        )
+    )
+
+    sdk_call = (
+        provider.client.responses.stream
+        if use_streaming
+        else provider.client.responses.create
+    )
+    assert counter.call_args.kwargs == _count_projection(expected)
+    assert sdk_call.call_args.kwargs == expected
+    assert "request_options" not in sdk_call.call_args.kwargs
+
+
+def test_native_count_overrides_a_stale_calibrated_estimate_before_dispatch():
+    provider, counter = _native_provider(default_model="gpt-5-mini", input_tokens=10)
+    provider._budget_calibration["gpt-5-mini"] = (100.0, 1, 100)
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create.return_value = response
+
+    asyncio.run(provider.complete(_request("native count wins")))
+
+    assert counter.await_count == 1
+    assert provider.client.responses.create.await_count == 1
+
+
+def test_native_preflight_is_pure_and_final_dispatch_uses_a_fresh_count():
+    provider, counter = _native_provider(default_model="gpt-5-mini")
+    request = _request("native count")
+    state_before = (
+        provider._client,
+        provider._pending_additional_tools_item,
+        provider._tool_search_roster,
+        dict(provider._tool_search_extra),
+        set(provider._native_call_ids),
+        dict(provider._native_call_types),
+        dict(provider._budget_calibration),
+    )
+
+    decision = asyncio.run(provider.request_budget(request, context_estimate=10))
+
+    assert decision["measurement"]["input_tokens"] == 10
+    assert (
+        provider._client,
+        provider._pending_additional_tools_item,
+        provider._tool_search_roster,
+        provider._tool_search_extra,
+        provider._native_call_ids,
+        provider._native_call_types,
+        provider._budget_calibration,
+    ) == state_before
+
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    asyncio.run(provider.complete(request))
+
+    # One count makes the Context-facing decision and a separate fresh count
+    # protects the exact payload immediately before the create dispatch.
+    assert counter.await_count == 2
+    assert provider.client.responses.create.await_count == 1
+
+
+def test_native_count_over_allowance_blocks_generation_dispatch():
+    provider, counter = _native_provider(default_model="gpt-5-mini")
+    params = provider._budget_params(_request())
+    counter.return_value = SimpleNamespace(
+        input_tokens=provider._budget_input_limit(params) + 1
+    )
+
+    with pytest.raises(kernel_errors.ContextLengthError, match="native input allowance"):
+        asyncio.run(provider.complete(_request()))
+
+    assert counter.await_count == 1
+    provider.client.responses.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("reported", "available"),
+    [(0, True), (None, False), (-1, False), (True, False), ("10", False)],
+)
+def test_native_count_validates_counter_response(reported, available):
+    provider, _ = _native_provider(default_model="gpt-5-mini", input_tokens=reported)
+
+    decision = asyncio.run(provider.request_budget(_request(), context_estimate=10))
+
+    if available:
+        assert decision["measurement"]["input_tokens"] == reported
+    else:
+        assert decision is None
+
+
+def test_native_count_failure_and_cancellation_do_not_become_measurements():
+    provider, counter = _native_provider(default_model="gpt-5-mini")
+    counter.side_effect = RuntimeError("count failed")
+    assert asyncio.run(provider.request_budget(_request(), context_estimate=10)) is None
+
+    counter.side_effect = asyncio.CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(provider.request_budget(_request(), context_estimate=10))
+
+
+def test_native_count_is_unavailable_for_unknown_fields_custom_routes_and_subclasses(
+    monkeypatch,
+):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini",
+        extra_request_params={"unproved_input_option": "value"},
+    )
+    assert asyncio.run(provider.request_budget(_request(), context_estimate=10)) is None
+    counter.assert_not_called()
+
+    custom = _provider(default_model="gpt-5-mini")
+    assert "request_budget:provider_count" not in custom.get_info().capabilities
+    assert isinstance(custom.request_budget(_request(), context_estimate=10), dict)
+
+    environment_route, _ = _native_provider(default_model="gpt-5-mini")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.invalid/v1")
+    assert (
+        "request_budget:provider_count"
+        not in environment_route.get_info().capabilities
+    )
+
+    class DerivedOpenAIProvider(OpenAIProvider):
+        pass
+
+    subclass = DerivedOpenAIProvider(
+        api_key="test-key",
+        config={"base_url": "https://api.openai.com/v1"},
+    )
+    assert "request_budget:provider_count" not in subclass.get_info().capabilities
+
+
+def test_missing_native_helper_keeps_legacy_budget_behavior():
+    provider = OpenAIProvider(
+        api_key="test-key",
+        client=SimpleNamespace(
+            base_url="https://api.openai.com/v1/",
+            responses=SimpleNamespace(input_tokens=SimpleNamespace()),
+        ),
+        config={"use_streaming": False, "max_retries": 0},
+    )
+
+    decision = provider.request_budget(_request(), context_estimate=10)
+
+    assert isinstance(decision, dict)
+    assert "measurement" not in decision
+    assert "request_budget:provider_count" not in provider.get_info().capabilities
 
 
 def test_preflight_uses_complete_assembled_payload_and_full_output_reserve():
@@ -425,7 +677,7 @@ def test_low_level_direct_dispatch_uses_the_local_guard():
     params = provider._budget_params(_request())
     calls = []
 
-    def reject(assembled):
+    def reject(assembled, **_kwargs):
         calls.append(assembled)
         raise kernel_errors.ContextLengthError("local", provider="openai")
 
@@ -468,7 +720,7 @@ def test_over_budget_continuation_raises_without_a_second_sdk_dispatch():
     provider.client.responses.create = AsyncMock(return_value=incomplete)
     guard_calls = 0
 
-    def guard_then_reject_continuation(_params):
+    def guard_then_reject_continuation(_params, **_kwargs):
         nonlocal guard_calls
         guard_calls += 1
         # Initial payload is checked before llm:request and again at its direct
