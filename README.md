@@ -546,6 +546,50 @@ authoritative API validation and warns once per model. The API can still reject
 the actual request for context overflow; this behavior never discards protected
 input to make the request fit.
 
+### Native Responses input counts
+
+For a direct `OpenAIProvider` on the effective standard
+`https://api.openai.com/v1` route, `request_budget` uses the SDK's
+`responses.input_tokens.count` operation for a native input measurement. Its
+result is reported as:
+
+```python
+measurement = {
+    "kind": "provider_count",
+    "source": "official.operation",
+    "input_tokens": C,
+}
+```
+
+`C` is input-only. It is compared with the provider's input allowance, which
+already reserves the selected output cap and the safety reserve; neither is
+subtracted from `C`. The counter receives the finalized countable Responses
+projection: model, instructions, input/history (including native replay), tools,
+tool choice, parallel-tool setting, reasoning, text format, and truncation.
+Create-only response settings are not sent to the counter.
+
+The `request_budget:provider_count` capability means that `request_budget`
+returns an awaitable native decision. Consumers of that capability must await
+the result and handle `None`: an individual count can fail, be malformed, or
+be unprojectable after the capability was advertised. The instance capability
+remains advertised in those cases.
+
+Native counting is unavailable when the installed SDK lacks the stable helper,
+its version is missing, malformed, unsupported, or pre-release, or the
+provider is a subclass/custom/Azure/proxy route. Those legacy unsupported
+routes retain their established synchronous estimate-based `dict` or `None`
+`request_budget` result; they do not advertise
+`request_budget:provider_count`.
+
+There is no count cache. A Context/Loop measured preflight calls the counter once
+for its frozen candidate. Separately, generation takes one final pre-event count
+for its first SDK create/stream dispatch and refreshes that count immediately
+before every physical retry. Therefore a Context/Loop flow with `N` physical
+generation attempts makes `N + 1` count requests; a direct generation with `N`
+attempts makes `N`. The preflight does not mutate provider state or emit completion
+events. A successful final count overrides a stale serialized-byte calibration; an
+over-allowance count blocks generation before its SDK create/stream request.
+
 ### Metadata Keys
 
 The provider populates `ChatResponse.metadata` with OpenAI-specific state:

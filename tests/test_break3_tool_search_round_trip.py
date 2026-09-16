@@ -86,7 +86,20 @@ def _provider(**config_overrides: Any) -> OpenAIProvider:
     coordinator.get_capability = MagicMock(return_value=None)
     coordinator.hooks = MagicMock()
     coordinator.hooks.emit = AsyncMock(return_value=None)
-    return OpenAIProvider(api_key="test-key", config=config, coordinator=coordinator)
+    client = SimpleNamespace(
+        base_url="https://api.openai.com/v1",
+        responses=SimpleNamespace(
+            input_tokens=SimpleNamespace(
+                count=AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+            ),
+            create=AsyncMock(),
+            stream=MagicMock(),
+        ),
+        close=AsyncMock(),
+    )
+    return OpenAIProvider(
+        api_key="test-key", client=client, config=config, coordinator=coordinator
+    )
 
 
 def _complete_with_hosted_output(provider: OpenAIProvider):

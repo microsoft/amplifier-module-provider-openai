@@ -11,7 +11,7 @@ Verifies that:
 import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from amplifier_core.message_models import ChatRequest, Message
 
@@ -24,7 +24,18 @@ from amplifier_module_provider_openai import OpenAIProvider
 
 def _make_provider(**config_overrides) -> OpenAIProvider:
     config = {"max_retries": 0, "use_streaming": False, **config_overrides}
-    return OpenAIProvider(api_key="test-key", config=config)
+    client = SimpleNamespace(
+        base_url="https://api.openai.com/v1",
+        responses=SimpleNamespace(
+            input_tokens=SimpleNamespace(
+                count=AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+            ),
+            create=AsyncMock(),
+            stream=AsyncMock(),
+        ),
+        close=AsyncMock(),
+    )
+    return OpenAIProvider(api_key="test-key", client=client, config=config)
 
 
 def _simple_request() -> ChatRequest:
@@ -44,6 +55,29 @@ class DummyResponse:
         self.usage = SimpleNamespace(input_tokens=1, output_tokens=1)
         self.status = "completed"
         self.id = "resp_test"
+
+
+def test_cache_fixture_supplies_native_counter_without_constructing_a_real_sdk_client():
+    provider = _make_provider()
+    client = provider.client
+    client.responses.create.return_value = DummyResponse()
+
+    async def complete_and_close():
+        await provider.complete(_simple_request())
+        await provider.close()
+
+    with patch(
+        "amplifier_module_provider_openai.AsyncOpenAI",
+        side_effect=AssertionError(
+            "cache fixture must not construct a real SDK client"
+        ),
+    ) as real_client:
+        asyncio.run(complete_and_close())
+
+    client.responses.input_tokens.count.assert_awaited_once()
+    client.responses.create.assert_awaited_once()
+    client.close.assert_awaited_once()
+    real_client.assert_not_called()
 
 
 def _captured_params(provider: OpenAIProvider) -> Any:
