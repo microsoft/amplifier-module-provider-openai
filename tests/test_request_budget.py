@@ -353,9 +353,11 @@ def test_native_final_count_refresh_blocks_retry_before_second_generation_dispat
     else:
         provider.client.responses.create = AsyncMock(side_effect=retryable_failure)
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        with pytest.raises(kernel_errors.ContextLengthError, match="native input allowance"):
-            asyncio.run(provider.complete(request))
+    with (
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        pytest.raises(kernel_errors.ContextLengthError, match="native input allowance"),
+    ):
+        asyncio.run(provider.complete(request))
 
     # One pre-event count covers the first attempt. The retry obtains a fresh
     # count and is rejected before it can make a second physical dispatch.
