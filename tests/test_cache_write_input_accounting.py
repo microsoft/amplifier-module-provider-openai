@@ -64,7 +64,18 @@ def _make_provider(**config_overrides) -> OpenAIProvider:
         "default_model": _MODEL,
         **config_overrides,
     }
-    return OpenAIProvider(api_key="test-key", config=config)
+    client = SimpleNamespace(
+        base_url="https://api.openai.com/v1",
+        responses=SimpleNamespace(
+            input_tokens=SimpleNamespace(
+                count=AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+            ),
+            create=AsyncMock(),
+            stream=AsyncMock(),
+        ),
+        close=AsyncMock(),
+    )
+    return OpenAIProvider(api_key="test-key", client=client, config=config)
 
 
 def _simple_request() -> ChatRequest:

@@ -23,7 +23,7 @@ import copy
 import logging
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from amplifier_core import llm_errors as kernel_errors
@@ -38,7 +38,18 @@ from amplifier_module_provider_openai import (
 
 def _make_provider(**config_overrides) -> OpenAIProvider:
     config = {"max_retries": 0, "use_streaming": False, **config_overrides}
-    return OpenAIProvider(api_key="test-key", config=config)
+    client = SimpleNamespace(
+        base_url="https://api.openai.com/v1",
+        responses=SimpleNamespace(
+            input_tokens=SimpleNamespace(
+                count=AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+            ),
+            create=AsyncMock(),
+            stream=MagicMock(),
+        ),
+        close=AsyncMock(),
+    )
+    return OpenAIProvider(api_key="test-key", client=client, config=config)
 
 
 def _simple_request() -> ChatRequest:

@@ -5,6 +5,7 @@ not contact an API: parent DTU validation owns execution of this file.
 """
 
 import asyncio
+from importlib.metadata import PackageNotFoundError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -266,6 +267,7 @@ def test_native_count_failure_and_cancellation_do_not_become_measurements():
     provider, counter = _native_provider(default_model="gpt-5-mini")
     counter.side_effect = RuntimeError("count response malformed")
     assert asyncio.run(provider.request_budget(_request(), context_estimate=10)) is None
+    assert "request_budget:provider_count" in provider.get_info().capabilities
 
     counter.side_effect = asyncio.CancelledError
     with pytest.raises(asyncio.CancelledError):
@@ -279,6 +281,7 @@ def test_native_count_is_unavailable_for_unknown_fields_custom_routes_and_subcla
     )
     assert asyncio.run(provider.request_budget(_request(), context_estimate=10)) is None
     counter.assert_not_called()
+    assert "request_budget:provider_count" in provider.get_info().capabilities
 
     custom = _provider(default_model="gpt-5-mini")
     assert "request_budget:provider_count" not in custom.get_info().capabilities
@@ -382,6 +385,72 @@ def test_missing_native_helper_keeps_legacy_budget_behavior():
 
     assert isinstance(decision, dict)
     assert "measurement" not in decision
+    assert "request_budget:provider_count" not in provider.get_info().capabilities
+
+
+@pytest.mark.parametrize(
+    ("reported_version", "available"),
+    [
+        ("2.5.9", False),
+        ("2.6.0", True),
+        ("3.5.0", True),
+        ("3.5.0rc1", False),
+        ("malformed", False),
+        ("3.5", False),
+    ],
+)
+def test_uninitialized_standard_route_requires_a_supported_stable_sdk_version(
+    monkeypatch, reported_version, available
+):
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"base_url": "https://api.openai.com/v1"},
+    )
+    monkeypatch.setattr(
+        "amplifier_module_provider_openai.installed_package_version",
+        lambda _distribution: reported_version,
+    )
+
+    assert (
+        "request_budget:provider_count" in provider.get_info().capabilities
+    ) is available
+
+
+def test_uninitialized_standard_route_fails_closed_when_sdk_metadata_is_missing(
+    monkeypatch,
+):
+    provider = OpenAIProvider(
+        api_key="test-key",
+        config={"base_url": "https://api.openai.com/v1"},
+    )
+
+    def missing_sdk(_distribution):
+        raise PackageNotFoundError("openai")
+
+    monkeypatch.setattr(
+        "amplifier_module_provider_openai.installed_package_version", missing_sdk
+    )
+
+    assert "request_budget:provider_count" not in provider.get_info().capabilities
+
+
+def test_injected_callable_counter_remains_authoritative_over_sdk_version(monkeypatch):
+    provider, _ = _native_provider(default_model="gpt-5-mini")
+    monkeypatch.setattr(
+        "amplifier_module_provider_openai.installed_package_version",
+        lambda _distribution: "2.5.9",
+    )
+
+    assert "request_budget:provider_count" in provider.get_info().capabilities
+
+
+def test_custom_route_does_not_advertise_even_with_supported_sdk_version(monkeypatch):
+    provider = _provider(default_model="gpt-5-mini")
+    monkeypatch.setattr(
+        "amplifier_module_provider_openai.installed_package_version",
+        lambda _distribution: "3.5.0",
+    )
+
     assert "request_budget:provider_count" not in provider.get_info().capabilities
 
 

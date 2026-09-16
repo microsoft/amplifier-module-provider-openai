@@ -568,12 +568,18 @@ projection: model, instructions, input/history (including native replay), tools,
 tool choice, parallel-tool setting, reasoning, text format, and truncation.
 Create-only response settings are not sent to the counter.
 
-The measurement is unavailable rather than approximate when the SDK helper is
-missing or fails, the response is malformed, an unknown finalized input option
-cannot be projected, or the provider is a subclass/custom/Azure/proxy route.
-Those cases preserve the established synchronous, estimate-based
-`request_budget` behavior where it was previously available; they do not
-advertise `request_budget:provider_count`.
+The `request_budget:provider_count` capability means that `request_budget`
+returns an awaitable native decision. Consumers of that capability must await
+the result and handle `None`: an individual count can fail, be malformed, or
+be unprojectable after the capability was advertised. The instance capability
+remains advertised in those cases.
+
+Native counting is unavailable when the installed SDK lacks the stable helper,
+its version is missing, malformed, unsupported, or pre-release, or the
+provider is a subclass/custom/Azure/proxy route. Those legacy unsupported
+routes retain their established synchronous estimate-based `dict` or `None`
+`request_budget` result; they do not advertise
+`request_budget:provider_count`.
 
 There is no count cache. A Context/Loop measured preflight calls the counter once
 for its frozen candidate. Separately, generation takes one final pre-event count

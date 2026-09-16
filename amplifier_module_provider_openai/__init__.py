@@ -22,7 +22,11 @@ import uuid
 from collections import defaultdict
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any, Callable, ClassVar
+from importlib.metadata import (
+    PackageNotFoundError,
+    version as installed_package_version,
+)
+from typing import Any, Awaitable, Callable, ClassVar
 from urllib.parse import urlparse
 
 import openai
@@ -90,6 +94,28 @@ from ._tool_search import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MIN_NATIVE_INPUT_TOKEN_COUNT_SDK_VERSION = (2, 6, 0)
+
+
+def _installed_openai_supports_native_input_token_count() -> bool:
+    """Return whether the installed OpenAI SDK has the stable count helper."""
+    try:
+        reported_version = installed_package_version("openai")
+    except PackageNotFoundError:
+        return False
+    if not isinstance(reported_version, str):
+        return False
+    components = reported_version.split(".")
+    if len(components) != 3 or not all(
+        component.isascii() and component.isdecimal() for component in components
+    ):
+        return False
+    return (
+        tuple(int(component) for component in components)
+        >= _MIN_NATIVE_INPUT_TOKEN_COUNT_SDK_VERSION
+    )
+
 
 # ---------------------------------------------------------------------------
 # Process-wide concurrency gate
@@ -1694,12 +1720,16 @@ class OpenAIProvider:
         """Return whether this instance can honestly advertise native counting."""
         if not self._uses_standard_openai_endpoint():
             return False
-        if self._client is None:
-            # The pinned package declares the helper. Do not instantiate a
-            # client just to advertise an optional capability.
-            return True
-        input_tokens = getattr(getattr(self._client, "responses", None), "input_tokens", None)
-        return callable(getattr(input_tokens, "count", None))
+        if self._client is not None:
+            # An initialized injected client is the actual dispatch boundary;
+            # its callable helper is more authoritative than package metadata.
+            input_tokens = getattr(
+                getattr(self._client, "responses", None), "input_tokens", None
+            )
+            return callable(getattr(input_tokens, "count", None))
+        # Do not construct a client merely to inspect an optional capability.
+        # The helper was introduced in the stable 2.6.0 SDK release.
+        return _installed_openai_supports_native_input_token_count()
 
     def _native_count_params(self, params: dict[str, Any]) -> dict[str, Any] | None:
         """Project a finalized Responses payload onto the SDK count contract.
@@ -2100,8 +2130,12 @@ class OpenAIProvider:
         context_estimate: int,
         request_options: Mapping[str, Any] | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any] | None:
-        """Estimate the assembled request without emitting, dispatching, or mutating."""
+    ) -> dict[str, Any] | Awaitable[dict[str, Any] | None] | None:
+        """Return an awaitable native decision or a synchronous legacy estimate.
+
+        The awaitable resolves to ``None`` when the optional native count is
+        unavailable. This method never emits, dispatches, or mutates state.
+        """
         if isinstance(context_estimate, bool) or not isinstance(context_estimate, int):
             raise ValueError("context_estimate must be a nonnegative integer")
         if context_estimate < 0:
