@@ -6,7 +6,7 @@ not contact an API: parent DTU validation owns execution of this file.
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from amplifier_core import llm_errors as kernel_errors
@@ -60,6 +60,18 @@ class _StreamContext:
 
     async def get_final_response(self):
         return self.response
+
+
+class _RetryableFailingStreamContext:
+    """Stream request that fails before returning any generation response."""
+
+    async def __aenter__(self):
+        raise kernel_errors.LLMError(
+            "retryable stream failure", provider="openai", retryable=True
+        )
+
+    async def __aexit__(self, *args):
+        return False
 
 
 def _native_provider(*, input_tokens=10, **config):
@@ -252,7 +264,7 @@ def test_native_count_validates_counter_response(reported, available):
 
 def test_native_count_failure_and_cancellation_do_not_become_measurements():
     provider, counter = _native_provider(default_model="gpt-5-mini")
-    counter.side_effect = RuntimeError("count failed")
+    counter.side_effect = RuntimeError("count response malformed")
     assert asyncio.run(provider.request_budget(_request(), context_estimate=10)) is None
 
     counter.side_effect = asyncio.CancelledError
@@ -260,9 +272,7 @@ def test_native_count_failure_and_cancellation_do_not_become_measurements():
         asyncio.run(provider.request_budget(_request(), context_estimate=10))
 
 
-def test_native_count_is_unavailable_for_unknown_fields_custom_routes_and_subclasses(
-    monkeypatch,
-):
+def test_native_count_is_unavailable_for_unknown_fields_custom_routes_and_subclasses():
     provider, counter = _native_provider(
         default_model="gpt-5-mini",
         extra_request_params={"unproved_input_option": "value"},
@@ -274,13 +284,6 @@ def test_native_count_is_unavailable_for_unknown_fields_custom_routes_and_subcla
     assert "request_budget:provider_count" not in custom.get_info().capabilities
     assert isinstance(custom.request_budget(_request(), context_estimate=10), dict)
 
-    environment_route, _ = _native_provider(default_model="gpt-5-mini")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.invalid/v1")
-    assert (
-        "request_budget:provider_count"
-        not in environment_route.get_info().capabilities
-    )
-
     class DerivedOpenAIProvider(OpenAIProvider):
         pass
 
@@ -289,6 +292,78 @@ def test_native_count_is_unavailable_for_unknown_fields_custom_routes_and_subcla
         config={"base_url": "https://api.openai.com/v1"},
     )
     assert "request_budget:provider_count" not in subclass.get_info().capabilities
+
+
+def test_injected_standard_client_endpoint_wins_over_custom_environment(monkeypatch):
+    provider, _ = _native_provider(default_model="gpt-5-mini")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.invalid/v1")
+
+    assert "request_budget:provider_count" in provider.get_info().capabilities
+
+
+@pytest.mark.parametrize("injected_base_url", ["https://proxy.invalid/v1", None])
+def test_injected_client_endpoint_overrides_standard_config_and_environment(
+    monkeypatch, injected_base_url
+):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini",
+        base_url="https://api.openai.com/v1",
+    )
+    provider.client.base_url = injected_base_url
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+    assert "request_budget:provider_count" not in provider.get_info().capabilities
+    budget = provider.request_budget(_request(), context_estimate=10)
+    assert isinstance(budget, dict)
+    assert "measurement" not in budget
+    counter.assert_not_called()
+
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    asyncio.run(provider.complete(_request()))
+
+    assert provider.client.responses.create.await_count == 1
+    counter.assert_not_called()
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_native_final_count_refresh_blocks_retry_before_second_generation_dispatch(
+    use_streaming,
+):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini",
+        use_streaming=use_streaming,
+        max_retries=1,
+        retry_jitter=False,
+    )
+    request = _request("retry count")
+    allowance = provider._budget_input_limit(provider._budget_params(request))
+    counter.side_effect = [
+        SimpleNamespace(input_tokens=10),
+        SimpleNamespace(input_tokens=allowance + 1),
+    ]
+    retryable_failure = kernel_errors.LLMError(
+        "retryable generation failure", provider="openai", retryable=True
+    )
+    if use_streaming:
+        provider.client.responses.stream = MagicMock(
+            return_value=_RetryableFailingStreamContext()
+        )
+    else:
+        provider.client.responses.create = AsyncMock(side_effect=retryable_failure)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(kernel_errors.ContextLengthError, match="native input allowance"):
+            asyncio.run(provider.complete(request))
+
+    # One pre-event count covers the first attempt. The retry obtains a fresh
+    # count and is rejected before it can make a second physical dispatch.
+    assert counter.await_count == 2
+    if use_streaming:
+        assert provider.client.responses.stream.call_count == 1
+    else:
+        assert provider.client.responses.create.await_count == 1
 
 
 def test_missing_native_helper_keeps_legacy_budget_behavior():

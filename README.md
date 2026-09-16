@@ -576,12 +576,13 @@ Those cases preserve the established synchronous, estimate-based
 advertise `request_budget:provider_count`.
 
 There is no count cache. A Context/Loop measured preflight calls the counter once
-for its frozen candidate and the provider calls it again immediately before the
-matching generation dispatch: **two count requests per dispatched measured
-attempt**. A direct generation has **one** final-dispatch count request. The
-preflight does not mutate provider state or emit completion events. A successful
-final count overrides a stale serialized-byte calibration; an over-allowance
-count blocks generation before its SDK create/stream request.
+for its frozen candidate. Separately, generation takes one final pre-event count
+for its first SDK create/stream dispatch and refreshes that count immediately
+before every physical retry. Therefore a Context/Loop flow with `N` physical
+generation attempts makes `N + 1` count requests; a direct generation with `N`
+attempts makes `N`. The preflight does not mutate provider state or emit completion
+events. A successful final count overrides a stale serialized-byte calibration; an
+over-allowance count blocks generation before its SDK create/stream request.
 
 ### Metadata Keys
 

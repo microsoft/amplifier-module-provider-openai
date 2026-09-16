@@ -1670,9 +1670,16 @@ class OpenAIProvider:
         if type(self) is not OpenAIProvider:
             return False
 
-        endpoint: Any = self.base_url or os.environ.get("OPENAI_BASE_URL")
-        if endpoint is None and self._client is not None:
+        if self._client is not None:
+            # An injected client is the actual dispatch path. Its endpoint is
+            # therefore authoritative, even when config or the environment
+            # describes a standard route. A missing client URL is unknown, so
+            # fail closed rather than claim OpenAI's native counter for it.
             endpoint = getattr(self._client, "base_url", None)
+            if endpoint is None:
+                return False
+        else:
+            endpoint = self.base_url or os.environ.get("OPENAI_BASE_URL")
         if endpoint is None:
             return True
         parsed = urlparse(str(endpoint))
@@ -1733,9 +1740,10 @@ class OpenAIProvider:
             result = await counter(**count_params)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            # A preflight failure is unavailable, not an invented count. The
-            # existing final local guard remains the fallback for dispatch.
+        except (openai.APIError, RuntimeError, TypeError, ValueError):
+            # The optional SDK counter can fail in transport or response
+            # decoding; that leaves the measurement unavailable, not invented.
+            # The existing final local guard remains the fallback for dispatch.
             return None
         finally:
             if temporary_client:
@@ -3003,6 +3011,7 @@ class OpenAIProvider:
         # cannot be counted twice from both SSE and get_final_response().
         failed_stream_responses: list[Any] = []
         failed_stream_response_ids: set[int] = set()
+        generation_attempt = 0
 
         def _record_failed_stream_response(response: Any) -> None:
             if response is not None and id(response) not in failed_stream_response_ids:
@@ -3023,7 +3032,19 @@ class OpenAIProvider:
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
-            nonlocal captured_rate_limit_info
+            nonlocal captured_rate_limit_info, generation_attempt
+
+            # The initial count guarded the completed wire payload before the
+            # request event. Reuse it for this first physical dispatch only.
+            # retry_with_backoff invokes this coroutine again for each retry,
+            # so refresh the native measurement immediately before every
+            # later stream/create attempt without double-counting the first.
+            attempt_native_input_tokens = native_input_tokens
+            if generation_attempt:
+                attempt_native_input_tokens = (
+                    await self._guard_assembled_params_with_provider_count(params)
+                )
+            generation_attempt += 1
 
             async def _handle_context_overflow(e: Exception, error_msg: str):
                 """Raise ContextLengthError. Shared by the 400 path and the
@@ -3241,7 +3262,7 @@ class OpenAIProvider:
                     # Non-streaming path — preserved for tests and backward compat.
                     return await asyncio.wait_for(
                         self._create_response(
-                            params, native_input_tokens=native_input_tokens
+                            params, native_input_tokens=attempt_native_input_tokens
                         ),
                         timeout=effective_timeout,
                     )
