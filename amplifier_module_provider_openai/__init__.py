@@ -20,13 +20,11 @@ import os
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal
-from importlib.metadata import (
-    PackageNotFoundError,
-    version as installed_package_version,
-)
-from typing import Any, Awaitable, Callable, ClassVar
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as installed_package_version
+from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import openai
