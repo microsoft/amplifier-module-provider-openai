@@ -1636,6 +1636,8 @@ class OpenAIProvider:
                 provider=self.name,
             )
         allowance = advertised - output - 4096
+        if caps.max_input_tokens is not None:
+            allowance = min(allowance, caps.max_input_tokens - 4096)
         if allowance <= 0:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request has no input allowance after its output reserve "

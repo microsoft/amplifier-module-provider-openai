@@ -103,11 +103,14 @@ class TestGPT52Family:
 class TestGPT5MiniFamily:
     """Test GPT-5-mini model capabilities."""
 
-    def test_gpt_5_mini(self):
-        caps = get_capabilities("gpt-5-mini")
+    @pytest.mark.parametrize("model_id", ["gpt-5-mini", "gpt-5-mini-2025-08-07"])
+    def test_gpt_5_mini(self, model_id):
+        # Published limits: https://developers.openai.com/api/docs/models/gpt-5-mini
+        caps = get_capabilities(model_id)
         assert caps.family == "gpt-5-mini"
-        assert caps.context_window == 128_000
-        assert caps.max_output_tokens == 64_000
+        assert caps.context_window == 400_000
+        assert caps.max_output_tokens == 128_000
+        assert caps.max_input_tokens == 272_000
         assert caps.supports_reasoning is False
         assert caps.default_reasoning_effort is None
         assert caps.supports_vision is True
@@ -124,8 +127,9 @@ class TestGPT5MiniFamily:
         """The gpt-5.0-mini variant routes to the gpt-5-mini family."""
         caps = get_capabilities("gpt-5.0-mini")
         assert caps.family == "gpt-5-mini"
-        assert caps.context_window == 128_000
-        assert caps.max_output_tokens == 64_000
+        assert caps.context_window == 400_000
+        assert caps.max_output_tokens == 128_000
+        assert caps.max_input_tokens == 272_000
         assert caps.supports_reasoning is False
 
 
