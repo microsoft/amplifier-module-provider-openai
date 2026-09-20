@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import math
 
 from amplifier_core.message_models import Message
 
@@ -135,9 +136,15 @@ class NativeCheckpointMixin:
         self._native_busy = True
         try:
             request, kwargs = self._last_native_request
-            request = request.model_copy(
-                update={"messages": [Message(**m) for m in canonical]}
-            )
+            # Factories and ephemeral host guidance supply system messages in
+            # the actual request without adding them to canonical history.
+            # Bind compaction to the last successful request's exact instructions;
+            # changing those instructions on the next request invalidates it.
+            systems = [m for m in request.messages if m.role == "system"]
+            messages = [Message(**m) for m in canonical]
+            if systems:
+                messages = [*systems, *(m for m in messages if m.role != "system")]
+            request = request.model_copy(update={"messages": messages})
             params, _, _ = self._assemble_initial_responses_params(request, **kwargs)
             if (
                 params.get("conversation")
@@ -197,7 +204,22 @@ class NativeCheckpointMixin:
             self.seen.clear()
             self._checkpoint = record
             self._checkpoint_status = "created"
-            return self.native_status()
+            usage = data.get("usage") or {}
+            # Only declared finite counters cross the public response boundary.
+            # Omitted usage remains unknown, never an invented zero-cost call.
+            usage = (
+                {
+                    key: value
+                    for key, value in usage.items()
+                    if key in {"input_tokens", "output_tokens", "total_tokens"}
+                    and type(value) in (int, float)
+                    and math.isfinite(value)
+                    and value >= 0
+                }
+                if isinstance(usage, dict)
+                else {}
+            )
+            return {**self.native_status(), "usage": usage}
         finally:
             self._native_busy = False
 

@@ -59,7 +59,11 @@ bound is a visible unknown/recovery boundary, never silently truncated success.
 `native_compact(canonical=..., identity=...)` requires an idle, settled transport
 and a prior successful native request to bind its actual model/tool settings.
 It calls the SDK's raw `/responses/compact` endpoint once with SDK retries off.
-All returned JSON output items, including opaque encrypted content and retained
+Compaction preserves the last successful request's exact system instructions,
+including factory or ephemeral host policy absent from canonical history.
+Changed future instructions invalidate the derived checkpoint. Its result
+exposes only finite declared usage counters for host accounting; omitted usage
+remains unknown. All returned JSON output items, including opaque encrypted content and retained
 items, are copied unchanged. There is no synthetic summary and no automatic
 compaction while steering. The next fresh request uses the **entire** returned
 window plus only the new suffix, without `previous_response_id`. Request budgets

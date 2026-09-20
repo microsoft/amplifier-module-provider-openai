@@ -204,3 +204,49 @@ async def test_real_complete_guards_and_sends_same_opaque_payload_after_compacti
         call.args[0]["input"] == opaque
         for call in p._guard_assembled_params_with_provider_count.call_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_compaction_retains_actual_factory_instructions_and_public_usage():
+    p, canonical, opaque, api = make()
+    request, kwargs = p._last_native_request
+    request = request.model_copy(
+        update={
+            "messages": [
+                Message(role="system", content="Exact factory and host policy"),
+                *request.messages,
+            ]
+        }
+    )
+    p._last_native_request = request, kwargs
+    api.return_value = SimpleNamespace(
+        content=json.dumps(
+            {
+                "output": opaque,
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "encrypted_content": "never public",
+                    "total_tokens": float("inf"),
+                },
+            }
+        )
+    )
+    result = await p.native_compact(canonical=canonical, identity={"instance": "one"})
+    assert api.call_args.kwargs["instructions"] == "Exact factory and host policy"
+    assert result["usage"] == {"input_tokens": 12, "output_tokens": 3}
+    assert len(canonical) == 1 and canonical[0]["role"] == "user"
+    p.full_messages = canonical
+    params, _, _ = p._assemble_initial_responses_params(request)
+    assert p._apply_checkpoint(params, params)["input"] == opaque
+    changed = request.model_copy(
+        update={
+            "messages": [
+                Message(role="system", content="Changed policy"),
+                *request.messages[1:],
+            ]
+        }
+    )
+    params, _, _ = p._assemble_initial_responses_params(changed)
+    assert p._apply_checkpoint(params, params) == params
+    assert p.native_export_checkpoint() is None
