@@ -243,6 +243,8 @@ async def test_current_provider_pure_planner_does_not_advance_lineage_before_act
         params, _, _ = p._assemble_initial_responses_params(request)
         assert params["input"]  # full preflight view
         p.socket.feed(created("second"), finished("second"))
+        # A new top-level complete() resets this attempt boundary.
+        p._native_request_attempted = False
         await p._create_response(params)
         assert p.socket.sent[-1]["input"] == []  # no duplicate user input
         assert p.socket.sent[-1]["previous_response_id"] == "first"
@@ -389,3 +391,16 @@ async def test_pending_steering_never_moves_to_rewritten_context_or_closed_socke
     with pytest.raises(LLMError, match="pending steering"):
         await p._renew_idle_connection()
     assert not socket.sent and p.request_uncertain
+
+
+@pytest.mark.asyncio
+async def test_driver_internal_continuation_cannot_issue_a_second_native_request():
+    p, _ = make()
+    p._native_request_attempted = True
+    token = NATIVE_REQUEST.set(p)
+    try:
+        with pytest.raises(LLMError, match="no internal replay") as result:
+            await p._create_response({"input": []})
+        assert result.value.retryable is False and not p.socket.sent
+    finally:
+        NATIVE_REQUEST.reset(token)

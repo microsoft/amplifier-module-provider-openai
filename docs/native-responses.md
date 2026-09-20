@@ -62,7 +62,11 @@ It calls the SDK's raw `/responses/compact` endpoint once with SDK retries off.
 All returned JSON output items, including opaque encrypted content and retained
 items, are copied unchanged. There is no synthetic summary and no automatic
 compaction while steering. The next fresh request uses the **entire** returned
-window plus only the new suffix, without `previous_response_id`.
+window plus only the new suffix, without `previous_response_id`. Request budgets
+and the initial send guard measure that same opaque window through a pure
+planner; fitting does not advance connection lineage. Each top-level completion
+can issue one native request. A driver-internal continuation requires an explicit
+next provider call instead of silently replaying the request.
 
 `native_export_checkpoint()` is a **private host persistence API**, never model
 or UI content. `native_restore_checkpoint(record, canonical=..., identity=...)`

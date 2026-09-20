@@ -8,6 +8,7 @@ unchanged unless a host explicitly wraps this instance and supplies an owner.
 import asyncio
 import contextvars
 import copy
+import inspect
 import json
 import time
 import uuid
@@ -23,6 +24,7 @@ from . import OpenAIProvider, _RawResponseObject
 from .native_checkpoint import NativeCheckpointMixin
 
 NATIVE_REQUEST = contextvars.ContextVar("openai_native_request", default=None)
+NATIVE_BUDGET = contextvars.ContextVar("openai_native_budget", default=None)
 
 
 def key(message):
@@ -131,6 +133,48 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     self._close_failure = type(exc).__name__
                 self.socket = None
 
+    async def request_budget(self, request, **kwargs):
+        owner = self.owner_getter()
+        options = self._merge_request_options(
+            kwargs.get("request_options"),
+            {k: v for k, v in kwargs.items() if k != "request_options"},
+        )
+        canonical = None
+        if (
+            owner is not None
+            and self._checkpoint
+            and options.get("model", self.default_model) == "gpt-6-astra"
+            and options.get("extended_thinking") is not False
+            and (request.metadata or {}).get("stream") is not False
+        ):
+            canonical = await owner.context.get_messages()
+        token = NATIVE_BUDGET.set((self, canonical) if canonical is not None else None)
+        try:
+            result = super().request_budget(request, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+        finally:
+            NATIVE_BUDGET.reset(token)
+
+    def _assemble_initial_responses_params(self, request, **kwargs):
+        params, state, logs = super()._assemble_initial_responses_params(
+            request, **kwargs
+        )
+        if NATIVE_REQUEST.get() is self:
+            # Retain the canonical wire view only in private planning state. The
+            # public hook/budget payload is the actual full compact window.
+            state = {**state, "native_full_params": copy.deepcopy(params)}
+            params = self._plan_checkpoint(params, self.full_messages)
+        else:
+            budget = NATIVE_BUDGET.get()
+            if budget is not None and budget[0] is self:
+                params = self._plan_checkpoint(params, budget[1])
+        return params, state, logs
+
+    def _commit_initial_assembly_state(self, state):
+        super()._commit_initial_assembly_state(state)
+        if NATIVE_REQUEST.get() is self:
+            self._native_full_params = state.get("native_full_params")
+
     async def complete(self, request, **kwargs):
         kwargs = self._merge_request_options(
             kwargs.pop("request_options", None), kwargs
@@ -150,6 +194,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         if self.owner is not None or self._native_busy:
             raise RuntimeError("Native provider already owns a generation")
         self.owner = owner
+        self._native_full_params = None
+        self._native_request_attempted = False
         self._request_messages = [
             m.model_dump()
             for m in request.messages
@@ -434,9 +480,17 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 params, native_input_tokens=native_input_tokens
             )
         try:
+            if getattr(self, "_native_request_attempted", False):
+                raise LLMError(
+                    "Native transport requires an explicit next provider request; no internal replay",
+                    provider=self.name,
+                    retryable=False,
+                )
             # Planning uses the full request without advancing connection lineage.
             # Commit native deltas only once, immediately before the actual send.
-            full_params = copy.deepcopy(params)
+            full_params = copy.deepcopy(
+                getattr(self, "_native_full_params", None) or params
+            )
             ordinary = super()._convert_messages(
                 self._prepare_native_messages(self._request_messages)
             )
@@ -454,6 +508,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 self._guard_assembled_params(
                     params, native_input_tokens=native_input_tokens
                 )
+            self._native_request_attempted = True
             return await self._native_response(params)
         except asyncio.CancelledError:
             await self._uncertain("cancelled")

@@ -201,25 +201,38 @@ class NativeCheckpointMixin:
         finally:
             self._native_busy = False
 
-    def _apply_checkpoint(self, params, full_params):
+    def _checkpoint_matches(self, params, canonical):
         record = self._checkpoint
         if not record:
-            return params
+            return False
         count, wire_count = record["sourceCount"], record["wireCount"]
-        full = full_params["input"]
-        if (
-            digest(self.full_messages[:count]) != record["sourceRevision"]
-            or self._config_digest() != record["configDigest"]
-            or binding(full_params) != record["requestBinding"]
-            or digest(full[:wire_count]) != record["wireRevision"]
-        ):
+        return (
+            len(canonical) >= count
+            and digest(canonical[:count]) == record["sourceRevision"]
+            and self._config_digest() == record["configDigest"]
+            and binding(params) == record["requestBinding"]
+            and digest(params["input"][:wire_count]) == record["wireRevision"]
+        )
+
+    def _plan_checkpoint(self, params, canonical):
+        # Pure preflight: do not mutate provider lineage or discard state while
+        # a fitter is exploring candidate request windows.
+        if not self._checkpoint_matches(params, canonical):
+            return params
+        return {
+            **params,
+            "input": copy.deepcopy(self._checkpoint["output"])
+            + params["input"][self._checkpoint["wireCount"] :],
+        }
+
+    def _apply_checkpoint(self, params, full_params):
+        if not self._checkpoint:
+            return params
+        if not self._checkpoint_matches(full_params, self.full_messages):
             self._discard_checkpoint("history_or_configuration_changed")
             return full_params
         if not self.previous_response_id:
             # Preserve EVERY returned item unchanged, followed only by the new
             # suffix. No inspection, reconstruction, or synthetic summary.
-            params = {
-                **params,
-                "input": copy.deepcopy(record["output"]) + full[wire_count:],
-            }
+            params = self._plan_checkpoint(full_params, self.full_messages)
         return params

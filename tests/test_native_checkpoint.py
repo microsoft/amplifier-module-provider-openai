@@ -115,3 +115,92 @@ async def test_uncertain_native_outcome_prevents_compaction_or_restore():
     with pytest.raises(ValueError):
         p.native_restore_checkpoint({}, canonical=messages, identity={})
     assert api.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_budget_and_initial_guard_measure_exact_opaque_window_without_advancing_lineage():
+    from amplifier_module_provider_openai.native import NATIVE_REQUEST
+
+    p, messages, opaque, _ = make()
+    identity = {"instance": "selected", "model": "gpt-6-astra"}
+    await p.native_compact(canonical=messages, identity=identity)
+    owner = SimpleNamespace(
+        context=SimpleNamespace(get_messages=AsyncMock(return_value=messages))
+    )
+    p.owner_getter = lambda: owner
+    request = p._last_native_request[0]
+    p._provider_count_available = lambda: False
+    measured = []
+    original = p._estimated_input_tokens
+
+    def estimate(params, **kwargs):
+        measured.append(copy.deepcopy(params))
+        return original(params, **kwargs)
+
+    p._estimated_input_tokens = estimate
+    before = p.native_export_checkpoint()
+    budget = await p.request_budget(request, context_estimate=100)
+    assert budget and measured[0]["input"] == opaque
+    assert (
+        not p.seen
+        and p.previous_response_id is None
+        and p.native_export_checkpoint() == before
+    )
+    p.full_messages = messages
+    token = NATIVE_REQUEST.set(p)
+    try:
+        params, state, _ = p._assemble_initial_responses_params(request)
+        assert params["input"] == opaque
+        assert state["native_full_params"]["input"] != opaque
+        p._commit_initial_assembly_state(state)
+        assert p._native_full_params["input"] == state["native_full_params"]["input"]
+        assert not p.seen and p.previous_response_id is None
+    finally:
+        NATIVE_REQUEST.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_real_complete_guards_and_sends_same_opaque_payload_after_compaction():
+    import json
+
+    p, messages, opaque, _ = make()
+    await p.native_compact(
+        canonical=messages, identity={"instance": "one", "model": "gpt-6-astra"}
+    )
+    request = p._last_native_request[0]
+    owner = SimpleNamespace(
+        context=SimpleNamespace(get_messages=AsyncMock(return_value=messages)),
+        runtime=SimpleNamespace(emit=AsyncMock()),
+        config={},
+        native_job=lambda identity: None,
+    )
+    p.owner_getter = lambda: owner
+    p._guard_assembled_params_with_provider_count = AsyncMock(return_value=None)
+    p.socket = SimpleNamespace(
+        send=AsyncMock(),
+        close=AsyncMock(),
+        recv=AsyncMock(
+            side_effect=[
+                json.dumps({"type": "response.created", "response": {"id": "new"}}),
+                json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "new",
+                            "status": "completed",
+                            "model": "gpt-6-astra",
+                            "output": [],
+                            "usage": {"input_tokens": 1, "output_tokens": 0},
+                        },
+                    }
+                ),
+            ]
+        ),
+    )
+    await p.complete(request)
+    sent = json.loads(p.socket.send.call_args.args[0])
+    assert sent["input"] == opaque and "previous_response_id" not in sent
+    assert all(
+        call.args[0]["input"] == opaque
+        for call in p._guard_assembled_params_with_provider_count.call_args_list
+    )
