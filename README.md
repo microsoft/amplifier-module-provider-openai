@@ -648,3 +648,10 @@ This project may contain trademarks or logos for projects, products, or services
 trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+
+### Optional provider-owned native transport
+
+Hosts can opt into the `native` extra and the session-local
+`NativeResponsesProvider` adapter for supported Responses WebSocket steering and
+explicit opaque compaction. Ordinary provider mounting remains unchanged.
+See [native transport contract and limits](docs/native-responses.md).
