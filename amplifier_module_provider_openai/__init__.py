@@ -4037,6 +4037,8 @@ class OpenAIProvider:
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
         """
+        from .computer_history import project_failed_computer_history
+        messages = project_failed_computer_history(messages, self._native_call_types)
         openai_messages = []
         i = 0
 

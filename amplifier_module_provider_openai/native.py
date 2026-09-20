@@ -90,7 +90,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             await self.owner.runtime.emit(kind, **data)
 
     def _prepare_native_messages(self, messages):
-        return messages
+        from .computer_history import project_failed_computer_history
+        return project_failed_computer_history(messages, self._native_call_types)
 
     def _validate_native_items(self, items):
         return items

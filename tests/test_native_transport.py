@@ -404,3 +404,57 @@ async def test_driver_internal_continuation_cannot_issue_a_second_native_request
         assert result.value.retryable is False and not p.socket.sent
     finally:
         NATIVE_REQUEST.reset(token)
+
+
+def test_explicit_later_user_recovery_starts_new_lineage_once_without_native_call_replay():
+    from amplifier_core.llm_errors import InvalidRequestError
+
+    p, o = make()
+    messages = [
+        {"role": "user", "content": "Inspect"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_call",
+                    "id": "failed-computer",
+                    "name": "computer",
+                    "input": {"actions": [{"type": "screenshot"}]},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "failed-computer",
+            "content": json.dumps({"success": False, "error": {"code": "safety_halt"}}),
+        },
+    ]
+    original = copy.deepcopy(messages)
+    p.previous_response_id = "prior"
+    token = NATIVE_REQUEST.set(p)
+    try:
+        with pytest.raises(InvalidRequestError):
+            p._convert_messages(messages)
+        assert p.previous_response_id == "prior"
+        later = [
+            *messages,
+            {"role": "user", "content": "Keep the stop. Explain without tools."},
+        ]
+        wire = p._convert_messages(later)
+        assert p.previous_response_id is None
+        assert not any(
+            item.get("type") in {"computer_call", "computer_call_output"}
+            for item in wire
+        )
+        assert "safety_halt" in json.dumps(wire) and messages == original
+        epoch = p.epoch
+        p.previous_response_id = "new-lineage"
+        again = p._convert_messages(later)
+        assert p.previous_response_id == "new-lineage" and p.epoch == epoch
+        assert all(
+            item.get("type") not in {"computer_call", "computer_call_output"}
+            for item in again
+        )
+        assert p.socket.sent == [] and o.events == [] and o.messages == []
+    finally:
+        NATIVE_REQUEST.reset(token)
