@@ -91,13 +91,15 @@ class TestGetInfoContextWindowReporting:
         # gpt-5-mini has no long_context_pricing_threshold → always reports caps.context_window
         provider = _make_provider(enable_long_context=True, default_model="gpt-5-mini")
         info = provider.get_info()
-        assert info.defaults["context_window"] == 128_000
+        assert info.defaults["context_window"] == 400_000
+        assert info.defaults["max_output_tokens"] == 128_000
 
     def test_no_threshold_model_default_flag(self):
         """Model without pricing threshold, default flag → reports caps.context_window."""
         provider = _make_provider(default_model="gpt-5-mini")
         info = provider.get_info()
-        assert info.defaults["context_window"] == 128_000
+        assert info.defaults["context_window"] == 400_000
+        assert info.defaults["max_output_tokens"] == 128_000
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +109,18 @@ class TestGetInfoContextWindowReporting:
 
 class TestListModelsContextWindowReporting:
     """list_models() must report context_window based on the flag."""
+
+    def test_gpt_5_mini_limits_match_public_info(self):
+        """Discovery and get_info must expose the same published mini limits."""
+        provider = _make_list_models_provider(default_model="gpt-5-mini")
+        provider._client.models.list.return_value = _fake_models_response(
+            ["gpt-5-mini", "gpt-5-mini-2025-08-07"]
+        )
+        models = asyncio.run(provider.list_models())
+        assert {m.id for m in models} == {"gpt-5-mini", "gpt-5-mini-2025-08-07"}
+        for model in models:
+            assert model.context_window == 400_000
+            assert model.max_output_tokens == 128_000
 
     def test_list_models_default_272k(self):
         """list_models() without flag → GPT-5.4 model has context_window=272_000."""

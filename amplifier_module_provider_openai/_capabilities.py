@@ -173,6 +173,10 @@ class ModelCapabilities:
     """
 
 
+    max_input_tokens: int | None = None
+    """Independent input ceiling, if documented; shrinking output cannot raise it."""
+
+
 def _detect_family(model_id: str) -> str:
     """Classify *model_id* into a capability family.
 
@@ -288,10 +292,12 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
         )
 
     if family == "gpt-5-mini":
+        # https://developers.openai.com/api/docs/models/gpt-5-mini
         return ModelCapabilities(
             family="gpt-5-mini",
-            context_window=128_000,
-            max_output_tokens=64_000,
+            context_window=400_000,
+            max_output_tokens=128_000,
+            max_input_tokens=272_000,
             supports_reasoning=False,
             default_reasoning_effort=None,
             supports_vision=True,

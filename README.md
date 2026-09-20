@@ -33,7 +33,7 @@ Provides access to OpenAI's GPT-6, GPT-5, and GPT-4 models as an LLM provider fo
 - `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
 - `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
-- `gpt-5-mini` - Smaller, faster GPT-5
+- `gpt-5-mini` - Smaller, faster GPT-5: 400,000-token total context, 272,000-token maximum input, and 128,000-token maximum output. Preflight retains its 4,096-token safety reserve; reducing the output cap does not raise the input ceiling.
 - `gpt-5-nano` - Smallest GPT-5 variant
 
 ## Configuration

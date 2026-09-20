@@ -101,6 +101,38 @@ def _count_projection(params):
     }
 
 
+def test_gpt_5_mini_native_budget_uses_published_limits():
+    """A native count above the old 59,904 allowance still fits mini."""
+    provider, counter = _native_provider(input_tokens=100_000, default_model="gpt-5-mini")
+    decision = asyncio.run(provider.request_budget(_request(), context_estimate=80_000))
+
+    assert decision["max_output_tokens"] == 128_000
+    assert decision["input_limit_tokens"] == 267_904  # 400k - 128k - 4096 reserve
+    assert decision["estimated_input_tokens"] == 100_000
+    assert decision["context_token_budget"] == 80_000
+    counter.assert_awaited_once()
+
+
+def test_gpt_5_mini_reduced_output_cannot_exceed_documented_input_ceiling():
+    provider, counter = _native_provider(input_tokens=300_000, default_model="gpt-5-mini")
+    request = _request(output=1_000)
+    decision = asyncio.run(provider.request_budget(request, context_estimate=300_000))
+
+    assert decision["max_output_tokens"] == 1_000
+    assert decision["input_limit_tokens"] == 272_000 - 4_096
+    assert decision["estimated_input_tokens"] > decision["input_limit_tokens"]
+    with pytest.raises(kernel_errors.ContextLengthError, match="native input allowance"):
+        asyncio.run(provider.complete(request))
+    provider.client.responses.create.assert_not_called()
+    assert counter.await_count == 2  # preflight plus the independent dispatch guard
+
+
+def test_models_without_an_input_ceiling_keep_existing_output_reserve_policy():
+    provider = _provider(default_model="gpt-5.3")
+    params = provider._budget_params(_request(output=1_000))
+    assert provider._budget_input_limit(params) == 400_000 - 1_000 - 4_096
+
+
 def test_native_count_returns_official_measurement_for_the_finalized_projection():
     provider, counter = _native_provider(default_model="gpt-5-mini")
     request = ChatRequest(
@@ -464,14 +496,14 @@ def test_preflight_uses_complete_assembled_payload_and_full_output_reserve():
     assert params["instructions"] == "be concise"
     assert params["temperature"] == 0.2
     assert budget["estimated_input_tokens"] == provider._serialized_input_bytes(params)
-    assert budget["input_limit_tokens"] == 128_000 - 1_000 - 4_096
+    assert budget["input_limit_tokens"] == 272_000 - 4_096
     assert budget["context_token_budget"] == 123
     assert budget["max_output_tokens"] == 1_000
 
 
 def test_cold_oversize_preflight_returns_none_without_state_or_log_side_effects(caplog):
     provider = _provider(default_model="gpt-5-mini")
-    request = _request("cold-preflight-private-content-" * 5_000, output=1_000)
+    request = _request("cold-preflight-private-content-" * 15_000, output=1_000)
     state_before = (
         dict(provider._budget_calibration),
         set(provider._budget_uncalibrated_warned_models),
@@ -685,7 +717,11 @@ def test_final_guard_uses_same_growth_bound_and_has_scalar_attribution():
     provider = _provider(default_model="gpt-5-mini")
     base = provider._budget_params(_request("small"))
     base_bytes = provider._serialized_input_bytes(base)
-    provider._budget_calibration["gpt-5-mini"] = (0.25, base_bytes, 50_000)
+    provider._budget_calibration["gpt-5-mini"] = (
+        0.25,
+        base_bytes,
+        provider._budget_input_limit(base) - 10_000,
+    )
     params = provider._budget_params(_request("x" * 20_000))
 
     with pytest.raises(kernel_errors.ContextLengthError, match="input_items=.*tools="):
@@ -694,7 +730,7 @@ def test_final_guard_uses_same_growth_bound_and_has_scalar_attribution():
 
 @pytest.mark.parametrize("use_streaming", [False, True])
 def test_cold_oversize_dispatches_once_warns_once_and_calibrates(use_streaming, caplog):
-    private_content = "cold-dispatch-private-content-" * 5_000
+    private_content = "cold-dispatch-private-content-" * 15_000
     provider = _provider(
         default_model="gpt-5-mini",
         use_streaming=use_streaming,
@@ -743,7 +779,7 @@ def test_cold_oversize_repeat_without_usage_warns_once_per_model(caplog):
     response = _response(0)
     response.output = []
     provider.client.responses.create = AsyncMock(return_value=response)
-    request = _request("cold-repeat-private-content-" * 5_000, output=1_000)
+    request = _request("cold-repeat-private-content-" * 15_000, output=1_000)
 
     caplog.clear()
     asyncio.run(provider.complete(request))
@@ -765,7 +801,7 @@ def test_cold_oversize_warning_is_isolated_by_model(caplog):
     response = _response(0)
     response.output = []
     provider.client.responses.create = AsyncMock(return_value=response)
-    request = _request("cold-model-private-content-" * 5_000, output=1_000)
+    request = _request("cold-model-private-content-" * 15_000, output=1_000)
 
     caplog.clear()
     asyncio.run(provider.complete(request))
