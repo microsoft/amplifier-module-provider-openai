@@ -7,7 +7,7 @@ import math
 
 from amplifier_core.message_models import Message
 
-from . import _read_raw_json_body
+from . import OpenAIProvider, _read_raw_json_body
 
 FORMAT = "openai.responses.compact.v1"
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
@@ -223,28 +223,63 @@ class NativeCheckpointMixin:
         finally:
             self._native_busy = False
 
-    def _checkpoint_matches(self, params, canonical):
+    def _checkpoint_prefix_length(self, params, canonical):
+        """Locate the exact covered wire prefix, allowing normal reasoning expiry.
+
+        A new user turn expires prior reasoning in the regular serializer. The
+        canonical prefix is still identical, but its wire item count shrinks.
+        Reconstruct the original wire view and verify its saved digest before
+        permitting only that deletion; never relax text, tool or policy checks.
+        """
         record = self._checkpoint
         if not record:
-            return False
+            return None
         count, wire_count = record["sourceCount"], record["wireCount"]
-        return (
+        if not (
             len(canonical) >= count
             and digest(canonical[:count]) == record["sourceRevision"]
             and self._config_digest() == record["configDigest"]
             and binding(params) == record["requestBinding"]
-            and digest(params["input"][:wire_count]) == record["wireRevision"]
-        )
+        ):
+            return None
+        if digest(params["input"][:wire_count]) == record["wireRevision"]:
+            return wire_count
+        if self.reasoning_replay_scope != "turn" or not any(
+            message.get("role") == "user"
+            and not (message.get("metadata") or {}).get("ephemeral")
+            for message in canonical[count:]
+        ):
+            return None
+
+        # Bypass native lineage/delta selection. This isolated base serializer
+        # neither mutates live call attribution nor emits planning diagnostics.
+        planner = copy.copy(self)
+        planner._native_call_ids = set(self._native_call_ids)
+        planner._native_call_types = dict(self._native_call_types)
+        planner._assembly_log_records = []
+        original = OpenAIProvider._convert_messages(planner, canonical[:count])
+        if len(original) != wire_count or digest(original) != record["wireRevision"]:
+            return None
+        covered = [item for item in original if item.get("type") != "reasoning"]
+        if len(covered) == wire_count:
+            return None
+        if digest(params["input"][: len(covered)]) != digest(covered):
+            return None
+        return len(covered)
+
+    def _checkpoint_matches(self, params, canonical):
+        return self._checkpoint_prefix_length(params, canonical) is not None
 
     def _plan_checkpoint(self, params, canonical):
         # Pure preflight: do not mutate provider lineage or discard state while
         # a fitter is exploring candidate request windows.
-        if not self._checkpoint_matches(params, canonical):
+        prefix_length = self._checkpoint_prefix_length(params, canonical)
+        if prefix_length is None:
             return params
         return {
             **params,
             "input": copy.deepcopy(self._checkpoint["output"])
-            + params["input"][self._checkpoint["wireCount"] :],
+            + params["input"][prefix_length:],
         }
 
     def _apply_checkpoint(self, params, full_params):

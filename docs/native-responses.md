@@ -76,8 +76,15 @@ next provider call instead of silently replaying the request.
 or UI content. `native_restore_checkpoint(record, canonical=..., identity=...)`
 verifies its format, record digest, configuration digest, exact canonical prefix
 count/hash, model and provider instance. A new suffix is allowed. Actual request
-assembly must also match the exact original wire prefix and request settings;
-rewriting, request fitting, or changed tools discards derived state visibly.
+assembly must also match the exact original wire prefix and request settings.
+With turn-scoped reasoning, a later real user message normally removes prior
+reasoning items from that wire view. The planner allows that deletion only after
+reconstructing and verifying the saved original wire digest, then comparing every
+remaining covered item exactly. It uses the resulting shorter prefix boundary,
+preserving the opaque checkpoint and sending only the new suffix. Text, tool
+results, authority, instructions and configuration receive no such relaxation.
+An unrecognized serialization change, rewriting, request fitting, or changed
+tools discards derived state visibly.
 Original history is untouched. This format is distinct from context-managed
 summaries and cannot be restored through their summary capability. A host must
 save originals first, bind ownership, use private atomic persistence, and mark

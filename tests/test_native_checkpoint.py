@@ -160,14 +160,27 @@ async def test_budget_and_initial_guard_measure_exact_opaque_window_without_adva
 
 
 @pytest.mark.asyncio
-async def test_real_complete_guards_and_sends_same_opaque_payload_after_compaction():
+@pytest.mark.parametrize("new_user_after_reasoning", [False, True])
+async def test_real_complete_guards_and_sends_same_opaque_payload_after_compaction(
+    new_user_after_reasoning,
+):
     import json
 
-    p, messages, opaque, _ = make()
-    await p.native_compact(
-        canonical=messages, identity={"instance": "one", "model": "gpt-6-astra"}
-    )
-    request = p._last_native_request[0]
+    if new_user_after_reasoning:
+        p, messages, _, opaque, _ = await reasoning_checkpoint()
+        messages = [*messages, {"role": "user", "content": "Repeat the value"}]
+        request = ChatRequest(
+            messages=[Message(**m) for m in messages], max_output_tokens=32
+        )
+        params, _, _ = p._assemble_initial_responses_params(request)
+        expected_input = [*opaque, params["input"][-1]]
+    else:
+        p, messages, opaque, _ = make()
+        await p.native_compact(
+            canonical=messages, identity={"instance": "one", "model": "gpt-6-astra"}
+        )
+        request = p._last_native_request[0]
+        expected_input = opaque
     owner = SimpleNamespace(
         context=SimpleNamespace(get_messages=AsyncMock(return_value=messages)),
         runtime=SimpleNamespace(emit=AsyncMock()),
@@ -199,9 +212,9 @@ async def test_real_complete_guards_and_sends_same_opaque_payload_after_compacti
     )
     await p.complete(request)
     sent = json.loads(p.socket.send.call_args.args[0])
-    assert sent["input"] == opaque and "previous_response_id" not in sent
+    assert sent["input"] == expected_input and "previous_response_id" not in sent
     assert all(
-        call.args[0]["input"] == opaque
+        call.args[0]["input"] == expected_input
         for call in p._guard_assembled_params_with_provider_count.call_args_list
     )
 
@@ -248,5 +261,140 @@ async def test_compaction_retains_actual_factory_instructions_and_public_usage()
         }
     )
     params, _, _ = p._assemble_initial_responses_params(changed)
+    assert p._apply_checkpoint(params, params) == params
+    assert p.native_export_checkpoint() is None
+
+
+async def reasoning_checkpoint():
+    """A completed turn with tool evidence and real typed reasoning content."""
+    from amplifier_core.message_models import ThinkingBlock
+
+    p, _, opaque, api = make()
+    canonical = [
+        {"role": "user", "content": "Read the synthetic value"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_call", "id": "call_fixture", "name": "read", "input": {}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_fixture", "content": '{"value":17}'},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingBlock(
+                    thinking="synthetic reasoning",
+                    content=[
+                        {
+                            "id": "rs_fixture",
+                            "encrypted_content": "ENC_fixture",
+                            "summary": "synthetic reasoning",
+                        }
+                    ],
+                ).model_dump(),
+                {"type": "text", "text": "FINAL-B 17"},
+            ],
+        },
+    ]
+    request = ChatRequest(
+        messages=[Message(**m) for m in canonical], max_output_tokens=32
+    )
+    p._last_native_request = request, {}
+    identity = {"instance": "reasoning", "model": "gpt-6-astra"}
+    await p.native_compact(canonical=canonical, identity=identity)
+    record = p.native_export_checkpoint()
+    assert any(
+        item.get("type") == "reasoning" for item in api.call_args.kwargs["input"]
+    )
+    q, _, _, unused = make()
+    q.native_restore_checkpoint(record, canonical=canonical, identity=identity)
+    return q, canonical, record, opaque, unused
+
+
+@pytest.mark.asyncio
+async def test_new_user_reuses_restored_reasoning_checkpoint_without_resending_tool_result():
+    from amplifier_module_provider_openai.native import NATIVE_REQUEST
+
+    p, canonical, record, opaque, unused = await reasoning_checkpoint()
+    original = copy.deepcopy(canonical)
+    canonical = [*canonical, {"role": "user", "content": "Repeat the tag and value"}]
+    request = ChatRequest(
+        messages=[Message(**m) for m in canonical], max_output_tokens=32
+    )
+    params, _, _ = p._assemble_initial_responses_params(request)
+    assert not any(item.get("type") == "reasoning" for item in params["input"])
+    assert record["wireCount"] == len(params["input"])
+    expected = [*opaque, params["input"][-1]]
+    before = (
+        copy.deepcopy(p.seen),
+        copy.deepcopy(p.last_context),
+        set(p._native_call_ids),
+        dict(p._native_call_types),
+    )
+    assert p._plan_checkpoint(params, canonical)["input"] == expected
+    assert (p.seen, p.last_context, p._native_call_ids, p._native_call_types) == before
+    assert p.native_export_checkpoint() == record and canonical[:-1] == original
+    assert unused.await_count == 0
+
+    # Budgeting and the actual request planner must select the same payload.
+    p.owner_getter = lambda: SimpleNamespace(
+        context=SimpleNamespace(get_messages=AsyncMock(return_value=canonical))
+    )
+    p._provider_count_available = lambda: False
+    measured = []
+    estimate = p._estimated_input_tokens
+    p._estimated_input_tokens = lambda params, **kwargs: (
+        measured.append(copy.deepcopy(params)) or estimate(params, **kwargs)
+    )
+    assert await p.request_budget(request, context_estimate=100)
+    assert measured[0]["input"] == expected
+    p.full_messages = canonical
+    token = NATIVE_REQUEST.set(p)
+    try:
+        planned, state, _ = p._assemble_initial_responses_params(request)
+        assert planned["input"] == expected
+        assert (
+            p._apply_checkpoint(planned, state["native_full_params"])["input"]
+            == expected
+        )
+    finally:
+        NATIVE_REQUEST.reset(token)
+    assert not any(item.get("type") == "function_call_output" for item in expected)
+    assert p.native_export_checkpoint() == record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["canonical", "tool_result", "assistant", "instructions", "insert", "ephemeral"],
+)
+async def test_reasoning_expiry_does_not_relax_other_checkpoint_boundaries(change):
+    p, canonical, record, _, _ = await reasoning_checkpoint()
+    canonical = [*canonical, {"role": "user", "content": "Repeat the value"}]
+    request = ChatRequest(
+        messages=[Message(**m) for m in canonical], max_output_tokens=32
+    )
+    params, _, _ = p._assemble_initial_responses_params(request)
+    if change == "canonical":
+        canonical[0]["content"] = "different authority"
+    elif change == "tool_result":
+        next(
+            item
+            for item in params["input"]
+            if item.get("type") == "function_call_output"
+        )["output"] = "different result"
+    elif change == "assistant":
+        next(item for item in params["input"] if item.get("role") == "assistant")[
+            "content"
+        ] = "different text"
+    elif change == "instructions":
+        params["instructions"] = "different policy"
+    elif change == "insert":
+        params["input"].insert(0, {"role": "developer", "content": "new authority"})
+    elif change == "ephemeral":
+        canonical[-1]["metadata"] = {"ephemeral": True}
+    assert p._plan_checkpoint(params, canonical) == params
+    assert p.native_export_checkpoint() == record
+    p.full_messages = canonical
     assert p._apply_checkpoint(params, params) == params
     assert p.native_export_checkpoint() is None
