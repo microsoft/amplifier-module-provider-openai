@@ -1533,6 +1533,7 @@ class OpenAIProvider:
         # oversized request will be sent for authoritative API validation.
         # This stays in-memory and is bounded to one scalar model id per model.
         self._budget_uncalibrated_warned_models: set[str] = set()
+        self._budget_nontext_warned_models: set[str] = set()
 
     def _prepare_astra_params(self, params: dict[str, Any]) -> None:
         """Apply Astra's final-wire compatibility rules after extras merge."""
@@ -1646,10 +1647,52 @@ class OpenAIProvider:
             )
         return allowance
 
+    @staticmethod
+    def _has_nontext_budget_input(params: dict[str, Any]) -> bool:
+        """Identify typed media only at Responses input-content positions.
+
+        Image/file transport bytes and model input tokens have no stable ratio.
+        Do not scan arbitrary dictionaries or strings: tool schemas, arguments,
+        and text quoting a data URL remain text for the local budget guard.
+        """
+        items = params.get("input")
+        if not isinstance(items, (list, tuple)):
+            return False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in (None, "message") and item.get("role") in (
+                "user",
+                "system",
+                "developer",
+                "assistant",
+            ):
+                content = item.get("content")
+            elif item_type in ("function_call_output", "custom_tool_call_output"):
+                content = item.get("output")
+            elif item_type == "computer_call_output":
+                output = item.get("output")
+                if (
+                    isinstance(output, dict)
+                    and output.get("type") == "computer_screenshot"
+                ):
+                    return True
+                continue
+            else:
+                continue
+            if isinstance(content, (list, tuple)) and any(
+                isinstance(block, dict)
+                and block.get("type") in ("input_image", "input_file")
+                for block in content
+            ):
+                return True
+        return False
+
     def _estimated_input_tokens(
         self, params: dict[str, Any], *, serialized_bytes: int | None = None
     ) -> tuple[int, int]:
-        """Return (estimated input tokens, serialized UTF-8 bytes) for *params*."""
+        """Return a text-only estimate and serialized UTF-8 bytes for *params*."""
         if serialized_bytes is None:
             serialized_bytes = self._serialized_input_bytes(params)
         model = params.get("model")
@@ -2165,6 +2208,10 @@ class OpenAIProvider:
 
         serialized_bytes = self._serialized_input_bytes(params)
         allowance = self._budget_input_limit(params)
+        if self._has_nontext_budget_input(params):
+            # No invented media cost or compaction target when native counting
+            # is unavailable. Final dispatch still validates the exact request.
+            return None
         estimated, _ = self._estimated_input_tokens(
             params, serialized_bytes=serialized_bytes
         )
@@ -2206,6 +2253,18 @@ class OpenAIProvider:
                 f"{self._budget_attribution(params)}).",
                 provider=self.name,
             )
+        if self._has_nontext_budget_input(params):
+            if model not in self._budget_nontext_warned_models:
+                logger.warning(
+                    "[PROVIDER] Local byte budget cannot measure non-text input; "
+                    "sending request for API validation and API may reject it "
+                    "(model=%s, serialized_bytes=%s, input_limit_tokens=%s).",
+                    model,
+                    serialized_bytes,
+                    allowance,
+                )
+                self._budget_nontext_warned_models.add(model)
+            return
         estimate, _ = self._estimated_input_tokens(
             params, serialized_bytes=serialized_bytes
         )
@@ -2240,6 +2299,10 @@ class OpenAIProvider:
 
     def _record_budget_calibration(self, params: dict[str, Any], response: Any) -> None:
         """Learn only valid raw Responses gross input usage for the dispatched params."""
+        if self._has_nontext_budget_input(params):
+            # Gross usage includes media tokens; it cannot calibrate text bytes.
+            # Actual response usage/accounting is preserved independently.
+            return
         if getattr(response, "status", None) != "completed":
             return
         usage = getattr(response, "usage", None)
