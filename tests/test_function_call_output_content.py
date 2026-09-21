@@ -283,4 +283,8 @@ def test_streaming_complete_uses_effective_model_for_rich_tool_output() -> None:
         "type": "input_image",
         "image_url": f"data:image/png;base64,{_image_data()}",
     }
-    assert output[2] == {"type": "input_text", "text": "after"}
+    assert output[2] == {
+        "type": "input_text",
+        "text": "after",
+        "prompt_cache_breakpoint": {"mode": "explicit"},
+    }

@@ -33,7 +33,7 @@ Provides access to OpenAI's GPT-6, GPT-5, and GPT-4 models as an LLM provider fo
 - `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
 - `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
-- `gpt-5-mini` - Smaller, faster GPT-5
+- `gpt-5-mini` - Smaller, faster GPT-5: 400,000-token total context, 272,000-token maximum input, and 128,000-token maximum output. Preflight retains its 4,096-token safety reserve; reducing the output cap does not raise the input ceiling.
 - `gpt-5-nano` - Smallest GPT-5 variant
 
 ## Configuration
@@ -243,19 +243,21 @@ OpenAI's July 2025 guidance.
 | `"in_memory"` | 5–10 min in-process cache. Rejected by gpt-5.5/5.6 (auto-dropped to `"24h"` with a warning). |
 | `null` | Field omitted; OpenAI picks the per-model default. |
 
-### `prompt_cache_options` — explicit-mode dropped at mount
+### `prompt_cache_options` — tool-result boundaries alongside implicit caching
 
-`prompt_cache_options` is `{mode, ttl}`. **`mode: "explicit"` is rejected at
-mount** and downgraded to implicit with a one-time warning (the `ttl` key
-passes through unchanged): this provider ships no `prompt_cache_breakpoint`
-mechanism anywhere, and explicit mode with zero breakpoints disables prompt
-caching **entirely** — no reads, no writes — turning a ~95% cache-read workload
-into 100% full-price input (~10× regression, live-probed 2026-08-28).
+For `gpt-5.6-luna`, `gpt-5.6-terra` and their hyphenated variants, the provider
+adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
+result. A string output becomes an `input_text` block with identical text;
+structured outputs receive the marker on their last string-valued `input_text`
+block. Existing markers and non-text blocks are preserved. Instructions, roles,
+reasoning and native tool outputs are not rewritten.
 
-> Residual gap, by design: a caller passing
-> `prompt_cache_options={"mode": "explicit"}` via **per-call kwargs** bypasses
-> mount validation and reaches the wire. This is consistent with the provider's
-> stance on explicit caller overrides — the caller owns the consequences.
+Implicit caching, cache keys and TTL defaults are unchanged. Configured
+`mode: "explicit"` is still removed at mount with a warning, preserving `ttl`:
+requests without eligible results may have no boundary, and explicit-only
+caching without a boundary disables caching entirely. Per-call explicit
+options remain intentional caller overrides. Boundaries permit reuse; they do
+not guarantee cache hits after compaction or other prompt changes.
 
 ### `extra_request_params`
 
@@ -267,6 +269,11 @@ provider-computed key — so it overrides anything the provider set, deliberatel
 **Astra exception:** final compatibility checks run after this merge. Unsupported
 sampling, log-probability, reasoning-effort, and cache-TTL values fail before the
 SDK call; legacy cache retention is removed.
+
+**Luna/Terra cache exception:** after the final merge, automatic tool-result
+boundaries also apply to caller-supplied `input`, using the effective `model`.
+This can change a string output's wire representation to a block list while
+preserving its text. Caller-owned objects and existing markers are not mutated.
 
 - **User wins, loudly.** Any provider-computed key it clobbers is named in a
   one-time warning per key per provider instance. You own the consequences: an
@@ -527,6 +534,79 @@ transcript, so there is nothing a retry could shrink. A `context_length_exceeded
 **immediately** — no retry. Compaction is the context manager's job, driven by
 its own token threshold at request-build time.
 
+Before each SDK dispatch, the provider also applies a local, serialized-payload
+estimate. A fresh provider starts conservatively at one estimated token per UTF-8
+payload byte, so an initial long request or resumed session can have less usable
+capacity than a provider with matched response usage. Successful Responses API
+usage calibrates a model-local byte rate; it does not retain prompts and does not
+turn the bootstrap estimate into a permanent high-water limit. This is an
+operational guard, not an authoritative native-token tokenizer or a guarantee of
+the service's context limit.
+
+`request_budget` returns a concrete budget while that estimate is within its
+allowance. For an uncalibrated model whose serialized-byte bootstrap exceeds the
+allowance, it returns `None`: the local estimate cannot establish either a fit or
+an overflow. A compatible context-management loop must accept `None`, and a
+producer must be released only after its consumer has accepted that result. The
+provider validates the final payload, then sends that cold request for
+authoritative API validation and warns once per model. The API can still reject
+the actual request for context overflow; this behavior never discards protected
+input to make the request fit.
+
+The byte estimate applies only to text payloads. Typed image/file content and
+computer screenshots require the native count below: encoded bytes, URLs, and
+file identifiers cannot establish their model token cost. If counting is
+unavailable or fails, their preflight budget is `None` and the unchanged request
+is sent for API validation, with a scalar-only warning once per model. Model,
+output-reservation, and serialization checks still apply. Multimodal response
+usage remains in actual usage accounting but never calibrates the text byte
+estimate. Data URLs or image-shaped JSON inside ordinary text, tool arguments,
+or tool schemas remain subject to the text guard.
+
+### Native Responses input counts
+
+For a direct `OpenAIProvider` on the effective standard
+`https://api.openai.com/v1` route, `request_budget` uses the SDK's
+`responses.input_tokens.count` operation for a native input measurement. Its
+result is reported as:
+
+```python
+measurement = {
+    "kind": "provider_count",
+    "source": "official.operation",
+    "input_tokens": C,
+}
+```
+
+`C` is input-only. It is compared with the provider's input allowance, which
+already reserves the selected output cap and the safety reserve; neither is
+subtracted from `C`. The counter receives the finalized countable Responses
+projection: model, instructions, input/history (including native replay), tools,
+tool choice, parallel-tool setting, reasoning, text format, and truncation.
+Create-only response settings are not sent to the counter.
+
+The `request_budget:provider_count` capability means that `request_budget`
+returns an awaitable native decision. Consumers of that capability must await
+the result and handle `None`: an individual count can fail, be malformed, or
+be unprojectable after the capability was advertised. The instance capability
+remains advertised in those cases.
+
+Native counting is unavailable when the installed SDK lacks the stable helper,
+its version is missing, malformed, unsupported, or pre-release, or the
+provider is a subclass/custom/Azure/proxy route. Those legacy unsupported
+routes retain their established synchronous estimate-based `dict` or `None`
+`request_budget` result; they do not advertise
+`request_budget:provider_count`.
+
+There is no count cache. A Context/Loop measured preflight calls the counter once
+for its frozen candidate. Separately, generation takes one final pre-event count
+for its first SDK create/stream dispatch and refreshes that count immediately
+before every physical retry. Therefore a Context/Loop flow with `N` physical
+generation attempts makes `N + 1` count requests; a direct generation with `N`
+attempts makes `N`. The preflight does not mutate provider state or emit completion
+events. A successful final count overrides a stale serialized-byte calibration; an
+over-allowance count blocks generation before its SDK create/stream request.
+
 ### Metadata Keys
 
 The provider populates `ChatResponse.metadata` with OpenAI-specific state:
@@ -585,3 +665,16 @@ This project may contain trademarks or logos for projects, products, or services
 trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+
+### Optional provider-owned native transport
+
+Hosts can opt into the `native` extra and the session-local
+`NativeResponsesProvider` adapter for supported Responses WebSocket steering and
+explicit opaque compaction. Ordinary provider mounting remains unchanged.
+See [native transport contract and limits](docs/native-responses.md).
+
+### Continuing after a native computer screenshot failure
+
+A failed computer result remains a non-retryable local protocol error in its current turn (`computer_result_not_image`). After a later non-ephemeral user message, the provider builds a request-only projection: the failed native call/result pair becomes bounded, explicitly untrusted textual evidence carrying the original call identity, result kind and digest. Canonical messages are unchanged. Valid screenshot pairs and unrelated tools remain intact.
+
+This allows a user to discuss the failure without manufacturing a screenshot or replaying the prior action. It does not grant approval, resume a computer tool, clear a durable tool/provider halt, or rewrite the original result. Hosts must mark injected reminders/observations ephemeral; they are not new user input. The native transport uses the normalized view to start a new lineage once, retaining its existing refusal to move pending steering into a rewritten context. Real user instructions still require ordinary tool authority and any separate safety-halt resolution.

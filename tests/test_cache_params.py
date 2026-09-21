@@ -23,7 +23,18 @@ from amplifier_module_provider_openai import OpenAIProvider
 
 def _make_provider(**config_overrides) -> OpenAIProvider:
     config = {"max_retries": 0, "use_streaming": False, **config_overrides}
-    return OpenAIProvider(api_key="test-key", config=config)
+    client = SimpleNamespace(
+        base_url="https://api.openai.com/v1",
+        responses=SimpleNamespace(
+            input_tokens=SimpleNamespace(
+                count=AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+            ),
+            create=AsyncMock(),
+            stream=MagicMock(),
+        ),
+        close=AsyncMock(),
+    )
+    return OpenAIProvider(api_key="test-key", client=client, config=config)
 
 
 def _simple_request() -> ChatRequest:

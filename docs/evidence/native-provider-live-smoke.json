@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "scope": "actual provider transport with pure in-memory fixture owner",
+  "model": "gpt-6-astra",
+  "effort": "xhigh",
+  "sdk": "3.5.0",
+  "generationLimit": 2,
+  "maxOutputTokensPerGeneration": 1024,
+  "compactLimit": 1,
+  "events": [
+    {
+      "order": 1,
+      "event": "native.submitting",
+      "execution_replayed": false
+    },
+    {
+      "order": 2,
+      "event": "native.request"
+    },
+    {
+      "order": 3,
+      "event": "response.created",
+      "responseId": "resp_09ea7801e07defa2016ab072a3244887d088210480be7cf976"
+    },
+    {
+      "order": 4,
+      "event": "native.response.created",
+      "response_id": "resp_09ea7801e07defa2016ab072a3244887d088210480be7cf976"
+    },
+    {
+      "order": 5,
+      "event": "steering.sent",
+      "input_id": "fixture-correction-one",
+      "response_id": "resp_09ea7801e07defa2016ab072a3244887d088210480be7cf976"
+    },
+    {
+      "order": 6,
+      "event": "response.steer.accepted",
+      "steerId": "steer_ff4e6e7062e54cf782908b2468bbd4e6",
+      "parentId": "resp_09ea7801e07defa2016ab072a3244887d088210480be7cf976",
+      "errorCode": null
+    },
+    {
+      "order": 7,
+      "event": "steering.accepted",
+      "input_id": "fixture-correction-one",
+      "response_id": "resp_09ea7801e07defa2016ab072a3244887d088210480be7cf976",
+      "steer_id": "steer_ff4e6e7062e54cf782908b2468bbd4e6"
+    },
+    {
+      "order": 8,
+      "event": "fixture.tool.completed",
+      "callId": "call_UM1XakNt9EgrdiGKlKCtQZC8"
+    },
+    {
+      "order": 9,
+      "event": "response.incomplete",
+      "responseId": "resp_09ea7801e07defa2016ab072a3244887d088210480be7cf976"
+    },
+    {
+      "order": 10,
+      "event": "response.created",
+      "responseId": "resp_09ea7801e07defa2016ab072a4bc4887d0aba4bca803167795"
+    },
+    {
+      "order": 11,
+      "event": "steering.applied",
+      "input_id": "fixture-correction-one",
+      "response_id": "resp_09ea7801e07defa2016ab072a4bc4887d0aba4bca803167795",
+      "steer_id": "steer_ff4e6e7062e54cf782908b2468bbd4e6"
+    },
+    {
+      "order": 12,
+      "event": "native.response.created",
+      "response_id": "resp_09ea7801e07defa2016ab072a4bc4887d0aba4bca803167795"
+    },
+    {
+      "order": 13,
+      "event": "response.completed",
+      "responseId": "resp_09ea7801e07defa2016ab072a4bc4887d0aba4bca803167795"
+    },
+    {
+      "order": 14,
+      "event": "native.completed",
+      "response_id": "resp_09ea7801e07defa2016ab072a4bc4887d0aba4bca803167795"
+    }
+  ],
+  "responses": [
+    {
+      "id": "resp_09ea7801e07defa2016ab072a3244887d088210480be7cf976",
+      "status": "incomplete",
+      "event": "response.incomplete",
+      "usage": {
+        "input_tokens": 73,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 13,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 86
+      },
+      "incompleteReason": "steered"
+    },
+    {
+      "id": "resp_09ea7801e07defa2016ab072a4bc4887d0aba4bca803167795",
+      "status": "completed",
+      "event": "response.completed",
+      "usage": {
+        "input_tokens": 135,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 268,
+        "output_tokens_details": {
+          "reasoning_tokens": 250
+        },
+        "total_tokens": 403
+      },
+      "incompleteReason": null
+    }
+  ],
+  "toolCalls": [
+    {
+      "callId": "call_UM1XakNt9EgrdiGKlKCtQZC8",
+      "tool": "delegate",
+      "execution": "pure fixture value, no external effects"
+    }
+  ],
+  "sentToolResultIds": [],
+  "explicitRequests": 1,
+  "compactRequests": 1,
+  "reconnect": "idle_connection_renewed_and_handshake_succeeded",
+  "postReconnectGeneration": false,
+  "postCompactGeneration": false,
+  "nativeDesktopObserved": false,
+  "savedConfigurationChanged": false,
+  "publicAnswer": "FINAL-B: The fixture number hasn\u2019t been returned yet.",
+  "correctionApplied": true,
+  "settled": true,
+  "compactResult": {
+    "supported": true,
+    "transport": "responses_websocket",
+    "model": "gpt-6-astra",
+    "observerFailed": false,
+    "active": false,
+    "outcome": "settled",
+    "checkpoint": "created",
+    "format": "openai.responses.compact.v1",
+    "compactAvailable": true,
+    "automaticCompaction": false,
+    "usage": {
+      "input_tokens": 389,
+      "output_tokens": 198,
+      "total_tokens": 587
+    }
+  },
+  "checkpointState": "created",
+  "textDeltaCount": 12,
+  "createdCount": 2
+}
