@@ -658,36 +658,9 @@ def _extract_computer_actions(block: Any) -> list[dict[str, Any]]:
 
 
 def _extract_computer_screenshot_data_url(tool_content: Any) -> str:
-    """Build the `image_url` data URI OpenAI's `computer_call_output` expects.
-
-    Accepts either:
-    - a plain base64 PNG string (already-encoded image data), or
-    - a list of content blocks containing an `ImageBlock`-shaped dict
-      (`{"type": "image", "source": {"type": "base64", "media_type", "data"}}`),
-      mirroring the existing `role == "user"` image conversion (`input_image`,
-      above).
-
-    Raises ValueError if neither shape is present. A `computer_call_output`
-    with no image is not a valid response to a `computer_call` -- per the
-    "fail loud, never silently degrade" requirement, this must surface as an
-    error rather than be sent as a malformed/empty request.
-    """
-    if isinstance(tool_content, str) and tool_content:
-        return f"data:image/png;base64,{tool_content}"
-
-    if isinstance(tool_content, list):
-        for block in tool_content:
-            if isinstance(block, dict) and block.get("type") == "image":
-                source = block.get("source", {})
-                if source.get("type") == "base64" and source.get("data"):
-                    media_type = source.get("media_type", "image/png")
-                    return f"data:{media_type};base64,{source['data']}"
-
-    raise ValueError(
-        "computer_call tool result did not contain image data; expected a "
-        "base64 PNG string or an image content block "
-        f"(got: {type(tool_content).__name__})"
-    )
+    """Accept only bounded, validated image evidence; never coerce text/errors."""
+    from ._computer_result import screenshot_data_url
+    return screenshot_data_url(tool_content)
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -4198,9 +4171,20 @@ class OpenAIProvider:
                         # below, since computer call_ids are also present in
                         # _native_call_ids but need a different result shape.
                         if self._native_call_types.get(tool_call_id) == "computer":
-                            image_url = _extract_computer_screenshot_data_url(
-                                tool_content
-                            )
+                            try:
+                                image_url = _extract_computer_screenshot_data_url(tool_content)
+                            except ValueError as exc:
+                                from ._computer_result import result_kind
+                                error = kernel_errors.InvalidRequestError(
+                                    "Native computer result has no valid screenshot. The original tool "
+                                    "result is preserved; no image was invented and no tool was replayed. "
+                                    "Resolve the structured tool error or safety stop before continuing.",
+                                    provider=self.name, retryable=False,
+                                )
+                                error.code = "computer_result_not_image"
+                                error.tool_call_id = tool_call_id
+                                error.result_kind = result_kind(tool_content)
+                                raise error from exc
                             openai_messages.append(
                                 {
                                     "type": "computer_call_output",

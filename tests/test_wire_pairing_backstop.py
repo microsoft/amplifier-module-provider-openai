@@ -62,7 +62,7 @@ def test_computer_call_output_satisfies_wire_path_pairing() -> None:
         {
             "role": "tool",
             "tool_call_id": "call_cua1",
-            "content": "data:image/png;base64,AAAA",
+            "content": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
             "tool_name": "computer",
         },
     ]
@@ -130,7 +130,7 @@ def test_mixed_native_and_function_outputs_all_pair_at_the_wire() -> None:
         {
             "role": "tool",
             "tool_call_id": "call_cua1",
-            "content": "data:image/png;base64,AAAA",
+            "content": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
             "tool_name": "computer",
         },
         {

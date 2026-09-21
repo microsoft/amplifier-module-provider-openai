@@ -22,7 +22,6 @@ openai-turn1.json (real traffic captured against gpt-5.6).
 
 from __future__ import annotations
 
-import base64
 import json
 from pathlib import Path
 from typing import Any
@@ -561,7 +560,7 @@ class TestConvertMessagesComputerCallOutput:
         provider._native_call_ids = {"call_abc123"}
         provider._native_call_types = {"call_abc123": "computer"}
 
-        png_b64 = base64.b64encode(b"fake-png-bytes").decode("ascii")
+        png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
         messages = [
             {
                 "role": "tool",
@@ -598,7 +597,7 @@ class TestConvertMessagesComputerCallOutput:
         provider._native_call_ids = {"call_img_1"}
         provider._native_call_types = {"call_img_1": "computer"}
 
-        png_b64 = base64.b64encode(b"another-fake-png").decode("ascii")
+        png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
         messages = [
             {
                 "role": "tool",
@@ -642,7 +641,8 @@ class TestConvertMessagesComputerCallOutput:
             }
         ]
 
-        with pytest.raises(ValueError, match="did not contain image data"):
+        from amplifier_core.llm_errors import InvalidRequestError
+        with pytest.raises(InvalidRequestError, match="no valid screenshot"):
             provider._convert_messages(messages)
 
     def test_apply_patch_result_unaffected_by_computer_branch(self) -> None:
@@ -728,7 +728,7 @@ class TestComputerCallHistoryReplay:
         provider._native_call_ids = set()
         provider._native_call_types = {}
 
-        png_b64 = base64.b64encode(b"replay-png").decode("ascii")
+        png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
         messages = [
             {
                 "role": "assistant",
