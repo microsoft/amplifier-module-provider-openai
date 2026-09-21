@@ -5,6 +5,9 @@ not contact an API: parent DTU validation owns execution of this file.
 """
 
 import asyncio
+import base64
+import copy
+import json
 from importlib.metadata import PackageNotFoundError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -916,3 +919,309 @@ def test_over_budget_continuation_raises_without_a_second_sdk_dispatch():
         asyncio.run(provider.complete(_request("hello")))
 
     assert provider.client.responses.create.await_count == 1
+
+
+# Synthetic transport bytes exercise budgeting without image decoding or API calls.
+_IMAGE_URL = (
+    "data:image/png;base64,"
+    + base64.b64encode(
+        b"\x89PNG\r\n\x1a\n" + b"synthetic-image-budget-fixture" * 40_000
+    ).decode()
+)
+
+
+def _image_request():
+    return _request(
+        [
+            {"type": "text", "text": "Compare these two images."},
+            *[
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": _IMAGE_URL.split(",", 1)[1],
+                    },
+                }
+                for _ in range(2)
+            ],
+        ]
+    )
+
+
+def _calibrate_text(provider):
+    params = provider._budget_params(_request("small text calibration"))
+    provider._record_budget_calibration(params, _response(100))
+    return dict(provider._budget_calibration)
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_typed_images_without_native_count_dispatch_unchanged_without_calibration(
+    use_streaming,
+    caplog,
+):
+    provider = _provider(
+        default_model="gpt-5.6-terra",
+        enable_long_context=True,
+        use_streaming=use_streaming,
+    )
+    calibration = _calibrate_text(provider)
+    request = _image_request()
+    expected = provider._budget_params(request)
+    before = request.model_dump()
+    estimate, _ = provider._estimated_input_tokens(expected)
+    assert estimate > provider._budget_input_limit(expected)
+    response = _response(50_000)
+    response.output = []
+    if use_streaming:
+        provider.client.responses.stream = MagicMock(
+            return_value=_StreamContext(response)
+        )
+    else:
+        provider.client.responses.create = AsyncMock(return_value=response)
+
+    caplog.clear()
+    assert provider.request_budget(request, context_estimate=12_000) is None
+    assert not caplog.records
+    result = asyncio.run(provider.complete(request))
+    sdk_call = (
+        provider.client.responses.stream
+        if use_streaming
+        else provider.client.responses.create
+    )
+    assert sdk_call.call_count == 1
+    assert sdk_call.call_args.kwargs == expected
+    assert request.model_dump() == before
+    assert provider._budget_calibration == calibration
+    assert result.usage.input_tokens == 50_000
+    assert _IMAGE_URL not in caplog.text
+    assert "non-text input" in caplog.text
+
+
+@pytest.mark.parametrize("input_tokens", [10, 900_000])
+def test_typed_images_native_count_remains_authoritative(input_tokens):
+    provider, counter = _native_provider(
+        default_model="gpt-5.6-terra",
+        enable_long_context=True,
+        input_tokens=input_tokens,
+    )
+    calibration = _calibrate_text(provider)
+    request = _image_request()
+    params = provider._budget_params(request)
+    decision = asyncio.run(provider.request_budget(request, context_estimate=12_000))
+    assert decision["measurement"]["input_tokens"] == input_tokens
+    assert decision["input_limit_tokens"] == 767_904
+    assert counter.call_args.kwargs == _count_projection(params)
+    response = _response(input_tokens)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    if input_tokens > decision["input_limit_tokens"]:
+        with pytest.raises(
+            kernel_errors.ContextLengthError, match="native input allowance"
+        ):
+            asyncio.run(provider.complete(request))
+        provider.client.responses.create.assert_not_called()
+    else:
+        asyncio.run(provider.complete(request))
+        assert provider.client.responses.create.call_args.kwargs == params
+    assert counter.await_count == 2
+    assert provider._budget_calibration == calibration
+
+
+def test_failed_image_counter_falls_back_to_api_validation_without_usage_poisoning():
+    provider, counter = _native_provider(
+        default_model="gpt-5.6-terra", enable_long_context=True
+    )
+    calibration = _calibrate_text(provider)
+    counter.side_effect = RuntimeError("synthetic counter unavailable")
+    response = _response(50_000)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    request = _image_request()
+    assert (
+        asyncio.run(provider.request_budget(request, context_estimate=12_000)) is None
+    )
+    asyncio.run(provider.complete(request))
+    assert provider.client.responses.create.await_count == 1
+    assert provider._budget_calibration == calibration
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.invalid/image.png",
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_image", "file_id": "synthetic-file"}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "input_file", "file_data": "synthetic-file-data"}],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call",
+            "output": [
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.invalid/image.png",
+                }
+            ],
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call",
+            "output": [{"type": "input_file", "file_id": "synthetic-file"}],
+        },
+        {
+            "type": "computer_call_output",
+            "call_id": "call",
+            "output": {
+                "type": "computer_screenshot",
+                "image_url": "https://example.invalid/image.png",
+            },
+        },
+    ],
+)
+def test_nontext_wire_positions_do_not_create_or_poison_text_calibration(item):
+    provider = _provider(default_model="gpt-5-mini")
+    params = {"model": "gpt-5-mini", "max_output_tokens": 1000, "input": [item]}
+    before = copy.deepcopy(params)
+    provider._record_budget_calibration(params, _response(100_000))
+    assert provider._budget_calibration == {}
+    calibration = _calibrate_text(provider)
+    provider._record_budget_calibration(params, _response(100_000))
+    assert provider._budget_calibration == calibration
+    provider._budget_calibration["gpt-5-mini"] = (100_000.0, 1, 100_000)
+    provider._guard_assembled_params(params)
+    assert params == before
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _IMAGE_URL,
+        json.dumps({"type": "input_image", "image_url": _IMAGE_URL}),
+    ],
+)
+def test_textual_image_urls_and_quoted_image_json_keep_text_budget_enforcement(content):
+    provider = _provider(default_model="gpt-5-mini")
+    _calibrate_text(provider)
+    request = _request(content)
+    decision = provider.request_budget(request, context_estimate=100_000)
+    assert decision["context_token_budget"] < 100_000
+    with pytest.raises(kernel_errors.ContextLengthError, match="local input allowance"):
+        provider._guard_assembled_params(provider._budget_params(request))
+
+
+def test_tool_schema_image_examples_are_text_not_multimodal_input():
+    provider = _provider(default_model="gpt-5-mini")
+    params = provider._budget_params(_request())
+    params["tools"] = [
+        {
+            "type": "function",
+            "name": "example",
+            "parameters": {
+                "type": "object",
+                "example": {"type": "input_image", "image_url": _IMAGE_URL},
+            },
+        }
+    ]
+    _calibrate_text(provider)
+    with pytest.raises(kernel_errors.ContextLengthError, match="local input allowance"):
+        provider._guard_assembled_params(params)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"max_output_tokens": -1},
+        {"max_output_tokens": 900_000},
+        {"metadata": {"invalid": object()}},
+    ],
+)
+def test_typed_images_do_not_bypass_output_or_serialization_guards(invalid):
+    provider = _provider(default_model="gpt-5.6-terra", enable_long_context=True)
+    params = provider._budget_params(_image_request())
+    params.update(invalid)
+    with pytest.raises(
+        (kernel_errors.ContextLengthError, kernel_errors.InvalidRequestError)
+    ):
+        provider._guard_assembled_params(params)
+
+
+def test_tuple_typed_content_uses_the_same_multimodal_fallback():
+    provider = _provider(default_model="gpt-5-mini")
+    provider._budget_calibration["gpt-5-mini"] = (100_000.0, 1, 100_000)
+    params = {
+        "model": "gpt-5-mini",
+        "input": (
+            {
+                "role": "user",
+                "content": (
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.invalid/image.png",
+                    },
+                ),
+            },
+        ),
+    }
+    provider._guard_assembled_params(params)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {
+            "type": "function_call_output",
+            "call_id": "call",
+            "output": json.dumps({"type": "input_image", "image_url": _IMAGE_URL}),
+        },
+        {
+            "type": "function_call",
+            "call_id": "call",
+            "name": "example",
+            "arguments": json.dumps({"type": "input_image", "image_url": _IMAGE_URL}),
+        },
+    ],
+)
+def test_tool_output_text_and_arguments_keep_the_text_guard(item):
+    provider = _provider(default_model="gpt-5-mini")
+    _calibrate_text(provider)
+    params = {"model": "gpt-5-mini", "input": [item]}
+    with pytest.raises(kernel_errors.ContextLengthError, match="local input allowance"):
+        provider._guard_assembled_params(params)
+
+
+def test_nontext_warning_is_scalar_only_once_per_model(caplog):
+    provider = _provider(default_model="gpt-5-mini")
+    params = {
+        "model": "gpt-5-mini",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.invalid/private-image",
+                    },
+                ],
+            }
+        ],
+    }
+    caplog.clear()
+    provider._guard_assembled_params(params)
+    provider._guard_assembled_params(params)
+    assert len(caplog.records) == 1
+    assert "private-image" not in caplog.text
+    assert "non-text input" in caplog.text

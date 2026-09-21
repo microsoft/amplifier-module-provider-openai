@@ -546,6 +546,16 @@ authoritative API validation and warns once per model. The API can still reject
 the actual request for context overflow; this behavior never discards protected
 input to make the request fit.
 
+The byte estimate applies only to text payloads. Typed image/file content and
+computer screenshots require the native count below: encoded bytes, URLs, and
+file identifiers cannot establish their model token cost. If counting is
+unavailable or fails, their preflight budget is `None` and the unchanged request
+is sent for API validation, with a scalar-only warning once per model. Model,
+output-reservation, and serialization checks still apply. Multimodal response
+usage remains in actual usage accounting but never calibrates the text byte
+estimate. Data URLs or image-shaped JSON inside ordinary text, tool arguments,
+or tool schemas remain subject to the text guard.
+
 ### Native Responses input counts
 
 For a direct `OpenAIProvider` on the effective standard
