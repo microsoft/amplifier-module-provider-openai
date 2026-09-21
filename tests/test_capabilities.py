@@ -143,9 +143,9 @@ class TestOSeriesFamily:
         assert caps.max_output_tokens == 100_000
         assert caps.supports_reasoning is True
         assert caps.default_reasoning_effort == "medium"
-        assert caps.supports_vision is False
+        assert caps.supports_vision is True
         assert caps.supports_streaming is True
-        assert caps.capability_tags == ("tools", "reasoning", "streaming")
+        assert caps.capability_tags == ("tools", "reasoning", "streaming", "vision")
 
     def test_o4_mini(self):
         caps = get_capabilities("o4-mini")
@@ -154,8 +154,16 @@ class TestOSeriesFamily:
         assert caps.max_output_tokens == 100_000
         assert caps.supports_reasoning is True
         assert caps.default_reasoning_effort == "medium"
-        assert caps.supports_vision is False
+        assert caps.supports_vision is True
         assert caps.supports_streaming is True
+
+    @pytest.mark.parametrize(
+        "model", ["o1-mini", "o1-preview", "o3-mini", "o3-mini-2025-01-31"]
+    )
+    def test_text_only_siblings_remain_nonvision(self, model):
+        caps = get_capabilities(model)
+        assert caps.supports_vision is False
+        assert "vision" not in caps.capability_tags
 
 
 class TestDeepResearchFamily:

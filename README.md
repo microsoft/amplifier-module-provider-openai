@@ -473,6 +473,13 @@ The provider detects OpenAI Responses API `function_call` / `tool_call` blocks
 automatically, decodes JSON arguments, and returns standard `ToolCall` objects
 to Amplifier. No extra configuration is required.
 
+#### Tool-result images
+
+Ordinary function tools may return an ordered list of canonical text and
+base64-image blocks. The provider sends these directly as `input_text` and
+`input_image` items in the matching `function_call_output`; known
+non-vision models retain the text and receive an explicit image-omitted notice.
+
 ### Incomplete Response Auto-Continuation
 
 When OpenAI returns `status: "incomplete"` (e.g. `max_output_tokens` reached),

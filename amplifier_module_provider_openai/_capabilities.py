@@ -172,7 +172,6 @@ class ModelCapabilities:
     decoding \u2014 those are downstream/consumer concerns.
     """
 
-
     max_input_tokens: int | None = None
     """Independent input ceiling, if documented; shrinking output cannot raise it."""
 
@@ -279,15 +278,21 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
         )
 
     if family == "o-series":
+        # Image-input support differs within this family; o3-mini is text-only.
+        # Official model modality pages: /api/docs/models/{o1,o1-pro,o3,o3-pro,o4-mini}
+        # Match aliases and their dated snapshots without matching mini/preview siblings.
+        vision_model = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model_id.lower())
+        supports_vision = vision_model in {"o1", "o1-pro", "o3", "o3-pro", "o4-mini"}
         return ModelCapabilities(
             family="o-series",
             context_window=200_000,
             max_output_tokens=100_000,
             supports_reasoning=True,
             default_reasoning_effort="medium",
-            supports_vision=False,
+            supports_vision=supports_vision,
             supports_streaming=True,
-            capability_tags=("tools", "reasoning", "streaming"),
+            capability_tags=("tools", "reasoning", "streaming")
+            + (("vision",) if supports_vision else ()),
             supports_native_apply_patch=False,  # confirmed: o1, o1-pro, o3, o3-pro, o3-mini, o4-mini rejected
         )
 
