@@ -136,7 +136,7 @@ def test_converter_preserves_rich_function_output_order_and_strips_internal_fiel
 
 
 def test_converter_omits_images_for_known_nonvision_model_without_losing_text() -> None:
-    provider = _provider(default_model="o3")
+    provider = _provider(default_model="o3-mini")
     messages = provider._convert_messages(
         [
             _tool_message(
@@ -257,10 +257,10 @@ def test_blocking_complete_uses_effective_model_for_rich_tool_output() -> None:
     provider = _provider(use_streaming=False)
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
-    asyncio.run(provider.complete(_request_with_image_result(), model="o3"))
+    asyncio.run(provider.complete(_request_with_image_result(), model="o3-mini"))
 
     params = provider.client.responses.create.await_args.kwargs
-    assert params["model"] == "o3"
+    assert params["model"] == "o3-mini"
     output = _function_output(params["input"])["output"]
     assert output[0] == {"type": "input_text", "text": "before"}
     assert output[1]["text"].startswith("[Image omitted:")
@@ -288,3 +288,24 @@ def test_streaming_complete_uses_effective_model_for_rich_tool_output() -> None:
         "text": "after",
         "prompt_cache_breakpoint": {"mode": "explicit"},
     }
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["o1", "o1-pro", "o3", "o3-pro", "o4-mini", "o3-2025-04-16", "o4-mini-2025-04-16"],
+)
+def test_o_series_vision_models_preserve_function_tool_images(model: str) -> None:
+    provider = _provider(use_streaming=False, default_model="o3-mini")
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+
+    asyncio.run(provider.complete(_request_with_image_result(), model=model))
+
+    params = provider.client.responses.create.await_args.kwargs
+    assert params["model"] == model
+    output = _function_output(params["input"])["output"]
+    assert output[0]["text"] == "before"
+    assert output[1] == {
+        "type": "input_image",
+        "image_url": f"data:image/png;base64,{_image_data()}",
+    }
+    assert output[2]["text"] == "after"
