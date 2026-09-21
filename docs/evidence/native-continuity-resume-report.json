@@ -1,0 +1,91 @@
+{
+  "scope": "one continuation from retained exact reconstructed-fixture checkpoint; no new compaction",
+  "model": "gpt-6-astra",
+  "effort": "xhigh",
+  "sourceCommit": "0db11fa32c86f820458917a4d5679f8548cb508a",
+  "maxGenerations": 1,
+  "maxOutputTokens": 1024,
+  "maxRetries": 0,
+  "compactions": 0,
+  "toolExecutions": 0,
+  "generationRequests": [
+    {
+      "usesEntireOpaqueCheckpoint": true,
+      "onlyNewUserSuffix": true,
+      "inputTypes": [
+        "message",
+        "message",
+        "compaction",
+        "user"
+      ],
+      "historicalResultsSent": 0
+    }
+  ],
+  "events": [
+    {
+      "order": 1,
+      "event": "native.submitting",
+      "execution_replayed": false
+    },
+    {
+      "order": 2,
+      "event": "native.request"
+    },
+    {
+      "order": 3,
+      "event": "response.created",
+      "responseId": "resp_01d0128c2c529602016ab076c25df487d0b78dbe200b8c13bc"
+    },
+    {
+      "order": 4,
+      "event": "native.response.created",
+      "response_id": "resp_01d0128c2c529602016ab076c25df487d0b78dbe200b8c13bc"
+    },
+    {
+      "order": 5,
+      "event": "response.completed",
+      "responseId": "resp_01d0128c2c529602016ab076c25df487d0b78dbe200b8c13bc"
+    },
+    {
+      "order": 6,
+      "event": "native.completed",
+      "response_id": "resp_01d0128c2c529602016ab076c25df487d0b78dbe200b8c13bc"
+    }
+  ],
+  "responses": [
+    {
+      "id": "resp_01d0128c2c529602016ab076c25df487d0b78dbe200b8c13bc",
+      "status": "completed",
+      "usage": {
+        "input_tokens": 178,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 39,
+        "output_tokens_details": {
+          "reasoning_tokens": 29
+        },
+        "total_tokens": 217
+      },
+      "incompleteReason": null
+    }
+  ],
+  "answer": "FINAL-B 17",
+  "checks": {
+    "answerMatches": true,
+    "oneCompletedResponse": true,
+    "oneGeneration": true,
+    "noToolExecution": true,
+    "entireOpaqueOutputUsed": true,
+    "onlyNewUserSuffix": true,
+    "noHistoricalResultResent": true,
+    "canonicalPrefixUnchanged": true,
+    "checkpointUnchanged": true,
+    "privateStateBytesUnchanged": true,
+    "savedConfigurationUnchanged": true
+  },
+  "passed": true,
+  "privateStateSha256": "48afcfec1e0ff4e593ae2274bf2d50648d59e406a75e8a6efa53456cc14289d4",
+  "savedConfigurationUnchanged": true
+}

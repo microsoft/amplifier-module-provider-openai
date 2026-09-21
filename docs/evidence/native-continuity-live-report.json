@@ -1,0 +1,172 @@
+{
+  "scope": "reconstructed synthetic call/result fixture, not restoration of the previous smoke canonical history",
+  "model": "gpt-6-astra",
+  "effort": "xhigh",
+  "sdk": "3.5.0",
+  "maxGenerations": 2,
+  "maxCompactions": 1,
+  "maxOutputTokensPerGeneration": 1024,
+  "events": [
+    {
+      "order": 1,
+      "event": "native.submitting",
+      "execution_replayed": false
+    },
+    {
+      "order": 2,
+      "event": "native.request"
+    },
+    {
+      "order": 3,
+      "event": "response.created",
+      "responseId": "resp_01d0128c2c529602016ab073f313f487d0b412825c1a10c647"
+    },
+    {
+      "order": 4,
+      "event": "native.response.created",
+      "response_id": "resp_01d0128c2c529602016ab073f313f487d0b412825c1a10c647"
+    },
+    {
+      "order": 5,
+      "event": "response.completed",
+      "responseId": "resp_01d0128c2c529602016ab073f313f487d0b412825c1a10c647"
+    },
+    {
+      "order": 6,
+      "event": "native.completed",
+      "response_id": "resp_01d0128c2c529602016ab073f313f487d0b412825c1a10c647"
+    },
+    {
+      "order": 7,
+      "event": "fixture.private_state_saved"
+    },
+    {
+      "order": 8,
+      "event": "fixture.new_provider_restored_exact_checkpoint"
+    },
+    {
+      "order": 9,
+      "event": "native.submitting",
+      "execution_replayed": false
+    },
+    {
+      "order": 10,
+      "event": "native.request"
+    },
+    {
+      "order": 11,
+      "event": "response.created",
+      "responseId": "resp_0bed8a7072672a96016ab073fa541887d0a7ebe2c99433ca82"
+    },
+    {
+      "order": 12,
+      "event": "native.response.created",
+      "response_id": "resp_0bed8a7072672a96016ab073fa541887d0a7ebe2c99433ca82"
+    },
+    {
+      "order": 13,
+      "event": "response.completed",
+      "responseId": "resp_0bed8a7072672a96016ab073fa541887d0a7ebe2c99433ca82"
+    },
+    {
+      "order": 14,
+      "event": "native.completed",
+      "response_id": "resp_0bed8a7072672a96016ab073fa541887d0a7ebe2c99433ca82"
+    }
+  ],
+  "generationRequests": [
+    {
+      "inputTypes": [
+        "user",
+        "function_call",
+        "function_call_output",
+        "user"
+      ],
+      "resultCallIds": [
+        "call_UM1XakNt9EgrdiGKlKCtQZC8"
+      ],
+      "callIds": [
+        "call_UM1XakNt9EgrdiGKlKCtQZC8"
+      ],
+      "pairOrdered": true,
+      "usesOpaqueCheckpoint": false,
+      "previousResponseId": null
+    },
+    {
+      "inputTypes": [
+        "user",
+        "function_call",
+        "function_call_output",
+        "user",
+        "message",
+        "user"
+      ],
+      "resultCallIds": [
+        "call_UM1XakNt9EgrdiGKlKCtQZC8"
+      ],
+      "callIds": [
+        "call_UM1XakNt9EgrdiGKlKCtQZC8"
+      ],
+      "pairOrdered": true,
+      "usesOpaqueCheckpoint": false,
+      "previousResponseId": null
+    }
+  ],
+  "responses": [
+    {
+      "id": "resp_01d0128c2c529602016ab073f313f487d0b412825c1a10c647",
+      "status": "completed",
+      "usage": {
+        "input_tokens": 89,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 65,
+        "output_tokens_details": {
+          "reasoning_tokens": 55
+        },
+        "total_tokens": 154
+      },
+      "incompleteReason": null
+    },
+    {
+      "id": "resp_0bed8a7072672a96016ab073fa541887d0a7ebe2c99433ca82",
+      "status": "completed",
+      "usage": {
+        "input_tokens": 125,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 35,
+        "output_tokens_details": {
+          "reasoning_tokens": 25
+        },
+        "total_tokens": 160
+      },
+      "incompleteReason": null
+    }
+  ],
+  "toolExecutions": 0,
+  "compactionRequests": 1,
+  "errors": [],
+  "firstAnswer": "FINAL-B 17",
+  "compactionUsage": {
+    "input_tokens": 174,
+    "output_tokens": 100,
+    "total_tokens": 274
+  },
+  "privateStateSha256": "48afcfec1e0ff4e593ae2274bf2d50648d59e406a75e8a6efa53456cc14289d4",
+  "checkpointSha256": "42487c4150f0d1bc5cf09ae17c2ff39522505256a029b544e6931fd5a1daa831",
+  "privateStateBytesMatch": true,
+  "checkpointRestored": true,
+  "checkpointHashMatches": true,
+  "secondAnswer": "FINAL-B 17",
+  "sameTagAndValue": true,
+  "resultSentOnceToGenerations": false,
+  "secondRequestUsedCheckpoint": false,
+  "noToolExecution": true,
+  "passed": false,
+  "savedConfigurationChanged": false
+}

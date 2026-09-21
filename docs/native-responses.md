@@ -94,9 +94,14 @@ nonterminal receipts unknown after restart without replay.
 
 Protocol fixtures exercise real provider assembly/parsing, accepted vs applied
 identity, pending continuation, interruption/reconnect, bounded ownership and
-opaque JSON preservation/restore. They do not prove live provider availability.
-The selected live acceptance configuration was Terra/high; native steering was
-not enabled or live-tested on a different model.
+opaque JSON preservation/restore. Separately authorized synthetic live checks on
+2026-09-20 used the configured `gpt-6-astra` / `xhigh` account, OpenAI SDK 3.5.0,
+and a 1,024 output-token cap without changing saved defaults. They established
+real streaming steering and, in a separate retained fixture, exact checkpoint
+restoration and a completed continuation. The earlier failed continuity check is
+preserved alongside the fix evidence. These checks do not establish arbitrary
+account/model support or recovery of an unknown remote action. See
+[bounded live acceptance evidence](native-acceptance-2026-09-20.md).
 
 Protocol checked against current official documentation on 2026-09-20:
 [steering](https://developers.openai.com/api/docs/guides/steering),
