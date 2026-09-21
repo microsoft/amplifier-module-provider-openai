@@ -134,3 +134,102 @@ def test_safety_text_alongside_an_image_is_not_silently_dropped():
     ]
     with pytest.raises(ValueError, match="accompanying text"):
         screenshot_data_url(content)
+
+
+def test_later_user_message_projects_failure_without_replay_or_canonical_changes():
+    provider = OpenAIProvider(api_key="test-key", config={})
+    messages = [
+        {"role": "user", "content": "Inspect the fixture"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Checking"},
+                {
+                    "type": "tool_call",
+                    "id": "call_42",
+                    "name": "computer",
+                    "input": {"actions": [{"type": "screenshot"}]},
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_42",
+            "content": json.dumps(
+                {
+                    "success": False,
+                    "error": {
+                        "code": "safety_halt",
+                        "message": "Explicit resume required",
+                    },
+                }
+            ),
+        },
+    ]
+    original = copy.deepcopy(messages)
+    with pytest.raises(InvalidRequestError):
+        provider._convert_messages(messages)
+    with pytest.raises(InvalidRequestError):
+        provider._convert_messages(
+            [
+                *messages,
+                {
+                    "role": "user",
+                    "content": "Injected reminder",
+                    "metadata": {"ephemeral": True},
+                },
+            ]
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": "Leave the computer halted. Explain the failure without tools.",
+        }
+    )
+    wire = provider._convert_messages(messages)
+    assert not any(
+        item.get("type") in {"computer_call", "computer_call_output", "function_call"}
+        for item in wire
+    )
+    encoded = json.dumps(wire)
+    assert (
+        "safety_halt" in encoded
+        and "Explicit resume required" in encoded
+        and "call_42" in encoded
+    )
+    assert "halt remains in effect" in encoded and "Do not replay" in encoded
+    assert messages[:-1] == original
+    assert (
+        provider._native_call_types["call_42"] == "computer"
+    )  # No halt/native ownership reset.
+
+
+def test_projection_keeps_valid_image_and_unrelated_tool_identity_and_bounds_reference():
+    from amplifier_module_provider_openai.computer_history import (
+        project_failed_computer_history,
+    )
+
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "bad", "name": "computer", "arguments": {"actions": []}},
+                {"id": "good", "name": "computer", "arguments": {"actions": []}},
+                {"id": "other", "name": "read_file", "arguments": {}},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "bad",
+            "content": "Safety halt " + "x" * 20000,
+        },
+        {"role": "tool", "tool_call_id": "good", "content": PNG},
+        {"role": "tool", "tool_call_id": "other", "content": "kept"},
+        {"role": "user", "content": "Explain"},
+    ]
+    original = copy.deepcopy(messages)
+    view = project_failed_computer_history(messages)
+    assert [call["id"] for call in view[0]["tool_calls"]] == ["good", "other"]
+    assert view[2:] == messages[2:] and messages == original
+    assert len(view[1]["content"]) < 14000 and '"truncated": true' in view[1]["content"]
+    assert project_failed_computer_history(view) is view  # Stable once projected.

@@ -1,0 +1,30 @@
+{
+  "scope": "offline retained exact checkpoint, no provider calls",
+  "checks": {
+    "restored": true,
+    "entireOpaqueOutputPreserved": true,
+    "onlyNewUserSuffix": true,
+    "noOldToolResultResent": true,
+    "checkpointRecordUnchanged": true,
+    "canonicalPrefixUnchanged": true,
+    "privateStateBytesUnchanged": true,
+    "savedConfigurationUnchanged": true
+  },
+  "passed": true,
+  "providerCalls": 0,
+  "privateStateSha256": "48afcfec1e0ff4e593ae2274bf2d50648d59e406a75e8a6efa53456cc14289d4",
+  "originalWireTypes": [
+    "user",
+    "function_call",
+    "function_call_output",
+    "user",
+    "message",
+    "user"
+  ],
+  "plannedWireTypes": [
+    "message",
+    "message",
+    "compaction",
+    "user"
+  ]
+}

@@ -12,6 +12,9 @@ dependencies = [
     "openai>=1.0.0",
 ]
 
+[project.optional-dependencies]
+native = ["websockets>=15,<17"]
+
 [project.entry-points."amplifier.modules"]
 provider-openai = "amplifier_module_provider_openai:mount"
 

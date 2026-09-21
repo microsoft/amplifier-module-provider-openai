@@ -658,3 +658,16 @@ This project may contain trademarks or logos for projects, products, or services
 trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+
+### Optional provider-owned native transport
+
+Hosts can opt into the `native` extra and the session-local
+`NativeResponsesProvider` adapter for supported Responses WebSocket steering and
+explicit opaque compaction. Ordinary provider mounting remains unchanged.
+See [native transport contract and limits](docs/native-responses.md).
+
+### Continuing after a native computer screenshot failure
+
+A failed computer result remains a non-retryable local protocol error in its current turn (`computer_result_not_image`). After a later non-ephemeral user message, the provider builds a request-only projection: the failed native call/result pair becomes bounded, explicitly untrusted textual evidence carrying the original call identity, result kind and digest. Canonical messages are unchanged. Valid screenshot pairs and unrelated tools remain intact.
+
+This allows a user to discuss the failure without manufacturing a screenshot or replaying the prior action. It does not grant approval, resume a computer tool, clear a durable tool/provider halt, or rewrite the original result. Hosts must mark injected reminders/observations ephemeral; they are not new user input. The native transport uses the normalized view to start a new lineage once, retaining its existing refusal to move pending steering into a rewritten context. Real user instructions still require ordinary tool authority and any separate safety-halt resolution.
