@@ -206,11 +206,11 @@ async def complete(provider, request, options):
         raise SingleAttemptError("unsupported_endpoint_or_client")
     try:
         request, params, count_params = _plan(provider, request, options)
+        request_hash = _digest(params)
     except SingleAttemptError:
         raise
     except Exception:  # noqa: BLE001 - sanitize provider assembly diagnostics
         raise SingleAttemptError("invalid_request") from None
-    request_hash = _digest(params)
     client = None
     transport = None
     try:

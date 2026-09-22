@@ -219,6 +219,29 @@ async def test_final_wire_override_fails_before_any_client_or_send(wire, extra):
 
 
 @pytest.mark.parametrize(
+    "extra", [{"temperature": float("nan")}, {"metadata": {"invalid": object()}}]
+)
+@pytest.mark.asyncio
+async def test_noncanonical_params_are_sanitized_before_any_client(
+    wire, monkeypatch, extra
+):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Admission failure must precede HTTP/SDK client construction")
+
+    monkeypatch.setattr(bounded, "_http_client", forbidden)
+    monkeypatch.setattr(module, "AsyncOpenAI", forbidden)
+    provider = OpenAIProvider(
+        api_key="offline-dummy", config={"extra_request_params": extra}
+    )
+    with pytest.raises(bounded.SingleAttemptError) as error:
+        await run(provider)
+    assert error.value.reason == "invalid_request"
+    assert str(error.value) == "single_attempt.invalid_request"
+    assert error.value.retryable is False
+    assert wire.calls == wire.clients == []
+
+
+@pytest.mark.parametrize(
     "changes",
     [
         {"reasoning_effort": None},
