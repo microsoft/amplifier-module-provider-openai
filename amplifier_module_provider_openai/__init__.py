@@ -188,6 +188,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     )
     await coordinator.mount("providers", provider, name="openai")
 
+    from .images import register_image_backend
+
+    remove_image_backend = register_image_backend(coordinator, provider, config)
+
     coordinator.register_contributor(
         "session.cost",
         "provider-openai",
@@ -205,6 +209,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     # Return cleanup function
     async def cleanup():
+        remove_image_backend()
         await provider.close()
 
     return cleanup
@@ -1024,6 +1029,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "extra_request_params",
         "close_timeout",
         "tool_search",
+        "image_generation",
     }
 )
 
