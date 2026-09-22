@@ -993,9 +993,9 @@ def _decode_reasoning_state(
     return None, None, None
 
 
-# Every config key this module actually reads -- audited against every
-# `self.config.get(...)` call site in the constructor and the request path.
-# 28 entries. (Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.)
+# Every config key this module actually reads -- audited against mount,
+# constructor and request paths, including the optional image backend.
+# 32 entries. (Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.)
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "base_url",

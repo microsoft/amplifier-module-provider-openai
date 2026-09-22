@@ -551,7 +551,7 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
         | _DEPRECATED_ALIAS_CONFIG_KEYS
         | _INFRASTRUCTURE_CONFIG_KEYS
     )
-    # 31 keys: the 28 the config-surface-V2 survey counted (32 - 5 removed
+    # 32 keys: the 28 the config-surface-V2 survey counted (32 - 5 removed
     # [enable_state, enable_reasoning_context, enable_response_chaining,
     # thinking_budget_tokens, thinking_budget_buffer] + 1 added
     # [extra_request_params]), + 1 added by the reasoning.context gate fix
@@ -559,6 +559,22 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
     # (close_timeout -- the ceiling close() puts on the HTTP client's
     # shutdown), + 1 added by deferred tool loading (tool_search -- ONE
     # key holding the whole {mode, namespaces, always_loaded} mapping, so
-    # the surface grows by one entry, not three). Audited against every
+    # the surface grows by one entry, not three), + 1 optional Images API
+    # backend configuration object (image_generation). Audited against every
     # `self.config.get(...)` call site in the constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 31
+    assert len(_CONSUMED_CONFIG_KEYS) == 32
+    assert "image_generation" in _CONSUMED_CONFIG_KEYS
+
+
+def test_image_backend_configuration_is_consumed_without_changing_chat_wire(caplog):
+    """An optional image backend must not leak its config/model into Responses."""
+    provider = _make_provider(
+        default_model="gpt-5.6-terra",
+        image_generation={"enabled": True, "id": "images", "model": "fixture-image"},
+    )
+    provider.client.responses.create = AsyncMock(return_value=_DummyResponse())
+    asyncio.run(provider.complete(_simple_request()))
+    params = _captured_params(provider)
+    assert params["model"] == "gpt-5.6-terra"
+    assert "image_generation" not in params
+    assert "image_generation" not in caplog.text
