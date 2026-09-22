@@ -107,3 +107,20 @@ def test_registration_is_opt_in_explicit_and_cleanup_does_not_remove_other_backe
     capabilities["image.backends"]["other"] = object()
     cleanup()
     assert set(capabilities["image.backends"]) == {"other"}
+
+
+def test_old_cleanup_cannot_remove_replacement_registration_with_same_identity():
+    capabilities = {}
+    coordinator = SimpleNamespace(
+        get_capability=capabilities.get, register_capability=capabilities.__setitem__
+    )
+    config = {"image_generation": {"enabled": True, "id": "chosen", "model": "configured"}}
+    cleanup_old = register_image_backend(coordinator, SimpleNamespace(), config)
+    old_backend = capabilities["image.backends"].pop("chosen")
+    cleanup_new = register_image_backend(coordinator, SimpleNamespace(), config)
+    replacement = capabilities["image.backends"]["chosen"]
+    assert replacement is not old_backend
+    cleanup_old()
+    assert capabilities["image.backends"]["chosen"] is replacement
+    cleanup_new()
+    assert not capabilities["image.backends"]
