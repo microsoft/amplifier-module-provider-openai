@@ -2457,6 +2457,10 @@ class OpenAIProvider:
         provider_capabilities = ["streaming", "tools", "reasoning", "batch", "json_mode"]
         if self._provider_count_available():
             provider_capabilities.append("request_budget:provider_count")
+        from ._single_attempt import CAPABILITY, endpoint
+
+        if endpoint(self) is not None:
+            provider_capabilities.append(CAPABILITY)
         return ProviderInfo(
             id="openai",
             display_name="OpenAI",
@@ -2963,6 +2967,15 @@ class OpenAIProvider:
             ChatResponse with content blocks, tool calls, usage
         """
         kwargs = self._merge_request_options(request_options, kwargs)
+
+        if "single_attempt" in kwargs:
+            from ._single_attempt import SingleAttemptError, complete
+
+            single_attempt = kwargs.pop("single_attempt")
+            if type(single_attempt) is not bool:
+                raise SingleAttemptError("invalid_options")
+            if single_attempt:
+                return await complete(self, request, kwargs)
 
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
