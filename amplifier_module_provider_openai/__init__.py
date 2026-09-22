@@ -1950,7 +1950,7 @@ class OpenAIProvider:
                 *(m.model_dump() for m in developer_msgs),
                 *(m.model_dump() for m in conversation),
             ]
-            model_name = kwargs.get("model", self.default_model)
+            model_name = kwargs.get("model") or request.model or self.default_model
             background_mode = kwargs.get("background", False)
             if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
                 ("o3-deep-research", "o4-mini-deep-research")
@@ -2902,6 +2902,43 @@ class OpenAIProvider:
             tool_call_id=call_id,
             name=tool_name,
         )
+
+    def supports_native_compaction(self) -> bool:
+        """Only claim the official endpoint contract, never an inherited proxy."""
+        return self._uses_standard_openai_endpoint() and callable(getattr(self.client.responses, "compact", None))
+
+    def validate_compacted_context(self, message: dict[str, Any]) -> bool:
+        """Reject a placeholder whose actual opaque transport is unavailable."""
+        from .compaction import canonical_window
+
+        return canonical_window(message, self.default_model) is not None
+
+    async def compact_context(self, request: ChatRequest) -> dict[str, Any]:
+        """Compact a bounded window and retain every returned canonical item.
+
+        No tools are executed, no original messages are changed, and no server
+        conversation is created. Hosts persist this derived checkpoint alongside
+        (never in place of) canonical history.
+        """
+        from .compaction import canonical_usage, compacted_message
+
+        if not self.supports_native_compaction():
+            raise NotImplementedError("This endpoint does not advertise native Responses compaction")
+        params = self._budget_params(request)
+        input_tokens = await self._guard_assembled_params_with_provider_count(params)
+        compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
+        response = await self.client.responses.compact(**compact_params)
+        # SDK output models can invent unset fields (e.g. phase=None on a
+        # retained user message), which are illegal when replayed as input.
+        # exclude_unset preserves exactly the fields actually returned, including
+        # explicit null values, instead of normalizing the canonical window.
+        output = [item.model_dump(mode="json", exclude_unset=True, warnings=False) if hasattr(item, "model_dump")
+                  else copy.deepcopy(item) for item in response.output]
+        usage = getattr(response, "usage", None)
+        if hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
+        return {"kind": "native", "message": compacted_message(params["model"], output),
+                "usage": canonical_usage(usage), "input_tokens": input_tokens}
 
     async def complete(
         self,
@@ -4187,8 +4224,10 @@ class OpenAIProvider:
             List of OpenAI-formatted message objects per Responses API spec
         """
         from .computer_history import project_failed_computer_history
+        from .compaction import canonical_window
         messages = project_failed_computer_history(messages, self._native_call_types)
         openai_messages = []
+        canonical_item_ids = set()
         i = 0
         model_name = model or self.default_model
 
@@ -4232,6 +4271,15 @@ class OpenAIProvider:
 
         while i < len(messages):
             msg = messages[i]
+            window = canonical_window(msg, model_name)
+            if window is not None:
+                # Standalone compact output is already canonical. Preserve the
+                # full list byte-for-byte in JSON values, including retained
+                # items before/after encrypted state; do not repair inside it.
+                openai_messages.extend(window)
+                canonical_item_ids.update(id(item) for item in window)
+                i += 1
+                continue
             role = msg.get("role")
             content = msg.get("content", "")
 
@@ -4855,6 +4903,7 @@ class OpenAIProvider:
             repaired.append(item)
             if (
                 isinstance(item, dict)
+                and id(item) not in canonical_item_ids
                 and item.get("type") == "function_call"
                 and item.get("call_id")
                 and item["call_id"] not in output_call_ids
