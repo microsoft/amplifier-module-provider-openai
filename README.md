@@ -678,3 +678,25 @@ See [native transport contract and limits](docs/native-responses.md).
 A failed computer result remains a non-retryable local protocol error in its current turn (`computer_result_not_image`). After a later non-ephemeral user message, the provider builds a request-only projection: the failed native call/result pair becomes bounded, explicitly untrusted textual evidence carrying the original call identity, result kind and digest. Canonical messages are unchanged. Valid screenshot pairs and unrelated tools remain intact.
 
 This allows a user to discuss the failure without manufacturing a screenshot or replaying the prior action. It does not grant approval, resume a computer tool, clear a durable tool/provider halt, or rewrite the original result. Hosts must mark injected reminders/observations ephemeral; they are not new user input. The native transport uses the normalized view to start a new lineage once, retaining its existing refusal to move pending steering into a rewritten context. Real user instructions still require ordinary tool authority and any separate safety-halt resolution.
+
+### Standalone compaction for the ordinary Responses provider
+
+The ordinary `OpenAIProvider` now exposes optional host capabilities:
+`supports_native_compaction()`, `validate_compacted_context(message)`, and
+`compact_context(request)`. This is distinct from the separate WebSocket adapter.
+The official OpenAI endpoint and an SDK exposing `responses.compact` are required;
+compatible proxies do not inherit that claim.
+
+The host must persist the returned `message` as derived state alongside its
+original transcript. Its metadata contains the **entire canonical output window**,
+including retained items before/after encrypted state. Continuation expands that
+window unchanged, validates the model identity, and does not fabricate tool
+results inside it. Count and fit the complete assembled window via
+`request_budget`; the short carrier label is not its token count. A missing or
+invalid carrier must rebuild from original history, not continue with the label.
+
+`compact_context` counts input before dispatch, never executes tools, and returns
+normalized usage with separate cache-write/read buckets. Native compact cost is
+left unavailable when the response does not report it. Canonical SDK output uses
+`exclude_unset=True` so SDK-invented defaults do not become invalid input fields.
+See the [OpenAI compaction contract](https://developers.openai.com/api/docs/guides/compaction).
