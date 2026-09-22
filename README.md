@@ -95,6 +95,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `max_concurrent_requests` | **Amplifier-only** | Process-wide in-flight concurrency gate (default 5; 0 disables). | — | |
 | `extra_request_params` | **Amplifier-only (escape hatch)** | Responses API params override provider defaults; Astra's final compatibility checks still apply. Round-tripped by app-cli config tooling. | Depends on what you set. | |
 | `tool_search` | `tools` (shape) | Mapping: `mode` (`off` default \| `namespaced`), optional `namespaces` table, optional `always_loaded`. See [Deferred tool loading](#deferred-tool-loading-tool_searchmode). | Non-default rebuilds the prompt cache once, and the model must *search* for a deferred tool. | |
+| `image_generation` | Separate Images API backend | Optional object: `enabled`, unique backend `id`, explicit image `model`, optional `timeout` (1–600 seconds; default 180). See [Image backend](#image-backend). | Separate paid image requests; no automatic retry. | |
 
 **Deprecated aliases** (still work, warn once, will be removed):
 
@@ -112,6 +113,39 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `enable_reasoning_context` | Removed — `reasoning.context` is now forwarded whenever you supply it. Set the first-class key `reasoning_context = "current_turn"` (composes with `reasoning_effort`), or put it in the legacy `reasoning` dict, e.g. `reasoning = {effort = "high", context = "current_turn"}`. |
 | `thinking_budget_tokens` | Removed — `extended_thinking` still forces high reasoning effort, but no longer adjusts `max_output_tokens`. Set `max_output_tokens` directly. |
 | `thinking_budget_buffer` | Removed — see `thinking_budget_tokens`. |
+
+### Image backend
+
+Image generation is disabled unless `image_generation.enabled` is exactly `true`.
+Configure it on the ordinary API provider instance whose credential and endpoint
+should serve image requests; the chat model and provider selection remain separate:
+
+```yaml
+image_generation:
+  enabled: true
+  id: images
+  model: YOUR_CHOSEN_IMAGE_MODEL
+```
+
+This settings-only object also works through a host's advanced JSON configuration
+editor. Mount registers an `image.backends` capability keyed by the explicit ID;
+duplicate IDs fail instead of choosing an account implicitly. Cleanup removes only
+its own backend. Registration reports configured support, never verified account
+entitlement, and does not add image generation to chat-model capabilities.
+
+The backend accepts generate/edit requests from an independently mounted tool. It
+returns one PNG as bytes, the provider request ID and optional reported usage.
+Edit inputs are supplied as bytes. It does not read/write files, download image
+URLs, install a tool, choose a different account/model or own permission policy.
+Requests use the Images API with SDK retries disabled, including on timeouts and
+server errors: the caller must reconcile uncertain paid outcomes before a new
+request. Hosts own durable receipts, input lineage, artifact verification, visual
+inspection and saved output delivery. Chat-token cost accounting does not include
+these separate calls.
+
+Choose an image model supported by the account and endpoint using the current
+[image generation guide](https://developers.openai.com/api/docs/guides/image-generation).
+No default image model or automatic account fallback is supplied.
 
 ### Unrecognized config keys
 
