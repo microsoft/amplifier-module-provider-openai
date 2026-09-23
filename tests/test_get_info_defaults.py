@@ -74,7 +74,7 @@ class TestGetInfoUsesCapabilities:
         info = provider.get_info()
         assert info.defaults["max_tokens"] == 16384
         assert info.defaults["temperature"] is None
-        assert info.defaults["timeout"] == 600.0
+        assert info.defaults["timeout"] is None
 
 
 class TestGPT54CostSafeBehaviorRegression:

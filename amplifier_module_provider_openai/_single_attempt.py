@@ -112,6 +112,10 @@ def _plan(provider, request, options):
         "content": request.messages[0].content,
     }:
         raise SingleAttemptError("invalid_request")
+    # Ordinary assembly removes this transport option from JSON. This bounded
+    # mode must still reject an escape-hatch override of its admitted deadline.
+    if "timeout" in provider.extra_request_params:
+        raise SingleAttemptError("wire_mismatch")
     params, _, _ = provider._assemble_initial_responses_params(request, **options)
     expected_input = [
         {

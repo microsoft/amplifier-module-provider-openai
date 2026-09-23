@@ -90,7 +90,8 @@ async def test_compact_returns_all_canonical_items_then_passes_them_as_is():
     before = request.model_dump()
     result = await provider.compact_context(request)
     params = responses.compact.call_args.kwargs
-    assert set(params) == {"model", "input", "instructions"}
+    assert set(params) == {"model", "input", "instructions", "timeout"}
+    assert params["timeout"].read is None
     assert params["instructions"] == "Stable instructions"
     assert request.model_dump() == before
     continuation = ChatRequest(

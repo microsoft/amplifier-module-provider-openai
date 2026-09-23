@@ -104,7 +104,9 @@ class DummyResponse:
 
 
 def _captured(provider: OpenAIProvider) -> dict[str, Any]:
-    return cast(AsyncMock, provider.client.responses.create).call_args.kwargs
+    return {key: value for key, value in
+        cast(AsyncMock, provider.client.responses.create).call_args.kwargs.items()
+        if key != "timeout"}
 
 
 def _run(provider: OpenAIProvider, request: ChatRequest) -> dict[str, Any]:

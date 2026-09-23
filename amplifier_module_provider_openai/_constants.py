@@ -35,7 +35,7 @@ DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
 DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
-DEFAULT_TIMEOUT = 600.0  # 10 minutes
+DEFAULT_TIMEOUT = None  # Wait for completion unless the caller selects a deadline.
 # `None` (omit the field) is the cache-friendly default. OpenAI's
 # `truncation="auto"` silently drops oldest messages when context fills,
 # which rewrites the cached prefix and busts prompt caching — listed on
@@ -58,9 +58,7 @@ MAX_CONTINUATION_ATTEMPTS = 5
 
 # Deep research / background mode constants
 DEFAULT_POLL_INTERVAL = 5.0  # seconds between status polls
-DEFAULT_BACKGROUND_TIMEOUT = (
-    1800.0  # 30 minutes for background requests (deep research can be slow)
-)
+DEFAULT_BACKGROUND_TIMEOUT = None
 
 # Ceiling on how long close() waits for the HTTP client to shut down.
 # An httpx transport with a wedged connection can leave AsyncOpenAI.close()

@@ -19,6 +19,15 @@ from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 from amplifier_module_provider_openai import OpenAIProvider, _tool_search
 
 
+def _wire_params(sdk_kwargs):
+    # The SDK consumes timeout locally; it is not a JSON body field and must
+    # not change input-token measurements or the exact assembled wire payload.
+    result = dict(sdk_kwargs)
+    timeout = result.pop("timeout")
+    assert timeout.read is None and timeout.write is None
+    return result
+
+
 def _provider(**config):
     return OpenAIProvider(
         api_key="test-key",
@@ -215,7 +224,7 @@ def test_native_count_and_generation_share_final_assembly_for_both_dispatch_path
         else provider.client.responses.create
     )
     assert counter.call_args.kwargs == _count_projection(expected)
-    assert sdk_call.call_args.kwargs == expected
+    assert _wire_params(sdk_call.call_args.kwargs) == expected
     assert "request_options" not in sdk_call.call_args.kwargs
 
 
@@ -562,7 +571,7 @@ def test_preflight_assembly_matches_nonstream_sdk_payload():
         )
     )
 
-    assert provider.client.responses.create.call_args.kwargs == expected
+    assert _wire_params(provider.client.responses.create.call_args.kwargs) == expected
 
 
 def test_negative_output_reserve_cannot_enlarge_the_input_allowance():
@@ -593,7 +602,7 @@ def test_preflight_assembly_matches_streaming_sdk_payload_and_final_usage():
 
     asyncio.run(provider.complete(request))
 
-    assert provider.client.responses.stream.call_args.kwargs == expected
+    assert _wire_params(provider.client.responses.stream.call_args.kwargs) == expected
     assert "gpt-5-mini" in provider._budget_calibration
 
 
@@ -888,7 +897,7 @@ def test_continuation_rechecks_and_calibrates_its_exact_final_params():
     asyncio.run(provider.complete(request))
 
     assert provider.client.responses.create.await_count == 2
-    continuation_params = provider.client.responses.create.call_args_list[1].kwargs
+    continuation_params = _wire_params(provider.client.responses.create.call_args_list[1].kwargs)
     assert continuation_params["input"] == provider._build_continuation_input(
         provider.client.responses.create.call_args_list[0].kwargs["input"], []
     )
@@ -990,7 +999,7 @@ def test_typed_images_without_native_count_dispatch_unchanged_without_calibratio
         else provider.client.responses.create
     )
     assert sdk_call.call_count == 1
-    assert sdk_call.call_args.kwargs == expected
+    assert _wire_params(sdk_call.call_args.kwargs) == expected
     assert request.model_dump() == before
     assert provider._budget_calibration == calibration
     assert result.usage.input_tokens == 50_000
@@ -1023,7 +1032,7 @@ def test_typed_images_native_count_remains_authoritative(input_tokens):
         provider.client.responses.create.assert_not_called()
     else:
         asyncio.run(provider.complete(request))
-        assert provider.client.responses.create.call_args.kwargs == params
+        assert _wire_params(provider.client.responses.create.call_args.kwargs) == params
     assert counter.await_count == 2
     assert provider._budget_calibration == calibration
 

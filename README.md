@@ -78,7 +78,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `reasoning_summary` | `reasoning.summary` | Reasoning verbosity: `auto`\|`concise`\|`detailed`. | `detailed` uses more output tokens. | |
 | `truncation` | `truncation` | `null` (default) omits the field; API errors on overflow. `"auto"` drops oldest messages (busts cache). | `"auto"` lowers cache hit rate. | |
 | `raw` | **Amplifier-only** | When `true`, includes the full (redacted) request payload in `llm:request` events. | — | |
-| `timeout` | (client) | Per-request timeout seconds. | — | |
+| `timeout` | (client) | Optional model request timeout seconds; unset/null waits for completion or cancellation. Connection setup remains bounded. | — | |
 | `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
 | `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
 | `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. Astra removes this legacy field and warns once; use `prompt_cache_options.ttl: "30m"`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime where supported. | |
@@ -88,7 +88,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
 | `reasoning_replay_scope` | **Amplifier-only** | Bounds inline reasoning replay: `turn` (default) \| `all` \| `none`. | `"all"` grows the payload without bound (~1,200 chars/blob). | |
 | `poll_interval` | (background) | Seconds between background-mode status polls. | — | |
-| `background_timeout` | (background) | Timeout seconds for background (deep-research) requests. | — | |
+| `background_timeout` | (background) | Optional deadline for background (deep-research) requests; unset/null waits for completion or cancellation. | — | |
 | `priority` | **Amplifier-only** | Provider selection priority (lower = higher). | — | |
 | `use_streaming` | (transport) | Chunked HTTP transport (default `true`). Not progressive UI streaming. | — | |
 | `max_retries` / `min_retry_delay` / `max_retry_delay` / `retry_jitter` | (retry) | Shared retry-with-backoff configuration. | — | |
@@ -96,6 +96,15 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `extra_request_params` | **Amplifier-only (escape hatch)** | Responses API params override provider defaults; Astra's final compatibility checks still apply. Round-tripped by app-cli config tooling. | Depends on what you set. | |
 | `tool_search` | `tools` (shape) | Mapping: `mode` (`off` default \| `namespaced`), optional `namespaces` table, optional `always_loaded`. See [Deferred tool loading](#deferred-tool-loading-tool_searchmode). | Non-default rebuilds the prompt cache once, and the model must *search* for a deferred tool. | |
 | `image_generation` | Separate Images API backend | Optional object: `enabled`, unique backend `id`, explicit image `model`, optional `timeout` (1–600 seconds; default 180). See [Image backend](#image-backend). | Separate paid image requests; no automatic retry. | |
+
+Model completion, streaming, native compaction, and background response polling
+have no default elapsed or read deadline. User cancellation and actual transport
+or provider failures still end the wait; connection and pool acquisition remain
+bounded. An explicit request `timeout` (including `None`) takes precedence over
+`extra_request_params.timeout`, then the provider's `timeout` or
+`background_timeout`. Timeout controls stay out of the JSON request body.
+HTTP transports also accept an SDK `Timeout` object for individual phase limits;
+the optional WebSocket transport accepts scalar deadlines or `None`.
 
 **Deprecated aliases** (still work, warn once, will be removed):
 
