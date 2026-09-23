@@ -9,7 +9,7 @@ image_generation:
   enabled: true
   id: images
   model: YOUR_CHOSEN_IMAGE_MODEL
-  timeout: 180
+  timeout: null  # No implicit deadline; wait for completion or cancellation.
 ```
 
 No model is selected by default. `get_info()` and chat model capabilities remain
@@ -24,6 +24,13 @@ When enabled, the provider registers its explicit `id` in coordinator capability
 Images API generation endpoint; edits send those exact inputs to its edit endpoint.
 It returns PNG bytes, provider request ID and provider-reported usage when present.
 The backend does not own file access, tool authorization, artifacts or UI behavior.
+
+An omitted or null `timeout` waits for completion or cancellation, overriding any
+timeout on the ordinary provider client. An explicit positive finite number of
+seconds is honored, including subsecond values and values above 600 seconds.
+Numeric strings remain accepted for compatibility. Booleans, zero, negative and
+non-finite values are rejected before backend registration. A timeout or
+cancellation leaves the paid outcome uncertain; it does not trigger another call.
 
 Automatic SDK retries are disabled for these paid operations. The consumer must
 persist its effect receipt before requesting work and reconcile uncertain results

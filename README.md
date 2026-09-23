@@ -95,7 +95,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `max_concurrent_requests` | **Amplifier-only** | Process-wide in-flight concurrency gate (default 5; 0 disables). | — | |
 | `extra_request_params` | **Amplifier-only (escape hatch)** | Responses API params override provider defaults; Astra's final compatibility checks still apply. Round-tripped by app-cli config tooling. | Depends on what you set. | |
 | `tool_search` | `tools` (shape) | Mapping: `mode` (`off` default \| `namespaced`), optional `namespaces` table, optional `always_loaded`. See [Deferred tool loading](#deferred-tool-loading-tool_searchmode). | Non-default rebuilds the prompt cache once, and the model must *search* for a deferred tool. | |
-| `image_generation` | Separate Images API backend | Optional object: `enabled`, unique backend `id`, explicit image `model`, optional `timeout` (1–600 seconds; default 180). See [Image backend](#image-backend). | Separate paid image requests; no automatic retry. | |
+| `image_generation` | Separate Images API backend | Optional object: `enabled`, unique backend `id`, explicit image `model`, optional positive finite `timeout` seconds (unset/null waits for completion or cancellation). See [Image backend](#image-backend). | Separate paid image requests; no automatic retry. | |
 
 Model completion, streaming, native compaction, and background response polling
 have no default elapsed or read deadline. User cancellation and actual transport
@@ -206,7 +206,9 @@ Edit inputs are supplied as bytes. It does not read/write files, download image
 URLs, install a tool, choose a different account/model or own permission policy.
 Requests use the Images API with SDK retries disabled, including on timeouts and
 server errors: the caller must reconcile uncertain paid outcomes before a new
-request. Hosts own durable receipts, input lineage, artifact verification, visual
+request. Image timeout defaults to `None` and does not inherit the chat client's
+deadline. An explicit positive finite timeout is honored, without a 600-second
+ceiling. Hosts own durable receipts, input lineage, artifact verification, visual
 inspection and saved output delivery. Chat-token cost accounting does not include
 these separate calls.
 
