@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import math
 
 
 class OpenAIImageBackend:
@@ -16,11 +17,17 @@ class OpenAIImageBackend:
     def __init__(self, provider, config):
         self.provider = provider
         self.model = config.get("model")
-        self.timeout = float(config.get("timeout", 180))
-        if not 1 <= self.timeout <= 600:
-            raise ValueError(
-                "image_generation.timeout must be between 1 and 600 seconds"
-            )
+        timeout = config.get("timeout")
+        self.timeout = None
+        if timeout is not None:
+            error = "image_generation.timeout must be positive finite seconds or None"
+            try:
+                seconds = float(timeout)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(error) from None
+            if isinstance(timeout, bool) or not math.isfinite(seconds) or seconds <= 0:
+                raise ValueError(error)
+            self.timeout = seconds
 
     def describe(self):
         configured = isinstance(self.model, str) and bool(self.model.strip())

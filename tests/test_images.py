@@ -42,7 +42,7 @@ async def test_images_uses_explicit_model_one_image_no_retries_and_real_edit_byt
     result = await backend.generate(action="generate", images=[], **args)
     assert result["data"] == b"png bytes"
     assert result["request_id"] == "req-image" and result["usage"] is None
-    provider.client.with_options.assert_called_once_with(timeout=180, max_retries=0)
+    provider.client.with_options.assert_called_once_with(timeout=None, max_retries=0)
     client.images.generate.assert_awaited_once_with(
         model="configured-image-model", n=1, output_format="png", **args
     )
@@ -124,3 +124,33 @@ def test_old_cleanup_cannot_remove_replacement_registration_with_same_identity()
     assert capabilities["image.backends"]["chosen"] is replacement
     cleanup_new()
     assert not capabilities["image.backends"]
+
+
+@pytest.mark.parametrize("timeout", [None, 0.125, 180, 601, 86400, "1200"])
+def test_explicit_image_timeout_accepts_none_or_positive_finite_seconds(timeout):
+    backend, _, _ = fixture({"model": "configured", "timeout": timeout})
+    assert backend.timeout == (None if timeout is None else float(timeout))
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        0, -1, True, False, float("nan"), float("inf"), -float("inf"),
+        "NaN", "Infinity", "invalid", {}, [], 1j, 10**400,
+    ],
+)
+def test_invalid_image_timeout_is_rejected_before_registration_or_client_use(timeout):
+    capabilities = {}
+    coordinator = SimpleNamespace(
+        get_capability=capabilities.get, register_capability=capabilities.__setitem__
+    )
+    provider = SimpleNamespace(client=Mock())
+    with pytest.raises(ValueError, match="positive finite.*None"):
+        register_image_backend(
+            coordinator, provider,
+            {"image_generation": {
+                "enabled": True, "model": "configured", "timeout": timeout,
+            }},
+        )
+    assert capabilities == {}
+    provider.client.with_options.assert_not_called()
