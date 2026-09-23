@@ -984,7 +984,8 @@ class TestCreateResponseComputerUseFallback:
         result = await provider._create_response(params)
 
         assert result is sentinel
-        fake_client.responses.create.assert_awaited_once_with(**params)
+        fake_client.responses.create.assert_awaited_once_with(
+            **params, timeout=provider._transport_timeout(provider.timeout))
         fake_client.responses.with_raw_response.create.assert_not_called()
 
     @pytest.mark.asyncio

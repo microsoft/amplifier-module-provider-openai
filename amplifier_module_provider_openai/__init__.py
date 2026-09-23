@@ -1639,7 +1639,10 @@ class OpenAIProvider:
                 "400, not a provider error).",
                 ", ".join(clobbered),
             )
-        params.update(self.extra_request_params)
+        # SDK timeout controls transport rather than the JSON request. Resolve
+        # it separately so token counting/calibration never serializes it.
+        params.update({key: value for key, value in self.extra_request_params.items()
+                       if key != "timeout"})
 
     def _assembly_log(self, level: str, message: str, *args: Any) -> None:
         """Record assembly diagnostics when planning; otherwise log immediately."""
@@ -2470,7 +2473,7 @@ class OpenAIProvider:
                 "model": self.default_model,
                 "max_tokens": 16384,
                 "temperature": None,
-                "timeout": 600.0,
+                "timeout": DEFAULT_TIMEOUT,
                 "context_window": reported_context,
                 "max_output_tokens": caps.max_output_tokens,
             },
@@ -2937,7 +2940,9 @@ class OpenAIProvider:
         params = self._budget_params(request)
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
-        response = await self.client.responses.compact(**compact_params)
+        response = await self.client.responses.compact(
+            **compact_params, timeout=self._transport_timeout(self._request_timeout(request))
+        )
         # SDK output models can invent unset fields (e.g. phase=None on a
         # retained user message), which are illegal when replayed as input.
         # exclude_unset preserves exactly the fields actually returned, including
@@ -3079,8 +3084,25 @@ class OpenAIProvider:
             return []
         return response.tool_calls
 
+    def _request_timeout(self, request, *, background=False):
+        # An explicitly supplied None also overrides a configured deadline.
+        if "timeout" in getattr(request, "model_fields_set", ()):
+            return request.timeout
+        if "timeout" in self.extra_request_params:
+            return self.extra_request_params["timeout"]
+        return self.background_timeout if background else self.timeout
+
+    @staticmethod
+    def _transport_timeout(timeout):
+        # SDK defaults otherwise stop a healthy, quiet model after ten minutes.
+        # Bound connection/pool acquisition, not the model's time to respond.
+        if isinstance(timeout, openai.Timeout):
+            return timeout
+        return openai.Timeout(timeout, connect=5.0, pool=5.0)
+
     async def _create_response(
-        self, params: dict[str, Any], *, native_input_tokens: int | None = None
+        self, params: dict[str, Any], *, native_input_tokens: int | None = None,
+        timeout=openai.NOT_GIVEN,
     ) -> Any:
         """Call `client.responses.create(**params)`.
 
@@ -3115,14 +3137,22 @@ class OpenAIProvider:
         shape, a `RuntimeError` is raised with the original `ValidationError`
         preserved as its cause -- never a silently empty/partial response.
         """
+        # SDK options are not part of the Responses wire payload. Preserve the
+        # documented escape hatch without duplicate timeout keyword arguments.
+        params = dict(params)
+        extra_timeout = params.pop("timeout", self.timeout)
+        request_timeout = extra_timeout if timeout is openai.NOT_GIVEN else timeout
         if native_input_tokens is None:
             native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
         else:
             self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
+        transport_timeout = self._transport_timeout(request_timeout)
         if not _params_declare_computer_tool(params):
-            return await self.client.responses.create(**params)
+            return await self.client.responses.create(**params, timeout=transport_timeout)
 
-        raw_response = await self.client.responses.with_raw_response.create(**params)
+        raw_response = await self.client.responses.with_raw_response.create(
+            **params, timeout=transport_timeout
+        )
         try:
             return await _maybe_await(raw_response.parse())
         except ValidationError as e:
@@ -3170,6 +3200,7 @@ class OpenAIProvider:
         params, assembly_state, assembly_logs = self._assemble_initial_responses_params(
             request, **kwargs
         )
+        params.pop("timeout", None)
 
         message_list = list(request.messages)
         instructions = params.get("instructions")
@@ -3198,8 +3229,11 @@ class OpenAIProvider:
 
         start_time = time.time()
 
-        # Use appropriate timeout for background mode (deep research can take minutes)
-        effective_timeout = self.background_timeout if background_mode else self.timeout
+        # Model work has no default elapsed-time limit. Explicit caller limits
+        # still apply to streaming, ordinary and background requests.
+        request_timeout = self._request_timeout(request, background=background_mode)
+        # SDK Timeout objects specify phase limits, not a total elapsed budget.
+        effective_timeout = None if isinstance(request_timeout, openai.Timeout) else request_timeout
         poll_interval = kwargs.get("poll_interval", self.poll_interval)
 
         # Call provider API with shared retry_with_backoff from amplifier-core.
@@ -3298,7 +3332,9 @@ class OpenAIProvider:
 
                     try:
                         async with asyncio.timeout(effective_timeout):
-                            async with self.client.responses.stream(**params) as stream:
+                            async with self.client.responses.stream(
+                                **params, timeout=self._transport_timeout(request_timeout)
+                            ) as stream:
                                 if emit_stream_events:
                                     async for event in stream:
                                         et = event.type
@@ -3470,7 +3506,8 @@ class OpenAIProvider:
                     # Non-streaming path — preserved for tests and backward compat.
                     return await asyncio.wait_for(
                         self._create_response(
-                            params, native_input_tokens=attempt_native_input_tokens
+                            params, native_input_tokens=attempt_native_input_tokens,
+                            timeout=request_timeout,
                         ),
                         timeout=effective_timeout,
                     )
@@ -3750,12 +3787,11 @@ class OpenAIProvider:
 
                     # Check timeout
                     elapsed_total = time.time() - start_time
-                    if elapsed_total >= effective_timeout:
-                        logger.warning(
-                            f"[PROVIDER] Background request timed out after {elapsed_total:.1f}s "
-                            f"(status={current_status}, polls={poll_count})"
+                    if effective_timeout is not None and elapsed_total >= effective_timeout:
+                        raise kernel_errors.LLMTimeoutError(
+                            f"Background request exceeded the configured {effective_timeout}s deadline",
+                            provider=self.name, retryable=False,
                         )
-                        break
 
                     # Emit status update event
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3775,17 +3811,27 @@ class OpenAIProvider:
                         f"(poll {poll_count}, waiting {poll_interval}s)"
                     )
 
-                    # Wait before next poll
-                    await asyncio.sleep(poll_interval)
-
-                    # Poll for updated status
+                    # An explicit caller deadline covers both sleeping and
+                    # retrieving the existing response. Never return an unfinished
+                    # response as success or start a replacement generation.
+                    remaining = None if effective_timeout is None else max(
+                        0, effective_timeout - (time.time() - start_time))
                     try:
-                        response = await self.client.responses.retrieve(response_id)
+                        async with asyncio.timeout(remaining):
+                            await asyncio.sleep(poll_interval)
+                            response = await self.client.responses.retrieve(
+                                response_id, timeout=self._transport_timeout(request_timeout)
+                            )
+                    except TimeoutError as poll_error:
+                        raise kernel_errors.LLMTimeoutError(
+                            "Background response wait timed out", provider=self.name,
+                            retryable=False,
+                        ) from poll_error
                     except Exception as poll_error:
-                        logger.error(
-                            f"[PROVIDER] Failed to poll background request: {poll_error}"
-                        )
-                        break
+                        raise kernel_errors.LLMError(
+                            "Could not retrieve the existing background response",
+                            provider=self.name, retryable=False,
+                        ) from poll_error
 
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 logger.info(
@@ -3799,6 +3845,11 @@ class OpenAIProvider:
                     if hasattr(response, "error") and response.error:
                         error_msg = f"{error_msg}: {response.error}"
                     raise RuntimeError(error_msg)
+                if response.status == "cancelled":
+                    raise kernel_errors.LLMError(
+                        "Background response was cancelled by the provider",
+                        provider=self.name, retryable=False,
+                    )
                 self._record_budget_calibration(params, response)
 
             # Handle incomplete responses via auto-continuation
@@ -3861,8 +3912,8 @@ class OpenAIProvider:
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
-                            self._create_response(params),
-                            timeout=self.timeout,
+                            self._create_response(params, timeout=request_timeout),
+                            timeout=effective_timeout,
                         )
                         self._record_budget_calibration(params, final_response)
                         billed_responses.append(final_response)
@@ -3988,8 +4039,8 @@ class OpenAIProvider:
                 try:
                     continue_start = time.time()
                     final_response = await asyncio.wait_for(
-                        self._create_response(continue_params),
-                        timeout=self.timeout,
+                        self._create_response(continue_params, timeout=request_timeout),
+                        timeout=effective_timeout,
                     )
                     self._record_budget_calibration(continue_params, final_response)
                     billed_responses.append(final_response)

@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import websockets
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ToolCall
+from openai import NOT_GIVEN, Timeout
 from websockets.protocol import State
 
 from . import OpenAIProvider, _RawResponseObject
@@ -475,10 +476,10 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         )
         return True
 
-    async def _create_response(self, params, *, native_input_tokens=None):
+    async def _create_response(self, params, *, native_input_tokens=None, timeout=NOT_GIVEN):
         if NATIVE_REQUEST.get() is not self:
             return await super()._create_response(
-                params, native_input_tokens=native_input_tokens
+                params, native_input_tokens=native_input_tokens, timeout=timeout
             )
         try:
             if getattr(self, "_native_request_attempted", False):
@@ -510,7 +511,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     params, native_input_tokens=native_input_tokens
                 )
             self._native_request_attempted = True
-            return await self._native_response(params)
+            return await self._native_response(params, timeout=timeout)
         except asyncio.CancelledError:
             await self._uncertain("cancelled")
             raise
@@ -529,7 +530,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 retryable=False,
             ) from exc
 
-    async def _native_response(self, params):
+    async def _native_response(self, params, *, timeout=NOT_GIVEN):
+        if isinstance(timeout, Timeout):
+            raise TypeError("Native WebSocket transport requires a scalar request deadline")
         await self._connect()
         payload = copy.deepcopy(params)
         if payload.get("background") or payload.get("stream"):
@@ -601,7 +604,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         resumed_steer = self.pending_steer if self.pending_parent else None
         self.pending_parent = False
         self.pending_steer = None
-        async with asyncio.timeout(max(1, self.timeout - 2)):
+        async with asyncio.timeout(self.timeout if timeout is NOT_GIVEN else timeout):
             while True:
                 event_count += 1
                 if event_count > 100_000:
