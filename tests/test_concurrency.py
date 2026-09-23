@@ -24,12 +24,12 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
-
-import amplifier_module_provider_openai as _mod
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
-from amplifier_module_provider_openai import OpenAIProvider
+from openai import AsyncOpenAI
 
+import amplifier_module_provider_openai as _mod
+from amplifier_module_provider_openai import OpenAIProvider
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -103,7 +103,18 @@ def _make_provider(
         "max_concurrent_requests": max_concurrent,
         **extra_config,
     }
-    provider = OpenAIProvider(api_key="test-key", config=config)
+    # Both Responses operations must be inert. Mocking only create() leaves the
+    # final-input token counter using real transport before the semaphore gate.
+    client = SimpleNamespace(
+        base_url="https://api.openai.com/v1",
+        responses=SimpleNamespace(
+            create=AsyncMock(return_value=DummyResponse()),
+            input_tokens=SimpleNamespace(
+                count=AsyncMock(return_value=SimpleNamespace(input_tokens=10))
+            ),
+        ),
+    )
+    provider = OpenAIProvider(config=config, client=cast(AsyncOpenAI, client))
     coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, coordinator)
     return provider, coordinator
@@ -111,6 +122,67 @@ def _make_provider(
 
 def _simple_request() -> ChatRequest:
     return ChatRequest(messages=[Message(role="user", content="Hello")])
+
+
+async def _assert_concurrency(providers, expected_peak, monkeypatch):
+    """Hold API calls until every request has reached the real semaphore gate."""
+    at_gate = 0
+    all_at_gate = asyncio.Event()
+    release = asyncio.Event()
+    in_flight = 0
+    peak = 0
+    calls = 0
+    get_semaphore = _mod._get_process_semaphore
+
+    async def observe_gate(limit):
+        nonlocal at_gate
+        semaphore = await get_semaphore(limit)
+        at_gate += 1
+        if at_gate == len(providers):
+            all_at_gate.set()
+        return semaphore
+
+    async def held_api(**kwargs):
+        nonlocal in_flight, peak, calls
+        calls += 1
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await release.wait()
+            return DummyResponse()
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(_mod, "_get_process_semaphore", observe_gate)
+    for provider in providers:
+        provider.client.responses.create = held_api
+    tasks = [
+        asyncio.create_task(provider.complete(_simple_request()))
+        for provider in providers
+    ]
+    try:
+        # The timeout only bounds a broken test. No sleep duration determines
+        # overlap: all requests reach the gate before any API call is released.
+        async with asyncio.timeout(5):
+            await all_at_gate.wait()
+            assert in_flight == expected_peak
+            release.set()
+            results = await asyncio.gather(*tasks)
+        assert peak == expected_peak
+        assert calls == len(providers)
+        assert all(result is not None for result in results)
+        assert in_flight == 0
+        assert _mod._active_requests == _mod._waiting_requests == 0
+        for provider in {id(p): p for p in providers}.values():
+            assert provider.client.responses.input_tokens.count.await_count == sum(
+                candidate is provider for candidate in providers
+            )
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ============================================================================
@@ -192,105 +264,33 @@ class TestSemaphoreConfig:
 class TestSemaphoreLimitsConcurrency:
     """Verify that at most max_concurrent API calls are in-flight at once."""
 
-    def test_semaphore_limits_concurrent_calls(self):
-        """With limit=2 and 5 concurrent tasks, peak in-flight must be ≤ 2."""
-        max_concurrent = 2
-        provider, _ = _make_provider(max_concurrent=max_concurrent)
+    def test_semaphore_limits_concurrent_calls(self, monkeypatch):
+        """With limit=2 and 5 concurrent tasks, peak in-flight must equal 2."""
+        provider, _ = _make_provider(max_concurrent=2)
+        asyncio.run(_assert_concurrency([provider] * 5, 2, monkeypatch))
 
-        in_flight = 0
-        max_in_flight_seen = 0
-
-        async def slow_api(**kwargs):
-            nonlocal in_flight, max_in_flight_seen
-            in_flight += 1
-            max_in_flight_seen = max(max_in_flight_seen, in_flight)
-            await asyncio.sleep(0.02)  # enough for all 5 coroutines to be created
-            in_flight -= 1
-            return DummyResponse()
-
-        provider.client.responses.create = slow_api
-
-        async def _run():
-            request = _simple_request()
-            await asyncio.gather(*[provider.complete(request) for _ in range(5)])
-
-        asyncio.run(_run())
-        assert max_in_flight_seen <= max_concurrent, (
-            f"Expected ≤{max_concurrent} concurrent calls, saw {max_in_flight_seen}"
-        )
-
-    def test_semaphore_limit_of_1_serializes_calls(self):
+    def test_semaphore_limit_of_1_serializes_calls(self, monkeypatch):
         """Limit of 1 must fully serialize all API calls."""
         provider, _ = _make_provider(max_concurrent=1)
 
-        order: list[int] = []
-        n = 4
+        asyncio.run(_assert_concurrency([provider] * 4, 1, monkeypatch))
 
-        async def serialized_api(**kwargs):
-            order.append(len(order))
-            await asyncio.sleep(0.01)
-            return DummyResponse()
-
-        provider.client.responses.create = serialized_api
-
-        async def _run():
-            request = _simple_request()
-            await asyncio.gather(*[provider.complete(request) for _ in range(n)])
-
-        asyncio.run(_run())
-        # All n calls must have completed
-        assert len(order) == n
-
-    def test_disabled_semaphore_allows_full_concurrency(self):
+    def test_disabled_semaphore_allows_full_concurrency(self, monkeypatch):
         """With max_concurrent=0, all calls run without a gate."""
         provider, _ = _make_provider(max_concurrent=0)
 
-        in_flight = 0
-        max_in_flight_seen = 0
+        asyncio.run(_assert_concurrency([provider] * 5, 5, monkeypatch))
 
-        async def concurrent_api(**kwargs):
-            nonlocal in_flight, max_in_flight_seen
-            in_flight += 1
-            max_in_flight_seen = max(max_in_flight_seen, in_flight)
-            await asyncio.sleep(0.02)
-            in_flight -= 1
-            return DummyResponse()
-
-        provider.client.responses.create = concurrent_api
-
-        async def _run():
-            request = _simple_request()
-            await asyncio.gather(*[provider.complete(request) for _ in range(5)])
-
-        asyncio.run(_run())
-        # Without gate, multiple calls overlap
-        assert max_in_flight_seen > 1
-
-    def test_all_requests_complete_with_semaphore(self):
+    def test_all_requests_complete_with_semaphore(self, monkeypatch):
         """Semaphore must not prevent any request from completing."""
         provider, _ = _make_provider(max_concurrent=2)
 
-        call_count = 0
+        asyncio.run(_assert_concurrency([provider] * 6, 2, monkeypatch))
 
-        async def counting_api(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            await asyncio.sleep(0.005)
-            return DummyResponse()
-
-        provider.client.responses.create = counting_api
-
-        async def _run():
-            request = _simple_request()
-            results = await asyncio.gather(
-                *[provider.complete(request) for _ in range(6)]
-            )
-            return results
-
-        results = asyncio.run(_run())
-        assert call_count == 6
-        assert len(results) == 6
-        assert all(r is not None for r in results)
+    def test_semaphore_is_shared_across_provider_instances(self, monkeypatch):
+        first, _ = _make_provider(max_concurrent=2)
+        second, _ = _make_provider(max_concurrent=2)
+        asyncio.run(_assert_concurrency([first, second] * 3, 2, monkeypatch))
 
 
 # ============================================================================
@@ -409,14 +409,7 @@ class TestConcurrencyEventEmission:
 
     def test_no_event_emitted_without_coordinator(self):
         """When no coordinator is attached, provider:concurrency is silently skipped."""
-        provider = OpenAIProvider(
-            api_key="test-key",
-            config={
-                "use_streaming": False,
-                "max_retries": 0,
-                "max_concurrent_requests": 5,
-            },
-        )
+        provider, _ = _make_provider(max_concurrent=5)
         provider.coordinator = None
         provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
