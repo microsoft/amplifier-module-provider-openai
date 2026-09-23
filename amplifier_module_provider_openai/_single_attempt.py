@@ -19,6 +19,7 @@ import httpx
 from amplifier_core import llm_errors
 
 CAPABILITY = "completion:single_attempt:v1"
+CAPABILITY_V2 = "completion:single_attempt:v2"
 RECEIPT_KEY = "openai:single_attempt"
 CLOSE_TIMEOUT = 3.0
 
@@ -76,10 +77,19 @@ def _integer(value):
     return type(value) is int and value >= 0
 
 
-def _plan(provider, request, options):
+def _plan(provider, request, options, *, version=1):
     # Snapshot admission before any await; assembly is already a pure provider
     # transaction, and never commits chat history or conversion state here.
     request = copy.deepcopy(request)
+    if type(version) is not int or version not in (1, 2):
+        raise SingleAttemptError("invalid_options")
+    deadline_valid = (
+        version == 2 and request.timeout is None
+    ) or (
+        type(request.timeout) in (int, float)
+        and math.isfinite(request.timeout)
+        and request.timeout > 0
+    )
     if (
         not isinstance(request.model, str)
         or not request.model
@@ -87,9 +97,7 @@ def _plan(provider, request, options):
         or not request.reasoning_effort
         or not _integer(request.max_output_tokens)
         or request.max_output_tokens < 1
-        or type(request.timeout) not in (int, float)
-        or not math.isfinite(request.timeout)
-        or request.timeout <= 0
+        or not deadline_valid
         or len(request.messages) != 1
         or request.messages[0].role != "user"
         or not isinstance(request.messages[0].content, str)
@@ -201,7 +209,7 @@ def _http_client(timeout):
     return httpx.AsyncClient(timeout=timeout, follow_redirects=False)
 
 
-async def complete(provider, request, options):
+async def complete(provider, request, options, *, version=1):
     """Return only after one bounded SDK exchange and confirmed client close."""
     from . import AsyncOpenAI
 
@@ -209,7 +217,7 @@ async def complete(provider, request, options):
     if base_url is None:
         raise SingleAttemptError("unsupported_endpoint_or_client")
     try:
-        request, params, count_params = _plan(provider, request, options)
+        request, params, count_params = _plan(provider, request, options, version=version)
         request_hash = _digest(params)
     except SingleAttemptError:
         raise
@@ -265,7 +273,7 @@ async def complete(provider, request, options):
     result.metadata = {
         **(result.metadata or {}),
         RECEIPT_KEY: {
-            "version": 1,
+            "version": version,
             "model": request.model,
             "reasoning_effort": request.reasoning_effort,
             "max_output_tokens": request.max_output_tokens,
