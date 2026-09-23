@@ -2460,10 +2460,10 @@ class OpenAIProvider:
         provider_capabilities = ["streaming", "tools", "reasoning", "batch", "json_mode"]
         if self._provider_count_available():
             provider_capabilities.append("request_budget:provider_count")
-        from ._single_attempt import CAPABILITY, endpoint
+        from ._single_attempt import CAPABILITY, CAPABILITY_V2, endpoint
 
         if endpoint(self) is not None:
-            provider_capabilities.append(CAPABILITY)
+            provider_capabilities.extend((CAPABILITY, CAPABILITY_V2))
         return ProviderInfo(
             id="openai",
             display_name="OpenAI",
@@ -2973,14 +2973,19 @@ class OpenAIProvider:
         """
         kwargs = self._merge_request_options(request_options, kwargs)
 
-        if "single_attempt" in kwargs:
+        if "single_attempt" in kwargs or "single_attempt_version" in kwargs:
             from ._single_attempt import SingleAttemptError, complete
 
-            single_attempt = kwargs.pop("single_attempt")
+            version_given = "single_attempt_version" in kwargs
+            version = kwargs.pop("single_attempt_version", 1)
+            single_attempt = kwargs.pop("single_attempt", False)
             if type(single_attempt) is not bool:
                 raise SingleAttemptError("invalid_options")
+            if (type(version) is not int or version not in (1, 2)
+                    or (version_given and not single_attempt)):
+                raise SingleAttemptError("invalid_options")
             if single_attempt:
-                return await complete(self, request, kwargs)
+                return await complete(self, request, kwargs, version=version)
 
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)

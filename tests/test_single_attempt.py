@@ -67,6 +67,7 @@ def wire(monkeypatch):
         def __init__(self):
             self.calls = []
             self.clients = []
+            self.timeouts = []
             self.count = {"input_tokens": 12}
             self.generation = response()
 
@@ -80,6 +81,7 @@ def wire(monkeypatch):
         async def send(self, req):
             payload = json.loads(req.content)
             self.calls.append((req.url.path, payload))
+            self.timeouts.append(copy.deepcopy(req.extensions.get("timeout")))
             if self.redirect and req.url.path == self.redirect:
                 return httpx.Response(
                     307, headers={"location": "https://api.openai.com/v1/elsewhere"}
@@ -455,3 +457,124 @@ async def test_malformed_mode_is_not_silently_ignored(wire, option):
     with pytest.raises(bounded.SingleAttemptError, match="invalid_options"):
         await provider.complete(request(), request_options={"single_attempt": option})
     assert wire.calls == wire.clients == []
+
+
+@pytest.mark.parametrize("timeout", [None, 17.5])
+@pytest.mark.asyncio
+async def test_v2_actual_sdk_binds_nullable_or_explicit_deadline(wire, timeout):
+    provider = OpenAIProvider(api_key="offline-dummy", config={"timeout": 0.001})
+    assert bounded.CAPABILITY in provider.get_info().capabilities
+    assert bounded.CAPABILITY_V2 in provider.get_info().capabilities
+    result = await provider.complete(
+        request(timeout=timeout),
+        request_options={"single_attempt": True, "single_attempt_version": 2},
+    )
+    receipt = result.metadata[bounded.RECEIPT_KEY]
+    assert receipt["version"] == 2 and receipt["timeout_seconds"] == timeout
+    assert receipt["native_count_requests"] == receipt["generation_requests"] == 1
+    assert receipt["max_output_tokens"] == 1024 and receipt["closed"] is True
+    assert len(wire.calls) == 2 and len(wire.clients) == wire.closed == 1
+    assert wire.clients[0].timeout == timeout
+    assert wire.timeouts == [dict.fromkeys(("connect", "read", "write", "pool"), timeout)] * 2
+    assert all("timeout" not in body and "single_attempt_version" not in body for _, body in wire.calls)
+
+
+@pytest.mark.parametrize("options", [
+    {"single_attempt": True, "single_attempt_version": True},
+    {"single_attempt": True, "single_attempt_version": False},
+    {"single_attempt": True, "single_attempt_version": "2"},
+    {"single_attempt": True, "single_attempt_version": 2.0},
+    {"single_attempt": True, "single_attempt_version": None},
+    {"single_attempt": True, "single_attempt_version": 3},
+    {"single_attempt": False, "single_attempt_version": 2},
+    {"single_attempt_version": 2},
+    {"single_attempt_version": 3},
+])
+@pytest.mark.asyncio
+async def test_version_selector_refuses_before_clients_or_normal_fallback(wire, options):
+    provider = OpenAIProvider(api_key="offline-dummy")
+    with pytest.raises(bounded.SingleAttemptError, match="invalid_options"):
+        await provider.complete(request(timeout=None), request_options=options)
+    assert wire.calls == wire.clients == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_v1_selector_preserves_original_receipt(wire):
+    result = await OpenAIProvider(api_key="offline-dummy").complete(
+        request(), request_options={"single_attempt": True, "single_attempt_version": 1},
+    )
+    receipt = result.metadata[bounded.RECEIPT_KEY]
+    assert receipt["version"] == 1 and receipt["timeout_seconds"] == 45
+
+
+@pytest.mark.asyncio
+async def test_v2_timeout_escape_hatch_does_not_override_admission(wire):
+    provider = OpenAIProvider(api_key="offline-dummy", config={"extra_request_params": {"timeout": None}})
+    with pytest.raises(bounded.SingleAttemptError, match="wire_mismatch"):
+        await provider.complete(request(timeout=None), request_options={"single_attempt": True, "single_attempt_version": 2})
+    assert wire.calls == wire.clients == []
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+@pytest.mark.asyncio
+async def test_v2_invalid_deadline_fails_before_client(wire, timeout):
+    with pytest.raises(bounded.SingleAttemptError, match="invalid_request"):
+        await OpenAIProvider(api_key="offline-dummy").complete(
+            request(timeout=timeout), request_options={"single_attempt": True, "single_attempt_version": 2},
+        )
+    assert wire.calls == wire.clients == []
+
+
+@pytest.mark.parametrize("phase", ["count", "generation"])
+@pytest.mark.asyncio
+async def test_v2_healthy_call_waits_until_explicit_cancellation_then_closes(wire, phase):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = wire.send
+    target = "/v1/responses/input_tokens" if phase == "count" else "/v1/responses"
+    async def delayed(req):
+        response = await original(req)
+        if req.url.path == target:
+            entered.set()
+            await release.wait()
+        return response
+    wire.send = delayed
+    provider = OpenAIProvider(api_key="offline-dummy", config={"timeout": 0.001})
+    task = asyncio.create_task(provider.complete(
+        request(timeout=None), request_options={"single_attempt": True, "single_attempt_version": 2},
+    ))
+    await entered.wait()
+    # Exceeds the configured provider deadline; the explicit admitted null wins.
+    await asyncio.sleep(0.02)
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(wire.calls) == (1 if phase == "count" else 2)
+    assert wire.closed == 1 and wire.clients[0].is_closed()
+
+
+@pytest.mark.asyncio
+async def test_v2_explicit_experiment_expiry_closes_without_replay(wire):
+    wire.hold = asyncio.Event()
+    with pytest.raises(bounded.SingleAttemptError, match="timeout"):
+        await OpenAIProvider(api_key="offline-dummy").complete(
+            request(timeout=0.01), request_options={"single_attempt": True, "single_attempt_version": 2},
+        )
+    assert len(wire.calls) == wire.closed == 1
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "over-output", "close-failed"])
+@pytest.mark.asyncio
+async def test_v2_no_deadline_keeps_output_completion_and_close_gates(wire, failure):
+    if failure == "incomplete":
+        wire.generation["status"] = "incomplete"
+    elif failure == "over-output":
+        wire.generation["usage"]["output_tokens"] = 1025
+    else:
+        wire.close_failure = "error"
+    with pytest.raises(bounded.SingleAttemptError):
+        await OpenAIProvider(api_key="offline-dummy").complete(
+            request(timeout=None), request_options={"single_attempt": True, "single_attempt_version": 2},
+        )
+    assert len(wire.calls) == 2 and wire.closed == 1

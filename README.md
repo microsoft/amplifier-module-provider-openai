@@ -126,21 +126,31 @@ the optional WebSocket transport accepts scalar deadlines or `None`.
 ### Bounded single-attempt completion
 
 A fresh base `OpenAIProvider` using the standard OpenAI endpoint and an SDK with
-native input counting advertises `completion:single_attempt:v1`. A host can use
-this capability for an explicitly admitted readiness check:
+native input counting advertises `completion:single_attempt:v1` and
+`completion:single_attempt:v2`. A host can use v2 for an explicitly admitted
+readiness check without an implicit elapsed deadline:
 
 ```python
 request = ChatRequest(
     messages=[Message(role="user", content="Reply with OK.")],
     model="gpt-5.6-terra", reasoning_effort="high",
-    max_output_tokens=1024, timeout=45, stream=False,
+    max_output_tokens=1024, timeout=None, stream=False,
 )
-response = await provider.complete(request, request_options={"single_attempt": True})
+response = await provider.complete(
+    request, request_options={"single_attempt": True, "single_attempt_version": 2},
+)
 ```
 
 Check the capability first: older providers may ignore an unknown request option.
-The mode requires explicit model, effort, positive output cap and finite positive
-timeout, and exactly one nonblank user text message with no tools or conversation.
+Both versions require explicit model, effort, a positive output cap, and exactly
+one nonblank user text message with no tools or conversation. V2 admits `timeout=None`
+or an explicit finite positive deadline for count plus generation. It uses that
+admitted value directly, without falling back to provider timeout configuration;
+timeout overrides in `extra_request_params` remain invalid in this mode.
+The original `{"single_attempt": True}` option remains v1 and requires a finite
+positive timeout. An explicit version 1 selects that same contract. Unknown or
+malformed selectors, or a version selector without enabled single-attempt mode,
+fail before creating a client. Hosts must verify the matching capability first.
 The host chooses and durably admits those values; 1,024 is an example bound, not a
 guarantee that reasoning plus visible output will fit. Selected effort is never
 lowered to make the check succeed.
@@ -150,19 +160,22 @@ extras, then uses one owned SDK client for one native count and at most one
 generation. SDK retries and redirects are disabled. A failed/unavailable count
 cannot fall back to local estimation. There is no streaming, background polling,
 continuation, or truncated-tool retry. Incomplete, refused, empty, malformed,
-wrong-model, or over-budget responses fail. The timeout bounds count plus
+wrong-model, or over-budget responses fail. An explicit timeout bounds count plus
 generation; strict client closure has a separate three-second ceiling. A failed
 or timed-out close cannot produce success. Existing/injected clients, custom
 endpoints, subclasses and unsupported SDKs do not advertise this mode and are
 refused before dispatch.
 
 Success retains normal `ChatResponse` usage and adds `metadata["openai:single_attempt"]`
-with `version: 1`, the admitted `model`, `reasoning_effort`, `max_output_tokens`,
+with the selected `version` (1 or 2), the admitted `model`, `reasoning_effort`, `max_output_tokens`,
 `timeout_seconds`, `native_count_requests: 1`, `generation_requests: 1`,
 `native_input_tokens`, `retries: 0`, `continuations: 0`, `closed: true`, and
 SHA-256 hashes `input_sha256` and `request_sha256` of canonical JSON wire input
 and complete generation parameters. No prompt, credential or response text is in
-that receipt. Failures raise nonretryable `SingleAttemptError` with a fixed
+that receipt. V2 binds a null `timeout_seconds` when no deadline was admitted;
+historical v1 receipt fields and semantics are unchanged. Explicit cancellation
+still closes the owned client and never authorizes replay. Failures raise
+nonretryable `SingleAttemptError` with a fixed
 `reason` and no success receipt; a failure may follow a transmitted request.
 The caller must retain its durable attempt and must not automatically replay it.
 This option does not provide cross-call/process idempotency, a monetary budget,
