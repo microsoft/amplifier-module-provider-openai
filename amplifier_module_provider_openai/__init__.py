@@ -47,7 +47,7 @@ from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from ._capabilities import get_capabilities
+from ._capabilities import GPT_6_MODEL_IDS, get_capabilities
 from ._constants import (
     BACKGROUND_POLLING_STATUSES,
     BACKGROUND_STATUS_FAILED,
@@ -220,6 +220,17 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 # an opaque API HTTP 400.
 _GPT_5_5_PRO_ALLOWED_EFFORTS = frozenset({"medium", "high", "xhigh"})
 _GPT_6_ASTRA_ALLOWED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+# Sol/Luna, unlike Astra, also accept "none" (verified against the live model
+# pages https://developers.openai.com/api/docs/models/gpt-6-sol and .../gpt-6-luna,
+# 2026-09-24). Both default to "medium" server-side when omitted.
+_GPT_6_SOL_LUNA_ALLOWED_EFFORTS = frozenset(
+    {"none", "low", "medium", "high", "xhigh", "max"}
+)
+_GPT_6_ALLOWED_EFFORTS: dict[str, frozenset[str]] = {
+    "gpt-6-astra": _GPT_6_ASTRA_ALLOWED_EFFORTS,
+    "gpt-6-sol": _GPT_6_SOL_LUNA_ALLOWED_EFFORTS,
+    "gpt-6-luna": _GPT_6_SOL_LUNA_ALLOWED_EFFORTS,
+}
 
 
 def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
@@ -253,39 +264,65 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     )
 
 
-def _validate_gpt_6_astra_params(params: dict[str, Any]) -> None:
-    """Reject documented-invalid fields from a final Astra wire payload."""
-    if params.get("model") != "gpt-6-astra":
+def _validate_gpt_6_params(params: dict[str, Any]) -> None:
+    """Reject documented-invalid fields from a final GPT-6 wire payload.
+
+    Covers all three exact GPT-6 model IDs (Astra, Sol, Luna). Astra has no
+    "none" reasoning effort and never accepts sampling fields. Sol/Luna DO
+    accept "none" (which turns reasoning off entirely) -- when effort is
+    "none" they behave like a non-reasoning model and accept
+    temperature/top_p/logprobs as usual; for any other effort (including the
+    model default when effort is omitted) the same sampling-field rejection
+    as Astra applies. The `include: ["message.output_text.logprobs"]` and
+    `prompt_cache_options.ttl` restrictions apply to every GPT-6 model, same
+    as Astra -- prompt caching on this exact-model-ID family is documented
+    with the same 30m-only TTL, and none of the three models are documented
+    to return per-token logprobs.
+    """
+    model = params.get("model")
+    allowed_efforts = _GPT_6_ALLOWED_EFFORTS.get(model)
+    if allowed_efforts is None:
         return
 
     reasoning = params.get("reasoning")
     effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
-    if effort is not None and effort not in _GPT_6_ASTRA_ALLOWED_EFFORTS:
+    if effort is not None and effort not in allowed_efforts:
         raise kernel_errors.InvalidRequestError(
-            f"Model 'gpt-6-astra' does not support reasoning.effort={effort!r}. "
-            "Use 'low' for lightweight tasks, or omit reasoning.effort. "
-            f"Supported efforts: {sorted(_GPT_6_ASTRA_ALLOWED_EFFORTS)}."
+            f"Model {model!r} does not support reasoning.effort={effort!r}. "
+            f"Supported efforts: {sorted(allowed_efforts)}."
         )
 
+    # Astra always rejects sampling fields (its allowed-effort set has no
+    # "none"). Sol/Luna only reject them while reasoning is active (i.e.
+    # effort is anything other than "none"). An explicit None value is always
+    # dropped (never sent), regardless of whether reasoning is active -- it
+    # means "no opinion", not "send null". `effort == "none"` already implies
+    # "none" is in `allowed_efforts` -- the check above raises otherwise --
+    # so no separate per-model literal is needed here.
+    reasoning_disabled = effort == "none"
     for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
-        if field in params and params[field] is not None:
+        if field not in params:
+            continue
+        if params[field] is not None and not reasoning_disabled:
             raise kernel_errors.InvalidRequestError(
-                f"Model 'gpt-6-astra' does not support {field!r}; remove it from "
-                "the request or extra_request_params."
+                f"Model {model!r} does not support {field!r} while reasoning "
+                "is active; remove it from the request or extra_request_params"
+                + (", or set reasoning.effort='none'." if "none" in allowed_efforts else ".")
             )
-        params.pop(field, None)
+        if params[field] is None:
+            params.pop(field, None)
 
     include = params.get("include")
     if isinstance(include, (list, tuple)) and "message.output_text.logprobs" in include:
         raise kernel_errors.InvalidRequestError(
-            "Model 'gpt-6-astra' does not support "
+            f"Model {model!r} does not support "
             "'message.output_text.logprobs' in include."
         )
 
     options = params.get("prompt_cache_options")
     if isinstance(options, dict) and options.get("ttl") not in (None, "30m"):
         raise kernel_errors.InvalidRequestError(
-            "Model 'gpt-6-astra' supports only prompt_cache_options.ttl='30m'."
+            f"Model {model!r} supports only prompt_cache_options.ttl='30m'."
         )
 
 
@@ -525,6 +562,60 @@ def _extract_error_fields(body: object) -> tuple[str | None, str | None]:
     if isinstance(err, dict):
         return err.get("code"), err.get("type")
     return body.get("code"), body.get("type")
+
+
+_MISALIGNMENT_POLICY_ERROR_CODE = "misalignment_policy_violation"
+
+
+def _misalignment_stop_error(
+    err_code: str | None, message: str | None, *, provider: str
+) -> kernel_errors.LLMError | None:
+    """Classify a documented misalignment-monitoring stop as one stable,
+    non-retryable kernel error, regardless of which of the three wire shapes
+    it arrived in (pre-stream/non-streaming HTTP 403, a `response.failed`
+    stream terminal, or a bare/flat mid-stream SSE `openai.APIError`).
+
+    Per https://developers.openai.com/api/docs/guides/safety-checks/misalignment-monitoring
+    (verified 2026-09-24): misalignment monitoring can stop a covered model's
+    conversation -- before streaming begins, or mid-stream even after output
+    was already emitted -- with error type "invalid_request_error" and code
+    "misalignment_policy_violation". "Match the error code rather than the
+    message text" per that doc, so this is the ONLY discriminator used here.
+    This is a deliberate, explicit server-side stop, not a transport hiccup:
+    retrying replays the identical blocked conversation and fails
+    identically. This is NOT GPT-6-specific -- the doc scopes coverage to any
+    Responses API request using persisted reasoning, WebSockets, or OpenAI
+    compaction, regardless of model.
+
+    `ContentFilterError` is the one stable kernel error class used for every
+    shape: it already means "content/policy blocked this request" to
+    callers, defaults to non-retryable, and callers do not need three
+    separate exception types to recognize the same server-side stop.
+    `status_code=403` is preserved even for shapes (the bare mid-stream
+    `openai.APIError`) that carry no status code of their own, matching the
+    documented HTTP status for this stop.
+
+    Returns None when *err_code* does not match (the normal case -- most
+    errors on any of these three paths are unrelated and fall through to
+    their existing classification).
+    """
+    if err_code != _MISALIGNMENT_POLICY_ERROR_CODE:
+        return None
+    return kernel_errors.ContentFilterError(
+        message or "Misalignment monitoring stopped this conversation "
+        f"({_MISALIGNMENT_POLICY_ERROR_CODE}).",
+        provider=provider,
+        status_code=403,
+    )
+
+
+def _terminal_response_error_fields(response: Any) -> tuple[str | None, str | None]:
+    """Return (code, message) from a captured `response.failed` terminal's
+    `.error`, tolerating a missing/partial shape."""
+    error = getattr(response, "error", None)
+    if error is None:
+        return None, None
+    return getattr(error, "code", None), getattr(error, "message", None)
 
 
 def _is_context_overflow(err_code: str | None, raw_msg: str) -> bool:
@@ -1584,7 +1675,12 @@ class OpenAIProvider:
         # that only occurs on continuation must still be reported exactly
         # once, not hidden.
         self._extra_params_warned_keys: set[str] = set()
-        self._astra_legacy_retention_warned = False
+        # Per-model, not a scalar bool: one provider instance can serve
+        # different GPT-6 models across calls (model is chosen per-request),
+        # so a single shared flag would suppress the warning for a second
+        # model after the first model already tripped it. Mirrors
+        # `_budget_uncalibrated_warned_models` below.
+        self._gpt6_legacy_retention_warned_models: set[str] = set()
         # Per-model scalar-only observations: (max raw-token/byte ratio,
         # serialized bytes, raw gross input tokens). Never retain a prompt.
         self._budget_calibration: dict[str, tuple[float, int, int]] = {}
@@ -1594,20 +1690,32 @@ class OpenAIProvider:
         self._budget_uncalibrated_warned_models: set[str] = set()
         self._budget_nontext_warned_models: set[str] = set()
 
-    def _prepare_astra_params(self, params: dict[str, Any]) -> None:
-        """Apply Astra's final-wire compatibility rules after extras merge."""
-        if params.get("model") != "gpt-6-astra":
-            return
-        legacy_retention = params.pop("prompt_cache_retention", None)
-        if legacy_retention is not None and not self._astra_legacy_retention_warned:
-            self._astra_legacy_retention_warned = True
-            self._assembly_log(
-                "warning",
-                "[PROVIDER] Dropping prompt_cache_retention=%r for gpt-6-astra; "
-                "it is unsupported. Use prompt_cache_options.ttl='30m' instead.",
-                legacy_retention,
-            )
-        _validate_gpt_6_astra_params(params)
+    def _prepare_gpt_6_params(self, params: dict[str, Any]) -> None:
+        """Apply GPT-6 family final-wire compatibility rules after extras merge.
+
+        The legacy `prompt_cache_retention` field is rejected by every exact
+        GPT-6 model ID (Astra, Sol, Luna) -- all three support only
+        `prompt_cache_options.ttl='30m'` for prompt caching, so the field is
+        dropped (with a one-time warning) for all of them, not just Astra.
+        Effort/sampling-field validation applies to all three GPT-6 model
+        IDs too -- see `_validate_gpt_6_params`.
+        """
+        model = params.get("model")
+        if model in GPT_6_MODEL_IDS:
+            legacy_retention = params.pop("prompt_cache_retention", None)
+            if (
+                legacy_retention is not None
+                and model not in self._gpt6_legacy_retention_warned_models
+            ):
+                self._gpt6_legacy_retention_warned_models.add(model)
+                self._assembly_log(
+                    "warning",
+                    "[PROVIDER] Dropping prompt_cache_retention=%r for %s; "
+                    "it is unsupported. Use prompt_cache_options.ttl='30m' instead.",
+                    legacy_retention,
+                    model,
+                )
+        _validate_gpt_6_params(params)
 
     def _prepare_computer_images(self, params, request, **kwargs):
         from .compaction import KEY
@@ -1955,7 +2063,7 @@ class OpenAIProvider:
             set(self._native_call_ids),
             dict(self._native_call_types),
             set(self._extra_params_warned_keys),
-            self._astra_legacy_retention_warned,
+            set(self._gpt6_legacy_retention_warned_models),
         )
         try:
             message_list = list(request.messages)
@@ -2044,7 +2152,14 @@ class OpenAIProvider:
                     effort = reasoning.get("effort")
                     if effort is not None:
                         params["reasoning"]["effort"] = effort
-                    elif model_name != "gpt-6-astra":
+                    elif model_name not in GPT_6_MODEL_IDS:
+                        # Every exact GPT-6 model ID (not just Astra) sends no
+                        # default effort when omitted -- Sol/Luna's own
+                        # documented "medium" default is applied server-side,
+                        # same as Astra's documented no-default behavior (see
+                        # README "GPT-6 family" / "Reasoning effort"). Before
+                        # Sol/Luna existed this only ever excluded Astra;
+                        # keep the whole family consistent going forward.
                         params["reasoning"]["effort"] = "medium"
                     for key in ("mode", "context"):
                         if reasoning.get(key) is not None:
@@ -2109,12 +2224,20 @@ class OpenAIProvider:
                 "prompt_cache_retention", self.prompt_cache_retention
             ) or None
             if (
-                model_name == "gpt-6-astra"
+                model_name in GPT_6_MODEL_IDS
                 and "prompt_cache_retention" not in self.config
                 and "prompt_cache_retention" not in kwargs
             ):
+                # Every exact GPT-6 model ID (Astra, Sol, Luna) rejects
+                # `prompt_cache_retention` outright -- `_prepare_gpt_6_params`
+                # drops the field unconditionally further down the pipeline.
+                # Suppress the module's own "24h" default here so a request
+                # the caller never asked to set doesn't trip that drop
+                # warning; an explicitly configured/per-call value still
+                # reaches `_prepare_gpt_6_params` and is dropped WITH a
+                # warning, same as before.
                 retention = None
-            if model_name != "gpt-6-astra":
+            if model_name not in GPT_6_MODEL_IDS:
                 retention = _drop_unsupported_in_memory_retention(
                     model_name,
                     retention,
@@ -2168,7 +2291,7 @@ class OpenAIProvider:
             if request.max_output_tokens is not None:
                 params["max_output_tokens"] = request.max_output_tokens
             params = self._prepare_computer_images(params, request, **kwargs)
-            self._prepare_astra_params(params)
+            self._prepare_gpt_6_params(params)
             if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
                 params.get("input"), list
             ):
@@ -2184,7 +2307,7 @@ class OpenAIProvider:
                     self._native_call_ids,
                     self._native_call_types,
                     self._extra_params_warned_keys,
-                    self._astra_legacy_retention_warned,
+                    self._gpt6_legacy_retention_warned_models,
                 ) = saved_state
 
     def _assemble_initial_responses_params(
@@ -2207,7 +2330,9 @@ class OpenAIProvider:
         planner._native_call_ids = set(self._native_call_ids)
         planner._native_call_types = dict(self._native_call_types)
         planner._extra_params_warned_keys = set(self._extra_params_warned_keys)
-        planner._astra_legacy_retention_warned = self._astra_legacy_retention_warned
+        planner._gpt6_legacy_retention_warned_models = set(
+            self._gpt6_legacy_retention_warned_models
+        )
         planner._assembly_log_records: list[tuple[str, str, tuple[Any, ...]]] = []
         planner._deferred_namespace_warnings: list[tuple[str, ...]] = []
 
@@ -2222,7 +2347,9 @@ class OpenAIProvider:
             "native_call_ids": planner._native_call_ids,
             "native_call_types": planner._native_call_types,
             "extra_params_warned_keys": planner._extra_params_warned_keys,
-            "astra_legacy_retention_warned": planner._astra_legacy_retention_warned,
+            "gpt6_legacy_retention_warned_models": (
+                planner._gpt6_legacy_retention_warned_models
+            ),
             "namespace_warnings": planner._deferred_namespace_warnings,
         }
         return params, state, planner._assembly_log_records
@@ -2236,7 +2363,9 @@ class OpenAIProvider:
         self._native_call_ids = state["native_call_ids"]
         self._native_call_types = state["native_call_types"]
         self._extra_params_warned_keys = state["extra_params_warned_keys"]
-        self._astra_legacy_retention_warned = state["astra_legacy_retention_warned"]
+        self._gpt6_legacy_retention_warned_models = state[
+            "gpt6_legacy_retention_warned_models"
+        ]
         for unlisted in state["namespace_warnings"]:
             warn_unlisted_tools(unlisted)
 
@@ -2530,9 +2659,10 @@ class OpenAIProvider:
                     default="false",
                     requires_model=True,  # NEW -- needed for show_when to see default_model
                     # Matches exactly the models with modelled long rates
-                    # (_LONG_RATES, _cost.py) -- gpt-5.6-sol/-terra/-luna (and
-                    # the over-included -cyber, harmless: the flag still
-                    # widens its reported window correctly). gpt-5.5 has NO
+                    # (_LONG_RATES, _cost.py) -- gpt-5.6-sol/-terra/-luna,
+                    # gpt-6-astra/-sol/-luna (and the over-included -cyber,
+                    # harmless: the flag still widens its reported window
+                    # correctly). gpt-5.5 has NO
                     # threshold at all (the flag would be a total no-op) and
                     # gpt-5.4*/-mini/-nano have a threshold but no long rates
                     # (cost-neutral) -- neither belongs behind this specific
@@ -2541,7 +2671,7 @@ class OpenAIProvider:
                     # expressible; this is the single expressible predicate
                     # that matches the models where the flag has a real cost.
                     show_when={
-                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-astra)$"
+                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna))$"
                     },
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
@@ -2678,10 +2808,11 @@ class OpenAIProvider:
                 ("o3-deep-research", "o4-mini-deep-research")
             )
 
-            # Filter to GPT-5+ series models or deep research models
+            # Filter to GPT-5+ series models, the exact GPT-6 model IDs, or
+            # deep research models
             if not (
                 model_id.startswith("gpt-5")
-                or model_id == "gpt-6-astra"
+                or model_id in GPT_6_MODEL_IDS
                 or is_deep_research
             ):
                 continue
@@ -2739,6 +2870,8 @@ class OpenAIProvider:
         # Known display name mappings
         display_names = {
             "gpt-6-astra": "GPT 6 Astra",
+            "gpt-6-sol": "GPT 6 Sol",
+            "gpt-6-luna": "GPT 6 Luna",
             "gpt-5.6": "GPT 5.6",
             "gpt-5.6-sol": "GPT 5.6 Sol",
             "gpt-5.6-terra": "GPT 5.6 Terra",
@@ -3488,6 +3621,18 @@ class OpenAIProvider:
                                         "response.completed" not in str(e)
                                         or final_response is None
                                     ):
+                                        misalignment = None
+                                        for failed in reversed(failed_stream_responses):
+                                            code, msg = _terminal_response_error_fields(
+                                                failed
+                                            )
+                                            misalignment = _misalignment_stop_error(
+                                                code, msg, provider=self.name
+                                            )
+                                            if misalignment is not None:
+                                                break
+                                        if misalignment is not None:
+                                            raise misalignment from e
                                         raise
                                     response = final_response
                                     logger.warning(
@@ -3606,6 +3751,17 @@ class OpenAIProvider:
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 if status == 403:
+                    err_code, _ = _extract_error_fields(body)
+                    # Pre-stream/non-streaming misalignment stop: checked
+                    # BEFORE the Cloudflare heuristic since it is a
+                    # deterministic, documented JSON error code -- never an
+                    # HTML challenge body -- and must classify the same way
+                    # as the other two misalignment shapes below.
+                    misalignment = _misalignment_stop_error(
+                        err_code, error_msg, provider=self.name
+                    )
+                    if misalignment is not None:
+                        raise misalignment from e
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
                             "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
@@ -3679,6 +3835,11 @@ class OpenAIProvider:
                 raw_msg = str(e).lower()
                 if _is_context_overflow(err_code, raw_msg):
                     return await _handle_context_overflow(e, error_msg)
+                misalignment = _misalignment_stop_error(
+                    err_code, error_msg, provider=self.name
+                )
+                if misalignment is not None:
+                    raise misalignment from e
                 if err_type == "invalid_request_error":
                     # Deterministic client error surfaced mid-stream -- retrying
                     # replays the identical request and fails identically.
@@ -4052,7 +4213,7 @@ class OpenAIProvider:
                 continue_params = self._prepare_computer_images(
                     continue_params, request, **kwargs
                 )
-                self._prepare_astra_params(continue_params)
+                self._prepare_gpt_6_params(continue_params)
                 if _supports_tool_output_cache_breakpoints(
                     continue_params.get("model")
                 ) and isinstance(continue_params.get("input"), list):

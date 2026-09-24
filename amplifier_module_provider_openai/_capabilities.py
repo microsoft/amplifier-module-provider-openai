@@ -10,7 +10,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-__all__ = ["ModelCapabilities", "get_capabilities"]
+__all__ = ["GPT_6_MODEL_IDS", "ModelCapabilities", "get_capabilities"]
+
+# Every exact GPT-6 model ID (Astra, Sol, Luna). Each is an exact model ID,
+# not a version family -- the public model pages list no dated snapshots for
+# any of the three, so do not extend these values to guessed/dated IDs.
+# Shared by _capabilities.py, _cost.py, and __init__.py wherever GPT-6-family
+# membership (as opposed to gpt-5.x version-gating) needs to be checked.
+GPT_6_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"})
 
 _GPT5_TAGS: tuple[str, ...] = (
     "tools",
@@ -242,13 +249,27 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
     - 5.3: 400K context, reasoning, no explicit effort
     - 5.2 and below: 200K context, reasoning, implicit effort
     """
-    # Astra is an exact model ID, not a version family. The public model page
-    # lists no dated snapshots, so do not extend these values to guessed IDs.
-    # `context_window` is Amplifier's safe input/compaction budget, not the
-    # native total window (1,050,000 tokens).
-    if model_id == "gpt-6-astra":
+    # Astra, Sol, and Luna are all exact model IDs, not a version family, and
+    # share identical model-details numbers: 1,050,000 marketing context
+    # window; 922,000 documented max input tokens; 128,000 max output; 272K
+    # short/long pricing split. `context_window` is Amplifier's safe
+    # input/compaction budget, not the native total window. The public model
+    # pages list no dated snapshots for any of the three, so do not extend
+    # these values to guessed/dated IDs.
+    # Sources (all verified 2026-09-24):
+    # https://developers.openai.com/api/docs/models/gpt-6-astra
+    # https://developers.openai.com/api/docs/models/gpt-6-sol
+    # https://developers.openai.com/api/docs/models/gpt-6-luna
+    # Unlike Astra, the Sol/Luna pages document `reasoning.effort` support for
+    # "none" (in addition to low/medium/high/xhigh/max) -- see
+    # `_GPT_6_ALLOWED_EFFORTS` in `__init__.py`, which is where that
+    # per-model distinction is actually enforced; capability metadata here is
+    # identical across all three. supports_native_apply_patch/
+    # supports_native_computer_use are True per the "Supported tools" list on
+    # each page (apply_patch, computer_use).
+    if model_id in GPT_6_MODEL_IDS:
         return ModelCapabilities(
-            family="gpt-6-astra",
+            family=model_id,
             context_window=922_000,
             max_output_tokens=128_000,
             supports_reasoning=True,

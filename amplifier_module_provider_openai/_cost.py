@@ -41,7 +41,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-from ._capabilities import get_capabilities
+from ._capabilities import GPT_6_MODEL_IDS, get_capabilities
 
 # ---------------------------------------------------------------------------
 # Internal constants
@@ -89,6 +89,23 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "output_per_m": Decimal("50.00"),
         "cache_read_per_m": Decimal("1.00"),
         "cache_write_per_m": Decimal("12.50"),
+    },
+    # GPT-6 Sol / Luna short-context Standard pricing, per 1M tokens.
+    # Source: https://developers.openai.com/api/docs/models/gpt-6-sol and
+    # https://developers.openai.com/api/docs/models/gpt-6-luna (verified
+    # 2026-09-24). Same cache-read (10% of input) / cache-write (1.25x
+    # input) relationship as Astra and gpt-5.6.
+    "gpt-6-sol": {
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("10.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("2.50"),
+    },
+    "gpt-6-luna": {
+        "input_per_m": Decimal("0.10"),
+        "output_per_m": Decimal("0.50"),
+        "cache_read_per_m": Decimal("0.01"),
+        "cache_write_per_m": Decimal("0.125"),
     },
     # ------------------------------------------------------------------
     # GPT 5.6 family: Sol / Terra / Luna  (GA 2026-07-09)
@@ -195,6 +212,21 @@ _LONG_RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("2.00"),
         "cache_write_per_m": Decimal("25.00"),
     },
+    # GPT-6 Sol / Luna long-context (>272K input) Standard pricing, per 1M
+    # tokens. Source: pricing page (verified 2026-09-24). Same 2x input/
+    # cached/cache-write, 1.5x output relationship as Astra.
+    "gpt-6-sol": {
+        "input_per_m": Decimal("4.00"),
+        "output_per_m": Decimal("15.00"),
+        "cache_read_per_m": Decimal("0.40"),
+        "cache_write_per_m": Decimal("5.00"),
+    },
+    "gpt-6-luna": {
+        "input_per_m": Decimal("0.20"),
+        "output_per_m": Decimal("0.75"),
+        "cache_read_per_m": Decimal("0.02"),
+        "cache_write_per_m": Decimal("0.25"),
+    },
     "gpt-5.6-sol": {
         "input_per_m": Decimal("8.00"),
         "output_per_m": Decimal("30.00"),
@@ -244,9 +276,10 @@ def _find_rates(
     m = _SNAPSHOT_RE.match(model)
     if m is None:
         return None
-    # Astra has one documented model ID and no dated snapshots. Do not assign
-    # its current prices to an invented future snapshot.
-    if m.group("base") == "gpt-6-astra":
+    # Every GPT-6 model (Astra, Sol, Luna) has one documented model ID and no
+    # dated snapshots. Do not assign current prices to an invented future
+    # snapshot for any of them.
+    if m.group("base") in GPT_6_MODEL_IDS:
         return None
     return table.get(m.group("base"))
 
@@ -275,10 +308,10 @@ def compute_cost(
             has that rate. usage.{prompt,input}_tokens_details.cache_write_tokens.
             Models without a cache_write_per_m rate never emit this field and bill
             it as ordinary input.
-        service_tier: Actual response service tier for GPT-6 Astra. Direct
-            callers retain the historic Standard/default estimate. Explicit
-            None or an unpriced tier returns None for Astra rather than
-            fabricating a Standard price.
+        service_tier: Actual response service tier for GPT-6 models (Astra,
+            Sol, Luna). Direct callers retain the historic Standard/default
+            estimate. Explicit None or an unpriced tier returns None for
+            these models rather than fabricating a Standard price.
 
     Returns:
         Decimal cost in USD, or None if the model is not in the pricing table.
@@ -291,7 +324,7 @@ def compute_cost(
     if rates is None:
         return None
 
-    if model == "gpt-6-astra":
+    if model in GPT_6_MODEL_IDS:
         if service_tier is None:
             return None
         tier = service_tier.lower()
@@ -305,7 +338,7 @@ def compute_cost(
             return None
     else:
         # Preserve legacy-model cost behavior; service tiers are only priced
-        # for Astra in this module.
+        # for the GPT-6 family (Astra, Sol, Luna) in this module.
         tier_multiplier = Decimal(1)
 
     # Long-context re-rating: when input tokens exceed the model's long-context
