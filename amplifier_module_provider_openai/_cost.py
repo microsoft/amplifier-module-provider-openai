@@ -23,7 +23,7 @@ Notes
 -----
 - O-series: completion_tokens already includes reasoning_tokens (no extra handling needed).
 - Cache-write cost: most OpenAI models have none (writes are free, reads discounted).
-  GPT-5.6 (Sol/Terra/Luna) and GPT-6 Astra bill cache-WRITE tokens at 1.25x the
+  GPT-5.6 (Sol/Terra/Luna) and GPT-6 (Astra/Sol/Luna) bill cache-WRITE tokens at 1.25x the
   input rate and reports them as usage.input_tokens_details.cache_write_tokens (Responses API)
   / usage.prompt_tokens_details.cache_write_tokens (Chat Completions). Rate entries that omit
   "cache_write_per_m" bill any write tokens as ordinary input (correct for pre-5.6 models,
@@ -41,7 +41,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-from ._capabilities import get_capabilities
+from ._capabilities import GPT_6_MODELS, get_capabilities
 
 # ---------------------------------------------------------------------------
 # Internal constants
@@ -70,7 +70,7 @@ _SNAPSHOT_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 #   "input_per_m":       Decimal,  # fresh input tokens, per 1M
 #   "output_per_m":      Decimal,  # output/completion tokens, per 1M
 #   "cache_read_per_m":  Decimal,  # cached input tokens, per 1M (0.00 = no discount)
-#   "cache_write_per_m": Decimal,  # OPTIONAL. cache-WRITE tokens, per 1M (GPT-5.6 only).
+#   "cache_write_per_m": Decimal,  # OPTIONAL. cache-WRITE tokens, per 1M (GPT-5.6/GPT-6).
 #                                  # Omit for models with no distinct write price -- write
 #                                  # tokens are then billed as ordinary input.
 # }
@@ -89,6 +89,18 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "output_per_m": Decimal("50.00"),
         "cache_read_per_m": Decimal("1.00"),
         "cache_write_per_m": Decimal("12.50"),
+    },
+    "gpt-6-sol": {
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("10.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("2.50"),
+    },
+    "gpt-6-luna": {
+        "input_per_m": Decimal("0.10"),
+        "output_per_m": Decimal("0.50"),
+        "cache_read_per_m": Decimal("0.01"),
+        "cache_write_per_m": Decimal("0.125"),
     },
     # ------------------------------------------------------------------
     # GPT 5.6 family: Sol / Terra / Luna  (GA 2026-07-09)
@@ -195,6 +207,18 @@ _LONG_RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("2.00"),
         "cache_write_per_m": Decimal("25.00"),
     },
+    "gpt-6-sol": {
+        "input_per_m": Decimal("4.00"),
+        "output_per_m": Decimal("15.00"),
+        "cache_read_per_m": Decimal("0.40"),
+        "cache_write_per_m": Decimal("5.00"),
+    },
+    "gpt-6-luna": {
+        "input_per_m": Decimal("0.20"),
+        "output_per_m": Decimal("0.75"),
+        "cache_read_per_m": Decimal("0.02"),
+        "cache_write_per_m": Decimal("0.25"),
+    },
     "gpt-5.6-sol": {
         "input_per_m": Decimal("8.00"),
         "output_per_m": Decimal("30.00"),
@@ -244,9 +268,9 @@ def _find_rates(
     m = _SNAPSHOT_RE.match(model)
     if m is None:
         return None
-    # Astra has one documented model ID and no dated snapshots. Do not assign
-    # its current prices to an invented future snapshot.
-    if m.group("base") == "gpt-6-astra":
+    # GPT-6 has three documented model IDs and no dated snapshots. Do not
+    # assign their current prices to invented future snapshots.
+    if m.group("base") in GPT_6_MODELS:
         return None
     return table.get(m.group("base"))
 
@@ -271,13 +295,13 @@ def compute_cost(
         cached_tokens: Number of prompt tokens served from cache (billed at
             cache_read_per_m). usage.{prompt,input}_tokens_details.cached_tokens.
         cache_write_tokens: Number of prompt tokens written to cache this call.
-            GPT-5.6 only; billed at cache_write_per_m (1.25x input) when the model
+            GPT-5.6/GPT-6; billed at cache_write_per_m (1.25x input) when the model
             has that rate. usage.{prompt,input}_tokens_details.cache_write_tokens.
             Models without a cache_write_per_m rate never emit this field and bill
             it as ordinary input.
-        service_tier: Actual response service tier for GPT-6 Astra. Direct
+        service_tier: Actual response service tier for the GPT-6 family. Direct
             callers retain the historic Standard/default estimate. Explicit
-            None or an unpriced tier returns None for Astra rather than
+            None or an unpriced tier returns None for GPT-6 rather than
             fabricating a Standard price.
 
     Returns:
@@ -291,7 +315,7 @@ def compute_cost(
     if rates is None:
         return None
 
-    if model == "gpt-6-astra":
+    if model in GPT_6_MODELS:
         if service_tier is None:
             return None
         tier = service_tier.lower()
@@ -305,7 +329,7 @@ def compute_cost(
             return None
     else:
         # Preserve legacy-model cost behavior; service tiers are only priced
-        # for Astra in this module.
+        # for the documented GPT-6 family in this module.
         tier_multiplier = Decimal(1)
 
     # Long-context re-rating: when input tokens exceed the model's long-context
@@ -331,7 +355,7 @@ def compute_cost(
         fresh_input = max(0, prompt_tokens - cached_tokens)
         write_cost = Decimal(0)
     else:
-        # GPT-5.6: cache-write tokens are a re-rated subset of prompt_tokens
+        # GPT-5.6/GPT-6: cache-write tokens are a re-rated subset of prompt_tokens
         # (billed at 1.25x input INSTEAD of the input rate, not on top of it).
         fresh_input = max(0, prompt_tokens - cached_tokens - cache_write_tokens)
         write_cost = Decimal(cache_write_tokens) * cache_write_rate / _PER_M

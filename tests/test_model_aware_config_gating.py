@@ -125,11 +125,11 @@ class TestConfigFieldGatingMetadata:
     prompt_cache_retention are no longer ConfigFields at all (config-surface
     V2 reduced the wizard to 4 fields) -- see test_wizard_surface.py."""
 
-    def test_enable_long_context_requires_model_and_shows_for_5_6_and_astra(self):
+    def test_enable_long_context_requires_model_and_shows_for_5_6_and_exact_gpt_6(self):
         field = _field(_make_provider(), "enable_long_context")
         assert field.requires_model is True
         assert field.show_when == {
-            "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-astra)$"
+            "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna))$"
         }
 
     def test_untouched_fields_keep_no_gating(self):
@@ -159,8 +159,19 @@ class TestShowWhenConsumerSimulation:
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
     )
-    NON_5_6_MODELS = ("gpt-5.4", "gpt-5.5", "gpt-5.5-pro", "gpt-4o", "gpt-5-mini")
+    NON_5_6_MODELS = (
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-4o",
+        "gpt-5-mini",
+        "gpt-6",
+        "gpt-6-terra",
+        "gpt-6-sol-2099-01-01",
+    )
 
     def _gated_fields(self, provider: OpenAIProvider) -> dict[str, dict[str, Any]]:
         info = provider.get_info()
