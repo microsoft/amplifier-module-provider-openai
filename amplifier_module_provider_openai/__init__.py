@@ -570,6 +570,115 @@ def _is_context_overflow(err_code: str | None, raw_msg: str) -> bool:
     return any(m in raw_msg for m in _CONTEXT_OVERFLOW_MESSAGE_MARKERS)
 
 
+# OpenAI's behavioral-misalignment monitor can stop a request or response for
+# this reason. Documented to appear in three shapes: a pre-stream HTTP 403
+# (JSON body `error.code`), a streamed `response.failed` terminal
+# (`response.error.code`), and a flat SSE `error` event (`event.code`). It is
+# also possible to see it on an ordinary HTTP 200 non-streaming response body
+# with `status: "failed"` (`response.error.code`), and (defensively) nested
+# under an `error` key on an event/body that otherwise looks flat. This is a
+# deliberate safety stop; OpenAI's guidance is that clients must not retry it
+# automatically.
+_MISALIGNMENT_POLICY_VIOLATION_CODE = "misalignment_policy_violation"
+
+
+def _misalignment_code(obj: Any) -> str | None:
+    """Extract an error `code` from any shape OpenAI uses for this signal.
+
+    Tries, in order: dict `{"error": {"code": ...}}`, dict `{"code": ...}`,
+    namespace/object `.error.code`, namespace/object `.code`. Returns None
+    for anything that doesn't carry a code this way. Never inspects message
+    text -- callers must not widen this to a substring match.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        # _extract_error_fields already falls back to obj["code"] itself
+        # when there's no nested "error" dict -- nothing left to add here.
+        code, _ = _extract_error_fields(obj)
+        return code
+    err = getattr(obj, "error", None)
+    if err is not None:
+        if isinstance(err, dict):
+            code = err.get("code")
+        else:
+            code = getattr(err, "code", None)
+        if code:
+            return code
+    return getattr(obj, "code", None)
+
+
+def _misalignment_details(obj: Any) -> tuple[str | None, str | None]:
+    """Best-effort (message, id) extraction from the same candidate shapes
+    `_misalignment_code` accepts, for a useful non-secret error message."""
+    if obj is None:
+        return None, None
+    if isinstance(obj, dict):
+        err = obj.get("error")
+        message = (err.get("message") if isinstance(err, dict) else None) or obj.get(
+            "message"
+        )
+        return message, obj.get("id")
+    err = getattr(obj, "error", None)
+    message = getattr(err, "message", None) if err is not None else None
+    message = message or getattr(obj, "message", None)
+    return message, getattr(obj, "id", None)
+
+
+def _classify_misalignment_policy_violation(
+    *,
+    provider: str,
+    model: str | None = None,
+    status_code: int | None = None,
+    body: object = None,
+    response: object = None,
+    event: object = None,
+    exc: BaseException | None = None,
+) -> "kernel_errors.ContentFilterError | None":
+    """Detect OpenAI's `misalignment_policy_violation` code wherever it can
+    appear, and translate it to a non-retryable ContentFilterError.
+
+    Checks `body`, `response`, and `event` candidates (whichever the caller
+    has), plus `exc.body` and a bare `exc.code` when an exception is given.
+    Returns None -- never raises on its own -- when no candidate carries the
+    code, so callers keep their existing fallthrough behavior unchanged.
+
+    `status_code` is only ever echoed back as-is (e.g. a real HTTP 403); this
+    never fabricates a status code for a mid-stream detection that has none.
+    """
+    candidates = (body, response, event)
+    matched: object = None
+    for candidate in candidates:
+        if _misalignment_code(candidate) == _MISALIGNMENT_POLICY_VIOLATION_CODE:
+            matched = candidate
+            break
+    if matched is None and exc is not None:
+        exc_body = getattr(exc, "body", None)
+        if _misalignment_code(exc_body) == _MISALIGNMENT_POLICY_VIOLATION_CODE:
+            matched = exc_body
+        elif getattr(exc, "code", None) == _MISALIGNMENT_POLICY_VIOLATION_CODE:
+            matched = exc
+    if matched is None:
+        return None
+
+    message, response_id = _misalignment_details(matched)
+    error_msg = message or (
+        "OpenAI blocked this request/response for a misalignment policy "
+        "violation (misalignment_policy_violation). This is a deliberate "
+        "safety stop, not a transient failure -- retrying will not succeed."
+    )
+    if response_id:
+        error_msg = f"{error_msg} (response_id={response_id})"
+
+    return kernel_errors.ContentFilterError(
+        error_msg,
+        provider=provider,
+        model=model,
+        status_code=status_code,
+        retryable=False,
+    )
+
+
 def _validate_prompt_cache_options(options: Any) -> None:
     """Validate the prompt_cache_options object shape/mode enum pre-flight."""
     if not isinstance(options, dict):
@@ -2175,9 +2284,20 @@ class OpenAIProvider:
             if background_mode:
                 params["background"] = True
             if kwargs.get("extended_thinking") and "reasoning" not in params:
+                # A request-level `reasoning_effort` kwarg (including the
+                # literal string "none") always wins and is sent as given.
+                # Falling back to config, use the NORMALIZED
+                # `self.reasoning_effort` -- not the raw `self.config` value
+                # -- because config `reasoning_effort: "none"` is the
+                # provisioning-UI omission sentinel (normalized to None by
+                # _resolve_config_reasoning_effort) and must fall back to
+                # "high" here, not be sent to the API as a literal "none"
+                # (which gpt-6-astra rejects outright and which silently
+                # disables reasoning on gpt-6-sol/-luna).
                 params["reasoning"] = {
                     "effort": kwargs.get("reasoning_effort")
-                    or self.config.get("reasoning_effort", "high"),
+                    or self.reasoning_effort
+                    or "high",
                     "summary": self.reasoning_summary,
                 }
             if self._model_may_reason(model_name) and "reasoning" not in params:
@@ -2455,6 +2575,30 @@ class OpenAIProvider:
             )
         return self._client
 
+    def _raise_if_misaligned_response(
+        self, response: Any, *, model: str | None
+    ) -> None:
+        """Raise ContentFilterError for a misalignment policy stop delivered
+        as an ordinary HTTP 200 body (`status: "failed"`, `error.code`)
+        rather than as a raised exception.
+
+        This is a real, documented shape: the Responses API can complete the
+        HTTP request successfully and still report `status="failed"` in the
+        body. A response like that must never be handed back as a completed
+        or partial success. No-op for anything else -- including other
+        `status="failed"` reasons -- which keep their prior (unclassified)
+        handling; only this one code gets a new classification.
+        """
+        if getattr(response, "status", None) != "failed":
+            return
+        misaligned = _classify_misalignment_policy_violation(
+            provider=self.name,
+            model=model,
+            response=response,
+        )
+        if misaligned is not None:
+            raise misaligned
+
     @staticmethod
     def _is_cloudflare_challenge(error: openai.APIStatusError) -> bool:
         """Detect Cloudflare bot-management challenge responses.
@@ -2613,6 +2757,14 @@ class OpenAIProvider:
             try:
                 return await self.client.models.list()
             except openai.RateLimitError as e:
+                misaligned = _classify_misalignment_policy_violation(
+                    provider=self.name,
+                    status_code=429,
+                    body=getattr(e, "body", None),
+                    exc=e,
+                )
+                if misaligned is not None:
+                    raise misaligned from e
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.RateLimitError(
@@ -2622,6 +2774,14 @@ class OpenAIProvider:
                     retryable=True,
                 ) from e
             except openai.AuthenticationError as e:
+                misaligned = _classify_misalignment_policy_violation(
+                    provider=self.name,
+                    status_code=401,
+                    body=getattr(e, "body", None),
+                    exc=e,
+                )
+                if misaligned is not None:
+                    raise misaligned from e
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.AuthenticationError(
@@ -2633,6 +2793,14 @@ class OpenAIProvider:
                 status = getattr(e, "status_code", 500)
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
+                misaligned = _classify_misalignment_policy_violation(
+                    provider=self.name,
+                    status_code=status if status == 403 else None,
+                    body=body,
+                    exc=e,
+                )
+                if misaligned is not None:
+                    raise misaligned from e
                 if status == 403:
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
@@ -3240,6 +3408,43 @@ class OpenAIProvider:
                 ) from e
             return _RawResponseObject(body)
 
+    async def _create_response_checked(
+        self, params: dict[str, Any], *, timeout=openai.NOT_GIVEN
+    ) -> Any:
+        """`_create_response()` plus misalignment-policy classification.
+
+        `_create_response()` itself does no SDK -> kernel error translation
+        (unlike the main `_do_complete()` path, which is guarded by
+        retry_with_backoff). This wraps the two other call sites that invoke
+        it directly -- the truncation retry and the incomplete-response
+        continuation call -- so a `misalignment_policy_violation` reaching
+        either of them is classified the same way: a real HTTP exception is
+        translated to a non-retryable ContentFilterError instead of escaping
+        as a raw SDK exception, and an ordinary HTTP 200 body with
+        `status: "failed"` is rejected instead of silently continuing as if
+        it were a normal (possibly partial) success.
+
+        Every other exception or response shape passes through completely
+        unchanged -- this adds exactly one classification, nothing else.
+        """
+        try:
+            response = await self._create_response(params, timeout=timeout)
+        except kernel_errors.LLMError:
+            raise
+        except Exception as e:
+            misaligned = _classify_misalignment_policy_violation(
+                provider=self.name,
+                model=params.get("model"),
+                status_code=getattr(e, "status_code", None),
+                body=getattr(e, "body", None),
+                exc=e,
+            )
+            if misaligned is not None:
+                raise misaligned from e
+            raise
+        self._raise_if_misaligned_response(response, model=params.get("model"))
+        return response
+
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
     ) -> ChatResponse:
@@ -3376,6 +3581,15 @@ class OpenAIProvider:
                     seq: dict[int, int] = {}  # block_index → next seq number
                     block_types: dict[int, str] = {}  # block_index → contract type
                     partial_emitted = False
+                    # Block indexes with a start event but no matching end
+                    # event yet. A tool-call (function_call) block in this
+                    # contract never emits a delta -- only start then done --
+                    # so `partial_emitted` alone misses "a tool call started
+                    # but the stream died before it closed" as a dangling
+                    # block. Tracked separately from `partial_emitted` so the
+                    # existing no-delta/no-abort behavior for text/reasoning
+                    # blocks is unchanged (see test_stream_no_abort_when_no_delta_emitted).
+                    open_block_indexes: set[int] = set()
                     # Terminal response captured off the stream events. The SDK's
                     # get_final_response() only accepts a `response.completed` event,
                     # so a legitimate non-completed terminal (`response.incomplete`
@@ -3413,9 +3627,39 @@ class OpenAIProvider:
                                                 event, "response", None
                                             )
                                         elif et == "response.failed":
-                                            _record_failed_stream_response(
-                                                getattr(event, "response", None)
+                                            failed_response = getattr(
+                                                event, "response", None
                                             )
+                                            _record_failed_stream_response(
+                                                failed_response
+                                            )
+                                            misaligned = (
+                                                _classify_misalignment_policy_violation(
+                                                    provider=self.name,
+                                                    model=params.get("model"),
+                                                    response=failed_response,
+                                                )
+                                            )
+                                            if misaligned is not None:
+                                                raise misaligned
+                                        elif et == "error":
+                                            # Flat SSE `error` event -- the
+                                            # other documented shape for a
+                                            # mid-stream policy stop. Only
+                                            # intercepted for this specific
+                                            # code; any other flat error event
+                                            # keeps its prior fallthrough
+                                            # behavior (the SDK's own
+                                            # end-of-stream handling below).
+                                            misaligned = (
+                                                _classify_misalignment_policy_violation(
+                                                    provider=self.name,
+                                                    model=params.get("model"),
+                                                    event=event,
+                                                )
+                                            )
+                                            if misaligned is not None:
+                                                raise misaligned
 
                                         if et == "response.output_item.added":
                                             idx = event.output_index
@@ -3429,6 +3673,7 @@ class OpenAIProvider:
                                             }.get(item_type, "text")
                                             block_types[idx] = block_type
                                             seq[idx] = 0
+                                            open_block_indexes.add(idx)
                                             payload: dict[str, Any] = {
                                                 "request_id": request_id,
                                                 "block_index": idx,
@@ -3485,6 +3730,7 @@ class OpenAIProvider:
 
                                         elif et == "response.output_item.done":
                                             idx = event.output_index
+                                            open_block_indexes.discard(idx)
                                             if idx in block_types:
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_end",
@@ -3509,9 +3755,31 @@ class OpenAIProvider:
                                                 event, "response", None
                                             )
                                         elif et == "response.failed":
-                                            _record_failed_stream_response(
-                                                getattr(event, "response", None)
+                                            failed_response = getattr(
+                                                event, "response", None
                                             )
+                                            _record_failed_stream_response(
+                                                failed_response
+                                            )
+                                            misaligned = (
+                                                _classify_misalignment_policy_violation(
+                                                    provider=self.name,
+                                                    model=params.get("model"),
+                                                    response=failed_response,
+                                                )
+                                            )
+                                            if misaligned is not None:
+                                                raise misaligned
+                                        elif et == "error":
+                                            misaligned = (
+                                                _classify_misalignment_policy_violation(
+                                                    provider=self.name,
+                                                    model=params.get("model"),
+                                                    event=event,
+                                                )
+                                            )
+                                            if misaligned is not None:
+                                                raise misaligned
 
                                 try:
                                     response = await stream.get_final_response()
@@ -3548,9 +3816,23 @@ class OpenAIProvider:
                                 )
                                 return response
                     except Exception as e:
-                        # If a partial stream was already emitted, signal abort to
-                        # consumers before re-raising for normal error translation.
-                        if partial_emitted and hooks_available:
+                        # If a partial stream was already emitted, OR a
+                        # tool-call block was opened and never closed, signal
+                        # abort to consumers before re-raising for normal
+                        # error translation. A tool-call (function_call)
+                        # block in this contract has no delta events of its
+                        # own -- only start then done -- so `partial_emitted`
+                        # alone would miss a dangling tool-call block left
+                        # open by a mid-stream failure (including this
+                        # classifier's own raise above). Scoped to tool_use
+                        # specifically: a text/reasoning block that started
+                        # but never got a delta keeps the prior no-abort
+                        # behavior (see test_stream_no_abort_when_no_delta_emitted).
+                        dangling_tool_call = any(
+                            block_types.get(idx) == "tool_use"
+                            for idx in open_block_indexes
+                        )
+                        if (partial_emitted or dangling_tool_call) and hooks_available:
                             await self.coordinator.hooks.emit(
                                 "llm:stream_aborted",
                                 {
@@ -3564,14 +3846,31 @@ class OpenAIProvider:
                         raise
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
-                    return await asyncio.wait_for(
+                    response = await asyncio.wait_for(
                         self._create_response(
                             params, native_input_tokens=attempt_native_input_tokens,
                             timeout=request_timeout,
                         ),
                         timeout=effective_timeout,
                     )
+                    self._raise_if_misaligned_response(
+                        response, model=params.get("model")
+                    )
+                    return response
             except openai.RateLimitError as e:
+                # An unexpected HTTP 429 carrying the exact misalignment code
+                # must still be classified as a non-retryable policy stop --
+                # not retried as an ordinary rate limit, whatever status code
+                # the monitor happens to be delivered on.
+                misaligned = _classify_misalignment_policy_violation(
+                    provider=self.name,
+                    model=params.get("model"),
+                    status_code=429,
+                    body=getattr(e, "body", None),
+                    exc=e,
+                )
+                if misaligned is not None:
+                    raise misaligned from e
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:
                     # Standard header (seconds)
@@ -3609,6 +3908,18 @@ class OpenAIProvider:
                     retry_after=retry_after,
                 ) from e
             except openai.AuthenticationError as e:
+                # Same defensive check for an unexpected HTTP 401 carrying
+                # the exact misalignment code -- must not be mislabeled as
+                # an authentication failure.
+                misaligned = _classify_misalignment_policy_violation(
+                    provider=self.name,
+                    model=params.get("model"),
+                    status_code=401,
+                    body=getattr(e, "body", None),
+                    exc=e,
+                )
+                if misaligned is not None:
+                    raise misaligned from e
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.AuthenticationError(
@@ -3621,6 +3932,15 @@ class OpenAIProvider:
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 err_code, _ = _extract_error_fields(body)
+                misaligned = _classify_misalignment_policy_violation(
+                    provider=self.name,
+                    model=params.get("model"),
+                    status_code=getattr(e, "status_code", None),
+                    body=body,
+                    exc=e,
+                )
+                if misaligned is not None:
+                    raise misaligned from e
                 if _is_context_overflow(err_code, raw_msg):
                     return await _handle_context_overflow(e, error_msg)
                 elif (
@@ -3643,6 +3963,15 @@ class OpenAIProvider:
                 status = getattr(e, "status_code", 500)
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
+                misaligned = _classify_misalignment_policy_violation(
+                    provider=self.name,
+                    model=params.get("model"),
+                    status_code=status if status == 403 else None,
+                    body=body,
+                    exc=e,
+                )
+                if misaligned is not None:
+                    raise misaligned from e
                 if status == 403:
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
@@ -3715,6 +4044,15 @@ class OpenAIProvider:
                 )
                 err_code, err_type = _extract_error_fields(body)
                 raw_msg = str(e).lower()
+                misaligned = _classify_misalignment_policy_violation(
+                    provider=self.name,
+                    model=params.get("model"),
+                    status_code=getattr(e, "status_code", None),
+                    body=body,
+                    exc=e,
+                )
+                if misaligned is not None:
+                    raise misaligned from e
                 if _is_context_overflow(err_code, raw_msg):
                     return await _handle_context_overflow(e, error_msg)
                 if err_type == "invalid_request_error":
@@ -3901,6 +4239,20 @@ class OpenAIProvider:
 
                 # Check for failed/cancelled status
                 if response.status == BACKGROUND_STATUS_FAILED:
+                    # This covers BOTH an initial response already status
+                    # "failed" (poll_count == 0, loop never entered) and one
+                    # that failed during polling -- the misalignment monitor
+                    # can stop a background (deep-research) response the
+                    # same as an ordinary one, and it must be classified the
+                    # same way here too: never retried, never a generic
+                    # RuntimeError.
+                    misaligned = _classify_misalignment_policy_violation(
+                        provider=self.name,
+                        model=params.get("model"),
+                        response=response,
+                    )
+                    if misaligned is not None:
+                        raise misaligned
                     error_msg = f"Background request failed after {poll_count} polls"
                     if hasattr(response, "error") and response.error:
                         error_msg = f"{error_msg}: {response.error}"
@@ -3972,7 +4324,9 @@ class OpenAIProvider:
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
-                            self._create_response(params, timeout=request_timeout),
+                            self._create_response_checked(
+                                params, timeout=request_timeout
+                            ),
                             timeout=effective_timeout,
                         )
                         self._record_budget_calibration(params, final_response)
@@ -4102,7 +4456,9 @@ class OpenAIProvider:
                 try:
                     continue_start = time.time()
                     final_response = await asyncio.wait_for(
-                        self._create_response(continue_params, timeout=request_timeout),
+                        self._create_response_checked(
+                            continue_params, timeout=request_timeout
+                        ),
                         timeout=effective_timeout,
                     )
                     self._record_budget_calibration(continue_params, final_response)
@@ -4115,7 +4471,17 @@ class OpenAIProvider:
                         accumulated_output.extend(final_response.output)
 
                 except Exception as e:
-                    if isinstance(e, kernel_errors.ContextLengthError):
+                    # A deterministic/policy failure must not be swallowed
+                    # into a partial "success" -- only genuinely transient
+                    # continuation failures fall back to the partial
+                    # response accumulated so far.
+                    if isinstance(
+                        e,
+                        (
+                            kernel_errors.ContextLengthError,
+                            kernel_errors.ContentFilterError,
+                        ),
+                    ):
                         raise
                     logger.error(
                         f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "

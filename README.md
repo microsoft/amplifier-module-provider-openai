@@ -840,3 +840,34 @@ normalized usage with separate cache-write/read buckets. Native compact cost is
 left unavailable when the response does not report it. Canonical SDK output uses
 `exclude_unset=True` so SDK-invented defaults do not become invalid input fields.
 See the [OpenAI compaction contract](https://developers.openai.com/api/docs/guides/compaction).
+
+### Misalignment policy stop (`misalignment_policy_violation`)
+
+OpenAI's behavioral-misalignment monitor can stop a request or response with
+code `misalignment_policy_violation`, in any of: a pre-stream HTTP 403, a
+streamed `response.failed` terminal, a flat SSE `error` event, an ordinary
+HTTP 200 non-streaming (or continuation/truncation-retry) body reporting
+`status: "failed"`, or a background (deep-research) response -- initial or
+polled via `responses.retrieve()` -- reporting `status: "failed"`. The
+provider recognizes this exact code wherever it appears (never by matching
+message text) and raises a non-retryable `ContentFilterError` -- it is never
+retried, never returned as a completed or partial response, and never
+escapes as a raw SDK exception (including a background poll, which would
+otherwise raise a generic `RuntimeError`). This also covers the code
+arriving on an unexpected HTTP status: a 429 or 401 carrying this exact code
+is still classified as the policy stop, not misread as an ordinary rate
+limit or authentication failure. A tool-call stream block left open by this
+(or any other) mid-stream failure still emits `llm:stream_aborted` even when
+no text/reasoning delta was ever sent for it.
+
+### `extended_thinking` and a config `reasoning_effort` of `"none"`
+
+Provider config `reasoning_effort: "none"` is the provisioning-UI omission
+sentinel (normalized to "use the model default" -- no reasoning param is
+injected on the normal request path). `extended_thinking=True` always injects
+a reasoning param, so it falls back to `"high"` when the *configured* effort
+is that sentinel, rather than sending a literal `"none"` (which `gpt-6-astra`
+rejects outright and which would silently disable reasoning on
+`gpt-6-sol`/`gpt-6-luna`). An explicit **request-level** `reasoning_effort`
+kwarg -- including a literal `"none"` -- is a caller instruction and is
+always sent exactly as given, with or without `extended_thinking`.
