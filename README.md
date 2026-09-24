@@ -782,6 +782,28 @@ A failed computer result remains a non-retryable local protocol error in its cur
 
 This allows a user to discuss the failure without manufacturing a screenshot or replaying the prior action. It does not grant approval, resume a computer tool, clear a durable tool/provider halt, or rewrite the original result. Hosts must mark injected reminders/observations ephemeral; they are not new user input. The native transport uses the normalized view to start a new lineage once, retaining its existing refusal to move pending steering into a rewritten context. Real user instructions still require ordinary tool authority and any separate safety-halt resolution.
 
+### Multiple attachments with the computer tool available
+
+OpenAI rejects multiple ordinary image inputs when its native `computer` tool
+is advertised. For these requests, the provider uses the mounted computer
+tool's existing function schema. Every attachment remains an image. Completed
+computer action/result pairs are represented as function pairs carrying the same
+call IDs, action batches, and screenshot bytes; saved messages are unchanged.
+New function calls still use the same mounted executor and its safety checks.
+
+The choice is applied before budgeting and dispatch, including host request
+extras. Native WebSocket conversations start one new lineage when changing
+computer transport, preserving saved history and outstanding job identities.
+Pending steering cannot cross that boundary. Single-image and screenshot-only
+native requests keep their existing format.
+
+The provider does not rewrite native compaction windows containing computer
+items, invent a function schema for a bare native declaration, reinterpret
+unfinished/ambiguous pairs, or clear pending safety checks. Such requests fail
+before dispatch with `computer_multi_image_incompatible`, preserving their
+originals. Explicit caller-forced native tool choices are also retained as a
+constraint. No automatic retry, image omission, or action replay is performed.
+
 ### Standalone compaction for the ordinary Responses provider
 
 The ordinary `OpenAIProvider` now exposes optional host capabilities:

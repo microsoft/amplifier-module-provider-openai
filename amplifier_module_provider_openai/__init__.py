@@ -1609,6 +1609,22 @@ class OpenAIProvider:
             )
         _validate_gpt_6_astra_params(params)
 
+    def _prepare_computer_images(self, params, request, **kwargs):
+        from .compaction import KEY
+        from .computer_images import prepare_computer_images
+
+        source_tools = [*(request.tools or []), *(kwargs.get("tools") or [])]
+        protected = any(
+            any(
+                item.get("type") in {"computer_call", "computer_call_output"}
+                for item in (message.metadata or {}).get(KEY, {}).get("output", [])
+            )
+            for message in request.messages
+        )
+        return prepare_computer_images(
+            params, source_tools, protected_computer_history=protected
+        )
+
     def _merge_extra_request_params(self, params: dict[str, Any]) -> None:
         """Merge config `extra_request_params` into *params*, user-wins.
 
@@ -2151,6 +2167,7 @@ class OpenAIProvider:
             # context request cannot silently regain its original reserve.
             if request.max_output_tokens is not None:
                 params["max_output_tokens"] = request.max_output_tokens
+            params = self._prepare_computer_images(params, request, **kwargs)
             self._prepare_astra_params(params)
             if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
                 params.get("input"), list
@@ -4032,6 +4049,9 @@ class OpenAIProvider:
                 # issues, not just the first. Merged last here too, for the
                 # same reason and with the same owner-beware semantics.
                 self._merge_extra_request_params(continue_params)
+                continue_params = self._prepare_computer_images(
+                    continue_params, request, **kwargs
+                )
                 self._prepare_astra_params(continue_params)
                 if _supports_tool_output_cache_breakpoints(
                     continue_params.get("model")
