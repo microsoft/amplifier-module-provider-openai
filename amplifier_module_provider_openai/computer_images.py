@@ -51,6 +51,7 @@ def prepare_computer_images(
     *,
     protected_computer_history: bool = False,
     function_lineage: bool = False,
+    retained_function_call_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Return compatible params without modifying caller-owned input or tools.
 
@@ -148,7 +149,11 @@ def prepare_computer_images(
             ):
                 _unsupported("a computer result is not a recorded screenshot")
             outputs[identity] = item
-    if calls.keys() != outputs.keys():
+    # A native transport delta may contain only a result for a function call
+    # already retained by that same server lineage. The caller must derive
+    # these IDs from its validated full request, never from opaque history.
+    retained = retained_function_call_ids if function_lineage else frozenset()
+    if calls.keys() - outputs.keys() or outputs.keys() - calls.keys() - retained:
         _unsupported("a computer call/result pair is incomplete")
 
     projected = copy.deepcopy(params)

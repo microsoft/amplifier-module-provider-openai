@@ -356,6 +356,97 @@ async def test_pending_native_steering_is_not_moved_to_new_computer_transport():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("singular_action", [False, True])
+async def test_native_function_batch_result_continues_without_resending_call(
+    singular_action,
+):
+    from amplifier_module_provider_openai.native import NATIVE_REQUEST
+
+    from .test_native_transport import make
+
+    instance, owner = make()
+    req = native_history_request()
+    req.model = "gpt-6-astra"
+    instance._native_response = AsyncMock(return_value={})
+    instance._guard_assembled_params_with_provider_count = AsyncMock()
+    token = NATIVE_REQUEST.set(instance)
+    try:
+
+        async def send():
+            messages = [m.model_dump() for m in req.messages]
+            instance._request_messages = messages
+            instance.full_messages = messages
+            owner.messages = messages
+            before = copy.deepcopy(messages)
+            params, state, _ = instance._assemble_initial_responses_params(req)
+            instance._commit_initial_assembly_state(state)
+            instance._native_request_attempted = False
+            await instance._create_response(params)
+            assert messages == before
+
+        await send()
+        instance.previous_response_id = "function-response"
+        epoch = instance.epoch
+        args = {"actions": [{"type": "screenshot"}]}
+        if singular_action:
+            args["action"] = "screenshot"
+        req.messages += [
+            Message(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_call",
+                        "id": "next-batch",
+                        "name": "computer",
+                        "input": args,
+                    }
+                ],
+                metadata={"converge_live_epoch": epoch},
+            ),
+            Message(
+                role="tool",
+                name="computer",
+                tool_call_id="next-batch",
+                content=req.messages[2].content,
+            ),
+        ]
+        await send()
+        sent = instance._native_response.call_args.args[0]
+        assert instance._native_response.await_count == 2
+        assert instance.previous_response_id == "function-response"
+        assert instance.epoch == epoch
+        assert len(sent["input"]) == 1
+        output = sent["input"][0]
+        assert output["type"] == "function_call_output"
+        assert output["call_id"] == "next-batch"
+        assert output["output"][0]["type"] == "input_image"
+        assert all(item.get("type") != "computer" for item in sent["tools"])
+    finally:
+        NATIVE_REQUEST.reset(token)
+
+
+def test_only_explicit_validated_function_lineage_can_accept_result_only_delta():
+    original = packet()
+    original["input"] = original["input"][1:2]
+    original["tools"] = [
+        {"type": "function", "name": "computer", "parameters": tool().parameters}
+    ]
+    for ids in (frozenset(), frozenset({"different-call"})):
+        with pytest.raises(llm_errors.InvalidRequestError, match="pair is incomplete"):
+            prepare_computer_images(
+                original, [], function_lineage=True, retained_function_call_ids=ids
+            )
+    projected = prepare_computer_images(
+        original,
+        [],
+        function_lineage=True,
+        retained_function_call_ids=frozenset({"c0"}),
+    )
+    assert projected["input"][0]["type"] == "function_call_output"
+    assert original["input"][0]["type"] == "computer_call_output"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-6-astra"])
 async def test_sdk_dispatch_and_budget_see_the_same_preserved_images(model):
     from .test_computer_use_integration import TestWireToolChoice

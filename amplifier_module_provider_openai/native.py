@@ -93,6 +93,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
 
     def _prepare_native_messages(self, messages):
         from .computer_history import project_failed_computer_history
+
         return project_failed_computer_history(messages, self._native_call_types)
 
     def _validate_native_items(self, items):
@@ -480,7 +481,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         )
         return True
 
-    async def _create_response(self, params, *, native_input_tokens=None, timeout=NOT_GIVEN):
+    async def _create_response(
+        self, params, *, native_input_tokens=None, timeout=NOT_GIVEN
+    ):
         if NATIVE_REQUEST.get() is not self:
             return await super()._create_response(
                 params, native_input_tokens=native_input_tokens, timeout=timeout
@@ -538,7 +541,17 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             params = {**params, "input": self._convert_messages(self._request_messages)}
             params = self._apply_checkpoint(params, full_params)
             params = prepare_computer_images(
-                params, [], function_lineage=function_computer
+                params,
+                [],
+                function_lineage=function_computer,
+                retained_function_call_ids=frozenset(
+                    item["call_id"]
+                    for item in ordinary
+                    if item.get("type") == "function_call"
+                    and item.get("name") == "computer"
+                    and self.previous_response_id
+                    and self._computer_function_lineage
+                ),
             )
             if native_input_tokens is None:
                 await self._guard_assembled_params_with_provider_count(params)
@@ -569,7 +582,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
 
     async def _native_response(self, params, *, timeout=NOT_GIVEN):
         if isinstance(timeout, Timeout):
-            raise TypeError("Native WebSocket transport requires a scalar request deadline")
+            raise TypeError(
+                "Native WebSocket transport requires a scalar request deadline"
+            )
         await self._connect()
         payload = copy.deepcopy(params)
         if payload.get("background") or payload.get("stream"):
