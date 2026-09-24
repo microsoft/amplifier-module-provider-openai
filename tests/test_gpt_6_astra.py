@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,6 +18,11 @@ from pydantic import ValidationError
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._capabilities import get_capabilities
 from amplifier_module_provider_openai._cost import compute_cost
+
+sys.path.insert(0, str(Path(__file__).parent))
+from _stream_fakes import CompletedStream as _CompletedStream
+from _stream_fakes import StreamContext as _StreamContext
+from _stream_fakes import TerminalFailedStream as _TerminalFailedStream
 
 
 def _provider(**config: object) -> OpenAIProvider:
@@ -59,55 +66,6 @@ def _response(
             input_tokens_details=SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
         ),
     )
-
-
-class _StreamContext:
-    def __init__(self, stream: object) -> None:
-        self._stream = stream
-
-    async def __aenter__(self) -> object:
-        return self._stream
-
-    async def __aexit__(self, *args: object) -> None:
-        return None
-
-
-class _TerminalFailedStream:
-    def __init__(self, failed_response: SimpleNamespace) -> None:
-        self._failed_response = failed_response
-        self._sent = False
-        self._response = SimpleNamespace(headers={})
-
-    def __aiter__(self) -> _TerminalFailedStream:
-        return self
-
-    async def __anext__(self) -> SimpleNamespace:
-        if self._sent:
-            raise StopAsyncIteration
-        self._sent = True
-        return SimpleNamespace(type="response.failed", response=self._failed_response)
-
-    async def get_final_response(self) -> None:
-        raise RuntimeError("Didn't receive a `response.completed` event.")
-
-
-class _CompletedStream:
-    def __init__(self, response: SimpleNamespace) -> None:
-        self._response = SimpleNamespace(headers={})
-        self._final_response = response
-        self._sent = False
-
-    def __aiter__(self) -> _CompletedStream:
-        return self
-
-    async def __anext__(self) -> SimpleNamespace:
-        if self._sent:
-            raise StopAsyncIteration
-        self._sent = True
-        return SimpleNamespace(type="response.completed", response=self._final_response)
-
-    async def get_final_response(self) -> SimpleNamespace:
-        return self._final_response
 
 
 class TestCapabilities:
