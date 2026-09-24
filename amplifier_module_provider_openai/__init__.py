@@ -560,6 +560,45 @@ def _extract_error_fields(body: object) -> tuple[str | None, str | None]:
     return body.get("code"), body.get("type")
 
 
+def _parse_retry_after_seconds(headers: Any) -> float | None:
+    """Parse a wait hint (seconds) from response headers, if present.
+
+    None-safe: `headers` may be `None` (no response captured) or any
+    header-like mapping exposing `.get`. Tries the standard `Retry-After`
+    header (delta-seconds form only -- an HTTP-date value is not a number
+    and is treated as absent, falling back to Azure's header or `None`;
+    OpenAI's documented shapes give no evidence of a date-form value in
+    practice) first, then Azure OpenAI's `x-ms-retry-after-ms`
+    (milliseconds, converted to seconds) as a fallback. A parsed value that
+    is negative or non-finite (`nan`, `inf`, `-inf`) is not a usable wait
+    hint either -- it is rejected the same as an unparseable one, and the
+    other header is tried instead. Returns `None` when neither header is
+    present or yields a valid non-negative finite number -- callers must
+    not treat that as zero.
+    """
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return None
+
+    def _valid_seconds(raw: Any, divisor: float = 1.0) -> float | None:
+        if not raw:
+            return None
+        try:
+            value = float(raw) / divisor
+        except (ValueError, TypeError):
+            return None
+        if not math.isfinite(value) or value < 0:
+            return None
+        return value
+
+    standard = _valid_seconds(getter("retry-after"))
+    if standard is not None:
+        return standard
+    return _valid_seconds(getter("x-ms-retry-after-ms"), divisor=1000.0)
+
+
 def _is_context_overflow(err_code: str | None, raw_msg: str) -> bool:
     """True when an OpenAI error denotes context-window overflow.
 
@@ -2767,11 +2806,22 @@ class OpenAIProvider:
                     raise misaligned from e
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
+                retry_after = _parse_retry_after_seconds(
+                    getattr(getattr(e, "response", None), "headers", None)
+                )
+                # Same fail-fast as the complete() 429 path: an advertised
+                # wait longer than max_delay means retrying automatically
+                # would exceed the retry budget anyway.
+                retryable = not (
+                    retry_after is not None
+                    and retry_after > self._retry_config.max_delay
+                )
                 raise kernel_errors.RateLimitError(
                     error_msg,
                     provider=self.name,
                     status_code=429,
-                    retryable=True,
+                    retryable=retryable,
+                    retry_after=retry_after,
                 ) from e
             except openai.AuthenticationError as e:
                 misaligned = _classify_misalignment_policy_violation(
@@ -2827,11 +2877,19 @@ class OpenAIProvider:
                         status_code=404,
                     ) from e
                 if status >= 500:
+                    retry_after = _parse_retry_after_seconds(
+                        getattr(getattr(e, "response", None), "headers", None)
+                    )
+                    retryable = not (
+                        retry_after is not None
+                        and retry_after > self._retry_config.max_delay
+                    )
                     raise kernel_errors.ProviderUnavailableError(
                         error_msg,
                         provider=self.name,
                         status_code=status,
-                        retryable=True,
+                        retryable=retryable,
+                        retry_after=retry_after,
                     ) from e
                 raise kernel_errors.LLMError(
                     error_msg,
@@ -3871,25 +3929,10 @@ class OpenAIProvider:
                 )
                 if misaligned is not None:
                     raise misaligned from e
-                retry_after = None
-                if hasattr(e, "response") and e.response is not None:
-                    # Standard header (seconds)
-                    ra_header = e.response.headers.get("retry-after")
-                    if ra_header:
-                        try:
-                            retry_after = float(ra_header)
-                        except (ValueError, TypeError):
-                            pass
-                    # Azure-specific fallback (milliseconds, divide by 1000)
-                    # Azure OpenAI returns x-ms-retry-after-ms instead of
-                    # (or in addition to) the standard retry-after header.
-                    if retry_after is None:
-                        ms_header = e.response.headers.get("x-ms-retry-after-ms")
-                        if ms_header:
-                            try:
-                                retry_after = float(ms_header) / 1000.0
-                            except (ValueError, TypeError):
-                                pass
+                response = getattr(e, "response", None)
+                retry_after = _parse_retry_after_seconds(
+                    getattr(response, "headers", None)
+                )
                 # Fail-fast: if retry_after exceeds max_delay, mark non-retryable
                 # so retry_with_backoff raises immediately instead of sleeping.
                 retryable = True
@@ -4000,11 +4043,23 @@ class OpenAIProvider:
                         status_code=404,
                     ) from e
                 if status >= 500:
+                    retry_after = _parse_retry_after_seconds(
+                        getattr(getattr(e, "response", None), "headers", None)
+                    )
+                    # Same fail-fast as the 429 path: an advertised wait
+                    # longer than max_delay means retrying automatically
+                    # would exceed the retry budget anyway, so surface a
+                    # non-retryable error immediately instead of sleeping.
+                    retryable = not (
+                        retry_after is not None
+                        and retry_after > self._retry_config.max_delay
+                    )
                     raise kernel_errors.ProviderUnavailableError(
                         error_msg,
                         provider=self.name,
                         status_code=status,
-                        retryable=True,
+                        retryable=retryable,
+                        retry_after=retry_after,
                     ) from e
                 raise kernel_errors.LLMError(
                     error_msg,

@@ -555,6 +555,41 @@ Astra-only WebSocket/steering path: Sol/Luna use ordinary Responses transport.
 Async tool-call orchestration, multi-agent orchestration, and compaction
 orchestration are not added by this update.
 
+### Rate limits and transient overload honor `Retry-After`
+
+A `429` (e.g. `slow_down`) and a `5xx` (e.g. `server_is_overloaded`, on any
+GPT-6 model or any other model this provider serves) both parse a wait hint
+before raising: the standard `Retry-After` header first, then Azure
+OpenAI's `x-ms-retry-after-ms` (milliseconds) as a fallback. Only the
+delta-seconds form of `Retry-After` (a bare number of seconds) is parsed;
+an HTTP-date value is treated as absent and falls back to Azure's header
+or `None` -- OpenAI's documented error shapes give no evidence the
+date form is actually used, so no date parsing is implemented. A parsed
+value that is negative or non-finite (`nan`/`inf`/`-inf`) is likewise
+treated as absent rather than passed through. The resulting `retry_after`
+is attached to the raised `RateLimitError` / `ProviderUnavailableError` so
+the shared retry machinery can honor it. As with the existing 429
+behavior, an advertised wait longer than `max_retry_delay` marks the error
+non-retryable and fails fast instead of sleeping past the configured retry
+budget; a `5xx` with no such header (or one within budget) keeps its prior
+default of retryable.
+
+### GPT-6 test coverage: fixture vs. live
+
+The GPT-6 error-contract and streaming-contract tests
+(`test_gpt_6_error_contract.py`, `test_gpt_6_streaming_contract.py`) run
+against synthetic, offline fixtures (mocked SDK exceptions/events) --
+deterministic, no network access, no credentials required, and part of
+the default test run. `test_gpt_6_live.py` is the only suite here that
+calls the real OpenAI API; it is marked `@pytest.mark.live`, which is
+deselected in CI (and by anyone running `-m "not live"` explicitly) but is
+NOT skipped by pytest by default on its own. The real gate against an
+accidental live call is the opt-in environment variable
+`AMPLIFIER_GPT6_LIVE=1`, required alongside a genuine `OPENAI_API_KEY`;
+without it every test in that file skips itself even if the marker filter
+is absent, so it never fires from CI's placeholder key. It covers Sol and
+Luna only (Astra is skipped by default to avoid its higher cost).
+
 ## Debugging (`raw`)
 
 Set `raw: true` to include the full, redacted request payload in the
