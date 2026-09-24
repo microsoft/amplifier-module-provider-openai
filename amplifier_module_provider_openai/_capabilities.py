@@ -10,7 +10,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-__all__ = ["ModelCapabilities", "get_capabilities"]
+__all__ = [
+    "GPT_6_MODELS",
+    "GPT_6_SOL_LUNA_MODELS",
+    "ModelCapabilities",
+    "get_capabilities",
+]
+
+GPT_6_MODELS = frozenset({"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"})
+GPT_6_SOL_LUNA_MODELS = frozenset({"gpt-6-sol", "gpt-6-luna"})
 
 _GPT5_TAGS: tuple[str, ...] = (
     "tools",
@@ -242,16 +250,17 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
     - 5.3: 400K context, reasoning, no explicit effort
     - 5.2 and below: 200K context, reasoning, implicit effort
     """
-    # Astra is an exact model ID, not a version family. The public model page
-    # lists no dated snapshots, so do not extend these values to guessed IDs.
+    # GPT-6 is an exact, three-model set. The public model pages list no dated
+    # snapshots, so do not extend these values to guessed IDs.
     # `context_window` is Amplifier's safe input/compaction budget, not the
     # native total window (1,050,000 tokens).
-    if model_id == "gpt-6-astra":
+    if model_id in GPT_6_MODELS:
         return ModelCapabilities(
-            family="gpt-6-astra",
+            family=model_id,
             context_window=922_000,
             max_output_tokens=128_000,
             supports_reasoning=True,
+            # Omit effort so each model applies its own documented default.
             default_reasoning_effort=None,
             supports_vision=True,
             supports_streaming=True,
@@ -260,6 +269,7 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
             supports_in_memory_retention=False,
             supports_native_apply_patch=True,
             supports_native_computer_use=True,
+            max_input_tokens=922_000,
         )
 
     family = _detect_family(model_id)

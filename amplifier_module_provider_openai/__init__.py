@@ -47,7 +47,7 @@ from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from ._capabilities import get_capabilities
+from ._capabilities import GPT_6_MODELS, GPT_6_SOL_LUNA_MODELS, get_capabilities
 from ._constants import (
     BACKGROUND_POLLING_STATUSES,
     BACKGROUND_STATUS_FAILED,
@@ -220,6 +220,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 # an opaque API HTTP 400.
 _GPT_5_5_PRO_ALLOWED_EFFORTS = frozenset({"medium", "high", "xhigh"})
 _GPT_6_ASTRA_ALLOWED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_GPT_6_SOL_LUNA_ALLOWED_EFFORTS = frozenset(
+    {"none", "low", "medium", "high", "xhigh", "max"}
+)
 
 
 def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
@@ -253,39 +256,69 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     )
 
 
-def _validate_gpt_6_astra_params(params: dict[str, Any]) -> None:
-    """Reject documented-invalid fields from a final Astra wire payload."""
-    if params.get("model") != "gpt-6-astra":
+def _validate_gpt_6_params(params: dict[str, Any]) -> None:
+    """Reject documented-invalid fields from a final exact GPT-6 wire payload."""
+    model = params.get("model")
+    if model not in GPT_6_MODELS:
         return
 
     reasoning = params.get("reasoning")
     effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
-    if effort is not None and effort not in _GPT_6_ASTRA_ALLOWED_EFFORTS:
+    allowed_efforts = (
+        _GPT_6_SOL_LUNA_ALLOWED_EFFORTS
+        if model in GPT_6_SOL_LUNA_MODELS
+        else _GPT_6_ASTRA_ALLOWED_EFFORTS
+    )
+    if effort is not None and effort not in allowed_efforts:
         raise kernel_errors.InvalidRequestError(
-            f"Model 'gpt-6-astra' does not support reasoning.effort={effort!r}. "
+            f"Model {model!r} does not support reasoning.effort={effort!r}. "
             "Use 'low' for lightweight tasks, or omit reasoning.effort. "
-            f"Supported efforts: {sorted(_GPT_6_ASTRA_ALLOWED_EFFORTS)}."
+            f"Supported efforts: {sorted(allowed_efforts)}."
         )
 
-    for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
-        if field in params and params[field] is not None:
+    # GPT-6 Sol/Luna allow Responses sampling fields only when an explicit
+    # literal `reasoning.effort="none"` is sent. Astra never allows `none`.
+    if effort != "none":
+        for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
+            if field in params and params[field] is not None:
+                raise kernel_errors.InvalidRequestError(
+                    f"Model {model!r} does not support {field!r} while reasoning "
+                    "is active; remove it from the request or extra_request_params."
+                )
+            params.pop(field, None)
+    else:
+        # `logprobs` remains an invalid top-level Responses field even when
+        # Sol/Luna explicitly disable reasoning.
+        if params.get("logprobs") is not None:
             raise kernel_errors.InvalidRequestError(
-                f"Model 'gpt-6-astra' does not support {field!r}; remove it from "
+                f"Model {model!r} does not support 'logprobs'; remove it from "
                 "the request or extra_request_params."
             )
-        params.pop(field, None)
+        params.pop("logprobs", None)
 
     include = params.get("include")
-    if isinstance(include, (list, tuple)) and "message.output_text.logprobs" in include:
+    if effort == "none" and isinstance(include, (list, tuple)):
+        include = [
+            value for value in include if value != "reasoning.encrypted_content"
+        ]
+        if include:
+            params["include"] = include
+        else:
+            params.pop("include", None)
+    if (
+        effort != "none"
+        and isinstance(include, (list, tuple))
+        and "message.output_text.logprobs" in include
+    ):
         raise kernel_errors.InvalidRequestError(
-            "Model 'gpt-6-astra' does not support "
+            f"Model {model!r} does not support "
             "'message.output_text.logprobs' in include."
         )
 
     options = params.get("prompt_cache_options")
     if isinstance(options, dict) and options.get("ttl") not in (None, "30m"):
         raise kernel_errors.InvalidRequestError(
-            "Model 'gpt-6-astra' supports only prompt_cache_options.ttl='30m'."
+            f"Model {model!r} supports only prompt_cache_options.ttl='30m'."
         )
 
 
@@ -1594,20 +1627,22 @@ class OpenAIProvider:
         self._budget_uncalibrated_warned_models: set[str] = set()
         self._budget_nontext_warned_models: set[str] = set()
 
-    def _prepare_astra_params(self, params: dict[str, Any]) -> None:
-        """Apply Astra's final-wire compatibility rules after extras merge."""
-        if params.get("model") != "gpt-6-astra":
+    def _prepare_gpt_6_params(self, params: dict[str, Any]) -> None:
+        """Apply exact GPT-6 final-wire compatibility rules after extras merge."""
+        model = params.get("model")
+        if model not in GPT_6_MODELS:
             return
         legacy_retention = params.pop("prompt_cache_retention", None)
         if legacy_retention is not None and not self._astra_legacy_retention_warned:
             self._astra_legacy_retention_warned = True
             self._assembly_log(
                 "warning",
-                "[PROVIDER] Dropping prompt_cache_retention=%r for gpt-6-astra; "
+                "[PROVIDER] Dropping prompt_cache_retention=%r for %s; "
                 "it is unsupported. Use prompt_cache_options.ttl='30m' instead.",
                 legacy_retention,
+                model,
             )
-        _validate_gpt_6_astra_params(params)
+        _validate_gpt_6_params(params)
 
     def _prepare_computer_images(self, params, request, **kwargs):
         from .compaction import KEY
@@ -2038,14 +2073,15 @@ class OpenAIProvider:
             _validate_reasoning_context(reasoning)
             if reasoning:
                 if isinstance(reasoning, dict):
-                    params["reasoning"] = {
-                        "summary": reasoning.get("summary", self.reasoning_summary)
-                    }
                     effort = reasoning.get("effort")
+                    params["reasoning"] = {}
                     if effort is not None:
                         params["reasoning"]["effort"] = effort
-                    elif model_name != "gpt-6-astra":
+                    elif model_name not in GPT_6_MODELS:
                         params["reasoning"]["effort"] = "medium"
+                    params["reasoning"]["summary"] = reasoning.get(
+                        "summary", self.reasoning_summary
+                    )
                     for key in ("mode", "context"):
                         if reasoning.get(key) is not None:
                             params["reasoning"][key] = reasoning[key]
@@ -2109,12 +2145,12 @@ class OpenAIProvider:
                 "prompt_cache_retention", self.prompt_cache_retention
             ) or None
             if (
-                model_name == "gpt-6-astra"
+                model_name in GPT_6_MODELS
                 and "prompt_cache_retention" not in self.config
                 and "prompt_cache_retention" not in kwargs
             ):
                 retention = None
-            if model_name != "gpt-6-astra":
+            if model_name not in GPT_6_MODELS:
                 retention = _drop_unsupported_in_memory_retention(
                     model_name,
                     retention,
@@ -2168,7 +2204,7 @@ class OpenAIProvider:
             if request.max_output_tokens is not None:
                 params["max_output_tokens"] = request.max_output_tokens
             params = self._prepare_computer_images(params, request, **kwargs)
-            self._prepare_astra_params(params)
+            self._prepare_gpt_6_params(params)
             if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
                 params.get("input"), list
             ):
@@ -2541,7 +2577,7 @@ class OpenAIProvider:
                     # expressible; this is the single expressible predicate
                     # that matches the models where the flag has a real cost.
                     show_when={
-                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-astra)$"
+                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna))$"
                     },
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
@@ -2681,7 +2717,7 @@ class OpenAIProvider:
             # Filter to GPT-5+ series models or deep research models
             if not (
                 model_id.startswith("gpt-5")
-                or model_id == "gpt-6-astra"
+                or model_id in GPT_6_MODELS
                 or is_deep_research
             ):
                 continue
@@ -2739,6 +2775,8 @@ class OpenAIProvider:
         # Known display name mappings
         display_names = {
             "gpt-6-astra": "GPT 6 Astra",
+            "gpt-6-sol": "GPT 6 Sol",
+            "gpt-6-luna": "GPT 6 Luna",
             "gpt-5.6": "GPT 5.6",
             "gpt-5.6-sol": "GPT 5.6 Sol",
             "gpt-5.6-terra": "GPT 5.6 Terra",
@@ -4052,7 +4090,7 @@ class OpenAIProvider:
                 continue_params = self._prepare_computer_images(
                     continue_params, request, **kwargs
                 )
-                self._prepare_astra_params(continue_params)
+                self._prepare_gpt_6_params(continue_params)
                 if _supports_tool_output_cache_breakpoints(
                     continue_params.get("model")
                 ) and isinstance(continue_params.get("input"), list):
@@ -4122,24 +4160,7 @@ class OpenAIProvider:
             if chat_response.usage is not None:
                 attempt_costs: list[Decimal | None] = []
                 for billed_response in billed_responses:
-                    usage_obj = getattr(billed_response, "usage", None)
-                    input_details = getattr(usage_obj, "input_tokens_details", None)
-                    attempt_costs.append(
-                        compute_cost(
-                            getattr(billed_response, "model", ""),
-                            prompt_tokens=getattr(usage_obj, "input_tokens", 0) or 0,
-                            completion_tokens=getattr(usage_obj, "output_tokens", 0)
-                            or 0,
-                            cached_tokens=getattr(input_details, "cached_tokens", 0)
-                            or 0,
-                            cache_write_tokens=(
-                                getattr(input_details, "cache_write_tokens", 0) or 0
-                            ),
-                            service_tier=getattr(billed_response, "service_tier", None),
-                        )
-                        if usage_obj is not None
-                        else None
-                    )
+                    attempt_costs.append(self._compute_attempt_cost(billed_response))
                 if attempt_costs and all(cost is not None for cost in attempt_costs):
                     total_cost = sum(attempt_costs, Decimal(0))
                     chat_response.usage = chat_response.usage.model_copy(
@@ -5224,6 +5245,27 @@ class OpenAIProvider:
         )
         return block, extra_item
 
+    def _compute_attempt_cost(self, response: Any) -> Decimal | None:
+        """Return one response's token cost without mutating provider state.
+
+        Subclasses with endpoint-specific pricing override this seam. The
+        completion path aggregates every billed response exactly once after all
+        attempts have completed, using the same result this base conversion
+        places on its standalone response usage.
+        """
+        usage_obj = getattr(response, "usage", None)
+        if usage_obj is None:
+            return None
+        input_details = getattr(usage_obj, "input_tokens_details", None)
+        return compute_cost(
+            getattr(response, "model", ""),
+            prompt_tokens=getattr(usage_obj, "input_tokens", 0) or 0,
+            completion_tokens=getattr(usage_obj, "output_tokens", 0) or 0,
+            cached_tokens=getattr(input_details, "cached_tokens", 0) or 0,
+            cache_write_tokens=getattr(input_details, "cache_write_tokens", 0) or 0,
+            service_tier=getattr(response, "service_tier", None),
+        )
+
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
         """Convert OpenAI response to ChatResponse format.
 
@@ -5591,27 +5633,11 @@ class OpenAIProvider:
             cache_write_tokens=cache_write_tokens,
         )
 
-        # M2: Stamp cost_usd onto Usage (zero-transformation passthrough from API fields).
-        # prompt_tokens is the total including cached AND cache-write; both are subtracted
-        # inside compute_cost to prevent double-charging. NOTE: this deliberately uses
-        # `_raw_input_tokens` (the unnormalized vendor gross), NOT `usage_counts["input"]`
-        # (which has cache_write subtracted out for the public Usage contract above) --
-        # compute_cost's own internal subtraction expects the raw combined total.
+        # Price the original response, not the normalized public Usage above.
+        # The pricing hook consumes gross input and subtracts cache subsets once;
+        # completion aggregates each billed attempt through the same hook.
         if usage_obj:
-            _prompt_tokens = getattr(usage_obj, "prompt_tokens", _raw_input_tokens)
-            _completion_tokens = getattr(
-                usage_obj, "completion_tokens", usage_counts["output"]
-            )
-            _cached_tokens = cache_read_tokens or 0
-            _cache_write_tokens = cache_write_tokens or 0
-            cost = compute_cost(
-                getattr(response, "model", ""),
-                prompt_tokens=_prompt_tokens,
-                completion_tokens=_completion_tokens,
-                cached_tokens=_cached_tokens,
-                cache_write_tokens=_cache_write_tokens,
-                service_tier=getattr(response, "service_tier", None),
-            )
+            cost = self._compute_attempt_cost(response)
             if cost is not None:
                 usage = usage.model_copy(update={"cost_usd": cost})
 
