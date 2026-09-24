@@ -68,6 +68,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         provider.socket = None
         provider.epoch = str(uuid.uuid4())
         provider.previous_response_id = None
+        provider._computer_function_lineage = False
         provider.response_id = None
         provider.owner = None
         provider.inflight = None
@@ -170,6 +171,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             budget = NATIVE_BUDGET.get()
             if budget is not None and budget[0] is self:
                 params = self._plan_checkpoint(params, budget[1])
+        # Checkpoint planning can supply additional native wire history. Apply
+        # the same compatibility contract to the final counted/dispatched view.
+        params = self._prepare_computer_images(params, request, **kwargs)
         return params, state, logs
 
     def _commit_initial_assembly_state(self, state):
@@ -496,14 +500,46 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             ordinary = super()._convert_messages(
                 self._prepare_native_messages(self._request_messages)
             )
+            from .computer_images import prepare_computer_images
+
+            function_computer = any(
+                tool.get("type") == "function" and tool.get("name") == "computer"
+                for tool in full_params.get("tools", [])
+            ) and not any(
+                tool.get("type") == "computer" for tool in full_params.get("tools", [])
+            )
+            ordinary = prepare_computer_images(
+                {**full_params, "input": ordinary},
+                [],
+                function_lineage=function_computer,
+            )["input"]
             if ordinary != full_params.get("input"):
                 raise LLMError(
                     "Native transport cannot preserve this input assembly extension; use ordinary transport",
                     provider=self.name,
                     retryable=False,
                 )
+            if (
+                self.previous_response_id
+                and function_computer != self._computer_function_lineage
+            ):
+                if self.pending_parent:
+                    raise LLMError(
+                        "Pending steering cannot move to a different computer tool transport; explicit recovery is required",
+                        provider=self.name,
+                        retryable=False,
+                    )
+                # The server's native pairs cannot be mixed with multiple
+                # ordinary images. Start one new lineage from the full saved
+                # request view, retaining async jobs and their original IDs.
+                self.previous_response_id = None
+                self.seen.clear()
+                self.epoch = str(uuid.uuid4())
             params = {**params, "input": self._convert_messages(self._request_messages)}
             params = self._apply_checkpoint(params, full_params)
+            params = prepare_computer_images(
+                params, [], function_lineage=function_computer
+            )
             if native_input_tokens is None:
                 await self._guard_assembled_params_with_provider_count(params)
             else:
@@ -511,6 +547,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     params, native_input_tokens=native_input_tokens
                 )
             self._native_request_attempted = True
+            self._computer_function_lineage = function_computer
             return await self._native_response(params, timeout=timeout)
         except asyncio.CancelledError:
             await self._uncertain("cancelled")
