@@ -42,3 +42,10 @@ jobs:
         # real /models endpoint, and a real vision completion). Run
         # those locally with a real OPENAI_API_KEY to validate.
         run: uv run pytest -q -m "not live"
+
+      - name: Verify wheel runtime dependencies without the dev group
+        run: |
+          uv build --wheel
+          uv venv "$RUNNER_TEMP/provider-runtime"
+          uv pip install --python "$RUNNER_TEMP/provider-runtime/bin/python" dist/*.whl amplifier-core
+          "$RUNNER_TEMP/provider-runtime/bin/python" -I tests/runtime_install_smoke.py
