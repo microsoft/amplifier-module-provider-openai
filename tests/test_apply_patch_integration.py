@@ -125,7 +125,7 @@ class TestConvertToolsFromRequestModelGating:
         assert len(func_tools) == 1
         assert func_tools[0]["name"] == "apply_patch"
 
-    @pytest.mark.parametrize("model", ["gpt-5.1", "gpt-6-astra"])
+    @pytest.mark.parametrize("model", ["gpt-5.1", "gpt-6-astra", "gpt-6.1-sol"])
     def test_native_apply_patch_sent_for_supporting_model(self, model: str) -> None:
         """Supporting models retain the native apply_patch wire declaration."""
         provider = _make_provider(default_model=model)

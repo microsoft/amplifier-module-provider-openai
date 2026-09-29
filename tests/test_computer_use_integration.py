@@ -189,7 +189,7 @@ class TestWireBodyComputerDeclaration:
     hitting."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-6-astra"])
+    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol"])
     async def test_computer_tool_reaches_client_create_call_bare(self, model: str) -> None:
         """End-to-end through provider.complete(): capture the exact kwargs
         passed to the OpenAI client for a computer-tool request and assert
