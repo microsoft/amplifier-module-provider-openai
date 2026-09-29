@@ -30,6 +30,7 @@ Provides access to OpenAI's GPT-6, GPT-5, and GPT-4 models as an LLM provider fo
 ## Supported Models
 
 - `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna` - GPT-6 exact model set. Each reports a 272,000-token input budget by default, or 922,000 with long context enabled (within its 1,050,000-token native total window), and supports a 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` tools. Sol and Luna have an API default of `medium` reasoning and also accept literal request-level `reasoning = { effort = "none" }`; Astra does not. No bare GPT-6, Terra, or dated GPT-6 IDs are inferred.
+- `gpt-6.1-sol` - Exact GPT-6.1 Sol model. It has the same reported 272,000-token standard input budget (922,000 with long context enabled), 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` support. It accepts `low`, `medium`, `high`, `xhigh`, and `max` reasoning effort. The configured `reasoning_effort = "none"` remains an omission sentinel, but literal API `reasoning.effort = "none"` and `minimal` are invalid. No snapshots or sibling GPT-6.1 IDs are inferred.
 - `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
 - `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
@@ -71,8 +72,8 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `api_key` | (auth) | OpenAI API key. Resolved from `OPENAI_API_KEY` if unset. | — | ✅ |
 | `base_url` | (client) | Custom endpoint. `null` = OpenAI default. | — | ✅ |
 | `default_model` | `model` | Model id used when a request doesn't pin one. | — | (picker) |
-| `reasoning_effort` | `reasoning.effort` | Session-default reasoning effort (canonical key). `"none"`/unset sends nothing. Astra accepts only `low`, `medium`, `high`, `xhigh`, or `max` when sent; Sol/Luna additionally accept literal request-level `none`. | Higher effort = more reasoning tokens, slower, costlier. | ✅ |
-| `enable_long_context` | **Amplifier-only** | Changes the *reported* context window (see [Long context](#long-context)). Does not map to an API param. | **≈2× on gpt-5.6/GPT-6 when input exceeds 272K** — whole-request re-rating. | ✅ |
+| `reasoning_effort` | `reasoning.effort` | Session-default reasoning effort (canonical key). `"none"`/unset sends nothing. Astra and GPT-6.1 Sol accept only `low`, `medium`, `high`, `xhigh`, or `max` when sent; GPT-6 Sol/Luna additionally accept literal request-level `none`. | Higher effort = more reasoning tokens, slower, costlier. | ✅ |
+| `enable_long_context` | **Amplifier-only** | Changes the *reported* context window (see [Long context](#long-context)). Does not map to an API param. | **≈2× on gpt-5.6/GPT-6/GPT-6.1 Sol when input exceeds 272K** — whole-request re-rating. | ✅ |
 | `max_output_tokens` | `max_output_tokens` | Output-token budget. `null` = the model capability's max. **Config key is `max_output_tokens`; the per-call kwarg is still `max_tokens`.** | Caps output length. | |
 | `reasoning` | `reasoning` | LEGACY effort alias. Use for the dict form (`{effort=..., mode="pro", context=...}`). `reasoning_effort` wins if both set. | See `reasoning_effort`. | |
 | `reasoning_summary` | `reasoning.summary` | Reasoning verbosity: `auto`\|`concise`\|`detailed`. | `detailed` uses more output tokens. | |
@@ -484,44 +485,48 @@ it does not map to an API parameter.
 - The threshold is measured on **INPUT tokens only**, at **272,000**.
 - The boundary is **strict**: exactly 272,000 is short-context; `> 272,000` is
   long.
-- On **gpt-5.6 and the exact GPT-6 set**, exceeding it re-rates the **ENTIRE request** — input, output,
+- On **gpt-5.6, the exact GPT-6 set, and exact GPT-6.1 Sol**, exceeding it re-rates the **ENTIRE request** — input, output,
   cached, and cache-write tokens — at long rates. **Whole-request, not
   marginal-on-the-overage.**
-- **Which models actually have the tier:** `gpt-5.6-sol` / `-terra` / `-luna`
-  and `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna` have modelled long rates. `gpt-5.4` and variants carry a
+- **Which models actually have the tier:** `gpt-5.6-sol` / `-terra` / `-luna`,
+  `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna`, and `gpt-6.1-sol` have modelled long rates. `gpt-5.4` and variants carry a
   272K threshold but have **no long rates modelled**, so the flag only changes
   the *reported* window for them. **`gpt-5.5` has no threshold at all** — the
   flag is a no-op there.
 - **What the flag does:** with it off (default), `get_info`/`list_models`
   report the 272K threshold as the context window, so unpinned sessions compact
   against the standard-priced window. With it on, they report the full measured
-  input budget (900,000 for 5.6, empirically measured; 922,000 for GPT-6,
-  reserving 128,000 output tokens from its 1,050,000-token total window).
+  input budget (900,000 for 5.6, empirically measured; 922,000 for GPT-6 and
+  GPT-6.1 Sol, reserving 128,000 output tokens from its 1,050,000-token total
+  window).
 
 The `enable_long_context` ConfigField is gated (`show_when`) to gpt-5.6-family
-models and exact GPT-6 IDs, where the flag carries a cost consequence.
+models, exact GPT-6 IDs, and exact GPT-6.1 Sol, where the flag carries a cost
+consequence.
 
-## GPT-6 Astra, Sol, and Luna
+## GPT-6 Astra, Sol, Luna, and GPT-6.1 Sol
 
-Only the documented exact `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` IDs are
-supported; this module does not infer support or pricing for a bare GPT-6,
-Terra, or hypothetical snapshots. Astra sends no default `reasoning.effort`.
-Sol and Luna have an API default of `medium`. The configured `"none"` selector remains an
+Only the documented exact `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, and
+`gpt-6.1-sol` IDs are supported; this module does not infer support or pricing
+for a bare GPT-6, GPT-6 Terra, GPT-6.1 siblings, or hypothetical snapshots.
+Astra and GPT-6.1 Sol send no default `reasoning.effort`; GPT-6.1 Sol's
+API default is `medium`. GPT-6 Sol and Luna also default to `medium`. The configured `"none"` selector remains an
 Amplifier omission sentinel, preserving that model default. A caller can instead
 send literal API `none` with request-level `reasoning = { effort = "none" }` for
 Sol/Luna; it removes encrypted-reasoning includes while retaining the existing
 reasoning-summary construction. Per-request `reasoning_effort: "none"` and
 provider config `reasoning: {effort: "none"}` also send literal API `none`;
 only the top-level provider config `reasoning_effort: "none"` means omission.
-`none`, `minimal`, or unknown efforts are rejected for Astra, while `minimal` or
-unknown efforts are rejected for Sol/Luna. Active/default reasoning rejects
+`none`, `minimal`, or unknown efforts are rejected for Astra and GPT-6.1 Sol,
+while `minimal` or unknown efforts are rejected for GPT-6 Sol/Luna.
+Active/default reasoning rejects
 `temperature`, `top_p`, `top_logprobs`, and
 `include: ["message.output_text.logprobs"]` after `extra_request_params` has
 performed its final merge. Top-level Responses `logprobs` is always rejected.
 
 Prompt caching uses `prompt_cache_options.ttl: "30m"` (the only documented TTL).
-The legacy `prompt_cache_retention` field is removed from every GPT-6 wire
-payload, including continuation calls. The existing explicit-cache-mode safety
+The legacy `prompt_cache_retention` field is removed from every GPT-6 and
+GPT-6.1 Sol wire payload, including continuation calls. The existing explicit-cache-mode safety
 guard remains: this provider does not create cache breakpoints, so explicit
 mode is dropped rather than disabling caching.
 
@@ -530,18 +535,22 @@ mode is dropped rather than disabling caching.
 The native total context window is 1,050,000 tokens and maximum output is
 128,000 tokens. The reported context window is the safe input and
 compaction budget: 272,000 by default to avoid long-context pricing, or
-922,000 with `enable_long_context: true`. The boundary is strict: exactly
-272,000 input tokens uses short pricing; 272,001 re-rates the whole request.
+922,000 with `enable_long_context: true`. The request preflight additionally
+reserves the selected output cap and 4,096 safety tokens from that reported
+budget, so the amount admitted in one request can be lower. The billing
+boundary remains strict: exactly 272,000 input tokens uses short pricing;
+272,001 re-rates the whole request.
 
 Rates are USD per million tokens in fresh input / cached input / cache writes /
 output order. Astra Standard/long rates are `$10 / $1 / $12.50 / $50` and
-`$20 / $2 / $25 / $75`; Sol rates are `$2 / $.20 / $2.50 / $10` and
-`$4 / $.40 / $5 / $15`; Luna rates are `$.10 / $.01 / $.125 / $.50` and
+`$20 / $2 / $25 / $75`; GPT-6 Sol rates are `$2 / $.20 / $2.50 / $10` and
+`$4 / $.40 / $5 / $15`; GPT-6.1 Sol rates are `$2 / $.10 / $2.50 / $10` and
+`$4 / $.20 / $5 / $15`; Luna rates are `$.10 / $.01 / $.125 / $.50` and
 `$.20 / $.02 / $.25 / $.75`. Static Batch and Flex rates are half the
 corresponding Standard rates; Fast rates are double. This provider does not
 implement Batch transport.
 
-Runtime GPT-6 accounting uses the actual response `service_tier`: `default` is
+Runtime GPT-6/GPT-6.1 Sol accounting uses the actual response `service_tier`: `default` is
 Standard, `flex` is half, and `priority` or `fast` is double. A Fast request
 may return `default` after a downgrade, which is charged at Standard instead.
 Missing or unpriced tiers report no cost rather than a fabricated estimate.
@@ -550,8 +559,9 @@ are each subtracted once from gross input. These are token-only estimates:
 hosted-tool fees and regional-processing uplifts are excluded.
 
 The Responses API supports more GPT-6 features than the ordinary HTTP adapter
-orchestrates. This Sol/Luna update does not extend the optional native adapter's
-Astra-only WebSocket/steering path: Sol/Luna use ordinary Responses transport.
+orchestrates. This Sol/Luna/GPT-6.1 Sol support does not extend the optional
+native adapter's Astra-only WebSocket/steering path: Sol, Luna, and GPT-6.1 Sol
+use ordinary Responses transport.
 Async tool-call orchestration, multi-agent orchestration, and compaction
 orchestration are not added by this update.
 

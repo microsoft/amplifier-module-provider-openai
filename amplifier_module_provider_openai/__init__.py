@@ -277,7 +277,8 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
         )
 
     # GPT-6 Sol/Luna allow Responses sampling fields only when an explicit
-    # literal `reasoning.effort="none"` is sent. Astra never allows `none`.
+    # literal `reasoning.effort="none"` is sent. Astra and GPT-6.1 Sol never
+    # allow `none`.
     if effort != "none":
         for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
             if field in params and params[field] is not None:
@@ -2577,7 +2578,7 @@ class OpenAIProvider:
                     # expressible; this is the single expressible predicate
                     # that matches the models where the flag has a real cost.
                     show_when={
-                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna))$"
+                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna)|gpt-6\.1-sol)$"
                     },
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
@@ -2777,6 +2778,7 @@ class OpenAIProvider:
             "gpt-6-astra": "GPT 6 Astra",
             "gpt-6-sol": "GPT 6 Sol",
             "gpt-6-luna": "GPT 6 Luna",
+            "gpt-6.1-sol": "GPT 6.1 Sol",
             "gpt-5.6": "GPT 5.6",
             "gpt-5.6-sol": "GPT 5.6 Sol",
             "gpt-5.6-terra": "GPT 5.6 Terra",

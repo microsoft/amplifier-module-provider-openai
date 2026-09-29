@@ -17,7 +17,7 @@ __all__ = [
     "get_capabilities",
 ]
 
-GPT_6_MODELS = frozenset({"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"})
+GPT_6_MODELS = frozenset({"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"})
 GPT_6_SOL_LUNA_MODELS = frozenset({"gpt-6-sol", "gpt-6-luna"})
 
 _GPT5_TAGS: tuple[str, ...] = (
@@ -250,8 +250,8 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
     - 5.3: 400K context, reasoning, no explicit effort
     - 5.2 and below: 200K context, reasoning, implicit effort
     """
-    # GPT-6 is an exact, three-model set. The public model pages list no dated
-    # snapshots, so do not extend these values to guessed IDs.
+    # GPT-6 plus GPT-6.1 Sol is an exact, four-model set. The public model
+    # pages list no dated snapshots, so do not extend these values to guessed IDs.
     # `context_window` is Amplifier's safe input/compaction budget, not the
     # native total window (1,050,000 tokens).
     if model_id in GPT_6_MODELS:
