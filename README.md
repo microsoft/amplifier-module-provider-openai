@@ -834,7 +834,10 @@ constraint. No automatic retry, image omission, or action replay is performed.
 The ordinary `OpenAIProvider` now exposes optional host capabilities:
 `supports_native_compaction()`, `validate_compacted_context(message)`, and
 `compact_context(request)`. This is distinct from the separate WebSocket adapter.
-The official OpenAI endpoint and an SDK exposing `responses.compact` are required;
+The runtime dependency requires OpenAI SDK 2.9.0 or later, which exposes
+`responses.compact`. An older retained SDK previously made native compaction
+unavailable despite an up-to-date provider module. The official OpenAI endpoint
+and an SDK exposing `responses.compact` are required;
 compatible proxies do not inherit that claim.
 
 The host must persist the returned `message` as derived state alongside its

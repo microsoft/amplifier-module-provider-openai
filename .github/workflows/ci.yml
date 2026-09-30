@@ -44,8 +44,15 @@ jobs:
         run: uv run pytest -q -m "not live"
 
       - name: Verify wheel runtime dependencies without the dev group
+        # Also exercise the supported SDK floor rather than only a fresh
+        # resolver's newest SDK. Older retained SDKs used to disable compact.
         run: |
           uv build --wheel
           uv venv "$RUNNER_TEMP/provider-runtime"
-          uv pip install --python "$RUNNER_TEMP/provider-runtime/bin/python" dist/*.whl amplifier-core
+          uv pip install --python "$RUNNER_TEMP/provider-runtime/bin/python" dist/*.whl amplifier-core 'openai==2.9.0'
           "$RUNNER_TEMP/provider-runtime/bin/python" -I tests/runtime_install_smoke.py
+
+      - name: Verify minimum SDK compaction with Core 2.0.1
+        run: |
+          uv pip install 'openai==2.9.0' 'amplifier-core==2.0.1'
+          uv run --no-sync pytest -q tests/test_wait_policy.py tests/test_native_compaction.py

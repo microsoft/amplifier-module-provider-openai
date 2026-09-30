@@ -11,6 +11,7 @@ from amplifier_module_provider_openai import _single_attempt as bounded
 async def main():
     provider = OpenAIProvider(api_key="synthetic-runtime-smoke")
     assert bounded.CAPABILITY in provider.get_info().capabilities
+    assert provider.supports_native_compaction()
     transport = bounded._http_client(5)
     try:
         assert transport.follow_redirects is False

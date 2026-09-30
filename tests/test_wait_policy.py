@@ -58,6 +58,9 @@ async def test_actual_sdk_model_transports_apply_wait_policy(mode, configured):
     try:
         assert "timeout" not in provider._budget_params(request())
         if mode == "compact":
+            # Exercise the installed SDK, not a mocked responses namespace:
+            # an obsolete retained SDK must not silently disable this route.
+            assert provider.supports_native_compaction() is True
             await provider.compact_context(request())
         elif mode == "raw":
             await provider._create_response({"model": "gpt-6-astra", "input": [],
