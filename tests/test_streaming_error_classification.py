@@ -1,4 +1,4 @@
-"""Streaming APIError classification.
+"""Bare openai.APIError classification -- and, separately, real streaming delivery.
 
 OpenAI returns HTTP 200 for the Responses API, opens the SSE stream, then
 emits an SSE "error" event when the request fails mid-stream. The openai SDK
@@ -8,6 +8,29 @@ every typed except branch in _do_complete() and landed in the generic
 `except Exception` catch-all, which hardcodes retryable=True. A deterministic
 400-class error (e.g. context overflow) was therefore retried max_retries
 times before failing.
+
+NOT every test below actually drives the SSE/streaming code path, and this
+was previously easy to misread from the file's old, single-shape framing:
+
+- Cases 1-6 (the `test_bare_api_error_*` / `test_context_overflow_api_error_*`
+  functions) construct a bare `openai.APIError` BY HAND and hand it directly
+  to `provider.client.responses.create` with `use_streaming=False`. This
+  proves the classification LADDER in `_do_complete()`'s `except
+  openai.APIError` branch is correct in isolation. It says NOTHING about how
+  such an error actually reaches that branch in practice, and does not
+  exercise real SSE bytes, `client.responses.stream()`, or any streaming
+  code at all -- despite a bare APIError being, in real life, the SSE
+  mid-stream shape. Read "streaming" in this module's *name* as "the code
+  path this classifier branch exists for", not as "every test below is a
+  streaming test".
+- Case 7 (`test_non_streaming_bad_request_current_wording_...`) is correctly
+  named: it drives the actual non-streaming `openai.BadRequestError` path.
+- The `test_streaming_path_*` functions in the "Streaming-path delivery"
+  section below are the ones that actually exercise `use_streaming=True`
+  and the real `client.responses.stream()` code branch (via a mock stream
+  object, not real SSE bytes over a transport -- see
+  test_misalignment_policy_violation.py for coverage that drives genuine SSE
+  bytes through the real SDK over httpx.MockTransport).
 
 This also covers the related stale-substring-gate fix: the non-streaming
 BadRequestError branch's context-overflow detection now checks the error
@@ -74,7 +97,7 @@ INVALID_VALUE_BODY = {
 # ---------------------------------------------------------------------------
 
 
-def test_bare_api_error_with_context_overflow_code_raises_context_length_error():
+def test_non_streaming_bare_api_error_with_context_overflow_code_raises_context_length_error():
     """bare openai.APIError with code=context_length_exceeded -> ContextLengthError,
     not a bare LLMError, and non-retryable."""
     provider = _make_provider()
@@ -99,7 +122,7 @@ def test_bare_api_error_with_context_overflow_code_raises_context_length_error()
 # ---------------------------------------------------------------------------
 
 
-def test_bare_api_error_message_only_overflow_raises_context_length_error():
+def test_non_streaming_bare_api_error_message_only_overflow_raises_context_length_error():
     """Same overflow condition but with NO machine-readable code -- the
     substring fallback ("exceeds the context window") must still catch it.
     This is the stale-substring-gate fix: the old markers ("context length",
@@ -126,7 +149,7 @@ def test_bare_api_error_message_only_overflow_raises_context_length_error():
 # ---------------------------------------------------------------------------
 
 
-def test_bare_api_error_invalid_value_raises_invalid_request_error():
+def test_non_streaming_bare_api_error_invalid_value_raises_invalid_request_error():
     """bare openai.APIError with a non-overflow code -> InvalidRequestError,
     non-retryable (deterministic client error, no point retrying)."""
     provider = _make_provider()
@@ -149,7 +172,7 @@ def test_bare_api_error_invalid_value_raises_invalid_request_error():
 # ---------------------------------------------------------------------------
 
 
-def test_api_connection_error_still_retryable():
+def test_non_streaming_api_connection_error_still_retryable():
     """openai.APIConnectionError is a subclass of openai.APIError but must
     remain retryable -- transport-level failures are genuinely transient.
     Regression guard for the blast-radius constraint: the new APIError
@@ -174,7 +197,7 @@ def test_api_connection_error_still_retryable():
 # ---------------------------------------------------------------------------
 
 
-def test_bare_api_error_unclassifiable_preserves_prior_default():
+def test_non_streaming_bare_api_error_unclassifiable_preserves_prior_default():
     """bare openai.APIError with body=None and no classifiable signal must
     preserve the pre-fix conservative default: LLMError, retryable=True."""
     provider = _make_provider()
@@ -197,7 +220,7 @@ def test_bare_api_error_unclassifiable_preserves_prior_default():
 # ---------------------------------------------------------------------------
 
 
-def test_context_overflow_api_error_is_not_retried():
+def test_non_streaming_context_overflow_api_error_is_not_retried():
     """Pre-fix behaviour: a bare APIError fell through to `except Exception`,
     which hardcodes retryable=True, so a deterministic context-overflow error
     was retried max_retries times (default 5 -> 6 total attempts). Post-fix,
