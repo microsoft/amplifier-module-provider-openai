@@ -51,7 +51,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27.0,<1" },
-    { name = "openai", specifier = ">=1.0.0" },
+    { name = "openai", specifier = ">=2.9.0" },
     { name = "websockets", marker = "extra == 'native'", specifier = ">=15,<17" },
 ]
 provides-extras = ["native"]

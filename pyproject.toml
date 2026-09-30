@@ -9,7 +9,9 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    "openai>=1.0.0",
+    # 2.9.0 exposes responses.compact. Older SDKs silently disable native
+    # compaction and leave hosts repeating large text-summary calls.
+    "openai>=2.9.0",
     "httpx>=0.27.0,<1",
 ]
 
@@ -51,4 +53,3 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "ruff>=0.14.10",
 ]
-
