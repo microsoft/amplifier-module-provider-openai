@@ -1,4 +1,4 @@
-"""Test for the config-surface V2 wizard reduction: exactly 4 ConfigFields,
+"""Test for the config-surface V2 wizard reduction: exactly 5 ConfigFields,
 with the exact prompt strings specified by the task.
 """
 
@@ -10,17 +10,18 @@ def _make_provider(**config_overrides) -> OpenAIProvider:
     return OpenAIProvider(api_key="test-key", config=config)
 
 
-def test_wizard_surface_has_exactly_four_fields_with_exact_prompts():
+def test_wizard_surface_has_exactly_five_fields_with_exact_prompts():
     provider = _make_provider()
     info = provider.get_info()
     fields_by_id = {f.id: f for f in info.config_fields}
 
     assert set(fields_by_id) == {
         "api_key",
+        "auto_continue",
         "base_url",
         "reasoning_effort",
         "enable_long_context",
-    }, f"Expected exactly 4 ConfigFields; got {sorted(fields_by_id)}"
+    }, f"Expected exactly 5 ConfigFields; got {sorted(fields_by_id)}"
 
     assert fields_by_id["api_key"].prompt == "Enter your OpenAI API key"
     assert fields_by_id["base_url"].prompt == "API base URL"

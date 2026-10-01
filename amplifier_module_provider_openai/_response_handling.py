@@ -606,7 +606,11 @@ def convert_response_with_accumulated_output(
         content=content_blocks,
         tool_calls=tool_calls if tool_calls else None,
         usage=usage,
-        finish_reason=getattr(final_response, "finish_reason", None),
+        finish_reason=(
+            "length"
+            if getattr(final_response, "status", None) == "incomplete"
+            else getattr(final_response, "finish_reason", None)
+        ),
         content_blocks=event_blocks if event_blocks else None,
         text=combined_text or None,
         metadata=metadata if metadata else None,
