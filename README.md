@@ -853,3 +853,15 @@ normalized usage with separate cache-write/read buckets. Native compact cost is
 left unavailable when the response does not report it. Canonical SDK output uses
 `exclude_unset=True` so SDK-invented defaults do not become invalid input fields.
 See the [OpenAI compaction contract](https://developers.openai.com/api/docs/guides/compaction).
+
+### Bounded output without a completion deadline
+
+`auto_continue` defaults to `true`, preserving normal continuation of truncated
+responses. Set it to `false` in provider configuration or pass
+`request_options={"auto_continue": False}` to `complete()` for a bounded output
+operation. The per-call option takes precedence and never changes the mounted
+provider. The option is consumed locally and is not sent to the API. An incomplete
+response retains its partial content and usage, reports `finish_reason="length"`,
+and is not retried with a larger output budget. Consumers must not treat that
+partial response as a complete summary. The provider advertises this optional
+contract as `completion:auto_continue:v1`. This option does not impose a time limit.

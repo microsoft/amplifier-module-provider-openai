@@ -576,7 +576,8 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
     # the surface grows by one entry, not three), + 1 optional Images API
     # backend configuration object (image_generation). Audited against every
     # `self.config.get(...)` call site in the constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 32
+    assert len(_CONSUMED_CONFIG_KEYS) == 33
+    assert "auto_continue" in _CONSUMED_CONFIG_KEYS
     assert "image_generation" in _CONSUMED_CONFIG_KEYS
 
 

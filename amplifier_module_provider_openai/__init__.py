@@ -1029,7 +1029,7 @@ def _decode_reasoning_state(
 
 # Every config key this module actually reads -- audited against mount,
 # constructor and request paths, including the optional image backend.
-# 32 entries. (Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.)
+# Removed keys live in _INERT_CONFIG_KEY_MESSAGES below.
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "base_url",
@@ -1055,6 +1055,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "priority",
         "enable_long_context",
         "use_streaming",
+        "auto_continue",
         "max_retries",
         "min_retry_delay",
         "max_retry_delay",
@@ -1553,6 +1554,9 @@ class OpenAIProvider:
         # This is NOT progressive token streaming to the user; it collects the complete
         # response before returning, matching what the Anthropic provider does.
         # Set to False to use the blocking create() path (useful for tests / compat).
+        self.auto_continue = _parse_config_bool(
+            "auto_continue", self.config.get("auto_continue", True), True
+        )
         self.use_streaming = _parse_config_bool(
             "use_streaming", self.config.get("use_streaming"), True
         )
@@ -2511,7 +2515,14 @@ class OpenAIProvider:
             reported_context = (
                 caps.long_context_pricing_threshold or caps.context_window
             )
-        provider_capabilities = ["streaming", "tools", "reasoning", "batch", "json_mode"]
+        provider_capabilities = [
+            "streaming",
+            "tools",
+            "reasoning",
+            "batch",
+            "json_mode",
+            "completion:auto_continue:v1",
+        ]
         if self._provider_count_available():
             provider_capabilities.append("request_budget:provider_count")
         from ._single_attempt import CAPABILITY, CAPABILITY_V2, endpoint
@@ -2532,6 +2543,14 @@ class OpenAIProvider:
                 "max_output_tokens": caps.max_output_tokens,
             },
             config_fields=[
+                ConfigField(
+                    id="auto_continue",
+                    display_name="Continue truncated responses",
+                    field_type="boolean",
+                    prompt="Automatically continue responses that reach the output limit",
+                    default="true",
+                    required=False,
+                ),
                 ConfigField(
                     id="api_key",
                     display_name="API Key",
@@ -3043,6 +3062,13 @@ class OpenAIProvider:
                 raise SingleAttemptError("invalid_options")
             if single_attempt:
                 return await complete(self, request, kwargs, version=version)
+
+        # This controls output continuation, not elapsed time. Bounded callers
+        # must be able to receive an incomplete result without paying for repeated
+        # full-input requests. Do not replace this with a completion deadline.
+        auto_continue = kwargs.get("auto_continue", self.auto_continue)
+        if type(auto_continue) is not bool:
+            raise ValueError("auto_continue must be a boolean")
 
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
@@ -3928,6 +3954,7 @@ class OpenAIProvider:
             while (
                 hasattr(final_response, "status")
                 and final_response.status == "incomplete"
+                and kwargs.get("auto_continue", self.auto_continue)
                 and continuation_count < MAX_CONTINUATION_ATTEMPTS
             ):
                 # P4: a response that ended INSIDE a function_call cannot be
@@ -5705,7 +5732,11 @@ class OpenAIProvider:
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
-            finish_reason=getattr(response, "finish_reason", None),
+            finish_reason=(
+                "length"
+                if getattr(response, "status", None) == "incomplete"
+                else getattr(response, "finish_reason", None)
+            ),
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
             output_text=raw_output_text,  # Per OpenAI docs: safest way to get final answer
