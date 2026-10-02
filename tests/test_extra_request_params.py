@@ -19,7 +19,10 @@ from amplifier_module_provider_openai import OpenAIProvider
 
 
 def _make_provider(**config_overrides) -> OpenAIProvider:
-    config = {"max_retries": 0, "use_streaming": False, **config_overrides}
+    # Temperature collision semantics are intentionally tested on GPT-5.6.
+    # The new GPT-6.1 default rejects sampling while reasoning is active.
+    config = {"max_retries": 0, "use_streaming": False,
+              "default_model": "gpt-5.6-sol", **config_overrides}
     return OpenAIProvider(api_key="test-key", config=config)
 
 

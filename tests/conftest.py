@@ -1,5 +1,4 @@
-"""
-Pytest configuration for module tests.
+"""Pytest configuration for module tests.
 
 Behavioral tests use inheritance from amplifier-core base classes.
 See tests/test_behavioral.py for the inherited tests.
@@ -9,3 +8,12 @@ The amplifier-core pytest plugin provides fixtures automatically:
 - module_type: Detected type (provider, tool, hook, etc.)
 - provider_module, tool_module, etc.: Mounted module instances
 """
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def offline_contract_credentials(request, monkeypatch):
+    """Mount real providers for offline inherited contracts, without secrets."""
+    if request.node.path.name in {"test_behavioral.py", "test_validation.py"}:
+        monkeypatch.setenv("OPENAI_API_KEY", "offline-contract-placeholder")
