@@ -172,7 +172,7 @@ def test_reasoning_effort_none_explicit():
     """reasoning_effort='none' explicitly set -> reasoning={'effort': 'none', 'summary': ...}.
     This is different from reasoning_effort=None (Python None = not set).
     GPT-5.4 uses 'none' as a string value meaning 'no reasoning'."""
-    provider = _make_provider()
+    provider = _make_provider(default_model="gpt-5.4")
     asyncio.run(provider.complete(_request_with_effort("none")))
     kwargs = _get_call_kwargs(provider)
     assert "reasoning" in kwargs

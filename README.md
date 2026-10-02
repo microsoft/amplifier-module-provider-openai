@@ -29,9 +29,13 @@ Provides access to OpenAI's GPT-6, GPT-5, and GPT-4 models as an LLM provider fo
 
 ## Supported Models
 
+The default is `gpt-6.1-sol` (October 2026 Sol-family refresh). Explicit
+`default_model` pins are preserved. Routing bundles choose their own candidates;
+this provider default does not alter their tier policy.
+
 - `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna` - GPT-6 exact model set. Each reports a 272,000-token input budget by default, or 922,000 with long context enabled (within its 1,050,000-token native total window), and supports a 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` tools. Sol and Luna have an API default of `medium` reasoning and also accept literal request-level `reasoning = { effort = "none" }`; Astra does not. No bare GPT-6, Terra, or dated GPT-6 IDs are inferred.
 - `gpt-6.1-sol` - Exact GPT-6.1 Sol model. It has the same reported 272,000-token standard input budget (922,000 with long context enabled), 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` support. It accepts `low`, `medium`, `high`, `xhigh`, and `max` reasoning effort. The configured `reasoning_effort = "none"` remains an omission sentinel, but literal API `reasoning.effort = "none"` and `minimal` are invalid. No snapshots or sibling GPT-6.1 IDs are inferred.
-- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. **`gpt-5.6-sol` is the default.** Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
+- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
 - `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5: 400,000-token total context, 272,000-token maximum input, and 128,000-token maximum output. Preflight retains its 4,096-token safety reserve; reducing the output cap does not raise the input ceiling.
@@ -49,7 +53,7 @@ configured directly in `settings.yaml` / the bundle config block — see the
 module = "provider-openai"
 name = "openai"
 config = {
-    default_model = "gpt-5.6-sol",
+    default_model = "gpt-6.1-sol",
     reasoning_effort = "low",              # none|minimal|low|medium|high|xhigh|max
     max_output_tokens = null,              # null = the model's capability max
     prompt_cache_retention = "24h",        # "24h" | "in_memory" | null
@@ -576,7 +580,7 @@ providers:
   - module: provider-openai
     config:
       raw: true
-      default_model: gpt-5.6-sol
+      default_model: gpt-6.1-sol
 ```
 
 ## Environment Variables
