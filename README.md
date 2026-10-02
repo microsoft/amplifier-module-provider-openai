@@ -4,6 +4,11 @@ GPT model integration for Amplifier via OpenAI's Responses API.
 
 ## Prerequisites
 
+Offline provider contracts run without real credentials: their scoped fixtures
+mount with a nonfunctional key and mock only SDK model listing. Run
+`uv run pytest -q -m "not live"` for all offline checks; separately marked
+inference tests require explicitly supplied live credentials.
+
 - **Python 3.11+**
 - **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
 
