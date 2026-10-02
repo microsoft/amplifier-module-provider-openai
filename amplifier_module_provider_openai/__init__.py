@@ -2544,14 +2544,6 @@ class OpenAIProvider:
             },
             config_fields=[
                 ConfigField(
-                    id="auto_continue",
-                    display_name="Continue truncated responses",
-                    field_type="boolean",
-                    prompt="Automatically continue responses that reach the output limit",
-                    default="true",
-                    required=False,
-                ),
-                ConfigField(
                     id="api_key",
                     display_name="API Key",
                     field_type="secret",

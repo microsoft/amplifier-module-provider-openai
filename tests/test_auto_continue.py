@@ -9,6 +9,32 @@ from amplifier_core import ChatRequest, Message
 from amplifier_module_provider_openai import OpenAIProvider
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, True),
+        ({"auto_continue": True}, True),
+        ({"auto_continue": False}, False),
+        ({"auto_continue": "true"}, True),
+        ({"auto_continue": "false"}, False),
+        ({"auto_continue": None}, True),
+    ],
+    ids=["default", "enabled", "disabled", "legacy-enabled", "legacy-disabled", "null"],
+)
+def test_config_auto_continue_parsing_and_metadata_do_not_create_client(
+    monkeypatch, config, expected
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-not-live")
+    p = OpenAIProvider(api_key=None, config=config, client=None)
+
+    assert p.auto_continue is expected
+    assert p._client is None
+    info = p.get_info()
+    assert p._client is None
+    assert "auto_continue" not in {f.id for f in info.config_fields}
+    assert "completion:auto_continue:v1" in info.capabilities
+
+
 def response(status):
     return SimpleNamespace(
         id="resp_fake",
@@ -62,6 +88,26 @@ async def test_normal_call_still_continues_and_accounts_for_both_requests():
     )
     assert p.client.responses.create.await_count == 2
     assert result.usage.input_tokens == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [False, "false"], ids=["disabled", "legacy-disabled"])
+async def test_config_disabled_returns_partial_without_per_call_override(value):
+    p = provider(auto_continue=value)
+    result = await p.complete(
+        ChatRequest(messages=[Message(role="user", content="Hello")])
+    )
+
+    assert p.client.responses.create.await_count == 1
+    assert result.content[0].text == "partial"
+    assert result.finish_reason == "length"
+    assert result.usage.input_tokens == 100
+    assert result.usage.output_tokens == 10
+    assert result.usage.total_tokens == 110
+    assert p.auto_continue is False
+    params = p.client.responses.create.call_args.kwargs
+    assert "auto_continue" not in params and "request_options" not in params
+    assert "completion:auto_continue:v1" in p.get_info().capabilities
 
 
 @pytest.mark.asyncio
