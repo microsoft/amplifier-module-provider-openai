@@ -84,6 +84,7 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `reasoning_effort` | `reasoning.effort` | Session-default reasoning effort (canonical key). `"none"`/unset sends nothing. Astra and GPT-6.1 Sol accept only `low`, `medium`, `high`, `xhigh`, or `max` when sent; GPT-6 Sol/Luna additionally accept literal request-level `none`. | Higher effort = more reasoning tokens, slower, costlier. | ✅ |
 | `enable_long_context` | **Amplifier-only** | Changes the *reported* context window (see [Long context](#long-context)). Does not map to an API param. | **≈2× on gpt-5.6/GPT-6/GPT-6.1 Sol when input exceeds 272K** — whole-request re-rating. | ✅ |
 | `max_output_tokens` | `max_output_tokens` | Output-token budget. `null` = the model capability's max. **Config key is `max_output_tokens`; the per-call kwarg is still `max_tokens`.** | Caps output length. | |
+| `auto_continue` | **Amplifier-only** | **Settings-only** (not prompted). Defaults to `true`; manually set `auto_continue: false` to return partial output without continuation. Does not control input truncation. | Continuation makes extra paid generation requests. | |
 | `reasoning` | `reasoning` | LEGACY effort alias. Use for the dict form (`{effort=..., mode="pro", context=...}`). `reasoning_effort` wins if both set. | See `reasoning_effort`. | |
 | `reasoning_summary` | `reasoning.summary` | Reasoning verbosity: `auto`\|`concise`\|`detailed`. | `detailed` uses more output tokens. | |
 | `truncation` | `truncation` | `null` (default) omits the field; API errors on overflow. `"auto"` drops oldest messages (busts cache). | `"auto"` lowers cache hit rate. | |
@@ -865,12 +866,15 @@ See the [OpenAI compaction contract](https://developers.openai.com/api/docs/guid
 
 ### Bounded output without a completion deadline
 
-`auto_continue` defaults to `true`, preserving normal continuation of truncated
-responses. Set it to `false` in provider configuration or pass
+`auto_continue` defaults to `true`, preserving normal continuation of responses
+that reach the output limit. It is settings-only and is not prompted by the
+configuration wizard. Set `auto_continue: false` manually in provider
+configuration or pass
 `request_options={"auto_continue": False}` to `complete()` for a bounded output
 operation. The per-call option takes precedence and never changes the mounted
 provider. The option is consumed locally and is not sent to the API. An incomplete
 response retains its partial content and usage, reports `finish_reason="length"`,
 and is not retried with a larger output budget. Consumers must not treat that
 partial response as a complete summary. The provider advertises this optional
-contract as `completion:auto_continue:v1`. This option does not impose a time limit.
+contract as `completion:auto_continue:v1`. This option does not impose a time limit
+or control input truncation (the separate `truncation` setting).
