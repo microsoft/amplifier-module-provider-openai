@@ -86,6 +86,7 @@ from ._response_handling import (
     merge_discarded_usage,
     parse_function_call_block,
 )
+from ._terminal_settlement import _caller_cancellations, _settle_optional
 from ._tool_search import (
     DEFAULT_ALWAYS_LOADED,
     TOOL_SEARCH_MODE_NAMESPACED,
@@ -99,7 +100,6 @@ from ._tool_search import (
     validate_tool_search_mode,
     warn_unlisted_tools,
 )
-from ._terminal_settlement import _caller_cancellations, _settle_optional
 from ._wait_observation import _WaitObserver
 
 logger = logging.getLogger(__name__)
