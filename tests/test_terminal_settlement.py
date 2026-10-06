@@ -391,7 +391,7 @@ async def test_native_core_callback_cleanup_is_not_provider_owned():
     from amplifier_module_provider_openai._terminal_settlement import _settle_optional
 
     coordinator = ModuleCoordinator()
-    ready, entered, cleanup, release, drained = (asyncio.Event() for _ in range(5))
+    ready, entered, cleanup, release, finish, drained = (asyncio.Event() for _ in range(6))
     context = ContextVar("native_terminal_context", default=None)
     seen, original = [], []
 
@@ -399,10 +399,10 @@ async def test_native_core_callback_cleanup_is_not_provider_owned():
         seen.append(context.get())
         entered.set()
         try:
-            await asyncio.Event().wait()
+            await release.wait()
         finally:
             cleanup.set()
-            await release.wait()
+            await finish.wait()
             seen.append(context.get())
             drained.set()
         return HookResult()
@@ -425,12 +425,12 @@ async def test_native_core_callback_cleanup_is_not_provider_owned():
         task.cancel("original-stop")
         with pytest.raises(asyncio.CancelledError, match="original-stop") as caught:
             await asyncio.wait_for(task, 2)
-        await asyncio.wait_for(cleanup.wait(), 2)
         assert caught.value is original[0] and task.cancelling() == 1
         assert entered.is_set() and seen == ["original-context"]
         assert not drained.is_set()
     finally:
         release.set()
+        finish.set()
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -438,3 +438,4 @@ async def test_native_core_callback_cleanup_is_not_provider_owned():
         if entered.is_set():
             await asyncio.wait_for(drained.wait(), 2)
     assert drained.is_set() and seen == ["original-context", "original-context"]
+    assert cleanup.is_set()
