@@ -22,7 +22,10 @@ from httpx._transports.default import map_httpcore_exceptions
 
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai import _wait_observation as observation_module
-from amplifier_module_provider_openai._generation_errors import OUTCOME_UNKNOWN_MESSAGE
+from amplifier_module_provider_openai._generation_errors import (
+    OUTCOME_UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
 from amplifier_module_provider_openai._wait_observation import _WaitObserver
 
 
@@ -64,8 +67,9 @@ class Hooks:
 
 
 class Loopback:
-    def __init__(self, mode="silent", *, streaming=False):
+    def __init__(self, mode="silent", *, streaming=False, failed_response=None):
         self.mode, self.streaming = mode, streaming
+        self.failed_response = failed_response
         self.posts = self.accepted = self.counts = self.retrieves = 0
         self.accepted_event, self.activity_sent = asyncio.Event(), asyncio.Event()
         self.release = asyncio.Event()
@@ -199,6 +203,26 @@ class Loopback:
                     b"Connection: close\r\n\r\n"
                 )
                 await writer.drain()
+                if self.mode == "failed_usage":
+                    writer.write(sse("response.created", 0, response=response("in_progress")))
+                    writer.write(sse("response.failed", 1, response=self.failed_response))
+                    await writer.drain()
+                    return
+                if self.mode == "partial_eof":
+                    writer.write(sse("response.created", 0, response=response("in_progress")))
+                    writer.write(sse("response.output_item.added", 1, output_index=0, item={
+                        "type": "message", "id": "msg_partial", "role": "assistant",
+                        "status": "in_progress", "content": [],
+                    }))
+                    writer.write(sse("response.content_part.added", 2, output_index=0,
+                                     content_index=0, item_id="msg_partial", part={
+                                         "type": "output_text", "text": "", "annotations": [],
+                                     }))
+                    writer.write(sse("response.output_text.delta", 3, output_index=0,
+                                     content_index=0, item_id="msg_partial",
+                                     delta="private-partial-text", logprobs=[]))
+                    await writer.drain()
+                    return
                 if self.mode == "comment_only":
                     writer.write(b": fixture heartbeat comment, not a parsed response\n\n")
                     await writer.drain()
@@ -317,6 +341,90 @@ def provider_for(fixture, *, fault=None, **config):
 
 def request(**kwargs):
     return ChatRequest(messages=[Message(role="user", content="private-prompt-sentinel")], **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("measurement", ["priority", "tier_missing", "absent", "zero"])
+async def test_real_sdk_failed_usage_settles_once_without_replay(measurement):
+    failed = response("failed")
+    failed["service_tier"] = None if measurement == "tier_missing" else "default"
+    failed["error"] = {"code": "server_error", "message": "private-failure-detail"}
+    if measurement == "priority":
+        failed["service_tier"] = "priority"
+        failed["usage"].update(input_tokens=272_001, output_tokens=1, total_tokens=272_002)
+    elif measurement == "tier_missing":
+        failed["usage"].update(input_tokens=100, output_tokens=10, total_tokens=110)
+    elif measurement == "absent":
+        failed["usage"] = None
+    else:
+        failed["usage"].update(input_tokens=0, output_tokens=0, total_tokens=0)
+    async with Loopback("failed_usage", streaming=True, failed_response=failed) as fixture:
+        provider, transport, hooks = provider_for(fixture, max_retries=1)
+        costs = []
+        provider._add_cost = costs.append
+        try:
+            with pytest.raises(RequestOutcomeUnknownError) as caught:
+                await asyncio.wait_for(provider.complete(request()), 3)
+            error = caught.value
+            assert str(error) == OUTCOME_UNKNOWN_MESSAGE and error.retryable is False
+            assert error.effects == "may_have_occurred"
+            assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 1
+            usage = error.usage
+            events = [data for name, data in hooks.events if name == "llm:response"]
+            assert len(events) == 1 and events[0]["status"] == "error"
+            assert events[0]["usage"] == usage
+            assert len(usage["attempts"]) == 1
+            if measurement == "priority":
+                assert usage["input_tokens"] == 272_001 and usage["output_tokens"] == 1
+                assert usage["cost_usd"] == "10.880190"
+                assert [str(cost) for cost in costs] == ["10.880190"]
+            elif measurement == "tier_missing":
+                assert usage["input_tokens"] == 100 and usage["output_tokens"] == 10
+                assert usage["cost_usd"] is None and costs == []
+            elif measurement == "absent":
+                assert usage["input_tokens"] is usage["output_tokens"] is None
+                assert usage["cost_usd"] is None and costs == []
+            else:
+                assert usage["input_tokens"] == usage["output_tokens"] == 0
+                assert len(costs) == 1 and costs[0] == 0
+            assert "private-" not in json.dumps(events)
+            assert "resp_loopback" not in json.dumps(events)
+            assert not any(name == "provider:retry" for name, _ in hooks.events)
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_partial_eof_aborts_once_without_canonical_result():
+    async with Loopback("partial_eof", streaming=True) as fixture:
+        provider, transport, hooks = provider_for(fixture, max_retries=1)
+        costs = []
+        provider._add_cost = costs.append
+        try:
+            with pytest.raises(RequestOutcomeUnknownError) as caught:
+                await asyncio.wait_for(provider.complete(request()), 3)
+            assert str(caught.value) == OUTCOME_UNKNOWN_MESSAGE
+            assert caught.value.retryable is False
+            assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 1
+            stream_events = [(name, data) for name, data in hooks.events if name.startswith("llm:stream_")]
+            assert [name for name, _ in stream_events] == [
+                "llm:stream_block_start", "llm:stream_block_delta", "llm:stream_aborted",
+            ]
+            assert len({data["request_id"] for _, data in stream_events}) == 1
+            assert stream_events[1][1]["sequence"] == 0
+            assert stream_events[2][1]["error"] == {
+                "type": "RequestOutcomeUnknown", "msg": OUTCOME_UNKNOWN_MESSAGE,
+            }
+            results = [data for name, data in hooks.events if name == "llm:response"]
+            assert len(results) == 1 and results[0]["status"] == "error"
+            assert results[0]["usage"] == caught.value.usage
+            assert caught.value.usage["input_tokens"] is caught.value.usage["output_tokens"] is None
+            assert costs == [] and "private-partial-text" not in json.dumps(results)
+            assert hooks.events.index(stream_events[2]) < next(
+                i for i, (name, _) in enumerate(hooks.events) if name == "llm:response"
+            )
+        finally:
+            await provider.close()
 
 
 @pytest.mark.asyncio

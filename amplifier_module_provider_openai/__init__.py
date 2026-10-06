@@ -3332,7 +3332,17 @@ class OpenAIProvider:
         # SDK Timeout objects specify phase limits, not a total elapsed budget.
         effective_timeout = None if isinstance(request_timeout, openai.Timeout) else request_timeout
         poll_interval = kwargs.get("poll_interval", self.poll_interval)
-        observer = _WaitObserver(getattr(self.coordinator, "hooks", None))
+        unsettled_generation = False
+
+        class _AccountingObserver(_WaitObserver):
+            async def attempt_started(self, timeout: Any, transport_timeout: Any) -> None:
+                nonlocal unsettled_generation
+                await super().attempt_started(timeout, transport_timeout)
+                # The existing create/stream seam calls this after preflight,
+                # immediately before dispatch. No new timer or SDK option.
+                unsettled_generation = True
+
+        observer = _AccountingObserver(getattr(self.coordinator, "hooks", None))
 
         # Call provider API with shared retry_with_backoff from amplifier-core.
         # Error translation happens inside _do_complete() so that retry_with_backoff
@@ -3343,18 +3353,36 @@ class OpenAIProvider:
         captured_rate_limit_info: dict[str, Any] = {}
         # A streaming `response.failed` terminal contains a vendor response that
         # may already have billable usage, even though the SDK subsequently
-        # raises and retry_with_backoff retries. Record only those explicit
+        # raises. It does not authorize replay. Record only those explicit
         # terminal failures: network exceptions provide no server evidence, and
         # completed/incomplete responses are recorded when returned so they
         # cannot be counted twice from both SSE and get_final_response().
         failed_stream_responses: list[Any] = []
-        failed_stream_response_ids: set[int] = set()
+        failed_stream_attempts: set[int] = set()
+        billed_responses: list[Any] = []
+        costs_accounted = False
         generation_attempt = 0
 
         def _record_failed_stream_response(response: Any) -> None:
-            if response is not None and id(response) not in failed_stream_response_ids:
-                failed_stream_response_ids.add(id(response))
+            # Repeated terminal events cannot charge the same physical attempt
+            # twice, even if the SDK produces distinct response objects.
+            if response is not None and generation_attempt not in failed_stream_attempts:
+                failed_stream_attempts.add(generation_attempt)
                 failed_stream_responses.append(response)
+
+        def _settle_error_usage(error: kernel_errors.LLMError) -> dict[str, Any] | None:
+            nonlocal costs_accounted
+            responses = [*billed_responses, *failed_stream_responses]
+            if unsettled_generation and not failed_stream_responses:
+                responses.append(None)
+            if not responses:
+                return None  # Proven admission refusals are not billable evidence.
+            # Terminal notification may fail after the normal cost callback.
+            # Construct the same receipt without committing those costs twice.
+            accounting = self._account_failed_responses(responses, add_cost=not costs_accounted)
+            costs_accounted = True
+            error.usage = accounting
+            return accounting
 
         # Per-request streaming override (does NOT mutate self.use_streaming).
         # Callers like session-namer pass metadata={"stream": False} to force
@@ -3370,7 +3398,7 @@ class OpenAIProvider:
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
-            nonlocal captured_rate_limit_info, generation_attempt
+            nonlocal captured_rate_limit_info, generation_attempt, unsettled_generation
 
             # The initial count guarded the completed wire payload before the
             # request event. Reuse it for this first physical dispatch only.
@@ -3559,6 +3587,8 @@ class OpenAIProvider:
                                                 getattr(event, "response", None)
                                             )
 
+                                if generation_attempt in failed_stream_attempts:
+                                    raise RequestOutcomeUnknownError(provider=self.name)
                                 try:
                                     response = await stream.get_final_response()
                                 except RuntimeError as e:
@@ -3594,6 +3624,7 @@ class OpenAIProvider:
                                 captured_rate_limit_info = (
                                     self._extract_rate_limit_headers(headers)
                                 )
+                                unsettled_generation = False
                                 return response
                     except (Exception, asyncio.CancelledError):
                         # If a partial stream was already emitted, signal abort to
@@ -3612,7 +3643,7 @@ class OpenAIProvider:
                         raise
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
-                    return await asyncio.wait_for(
+                    response = await asyncio.wait_for(
                         self._create_response(
                             params, native_input_tokens=attempt_native_input_tokens,
                             timeout=request_timeout,
@@ -3620,11 +3651,14 @@ class OpenAIProvider:
                         ),
                         timeout=effective_timeout,
                     )
+                    unsettled_generation = False
+                    return response
             except openai.RateLimitError as e:
                 if response_activity or not proven_rate_refusal(e):
                     raise RequestOutcomeUnknownError(
                         provider=self.name, status_code=429,
                     ) from e
+                unsettled_generation = False
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:
                     # Standard header (seconds)
@@ -3739,6 +3773,7 @@ class OpenAIProvider:
                 # max_retries times before surfacing.
                 if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
                     if not response_activity and proven_before_send(e):
+                        unsettled_generation = False
                         raise kernel_errors.LLMError(
                             "Provider connection setup failed before request send.",
                             provider=self.name, retryable=True,
@@ -3938,7 +3973,7 @@ class OpenAIProvider:
             final_response = response
             continuation_count = 0
             truncation_retry_done = False
-            billed_responses: list[Any] = [*failed_stream_responses, response]
+            billed_responses.extend([*failed_stream_responses, response])
 
             while (
                 hasattr(final_response, "status")
@@ -3995,6 +4030,7 @@ class OpenAIProvider:
                             ),
                             timeout=effective_timeout,
                         )
+                        unsettled_generation = False
                         self._record_budget_calibration(params, final_response)
                         billed_responses.append(final_response)
                         elapsed_ms += int((time.time() - retry_start) * 1000)
@@ -4127,6 +4163,7 @@ class OpenAIProvider:
                         ),
                         timeout=effective_timeout,
                     )
+                    unsettled_generation = False
                     self._record_budget_calibration(continue_params, final_response)
                     billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
@@ -4186,6 +4223,7 @@ class OpenAIProvider:
                     chat_response.usage = chat_response.usage.model_copy(
                         update={"cost_usd": total_cost}
                     )
+                    costs_accounted = True
                     self._add_cost(total_cost)
                 else:
                     chat_response.usage = chat_response.usage.model_copy(
@@ -4249,6 +4287,7 @@ class OpenAIProvider:
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
+            error_usage = _settle_error_usage(e)
 
             await observer.flush()
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4260,6 +4299,7 @@ class OpenAIProvider:
                         "error": error_msg,
                         "provider": self.name,
                         "model": params["model"],
+                        **({"usage": error_usage} if error_usage is not None else {}),
                     },
                 )
             raise
@@ -4273,6 +4313,7 @@ class OpenAIProvider:
             )
             error_msg = str(error)
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
+            error_usage = _settle_error_usage(error)
 
             # Emit error event
             await observer.flush()
@@ -4285,6 +4326,7 @@ class OpenAIProvider:
                         "error": error_msg,
                         "provider": self.name,
                         "model": params["model"],
+                        **({"usage": error_usage} if error_usage is not None else {}),
                     },
                 )
             raise error from e
@@ -5293,6 +5335,82 @@ class OpenAIProvider:
             cache_write_tokens=getattr(input_details, "cache_write_tokens", 0) or 0,
             service_tier=getattr(response, "service_tier", None),
         )
+
+    def _account_failed_responses(
+        self, responses: list[Any], *, add_cost: bool = True,
+    ) -> dict[str, Any]:
+        """Usage-only error receipt; never convert failed content or tool calls.
+
+        Core Usage requires integer counts. This bounded dict uses its field
+        names but retains null for missing measurements, distinct from measured
+        zero. Costs are existing-calculator estimates, not invoices. Known
+        subtotals remain visible when another attempt is unmeasured/unpriceable.
+        """
+        def count(obj: Any, name: str) -> int | None:
+            value = getattr(obj, name, None)
+            return value if type(value) is int and value >= 0 else None
+
+        attempts = []
+        costs: list[Decimal] = []
+        for response in responses:
+            usage = getattr(response, "usage", None)
+            inputs = count(usage, "input_tokens")
+            outputs = count(usage, "output_tokens")
+            input_details = getattr(usage, "input_tokens_details", None)
+            writes = count(input_details, "cache_write_tokens")
+            reads = count(input_details, "cached_tokens")
+            reasoning = count(getattr(usage, "output_tokens_details", None), "reasoning_tokens")
+            tier = getattr(response, "service_tier", None)
+            tier = tier if tier in ("default", "priority", "fast", "flex", "auto", "scale") else None
+            cost = None
+            details_valid = all(
+                getattr(input_details, field, None) is None
+                or count(input_details, field) is not None
+                for field in ("cache_write_tokens", "cached_tokens")
+            )
+            buckets_valid = details_valid and (
+                inputs is None or (writes or 0) + (reads or 0) <= inputs
+            )
+            normalized = (
+                inputs - (writes or 0) if inputs is not None and buckets_valid else None
+            )
+            if (inputs is not None and outputs is not None and buckets_valid
+                    and isinstance(getattr(response, "model", None), str)
+                    and (getattr(response, "service_tier", None) is None or tier is not None)):
+                cost = self._compute_attempt_cost(response)
+            if cost is not None:
+                costs.append(cost)
+            attempts.append({
+                "input_tokens": normalized,
+                "output_tokens": outputs,
+                "total_tokens": normalized + outputs
+                if normalized is not None and outputs is not None else None,
+                "cache_read_tokens": reads,
+                "cache_write_tokens": writes,
+                "reasoning_tokens": reasoning,
+                "service_tier": tier,
+                "cost_usd": str(cost) if cost is not None else None,
+            })
+
+        summary: dict[str, Any] = {}
+        for field in ("input_tokens", "output_tokens", "total_tokens",
+                      "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"):
+            values = [attempt[field] for attempt in attempts]
+            summary[field] = sum(values) if values and all(v is not None for v in values) else None
+        complete = bool(attempts) and len(costs) == len(attempts)
+        subtotal = sum(costs, Decimal(0)) if costs else None
+        summary.update({
+            "cost_usd": str(subtotal) if complete else None,
+            "cost_known_subtotal_usd": str(subtotal) if subtotal is not None else None,
+            "cost_scope": "reported_attempts" if complete else "known_attempts",
+            "cost_is_estimate": True,
+            "cost_complete": complete,
+            "attempts": attempts,
+        })
+        if add_cost:
+            for cost in costs:
+                self._add_cost(cost)
+        return summary
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
         """Convert OpenAI response to ChatResponse format.
