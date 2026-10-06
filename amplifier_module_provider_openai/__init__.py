@@ -99,6 +99,7 @@ from ._tool_search import (
     validate_tool_search_mode,
     warn_unlisted_tools,
 )
+from ._terminal_settlement import _caller_cancellations, _settle_optional
 from ._wait_observation import _WaitObserver
 
 logger = logging.getLogger(__name__)
@@ -3361,6 +3362,7 @@ class OpenAIProvider:
         failed_stream_attempts: set[int] = set()
         billed_responses: list[Any] = []
         costs_accounted = False
+        cost_commit: str | None = None
         generation_attempt = 0
 
         def _record_failed_stream_response(response: Any) -> None:
@@ -3370,8 +3372,8 @@ class OpenAIProvider:
                 failed_stream_attempts.add(generation_attempt)
                 failed_stream_responses.append(response)
 
-        def _settle_error_usage(error: kernel_errors.LLMError) -> dict[str, Any] | None:
-            nonlocal costs_accounted
+        def _settle_error_usage(error: BaseException) -> dict[str, Any] | None:
+            nonlocal costs_accounted, cost_commit
             responses = [*billed_responses, *failed_stream_responses]
             if unsettled_generation and not failed_stream_responses:
                 responses.append(None)
@@ -3379,10 +3381,50 @@ class OpenAIProvider:
                 return None  # Proven admission refusals are not billable evidence.
             # Terminal notification may fail after the normal cost callback.
             # Construct the same receipt without committing those costs twice.
-            accounting = self._account_failed_responses(responses, add_cost=not costs_accounted)
+            add_cost = not costs_accounted
+            # Commit is attempted at most once even if a callback partially
+            # updates state before raising. A failed callback is not replayable.
             costs_accounted = True
+            cancellations = _caller_cancellations()
+            try:
+                accounting = self._account_failed_responses(responses, add_cost=add_cost)
+            except (Exception, asyncio.CancelledError) as secondary:
+                if (isinstance(secondary, asyncio.CancelledError)
+                        and _caller_cancellations() > cancellations):
+                    raise
+                # Malformed accounting evidence is unavailable, never a reason
+                # to replace the original terminal failure or replay generation.
+                error.usage = None
+                logger.debug("Terminal usage receipt unavailable")
+                return None
+            if not add_cost and cost_commit is not None:
+                accounting["cost_commit"] = cost_commit
+            cost_commit = accounting["cost_commit"]
             error.usage = accounting
             return accounting
+
+        async def _settle_notification(
+            status: str, usage: dict[str, Any] | None, error_msg: str | None = None,
+        ) -> None:
+            try:
+                await _settle_optional(observer.flush)
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await _settle_optional(lambda: self.coordinator.hooks.emit(
+                        "llm:response",
+                        {
+                            "status": status,
+                            "duration_ms": int((time.time() - start_time) * 1000),
+                            "provider": self.name,
+                            "model": params["model"],
+                            **({"usage": usage} if usage is not None else {}),
+                            **({"error": error_msg} if error_msg is not None else {}),
+                        },
+                    ))
+            except asyncio.CancelledError as cancellation:
+                # A newer real Stop wins, but cannot discard the usage already
+                # measured/settled on the terminal path it interrupted.
+                cancellation.usage = usage
+                raise
 
         # Per-request streaming override (does NOT mutate self.use_streaming).
         # Callers like session-namer pass metadata={"stream": False} to force
@@ -3518,6 +3560,7 @@ class OpenAIProvider:
                                             text = event.delta
                                             if text:
                                                 idx = event.output_index
+                                                partial_emitted = True
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
                                                     {
@@ -3531,7 +3574,6 @@ class OpenAIProvider:
                                                     },
                                                 )
                                                 seq[idx] = seq.get(idx, 0) + 1
-                                                partial_emitted = True
 
                                         elif et in (
                                             "response.reasoning_summary_text.delta",
@@ -3540,6 +3582,7 @@ class OpenAIProvider:
                                             text = event.delta
                                             if text:
                                                 idx = event.output_index
+                                                partial_emitted = True
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
                                                     {
@@ -3553,7 +3596,6 @@ class OpenAIProvider:
                                                     },
                                                 )
                                                 seq[idx] = seq.get(idx, 0) + 1
-                                                partial_emitted = True
 
                                         elif et == "response.output_item.done":
                                             idx = event.output_index
@@ -3626,20 +3668,24 @@ class OpenAIProvider:
                                 )
                                 unsettled_generation = False
                                 return response
-                    except (Exception, asyncio.CancelledError):
+                    except (Exception, asyncio.CancelledError) as primary:
                         # If a partial stream was already emitted, signal abort to
                         # consumers before re-raising for normal error translation.
                         if partial_emitted and hooks_available:
-                            await self.coordinator.hooks.emit(
+                            cancelled = isinstance(primary, asyncio.CancelledError)
+                            await _settle_optional(lambda: self.coordinator.hooks.emit(
                                 "llm:stream_aborted",
                                 {
                                     "request_id": request_id,
                                     "error": {
-                                        "type": "RequestOutcomeUnknown",
-                                        "msg": OUTCOME_UNKNOWN_MESSAGE,
+                                        "type": "CancelledError" if cancelled else "RequestOutcomeUnknown",
+                                        "msg": (
+                                            "Local wait cancelled; provider effects are not confirmed rolled back."
+                                            if cancelled else OUTCOME_UNKNOWN_MESSAGE
+                                        ),
                                     },
                                 },
-                            )
+                            ))
                         raise
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
@@ -4224,14 +4270,16 @@ class OpenAIProvider:
                         update={"cost_usd": total_cost}
                     )
                     costs_accounted = True
+                    cost_commit = "unknown"
                     self._add_cost(total_cost)
+                    cost_commit = "committed"
                 else:
                     chat_response.usage = chat_response.usage.model_copy(
                         update={"cost_usd": None}
                     )
 
             # Emit llm:response event using canonical usage fields from chat_response
-            await observer.flush()
+            await _settle_optional(observer.flush)
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 event_usage: dict[str, Any] = {}
                 if chat_response.usage:
@@ -4278,8 +4326,9 @@ class OpenAIProvider:
 
             return chat_response
 
-        except asyncio.CancelledError:
-            await observer.flush()
+        except asyncio.CancelledError as e:
+            error_usage = _settle_error_usage(e)
+            await _settle_notification("cancelled", error_usage)
             raise
 
         except kernel_errors.LLMError as e:
@@ -4288,20 +4337,7 @@ class OpenAIProvider:
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
             error_usage = _settle_error_usage(e)
-
-            await observer.flush()
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": error_msg,
-                        "provider": self.name,
-                        "model": params["model"],
-                        **({"usage": error_usage} if error_usage is not None else {}),
-                    },
-                )
+            await _settle_notification("error", error_usage, error_msg)
             raise
 
         except Exception as e:
@@ -4316,19 +4352,7 @@ class OpenAIProvider:
             error_usage = _settle_error_usage(error)
 
             # Emit error event
-            await observer.flush()
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": error_msg,
-                        "provider": self.name,
-                        "model": params["model"],
-                        **({"usage": error_usage} if error_usage is not None else {}),
-                    },
-                )
+            await _settle_notification("error", error_usage, error_msg)
             raise error from e
 
     def _extract_rate_limit_headers(self, headers: Any) -> dict[str, Any]:
@@ -5377,7 +5401,15 @@ class OpenAIProvider:
             if (inputs is not None and outputs is not None and buckets_valid
                     and isinstance(getattr(response, "model", None), str)
                     and (getattr(response, "service_tier", None) is None or tier is not None)):
-                cost = self._compute_attempt_cost(response)
+                cancellations = _caller_cancellations()
+                try:
+                    cost = self._compute_attempt_cost(response)
+                except (Exception, asyncio.CancelledError) as secondary:
+                    if (isinstance(secondary, asyncio.CancelledError)
+                            and _caller_cancellations() > cancellations):
+                        raise
+                    # Pricing is secondary evidence, never the primary failure.
+                    logger.debug("Failure usage pricing unavailable")
             if cost is not None:
                 costs.append(cost)
             attempts.append({
@@ -5407,9 +5439,21 @@ class OpenAIProvider:
             "cost_complete": complete,
             "attempts": attempts,
         })
-        if add_cost:
+        summary["cost_commit"] = "not_attempted"
+        if add_cost and costs:
+            summary["cost_commit"] = "committed"
             for cost in costs:
-                self._add_cost(cost)
+                cancellations = _caller_cancellations()
+                try:
+                    self._add_cost(cost)
+                except (Exception, asyncio.CancelledError) as secondary:
+                    if (isinstance(secondary, asyncio.CancelledError)
+                            and _caller_cancellations() > cancellations):
+                        raise
+                    # It may have committed before raising. Do not call again,
+                    # and do not claim the session ledger contains the estimate.
+                    summary["cost_commit"] = "unknown"
+                    logger.debug("Failure usage cost callback unavailable")
         return summary
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:

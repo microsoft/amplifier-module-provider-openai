@@ -1,5 +1,6 @@
 """Optional, payload-free observations owned by one logical generation call."""
 
+import asyncio
 import logging
 import math
 import time
@@ -33,12 +34,18 @@ class _WaitObserver:
 
     async def _emit(self, payload: dict[str, Any]) -> None:
         if self._hooks is not None:
+            cancellations = asyncio.current_task().cancelling()
             try:
                 await self._hooks.emit("llm:progress", payload)
             except Exception:  # noqa: BLE001 - optional hook has no exception taxonomy
                 # Observation failures must not fail or replay generation.
-                # CancelledError is deliberately not caught.
                 logger.debug("Optional wait observation hook failed")
+            except asyncio.CancelledError:
+                # In-wait hooks run in the caller. Only an actual task cancel
+                # (including an explicit asyncio deadline) propagates.
+                if asyncio.current_task().cancelling() > cancellations:
+                    raise
+                logger.debug("Optional wait observation hook cancelled itself")
 
     async def attempt_started(self, timeout: Any, transport_timeout: Any) -> None:
         self._attempt += 1

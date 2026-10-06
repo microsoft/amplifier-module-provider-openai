@@ -145,12 +145,45 @@ are included. Existing call context supplies attribution.
 
 In-wait activity is limited to one publication per second across retries,
 continuations, and truncated-output recovery. One pending actual observation
-flushes immediately before local settlement, even inside that spacing window.
+is attempted immediately before local settlement, even inside that spacing window.
 There are no observation timers, sleeps, or heartbeats: silent waits produce no
 activity. Missing hooks mean observation unavailable; hook errors do not fail
 generation, and cancellation still propagates. These observations establish
 neither model computation nor transport health.
 The optional native WebSocket adapter does not produce this observation hook.
+
+#### Ordinary terminal settlement contract
+
+Terminal progress, partial-display abort, and error/cancellation notifications
+are best-effort local delivery, not generation work. Each has a 50ms delivery
+allowance (at most three deliveries, 150ms plus cooperative task drain), so a
+blocked optional hook cannot hold Stop merely to publish pending progress.
+Created delivery tasks are cancelled and awaited, never detached; hooks must
+yield to asyncio and honor cancellation. Synchronous blocking or hooks that
+suppress cancellation cannot be forcibly bounded by asyncio.
+An available responsive consumer receives exactly one sanitized abort with the
+matching display request ID when a partial display is cancelled. Delivery cannot
+be guaranteed to an unresponsive consumer. Hook errors or hook-internal
+cancellation cannot replace a primary provider error or caller cancellation.
+New caller cancellation takes precedence; its count and message are retained.
+This does not confirm remote cancellation or reverse billing.
+
+Cancelled ordinary calls after generation admission retain the same bounded usage-only dictionary on the
+typed `CancelledError` as failed calls, and attempt a `status: "cancelled"`
+`llm:response` event with that receipt. Measured prior attempts remain visible;
+unfinished or absent usage is null, not zero. `cost_known_subtotal_usd` covers
+only priceable reported attempts, not the unmeasured attempt or an account invoice.
+Pricing failures retain tokens with unknown cost. A cost callback is attempted
+at most once per known attempt; if it raises after possibly committing,
+`cost_commit: "unknown"` says the session ledger commit is unverified, not zero.
+Terminal delivery after normal cost commit never adds the cost again.
+
+Assembly and initial count guards fail locally before dispatch with their
+original typed exception; no retry or outcome-unknown claim is added. Dispatched
+failures keep the existing conservative exact-type refusal/connect mapping:
+arbitrary status codes or generic SDK failures are not proof of pre-send refusal.
+No new completion deadline, heartbeat, generation replay, or inherited
+non-streaming failed-status behavior is introduced by terminal settlement.
 
 **Deprecated aliases** (still work, warn once, will be removed):
 

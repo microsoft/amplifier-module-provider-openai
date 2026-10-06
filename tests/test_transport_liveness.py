@@ -67,12 +67,14 @@ class Hooks:
 
 
 class Loopback:
-    def __init__(self, mode="silent", *, streaming=False, failed_response=None):
+    def __init__(self, mode="silent", *, streaming=False, failed_response=None, initial_response=None):
         self.mode, self.streaming = mode, streaming
         self.failed_response = failed_response
+        self.initial_response = initial_response
         self.posts = self.accepted = self.counts = self.retrieves = 0
         self.accepted_event, self.activity_sent = asyncio.Event(), asyncio.Event()
         self.release = asyncio.Event()
+        self.pending_continuation = asyncio.Event()
         self.tasks, self.writers, self.errors = set(), set(), []
         self.payloads = []
 
@@ -169,8 +171,8 @@ class Loopback:
             if self.mode in {"background", "background_failure"}:
                 await self.send(writer, json.dumps(response("in_progress")).encode())
                 return
-            if self.mode in {"continuation", "tool_truncation"} and self.posts == 1:
-                incomplete = response("incomplete")
+            if self.mode in {"continuation", "continuation_pending", "tool_truncation"} and self.posts == 1:
+                incomplete = self.initial_response or response("incomplete")
                 incomplete["incomplete_details"] = {"reason": "max_output_tokens"}
                 if self.mode == "tool_truncation":
                     incomplete["output"] = [{
@@ -182,6 +184,9 @@ class Loopback:
                     incomplete["output"] = response()["output"]
                 await self.send(writer, json.dumps(incomplete).encode())
                 return
+            if self.mode == "continuation_pending":
+                self.pending_continuation.set()
+                await self.release.wait()
             if self.mode == "malformed" and not self.streaming:
                 await self.send(writer, b'{"output":BROKEN-private-error-sentinel')
                 return
@@ -208,7 +213,7 @@ class Loopback:
                     writer.write(sse("response.failed", 1, response=self.failed_response))
                     await writer.drain()
                     return
-                if self.mode == "partial_eof":
+                if self.mode in {"partial_eof", "partial_cancel"}:
                     writer.write(sse("response.created", 0, response=response("in_progress")))
                     writer.write(sse("response.output_item.added", 1, output_index=0, item={
                         "type": "message", "id": "msg_partial", "role": "assistant",
@@ -222,6 +227,8 @@ class Loopback:
                                      content_index=0, item_id="msg_partial",
                                      delta="private-partial-text", logprobs=[]))
                     await writer.drain()
+                    if self.mode == "partial_cancel":
+                        await self.release.wait()
                     return
                 if self.mode == "comment_only":
                     writer.write(b": fixture heartbeat comment, not a parsed response\n\n")
@@ -341,6 +348,214 @@ def provider_for(fixture, *, fault=None, **config):
 
 def request(**kwargs):
     return ChatRequest(messages=[Message(role="user", content="private-prompt-sentinel")], **kwargs)
+
+
+def assert_no_terminal_tasks():
+    assert not [task for task in asyncio.all_tasks()
+                if task.get_coro().__qualname__ == "_settle_optional.<locals>.delivery"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("displayed", [False, True])
+@pytest.mark.parametrize("behavior", ["ok", "raise", "internal_cancel", "block"])
+async def test_real_sdk_cancel_preserves_primary_through_optional_cleanup(displayed, behavior):
+    mode = "partial_cancel" if displayed else "observation_cancel"
+    async with Loopback(mode, streaming=True) as fixture:
+        provider, transport, hooks = provider_for(fixture)
+        reached = asyncio.Event()
+        hook_drained = asyncio.Event()
+        original_emit = hooks.emit
+        activities = 0
+
+        async def emit(name, data):
+            nonlocal activities
+            await original_emit(name, data)
+            if name == "llm:progress" and data["observation"] == "response_activity":
+                activities += 1
+            if name == "llm:stream_block_delta":
+                reached.set()
+            if not displayed and activities == 1:
+                reached.set()
+            cleanup = (name == "llm:stream_aborted" if displayed else (
+                name == "llm:progress" and activities == 2))
+            if cleanup:
+                try:
+                    if behavior == "raise":
+                        raise ValueError("private-cleanup")
+                    if behavior == "internal_cancel":
+                        raise asyncio.CancelledError("hook-not-caller")
+                    if behavior == "block":
+                        await asyncio.Event().wait()
+                finally:
+                    hook_drained.set()
+
+        hooks.emit = emit
+        task = asyncio.create_task(provider.complete(request()))
+        try:
+            await asyncio.wait_for(reached.wait(), 2)
+            start = time.monotonic()
+            task.cancel("caller-stop")
+            with pytest.raises(asyncio.CancelledError, match="caller-stop") as caught:
+                await asyncio.wait_for(task, 0.5)
+            assert time.monotonic() - start < 0.25
+            assert task.cancelling() == 1
+            assert caught.value.usage["input_tokens"] is None
+            assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 1
+            assert hook_drained.is_set()
+            aborts = [data for name, data in hooks.events if name == "llm:stream_aborted"]
+            deltas = [data for name, data in hooks.events if name == "llm:stream_block_delta"]
+            assert len(aborts) == (1 if displayed else 0)
+            if displayed:
+                assert aborts[0]["request_id"] == deltas[0]["request_id"]
+                assert aborts[0]["error"]["type"] == "CancelledError"
+                assert "private-" not in json.dumps(aborts)
+            assert not any(name == "provider:retry" for name, _ in hooks.events)
+            assert not any(name == "llm:response" and data["status"] == "ok"
+                           for name, data in hooks.events)
+            assert_no_terminal_tasks()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("measurement", ["known", "absent", "zero", "partial"])
+async def test_real_sdk_cancelled_continuation_usage_is_known_subtotal_only(measurement):
+    initial = response("incomplete")
+    initial["service_tier"] = "default"
+    if measurement == "absent":
+        initial["usage"] = None
+    elif measurement == "zero":
+        initial["usage"].update(input_tokens=0, output_tokens=0, total_tokens=0)
+    elif measurement == "partial":
+        initial["usage"]["input_tokens"] = None
+    async with Loopback("continuation_pending", initial_response=initial) as fixture:
+        provider, transport, hooks = provider_for(fixture)
+        costs = []
+        provider._add_cost = costs.append
+        task = asyncio.create_task(provider.complete(request()))
+        try:
+            await asyncio.wait_for(fixture.pending_continuation.wait(), 2)
+            task.cancel("caller-stop")
+            with pytest.raises(asyncio.CancelledError, match="caller-stop") as caught:
+                await task
+            usage = caught.value.usage
+            assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 2
+            assert len(usage["attempts"]) == 2
+            assert usage["attempts"][1]["input_tokens"] is None
+            assert usage["input_tokens"] is usage["cost_usd"] is None
+            assert usage["cost_complete"] is False and usage["cost_scope"] == "known_attempts"
+            if measurement in {"known", "zero"}:
+                assert usage["attempts"][0]["input_tokens"] == (10 if measurement == "known" else 0)
+                assert len(costs) == 1
+                assert usage["cost_known_subtotal_usd"] == str(costs[0])
+            else:
+                assert usage["cost_known_subtotal_usd"] is None and costs == []
+            if measurement == "partial":
+                assert usage["attempts"][0]["output_tokens"] == 5
+            terminal = [data for name, data in hooks.events if name == "llm:response"]
+            assert len(terminal) == 1 and terminal[0]["status"] == "cancelled"
+            assert terminal[0]["usage"] == usage
+            assert not any(name == "provider:retry" for name, _ in hooks.events)
+            assert_no_terminal_tasks()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_second_caller_cancel_during_abort_is_not_swallowed():
+    async with Loopback("partial_cancel", streaming=True) as fixture:
+        provider, transport, hooks = provider_for(fixture)
+        displayed, abort_entered, drained = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original_emit = hooks.emit
+
+        async def emit(name, data):
+            await original_emit(name, data)
+            if name == "llm:stream_block_delta":
+                displayed.set()
+            if name == "llm:stream_aborted":
+                abort_entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    drained.set()
+
+        hooks.emit = emit
+        task = asyncio.create_task(provider.complete(request()))
+        try:
+            await asyncio.wait_for(displayed.wait(), 2)
+            task.cancel("first-stop")
+            await abort_entered.wait()
+            task.cancel("second-stop")
+            with pytest.raises(asyncio.CancelledError, match="second-stop") as caught:
+                await task
+            assert task.cancelling() == 2 and drained.is_set()
+            assert caught.value.usage["input_tokens"] is None
+            assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 1
+            assert len([name for name, _ in hooks.events if name == "llm:stream_aborted"]) == 1
+            assert not any(name == "provider:retry" for name, _ in hooks.events)
+            assert_no_terminal_tasks()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secondary", ["calculator", "callback", "terminal_hook"])
+async def test_real_sdk_secondary_failure_never_masks_dispatched_unknown(secondary):
+    failed = response("failed")
+    failed["service_tier"] = "default"
+    failed["error"] = {"code": "server_error", "message": "private-primary"}
+    async with Loopback("failed_usage", streaming=True, failed_response=failed) as fixture:
+        provider, transport, hooks = provider_for(fixture)
+        costs = []
+
+        def callback(cost):
+            costs.append(cost)
+            if secondary == "callback":
+                raise ValueError("private-accounting")
+
+        def calculator(_):
+            raise ValueError("private-pricing")
+
+        provider._add_cost = callback
+        if secondary == "calculator":
+            provider._compute_attempt_cost = calculator
+        original_emit = hooks.emit
+
+        async def emit(name, data):
+            await original_emit(name, data)
+            if secondary == "terminal_hook" and name == "llm:response":
+                raise asyncio.CancelledError("hook-not-caller")
+
+        hooks.emit = emit
+        try:
+            with pytest.raises(RequestOutcomeUnknownError) as caught:
+                await provider.complete(request())
+            assert caught.value.request_outcome == "unknown"
+            assert caught.value.retryable is False
+            assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 1
+            usage = caught.value.usage
+            assert usage["input_tokens"] == 10 and usage["output_tokens"] == 5
+            assert len(costs) == (0 if secondary == "calculator" else 1)
+            if secondary == "calculator":
+                assert usage["cost_usd"] is None
+            elif secondary == "callback":
+                assert usage["cost_commit"] == "unknown"
+            terminal = [data for name, data in hooks.events if name == "llm:response"]
+            assert len(terminal) == 1 and terminal[0]["status"] == "error"
+            assert terminal[0]["usage"] == usage
+            assert "private-" not in json.dumps(terminal)
+            assert_no_terminal_tasks()
+        finally:
+            await provider.close()
 
 
 @pytest.mark.asyncio
@@ -549,7 +764,13 @@ async def test_real_sdk_pending_actual_flush_before_success_error_cancel(monkeyp
                     await task
             assert progress(hooks)[-1]["observation"] == "response_activity"
             assert len(progress(hooks)) == 3
-            assert hooks.events[-2][0] == "llm:progress"
+            if settlement == "cancel":
+                assert [name for name, _ in hooks.events[-3:]] == [
+                    "llm:progress", "llm:response", "wrapper:cancelled",
+                ]
+                assert hooks.events[-2][1]["status"] == "cancelled"
+            else:
+                assert hooks.events[-2][0] == "llm:progress"
             assert hooks.events[-1][0] == ("wrapper:cancelled" if settlement == "cancel" else "llm:response")
             assert fixture.posts == fixture.accepted == fixture.counts == 1
         finally:

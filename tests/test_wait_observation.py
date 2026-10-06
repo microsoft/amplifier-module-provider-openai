@@ -148,8 +148,11 @@ async def test_optional_hooks_and_hook_exceptions_do_not_fail_observations():
 async def test_hook_cancellation_propagates():
     class Cancel:
         async def emit(self, *_):
-            raise asyncio.CancelledError
+            asyncio.current_task().cancel("caller")
+            await asyncio.Event().wait()
 
     observer = _WaitObserver(Cancel())
-    with pytest.raises(asyncio.CancelledError):
-        await observer.attempt_started(None, openai.Timeout(None))
+    task = asyncio.create_task(observer.attempt_started(None, openai.Timeout(None)))
+    with pytest.raises(asyncio.CancelledError, match="caller"):
+        await task
+    assert task.cancelling() == 1
