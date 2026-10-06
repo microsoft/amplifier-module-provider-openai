@@ -117,6 +117,22 @@ bounded. An explicit request `timeout` (including `None`) takes precedence over
 HTTP transports also accept an SDK `Timeout` object for individual phase limits;
 the optional WebSocket transport accepts scalar deadlines or `None`.
 
+Ordinary generation never automatically replays an ambiguous failure: elapsed,
+read/write timeouts, resets, unknown EOF, malformed responses, generic SDK errors,
+and bare 5xx settle locally with a nonretryable outcome-unknown warning. The
+private exception cause is retained, not included in that warning. This
+conservative 5xx policy trades some formerly successful automatic retries for
+explicit failures rather than risking duplicate accepted generation.
+Bounded backoff remains only for an exact SDK/httpx/httpcore connect/pool failure
+chain before send (and before response activity), or an explicit pre-response
+rate-admission refusal (`rate_limit_exceeded`, or typed `slow_down`). An arbitrary
+429, challenge HTML, or missing output is not that proof. Read-only count and
+model-list retries retain their existing policy; SDK retries remain disabled.
+Cancellation stops the local wait without replay: provider-side work, billing,
+or other effects are not confirmed rolled back. Unlimited silent waits can still
+remain pending until completion, transport failure, an explicit limit, or Stop;
+this does not establish a repair for OS-specific network-switch stalls.
+
 **Deprecated aliases** (still work, warn once, will be removed):
 
 | Old key | Use instead |

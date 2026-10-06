@@ -71,6 +71,13 @@ from ._constants import (
     NATIVE_TOOL_TYPES,
 )
 from ._cost import compute_cost
+from ._generation_errors import (
+    OUTCOME_UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+    proven_before_send,
+    proven_rate_refusal,
+    unknown_timeout,
+)
 from ._response_handling import (
     FunctionCallTruncationError,
     convert_response_with_accumulated_output,
@@ -3365,6 +3372,7 @@ class OpenAIProvider:
                     await self._guard_assembled_params_with_provider_count(params)
                 )
             generation_attempt += 1
+            response_activity = False
 
             async def _handle_context_overflow(e: Exception, error_msg: str):
                 """Raise ContextLengthError. Shared by the 400 path and the
@@ -3417,6 +3425,7 @@ class OpenAIProvider:
                             ) as stream:
                                 if emit_stream_events:
                                     async for event in stream:
+                                        response_activity = True
                                         et = event.type
 
                                         # Capture the terminal response as we stream so a
@@ -3520,6 +3529,7 @@ class OpenAIProvider:
                                     # their accounting/recovery semantics identical
                                     # without emitting stream UI events.
                                     async for event in stream:
+                                        response_activity = True
                                         et = event.type
                                         if et in (
                                             "response.completed",
@@ -3567,7 +3577,7 @@ class OpenAIProvider:
                                     self._extract_rate_limit_headers(headers)
                                 )
                                 return response
-                    except Exception as e:
+                    except (Exception, asyncio.CancelledError):
                         # If a partial stream was already emitted, signal abort to
                         # consumers before re-raising for normal error translation.
                         if partial_emitted and hooks_available:
@@ -3576,8 +3586,8 @@ class OpenAIProvider:
                                 {
                                     "request_id": request_id,
                                     "error": {
-                                        "type": type(e).__name__,
-                                        "msg": str(e),
+                                        "type": "RequestOutcomeUnknown",
+                                        "msg": OUTCOME_UNKNOWN_MESSAGE,
                                     },
                                 },
                             )
@@ -3592,6 +3602,10 @@ class OpenAIProvider:
                         timeout=effective_timeout,
                     )
             except openai.RateLimitError as e:
+                if response_activity or not proven_rate_refusal(e):
+                    raise RequestOutcomeUnknownError(
+                        provider=self.name, status_code=429,
+                    ) from e
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:
                     # Standard header (seconds)
@@ -3619,10 +3633,8 @@ class OpenAIProvider:
                     and retry_after > self._retry_config.max_delay
                 ):
                     retryable = False
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.RateLimitError(
-                    error_msg,
+                    "Provider refused this request at rate admission.",
                     provider=self.name,
                     status_code=429,
                     retryable=retryable,
@@ -3665,16 +3677,9 @@ class OpenAIProvider:
                 error_msg = json.dumps(body) if body is not None else str(e)
                 if status == 403:
                     if self._is_cloudflare_challenge(e):
-                        logger.warning(
-                            "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-                            "with HTML body). Treating as transient — will retry."
-                        )
-                        raise kernel_errors.ProviderUnavailableError(
-                            "Cloudflare bot challenge (transient 403 with HTML body). "
-                            "This typically resolves on retry.",
-                            provider=self.name,
-                            status_code=403,
-                            retryable=True,
+                        # HTML/marker heuristics do not prove nonacceptance.
+                        raise RequestOutcomeUnknownError(
+                            provider=self.name, status_code=403,
                         ) from e
                     raise kernel_errors.AccessDeniedError(
                         error_msg,
@@ -3691,11 +3696,8 @@ class OpenAIProvider:
                         status_code=404,
                     ) from e
                 if status >= 500:
-                    raise kernel_errors.ProviderUnavailableError(
-                        error_msg,
-                        provider=self.name,
-                        status_code=status,
-                        retryable=True,
+                    raise RequestOutcomeUnknownError(
+                        provider=self.name, status_code=status,
                     ) from e
                 raise kernel_errors.LLMError(
                     error_msg,
@@ -3704,11 +3706,7 @@ class OpenAIProvider:
                     retryable=False,
                 ) from e
             except asyncio.TimeoutError as e:
-                raise kernel_errors.LLMTimeoutError(
-                    f"Request timed out after {effective_timeout}s",
-                    provider=self.name,
-                    retryable=True,
-                ) from e
+                raise unknown_timeout(provider=self.name) from e
             except kernel_errors.LLMError:
                 raise  # Already translated, don't double-wrap
             except openai.APIError as e:
@@ -3721,12 +3719,14 @@ class OpenAIProvider:
                 # deterministic 400 (context overflow, invalid params) was retried
                 # max_retries times before surfacing.
                 if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
-                    # Transport-level failures are genuinely transient.
-                    raise kernel_errors.LLMError(
-                        str(e) or f"{type(e).__name__}: (no message)",
-                        provider=self.name,
-                        retryable=True,
-                    ) from e
+                    if not response_activity and proven_before_send(e):
+                        raise kernel_errors.LLMError(
+                            "Provider connection setup failed before request send.",
+                            provider=self.name, retryable=True,
+                        ) from e
+                    if isinstance(e, openai.APITimeoutError):
+                        raise unknown_timeout(provider=self.name) from e
+                    raise RequestOutcomeUnknownError(provider=self.name) from e
                 body = getattr(e, "body", None)
                 error_msg = (
                     json.dumps(body)
@@ -3752,23 +3752,9 @@ class OpenAIProvider:
                         provider=self.name,
                         status_code=400,
                     ) from e
-                # Unclassifiable -- preserve the prior conservative default.
-                raise kernel_errors.LLMError(
-                    error_msg,
-                    provider=self.name,
-                    retryable=True,
-                ) from e
+                raise RequestOutcomeUnknownError(provider=self.name) from e
             except Exception as e:
-                body = getattr(e, "body", None)
-                if body is not None:
-                    error_msg = json.dumps(body)
-                else:
-                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
-                raise kernel_errors.LLMError(
-                    error_msg,
-                    provider=self.name,
-                    retryable=True,
-                ) from e
+                raise RequestOutcomeUnknownError(provider=self.name) from e
 
         async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
             """Callback invoked before each retry sleep."""
@@ -3868,10 +3854,7 @@ class OpenAIProvider:
                     # Check timeout
                     elapsed_total = time.time() - start_time
                     if effective_timeout is not None and elapsed_total >= effective_timeout:
-                        raise kernel_errors.LLMTimeoutError(
-                            f"Background request exceeded the configured {effective_timeout}s deadline",
-                            provider=self.name, retryable=False,
-                        )
+                        raise unknown_timeout(provider=self.name)
 
                     # Emit status update event
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3903,15 +3886,9 @@ class OpenAIProvider:
                                 response_id, timeout=self._transport_timeout(request_timeout)
                             )
                     except TimeoutError as poll_error:
-                        raise kernel_errors.LLMTimeoutError(
-                            "Background response wait timed out", provider=self.name,
-                            retryable=False,
-                        ) from poll_error
+                        raise unknown_timeout(provider=self.name) from poll_error
                     except Exception as poll_error:
-                        raise kernel_errors.LLMError(
-                            "Could not retrieve the existing background response",
-                            provider=self.name, retryable=False,
-                        ) from poll_error
+                        raise RequestOutcomeUnknownError(provider=self.name) from poll_error
 
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 logger.info(
@@ -4136,13 +4113,11 @@ class OpenAIProvider:
                         accumulated_output.extend(final_response.output)
 
                 except Exception as e:
-                    if isinstance(e, kernel_errors.ContextLengthError):
+                    if isinstance(e, kernel_errors.LLMError):
                         raise
-                    logger.error(
-                        f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
-                        f"Returning partial response from {continuation_count} continuation(s)"
-                    )
-                    break  # Return what we have so far
+                    if isinstance(e, (TimeoutError, openai.APITimeoutError)):
+                        raise unknown_timeout(provider=self.name) from e
+                    raise RequestOutcomeUnknownError(provider=self.name) from e
 
             # Log completion summary
             if continuation_count > 0:
@@ -4261,8 +4236,12 @@ class OpenAIProvider:
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error = (
+                unknown_timeout(provider=self.name)
+                if isinstance(e, (TimeoutError, openai.APITimeoutError))
+                else RequestOutcomeUnknownError(provider=self.name)
+            )
+            error_msg = str(error)
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             # Emit error event
@@ -4277,10 +4256,7 @@ class OpenAIProvider:
                         "model": params["model"],
                     },
                 )
-            # Re-raise with meaningful message if original was empty
-            if not str(e):
-                raise type(e)(error_msg) from e
-            raise
+            raise error from e
 
     def _extract_rate_limit_headers(self, headers: Any) -> dict[str, Any]:
         """Extract rate limit information from OpenAI response headers.
