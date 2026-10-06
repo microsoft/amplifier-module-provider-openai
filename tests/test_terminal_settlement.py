@@ -380,3 +380,61 @@ async def test_concurrent_logical_cancellations_have_separate_usage():
     assert calls == {"one": 2, "two": 2}
     assert p._add_cost.call_count == 2
     await p.close()
+
+
+@pytest.mark.asyncio
+async def test_native_core_callback_cleanup_is_not_provider_owned():
+    from contextvars import ContextVar
+
+    from amplifier_core import HookResult, ModuleCoordinator
+
+    from amplifier_module_provider_openai._terminal_settlement import _settle_optional
+
+    coordinator = ModuleCoordinator()
+    ready, entered, cleanup, release, drained = (asyncio.Event() for _ in range(5))
+    context = ContextVar("native_terminal_context", default=None)
+    seen, original = [], []
+
+    async def hook(*_):
+        seen.append(context.get())
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup.set()
+            await release.wait()
+            seen.append(context.get())
+            drained.set()
+        return HookResult()
+
+    coordinator.hooks.register("fixture:terminal", hook)
+
+    async def caller():
+        context.set("original-context")
+        ready.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as error:
+            original.append(error)
+            await _settle_optional(lambda: coordinator.hooks.emit("fixture:terminal", {}))
+            raise
+
+    task = asyncio.create_task(caller())
+    try:
+        await ready.wait()
+        task.cancel("original-stop")
+        with pytest.raises(asyncio.CancelledError, match="original-stop") as caught:
+            await asyncio.wait_for(task, 2)
+        await asyncio.wait_for(cleanup.wait(), 2)
+        assert caught.value is original[0] and task.cancelling() == 1
+        assert entered.is_set() and seen == ["original-context"]
+        assert not drained.is_set()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        # The fixture releases its own callback, not a foreign task drain.
+        if entered.is_set():
+            await asyncio.wait_for(drained.wait(), 2)
+    assert drained.is_set() and seen == ["original-context", "original-context"]

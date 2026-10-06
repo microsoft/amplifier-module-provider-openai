@@ -128,6 +128,19 @@ chain before send (and before response activity), or an explicit pre-response
 rate-admission refusal (`rate_limit_exceeded`, or typed `slow_down`). An arbitrary
 429, challenge HTML, or missing output is not that proof. Read-only count and
 model-list retries retain their existing policy; SDK retries remain disabled.
+An exact structured HTTP 429 `insufficient_quota` billing refusal, with no
+redirect history or earlier parsed activity, is separately nonretryable:
+`request_outcome: "not_accepted"`, `effects: "none"`, and no unmeasured usage
+attempt. Its public message is fixed, not the vendor body. Unknown/unstructured
+429s and quota errors after stream acceptance remain outcome-unknown.
+For an injected standard `AsyncOpenAI`, the provider uses the SDK's public
+`with_options(max_retries=0)` copy when needed, without changing the original's
+retry setting. The copy retains endpoint, authentication, timeout and HTTP
+transport options. It shares the HTTP client: provider `close()` still closes
+that transport, just as it did for direct injection; embedders must not use it
+after closure. If retry disabling fails, or an injected SDK subclass has nonzero
+retries, construction fails locally before any POST. Custom clients/test doubles
+are not proof of SDK retry safety and must enforce their own no-replay behavior.
 Cancellation stops the local wait without replay: provider-side work, billing,
 or other effects are not confirmed rolled back. Unlimited silent waits can still
 remain pending until completion, transport failure, an explicit limit, or Stop;
@@ -158,9 +171,14 @@ Terminal progress, partial-display abort, and error/cancellation notifications
 are best-effort local delivery, not generation work. Each has a 50ms delivery
 allowance (at most three deliveries, 150ms plus cooperative task drain), so a
 blocked optional hook cannot hold Stop merely to publish pending progress.
-Created delivery tasks are cancelled and awaited, never detached; hooks must
+Provider-created delivery tasks are cancelled and awaited, never detached; hooks must
 yield to asyncio and honor cancellation. Synchronous blocking or hooks that
 suppress cancellation cannot be forcibly bounded by asyncio.
+This drain covers only tasks created by the provider. A hook dispatcher such as
+Core's native registry owns its separate callback tasks and returns no awaitable
+callback-drain handle to the provider. Dispatcher-owned callback cleanup may
+continue after local provider settlement. This is not an all-callback drain or
+a guarantee of no post-settlement callback work.
 An available responsive consumer receives exactly one sanitized abort with the
 matching display request ID when a partial display is cancelled. Delivery cannot
 be guaranteed to an unresponsive consumer. Hook errors or hook-internal

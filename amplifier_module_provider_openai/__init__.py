@@ -73,9 +73,12 @@ from ._constants import (
 from ._cost import compute_cost
 from ._generation_errors import (
     OUTCOME_UNKNOWN_MESSAGE,
+    InjectedClientConfigurationError,
     RequestOutcomeUnknownError,
     proven_before_send,
+    proven_quota_refusal,
     proven_rate_refusal,
+    quota_refusal,
     unknown_timeout,
 )
 from ._response_handling import (
@@ -1309,6 +1312,20 @@ class OpenAIProvider:
         to work without valid credentials.
         """
         self._api_key = api_key
+        # Actual SDK clients can replay beneath our generation guards. The
+        # public copy preserves transport/options without mutating the embedder's
+        # client; close() retains its existing shared-HTTP-client lifecycle.
+        # Test doubles are not SDK clients and do not establish SDK retry safety.
+        if (client is not None and issubclass(type(client), openai.AsyncOpenAI)
+                and client.max_retries != 0):
+            if type(client) is not openai.AsyncOpenAI:
+                raise InjectedClientConfigurationError(provider=self.name)
+            try:
+                client = client.with_options(max_retries=0)
+            except Exception as error:
+                raise InjectedClientConfigurationError(provider=self.name) from error
+            if client.max_retries != 0:
+                raise InjectedClientConfigurationError(provider=self.name)
         self._client: AsyncOpenAI | None = client  # Lazy init if None
         self.config = config or {}
         self.coordinator = coordinator
@@ -3700,6 +3717,9 @@ class OpenAIProvider:
                     unsettled_generation = False
                     return response
             except openai.RateLimitError as e:
+                if not response_activity and proven_quota_refusal(e):
+                    unsettled_generation = False
+                    raise quota_refusal(provider=self.name) from e
                 if response_activity or not proven_rate_refusal(e):
                     raise RequestOutcomeUnknownError(
                         provider=self.name, status_code=429,
@@ -4019,7 +4039,7 @@ class OpenAIProvider:
             final_response = response
             continuation_count = 0
             truncation_retry_done = False
-            billed_responses.extend([*failed_stream_responses, response])
+            billed_responses.append(response)
 
             while (
                 hasattr(final_response, "status")

@@ -5,7 +5,6 @@ import httpx
 import openai
 from amplifier_core import llm_errors
 
-
 OUTCOME_UNKNOWN_MESSAGE = (
     "Provider wait ended without a confirmed result. The request may have been "
     "accepted; no automatic replacement request was sent."
@@ -23,6 +22,30 @@ class RequestOutcomeUnknownError(llm_errors.LLMError):
             OUTCOME_UNKNOWN_MESSAGE, provider=provider,
             status_code=status_code, retryable=False,
         )
+
+
+class InjectedClientConfigurationError(llm_errors.InvalidRequestError):
+    """An unsafe injected SDK client is refused locally before dispatch."""
+
+    request_outcome = "not_sent"
+    effects = "none"
+
+    def __init__(self, *, provider):
+        super().__init__(
+            "Injected OpenAI SDK client must support disabling SDK retries.",
+            provider=provider, retryable=False,
+        )
+
+
+def quota_refusal(*, provider):
+    error = llm_errors.RateLimitError(
+        "Provider refused this request because billing quota is unavailable.",
+        provider=provider, status_code=429, retryable=False,
+    )
+    error.request_outcome = "not_accepted"
+    error.effects = "none"
+    error.vendor_code = "insufficient_quota"
+    return error
 
 
 def unknown_timeout(*, provider):
@@ -83,3 +106,21 @@ def proven_rate_refusal(error):
         body.get("code") == "rate_limit_exceeded"
         or (body.get("type") == "rate_limit_error" and body.get("code") == "slow_down")
     )
+
+
+def proven_quota_refusal(error):
+    """Legacy structured billing refusal, separate from rate-backoff proof.
+
+    Only the exact HTTP 429 SDK error and documented insufficient_quota code
+    qualify, never message text or error.type alone. SDK 2.9+ preserves the
+    structured body (unwrapping its error envelope). The caller must exclude
+    prior parsed activity; redirected refusals cannot prove nonacceptance.
+    """
+    if (type(error) is not openai.RateLimitError or error.status_code != 429
+            or error.response.history):
+        return False
+    body = error.body
+    if not isinstance(body, dict):
+        return False
+    body = body.get("error", body)
+    return isinstance(body, dict) and body.get("code") == "insufficient_quota"

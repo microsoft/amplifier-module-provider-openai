@@ -24,6 +24,7 @@ from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai import _wait_observation as observation_module
 from amplifier_module_provider_openai._generation_errors import (
     OUTCOME_UNKNOWN_MESSAGE,
+    InjectedClientConfigurationError,
     RequestOutcomeUnknownError,
 )
 from amplifier_module_provider_openai._wait_observation import _WaitObserver
@@ -140,6 +141,9 @@ class Loopback:
             if path == "/v1/refused":
                 await self.send(writer, b'{"error":{"code":"rate_limit_exceeded"}}', status=429)
                 return
+            if path == "/v1/quota":
+                await self.send(writer, b'{"error":{"code":"insufficient_quota"}}', status=429)
+                return
             assert (method, path) == ("POST", "/v1/responses")
             self.posts += 1
             payload = json.loads(body)
@@ -151,10 +155,19 @@ class Loopback:
                     "message": "private-rate-sentinel",
                 }}).encode(), status=429)
                 return
+            if self.mode in {"quota", "unknown_429", "html_429"}:
+                body = (b"<html>fixture challenge</html>" if self.mode == "html_429"
+                        else json.dumps({"error": {
+                            "code": ("insufficient_quota" if self.mode == "quota" else "unknown"),
+                            "message": "private-quota-sentinel",
+                        }}).encode())
+                await self.send(writer, body, status=429)
+                return
             self.accepted += 1
             self.accepted_event.set()
             if self.mode.startswith("redirect"):
-                target = "/v1/refused" if self.mode == "redirect_refusal" else "/v1/unreachable"
+                target = ("/v1/refused" if self.mode == "redirect_refusal" else
+                          "/v1/quota" if self.mode == "redirect_quota" else "/v1/unreachable")
                 writer.write(
                     f"HTTP/1.1 307 Fixture\r\nLocation: https://api.openai.com{target}\r\n"
                     "Content-Length: 0\r\nConnection: close\r\n\r\n".encode()
@@ -211,6 +224,13 @@ class Loopback:
                 if self.mode == "failed_usage":
                     writer.write(sse("response.created", 0, response=response("in_progress")))
                     writer.write(sse("response.failed", 1, response=self.failed_response))
+                    await writer.drain()
+                    return
+                if self.mode == "post_event_quota":
+                    writer.write(sse("response.created", 0, response=response("in_progress")))
+                    writer.write(sse("error", 1, error={
+                        "code": "insufficient_quota", "message": "private-quota-sentinel",
+                    }))
                     await writer.drain()
                     return
                 if self.mode in {"partial_eof", "partial_cancel"}:
@@ -329,10 +349,10 @@ class LoopbackTransport(httpx.AsyncBaseTransport):
         await self.http.aclose()
 
 
-def provider_for(fixture, *, fault=None, **config):
+def provider_for(fixture, *, fault=None, sdk_retries=0, **config):
     transport = LoopbackTransport(fixture, fault)
     sdk = openai.AsyncOpenAI(
-        api_key="loopback-placeholder", max_retries=0,
+        api_key="loopback-placeholder", max_retries=sdk_retries,
         http_client=httpx.AsyncClient(transport=transport, trust_env=False,
                                      follow_redirects=fixture.mode.startswith("redirect")),
     )
@@ -350,9 +370,121 @@ def request(**kwargs):
     return ChatRequest(messages=[Message(role="user", content="private-prompt-sentinel")], **kwargs)
 
 
-def assert_no_terminal_tasks():
+def assert_no_provider_delivery_tasks():
     assert not [task for task in asyncio.all_tasks()
                 if task.get_coro().__qualname__ == "_settle_optional.<locals>.delivery"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_real_sdk_quota_refusal_is_not_an_unknown_billable_attempt(streaming):
+    async with Loopback("quota", streaming=streaming) as fixture:
+        provider, transport, hooks = provider_for(fixture)
+        costs = []
+        provider._add_cost = costs.append
+        try:
+            with pytest.raises(llm_errors.RateLimitError) as caught:
+                await provider.complete(request())
+            error = caught.value
+            assert error.retryable is False
+            assert error.request_outcome == "not_accepted" and error.effects == "none"
+            assert error.vendor_code == "insufficient_quota"
+            assert getattr(error, "cost_usd", None) is None
+            assert getattr(error, "usage", None) is None and costs == []
+            assert fixture.posts == fixture.counts == transport.dispatches == 1
+            assert fixture.accepted == 0
+            assert not any(name == "provider:retry" for name, _ in hooks.events)
+            public = [(name, data) for name, data in hooks.events if name == "llm:response"]
+            assert len(public) == 1 and public[0][1]["status"] == "error"
+            assert "usage" not in public[0][1]
+            assert "private-quota-sentinel" not in str(error) + json.dumps(public)
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["unknown_429", "html_429", "redirect_quota", "post_event_quota"])
+async def test_real_sdk_quota_counterexamples_remain_unknown(mode):
+    async with Loopback(mode, streaming=mode == "post_event_quota") as fixture:
+        provider, transport, hooks = provider_for(fixture)
+        try:
+            with pytest.raises(RequestOutcomeUnknownError) as caught:
+                await provider.complete(request())
+            assert caught.value.retryable is False
+            assert caught.value.request_outcome == "unknown"
+            assert caught.value.usage["attempts"][0]["input_tokens"] is None
+            assert fixture.posts == transport.dispatches == 1
+            assert fixture.accepted == (1 if mode in {"redirect_quota", "post_event_quota"} else 0)
+            assert not any(name == "provider:retry" for name, _ in hooks.events)
+            assert "private-quota-sentinel" not in str(caught.value)
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["500", "silent"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_real_sdk_injected_retries_do_not_replay_accepted_failure(mode, streaming):
+    async with Loopback(mode, streaming=streaming) as fixture:
+        transport = LoopbackTransport(fixture)
+        sdk = openai.AsyncOpenAI(
+            api_key="fixture",  # Deliberately retain the actual SDK default retries.
+            timeout=openai.Timeout(None, connect=5, pool=5, read=0.02, write=None),
+            default_headers={"x-fixture-option": "preserved"},
+            organization="fixture-org", project="fixture-project",
+            http_client=httpx.AsyncClient(transport=transport, trust_env=False),
+        )
+        provider = None
+        try:
+            assert sdk.max_retries == 2
+            provider = OpenAIProvider(client=sdk, config={
+                "default_model": "gpt-6-astra", "use_streaming": streaming,
+                "max_retries": 2, "max_concurrent_requests": 0,
+                "extra_request_params": {"timeout": sdk.timeout},
+            })
+            hooks = Hooks()
+            provider.coordinator = SimpleNamespace(hooks=hooks)
+            assert provider.client is not sdk and provider.client.max_retries == 0
+            assert sdk.max_retries == 2 and not sdk.is_closed()
+            assert provider.client.timeout == sdk.timeout
+            assert provider.client.base_url == sdk.base_url
+            assert provider.client.api_key == sdk.api_key
+            assert provider.client.organization == sdk.organization
+            assert provider.client.project == sdk.project
+            assert provider.client.default_headers["x-fixture-option"] == "preserved"
+            with pytest.raises(llm_errors.LLMError) as caught:
+                await provider.complete(request())
+            assert caught.value.retryable is False
+            assert caught.value.request_outcome == "unknown"
+            assert fixture.posts == fixture.accepted == transport.dispatches == 1
+            assert not any(name == "provider:retry" for name, _ in hooks.events)
+            assert transport.generation_limits[0] == {
+                "connect": 5, "pool": 5, "read": 0.02, "write": None,
+            }
+        finally:
+            if provider is not None:
+                await provider.close()
+                assert sdk.is_closed()  # Existing injected-transport close ownership.
+            await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_injected_sdk_subclass_with_retries_fails_locally_before_post():
+    class CustomSDK(openai.AsyncOpenAI):
+        pass
+
+    async with Loopback("500") as fixture:
+        transport = LoopbackTransport(fixture)
+        async with CustomSDK(
+            api_key="fixture", max_retries=2,
+            http_client=httpx.AsyncClient(transport=transport, trust_env=False),
+        ) as sdk:
+            with pytest.raises(InjectedClientConfigurationError) as caught:
+                OpenAIProvider(client=sdk)
+            assert caught.value.retryable is False
+            assert caught.value.request_outcome == "not_sent" and caught.value.effects == "none"
+            assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 0
+            assert sdk.max_retries == 2 and not sdk.is_closed()
 
 
 @pytest.mark.asyncio
@@ -412,7 +544,7 @@ async def test_real_sdk_cancel_preserves_primary_through_optional_cleanup(displa
             assert not any(name == "provider:retry" for name, _ in hooks.events)
             assert not any(name == "llm:response" and data["status"] == "ok"
                            for name, data in hooks.events)
-            assert_no_terminal_tasks()
+            assert_no_provider_delivery_tasks()
         finally:
             if not task.done():
                 task.cancel()
@@ -459,7 +591,7 @@ async def test_real_sdk_cancelled_continuation_usage_is_known_subtotal_only(meas
             assert len(terminal) == 1 and terminal[0]["status"] == "cancelled"
             assert terminal[0]["usage"] == usage
             assert not any(name == "provider:retry" for name, _ in hooks.events)
-            assert_no_terminal_tasks()
+            assert_no_provider_delivery_tasks()
         finally:
             if not task.done():
                 task.cancel()
@@ -499,7 +631,7 @@ async def test_real_sdk_second_caller_cancel_during_abort_is_not_swallowed():
             assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 1
             assert len([name for name, _ in hooks.events if name == "llm:stream_aborted"]) == 1
             assert not any(name == "provider:retry" for name, _ in hooks.events)
-            assert_no_terminal_tasks()
+            assert_no_provider_delivery_tasks()
         finally:
             if not task.done():
                 task.cancel()
@@ -553,7 +685,7 @@ async def test_real_sdk_secondary_failure_never_masks_dispatched_unknown(seconda
             assert len(terminal) == 1 and terminal[0]["status"] == "error"
             assert terminal[0]["usage"] == usage
             assert "private-" not in json.dumps(terminal)
-            assert_no_terminal_tasks()
+            assert_no_provider_delivery_tasks()
         finally:
             await provider.close()
 
