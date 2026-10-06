@@ -10,7 +10,7 @@ from amplifier_core import llm_errors
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
-from amplifier_module_provider_openai._generation_errors import RequestOutcomeUnknownError
+from amplifier_module_provider_openai._generation_errors import LocalRequestError, RequestOutcomeUnknownError
 
 
 def vendor_usage(inputs=100, outputs=10, *, writes=0, reads=0):
@@ -140,12 +140,35 @@ def test_terminal_hook_failure_does_not_add_success_cost_twice():
         events.append((name, payload))
 
     p.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=emit))
-    with pytest.raises(RequestOutcomeUnknownError) as caught:
+    with pytest.raises(LocalRequestError) as caught:
         asyncio.run(p.complete(ChatRequest(messages=[Message(role="user", content="Hello")])))
+    assert caught.value.request_outcome == "received"
+    assert caught.value.effects == "occurred"
     p._add_cost.assert_called_once_with(Decimal("0.0015"))
     assert caught.value.usage["cost_usd"] == "0.0015"
     assert len(caught.value.usage["attempts"]) == 1
     assert [data for name, data in events if name == "llm:response"][0]["status"] == "error"
+
+
+def test_concurrency_hook_failure_is_local_without_generation_dispatch():
+    p = provider()
+    p._add_cost = MagicMock()
+    p._create_response = AsyncMock()
+
+    async def emit(name, payload):
+        if name == "provider:concurrency":
+            raise RuntimeError("private-hook-failure")
+
+    p.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=emit))
+    with pytest.raises(LocalRequestError) as caught:
+        asyncio.run(p.complete(ChatRequest(messages=[Message(role="user", content="Hello")])))
+    assert caught.value.request_outcome == "not_dispatched"
+    assert caught.value.effects == "none"
+    assert caught.value.retryable is False
+    assert not hasattr(caught.value, "usage") or caught.value.usage is None
+    p._create_response.assert_not_awaited()
+    p._add_cost.assert_not_called()
+    assert "private-hook-failure" not in str(caught.value)
 
 
 @pytest.mark.parametrize("initial_count", [100, None])

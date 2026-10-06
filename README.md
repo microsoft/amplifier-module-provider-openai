@@ -143,6 +143,15 @@ retries, ordinary client admission fails locally before any POST. The separate
 bounded single-attempt mode still refuses injection without replacing or closing
 the injected client. Custom clients/test doubles
 are not proof of SDK retry safety and must enforce their own no-replay behavior.
+SDK subclasses, including an injected Azure SDK client, must be configured with
+`max_retries=0` before injection; the provider refuses an unsafe subclass rather
+than assuming its copy preserves subclass-specific authentication.
+The automatic-replacement guarantee concerns provider and SDK retry behavior.
+An injected HTTP transport that follows redirects may forward a POST to another
+hop; this inherited behavior is not qualified as a single-wire-POST guarantee.
+Known local concurrency/admission failures report `not_dispatched`/`none`;
+a received response followed by local processing failure reports
+`received`/`occurred`. Neither case authorizes generation replay.
 Cancellation stops the local wait without replay: provider-side work, billing,
 or other effects are not confirmed rolled back. Unlimited silent waits can still
 remain pending until completion, transport failure, an explicit limit, or Stop;

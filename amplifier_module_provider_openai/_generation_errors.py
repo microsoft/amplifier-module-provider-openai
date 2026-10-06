@@ -27,12 +27,25 @@ class RequestOutcomeUnknownError(llm_errors.LLMError):
 class InjectedClientConfigurationError(llm_errors.InvalidRequestError):
     """An unsafe injected SDK client is refused locally before dispatch."""
 
-    request_outcome = "not_sent"
+    request_outcome = "not_dispatched"
     effects = "none"
 
     def __init__(self, *, provider):
         super().__init__(
             "Injected OpenAI SDK client must support disabling SDK retries.",
+            provider=provider, retryable=False,
+        )
+
+
+class LocalRequestError(llm_errors.LLMError):
+    """A known local phase failure never authorizes generation replay."""
+
+    def __init__(self, *, provider, received=False):
+        self.request_outcome = "received" if received else "not_dispatched"
+        self.effects = "occurred" if received else "none"
+        super().__init__(
+            "Provider response was received; local processing failed."
+            if received else "Local request preparation failed before generation dispatch.",
             provider=provider, retryable=False,
         )
 

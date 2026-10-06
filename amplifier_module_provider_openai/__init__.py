@@ -74,6 +74,7 @@ from ._cost import compute_cost
 from ._generation_errors import (
     OUTCOME_UNKNOWN_MESSAGE,
     InjectedClientConfigurationError,
+    LocalRequestError,
     RequestOutcomeUnknownError,
     proven_before_send,
     proven_quota_refusal,
@@ -3359,6 +3360,7 @@ class OpenAIProvider:
         effective_timeout = None if isinstance(request_timeout, openai.Timeout) else request_timeout
         poll_interval = kwargs.get("poll_interval", self.poll_interval)
         unsettled_generation = False
+        response_received = False
 
         class _AccountingObserver(_WaitObserver):
             async def attempt_started(self, timeout: Any, transport_timeout: Any) -> None:
@@ -3959,6 +3961,7 @@ class OpenAIProvider:
                 self._retry_config,
                 on_retry=_on_retry,
             )
+            response_received = getattr(response, "status", None) in {"completed", "incomplete"}
             self._record_budget_calibration(params, response)
 
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -4371,7 +4374,11 @@ class OpenAIProvider:
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             error = (
-                unknown_timeout(provider=self.name)
+                LocalRequestError(provider=self.name, received=True)
+                if not unsettled_generation and (response_received or billed_responses)
+                else LocalRequestError(provider=self.name)
+                if generation_attempt == 0 and not unsettled_generation
+                else unknown_timeout(provider=self.name)
                 if isinstance(e, (TimeoutError, openai.APITimeoutError))
                 else RequestOutcomeUnknownError(provider=self.name)
             )
