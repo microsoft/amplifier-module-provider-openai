@@ -479,8 +479,9 @@ async def test_injected_sdk_subclass_with_retries_fails_locally_before_post():
             api_key="fixture", max_retries=2,
             http_client=httpx.AsyncClient(transport=transport, trust_env=False),
         ) as sdk:
+            provider = OpenAIProvider(client=sdk)
             with pytest.raises(InjectedClientConfigurationError) as caught:
-                OpenAIProvider(client=sdk)
+                await provider.complete(request())
             assert caught.value.retryable is False
             assert caught.value.request_outcome == "not_sent" and caught.value.effects == "none"
             assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 0

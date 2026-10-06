@@ -1312,20 +1312,6 @@ class OpenAIProvider:
         to work without valid credentials.
         """
         self._api_key = api_key
-        # Actual SDK clients can replay beneath our generation guards. The
-        # public copy preserves transport/options without mutating the embedder's
-        # client; close() retains its existing shared-HTTP-client lifecycle.
-        # Test doubles are not SDK clients and do not establish SDK retry safety.
-        if (client is not None and issubclass(type(client), openai.AsyncOpenAI)
-                and client.max_retries != 0):
-            if type(client) is not openai.AsyncOpenAI:
-                raise InjectedClientConfigurationError(provider=self.name)
-            try:
-                client = client.with_options(max_retries=0)
-            except Exception as error:
-                raise InjectedClientConfigurationError(provider=self.name) from error
-            if client.max_retries != 0:
-                raise InjectedClientConfigurationError(provider=self.name)
         self._client: AsyncOpenAI | None = client  # Lazy init if None
         self.config = config or {}
         self.coordinator = coordinator
@@ -2484,6 +2470,22 @@ class OpenAIProvider:
             self._client = AsyncOpenAI(
                 api_key=self._api_key, base_url=self.base_url, max_retries=0
             )
+        client = self._client
+        # Actual SDK clients can replay beneath our generation guards. The
+        # public copy preserves transport/options without mutating the embedder's
+        # client; close() retains its existing shared-HTTP-client lifecycle.
+        # Test doubles are not SDK clients and do not establish SDK retry safety.
+        if (issubclass(type(client), openai.AsyncOpenAI)
+                and client.max_retries != 0):
+            if type(client) is not openai.AsyncOpenAI:
+                raise InjectedClientConfigurationError(provider=self.name)
+            try:
+                client = client.with_options(max_retries=0)
+            except Exception as error:
+                raise InjectedClientConfigurationError(provider=self.name) from error
+            if client.max_retries != 0:
+                raise InjectedClientConfigurationError(provider=self.name)
+            self._client = client
         return self._client
 
     @staticmethod
@@ -3080,6 +3082,12 @@ class OpenAIProvider:
                 raise SingleAttemptError("invalid_options")
             if single_attempt:
                 return await complete(self, request, kwargs, version=version)
+
+        # Admit injected SDK options before ordinary count/generation activity.
+        # The strict single-attempt path above must still refuse an injected
+        # client without replacing or closing it.
+        if self._client is not None and issubclass(type(self._client), openai.AsyncOpenAI):
+            _ = self.client
 
         # This controls output continuation, not elapsed time. Bounded callers
         # must be able to receive an incomplete result without paying for repeated

@@ -139,7 +139,9 @@ retry setting. The copy retains endpoint, authentication, timeout and HTTP
 transport options. It shares the HTTP client: provider `close()` still closes
 that transport, just as it did for direct injection; embedders must not use it
 after closure. If retry disabling fails, or an injected SDK subclass has nonzero
-retries, construction fails locally before any POST. Custom clients/test doubles
+retries, ordinary client admission fails locally before any POST. The separate
+bounded single-attempt mode still refuses injection without replacing or closing
+the injected client. Custom clients/test doubles
 are not proof of SDK retry safety and must enforce their own no-replay behavior.
 Cancellation stops the local wait without replay: provider-side work, billing,
 or other effects are not confirmed rolled back. Unlimited silent waits can still
