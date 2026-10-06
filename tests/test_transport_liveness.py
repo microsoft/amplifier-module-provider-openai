@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import time
+from contextvars import ContextVar
 from types import SimpleNamespace
 
 import httpcore
@@ -20,7 +21,9 @@ from amplifier_core.message_models import ChatRequest, Message
 from httpx._transports.default import map_httpcore_exceptions
 
 from amplifier_module_provider_openai import OpenAIProvider
+from amplifier_module_provider_openai import _wait_observation as observation_module
 from amplifier_module_provider_openai._generation_errors import OUTCOME_UNKNOWN_MESSAGE
+from amplifier_module_provider_openai._wait_observation import _WaitObserver
 
 
 def response(status="completed"):
@@ -50,11 +53,14 @@ class Hooks:
     def __init__(self):
         self.events = []
         self.retry = asyncio.Event()
+        self.activity = asyncio.Event()
 
     async def emit(self, name, payload):
         self.events.append((name, payload))
         if name == "provider:retry":
             self.retry.set()
+        if name == "llm:progress" and payload["observation"] == "response_activity":
+            self.activity.set()
 
 
 class Loopback:
@@ -114,7 +120,8 @@ class Loopback:
                 count_payload = json.loads(body)
                 assert count_payload["model"] == "gpt-6-astra"
                 assert "input" in count_payload and "stream" not in count_payload
-                await self.send(writer, b'{"input_tokens":10}')
+                await self.send(writer, b'{"input_tokens":99999999}' if self.mode == "count_overflow"
+                                else b'{"input_tokens":10}')
                 return
             if method == "GET":
                 assert path == "/v1/responses/resp_loopback"
@@ -158,8 +165,33 @@ class Loopback:
             if self.mode in {"background", "background_failure"}:
                 await self.send(writer, json.dumps(response("in_progress")).encode())
                 return
+            if self.mode in {"continuation", "tool_truncation"} and self.posts == 1:
+                incomplete = response("incomplete")
+                incomplete["incomplete_details"] = {"reason": "max_output_tokens"}
+                if self.mode == "tool_truncation":
+                    incomplete["output"] = [{
+                        "type": "function_call", "id": "fc_fixture",
+                        "call_id": "call_fixture", "name": "fixture_tool",
+                        "arguments": '{"private-tool-sentinel":', "status": "incomplete",
+                    }]
+                else:
+                    incomplete["output"] = response()["output"]
+                await self.send(writer, json.dumps(incomplete).encode())
+                return
             if self.mode == "malformed" and not self.streaming:
                 await self.send(writer, b'{"output":BROKEN-private-error-sentinel')
+                return
+            if self.mode == "private_payload":
+                private_response = response()
+                private_response["output"].extend([
+                    {"type": "reasoning", "id": "rs_fixture",
+                     "summary": [{"type": "summary_text", "text": "private-thinking-sentinel"}],
+                     "encrypted_content": "private-encrypted-sentinel"},
+                    {"type": "function_call", "id": "fc_fixture", "call_id": "call_fixture",
+                     "name": "fixture_tool", "arguments": '{"secret":"private-tool-sentinel"}',
+                     "status": "completed"},
+                ])
+                await self.send(writer, json.dumps(private_response).encode())
                 return
             if self.streaming:
                 writer.write(
@@ -167,6 +199,17 @@ class Loopback:
                     b"Connection: close\r\n\r\n"
                 )
                 await writer.drain()
+                if self.mode == "comment_only":
+                    writer.write(b": fixture heartbeat comment, not a parsed response\n\n")
+                    await writer.drain()
+                if self.mode in {"observation_success", "observation_error", "observation_cancel"}:
+                    writer.write(sse("response.created", 0, response=response("in_progress")))
+                    writer.write(sse("response.in_progress", 1, response=response("in_progress")))
+                    await writer.drain()
+                    await self.release.wait()
+                    if self.mode == "observation_error":
+                        writer.transport.abort()
+                        return
                 if self.mode in {"activity", "reset_after_event", "truncated", "malformed", "post_event_error"}:
                     writer.write(sse("response.created", 0, response=response("in_progress")))
                     await writer.drain()
@@ -189,7 +232,7 @@ class Loopback:
                         }))
                         await writer.drain()
                         return
-                if self.mode in {"silent", "activity"}:
+                if self.mode in {"silent", "activity", "comment_only"}:
                     await self.release.wait()
                 if self.mode not in {"activity", "reset_after_event", "truncated", "malformed", "post_event_error"}:
                     writer.write(sse("response.created", 0, response=response("in_progress")))
@@ -202,7 +245,7 @@ class Loopback:
                                 truncated=self.mode == "truncated")
         except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
             pass
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - retain fixture failures for teardown
             self.errors.append(type(error).__name__ + ": " + str(error))
         finally:
             writer.close()
@@ -221,6 +264,7 @@ class LoopbackTransport(httpx.AsyncBaseTransport):
         self.fixture, self.fault = fixture, fault
         self.http = httpx.AsyncHTTPTransport(retries=0)
         self.limits = []
+        self.generation_limits = []
         self.dispatches = 0
 
     async def handle_async_request(self, request):
@@ -233,6 +277,7 @@ class LoopbackTransport(httpx.AsyncBaseTransport):
                 closed.bind(("127.0.0.1", 0))
                 port = closed.getsockname()[1]
         if generation:
+            self.generation_limits.append(request.extensions["timeout"])
             self.dispatches += 1
             if self.dispatches == 1 and self.fault:
                 if self.fault == "connect_refused":
@@ -278,19 +323,351 @@ def request(**kwargs):
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_real_sdk_default_silent_wait_then_success(streaming):
     async with Loopback(streaming=streaming) as fixture:
-        provider, transport, _ = provider_for(fixture)
+        provider, transport, hooks = provider_for(fixture)
         try:
             task = asyncio.create_task(provider.complete(request()))
             await asyncio.wait_for(fixture.accepted_event.wait(), 2)
             await asyncio.sleep(0.05)
             assert not task.done()
             assert fixture.posts == fixture.accepted == fixture.counts == 1
+            assert [e["observation"] for e in progress(hooks)] == ["attempt_started"]
             fixture.release.set()
             result = await asyncio.wait_for(task, 2)
             assert result.usage.input_tokens == 10 and result.usage.output_tokens == 5
             assert result.content[0].text == "fixture answer"
             assert transport.limits[-1] == {"connect": 5.0, "pool": 5.0, "read": None, "write": None}
         finally:
+            await provider.close()
+
+
+def progress(hooks):
+    return [data for name, data in hooks.events if name == "llm:progress"]
+
+
+def assert_payload(data):
+    assert set(data) == {"version", "observation", "attempt", "limits"}
+    assert data["version"] == 1
+    assert data["observation"] in {"attempt_started", "response_activity"}
+    assert type(data["attempt"]) is int and data["attempt"] > 0
+    assert set(data["limits"]) == {
+        "mode", "elapsed_seconds", "connect_seconds", "pool_seconds",
+        "read_seconds", "write_seconds",
+    }
+    assert data["limits"]["mode"] in {"none", "elapsed", "phase"}
+    for key, value in data["limits"].items():
+        if key != "mode" and value is not None:
+            assert type(value) is float and 0 <= value < float("inf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("policy", ["default", "scalar", "explicit_none", "extra_none", "phase", "request_scalar"])
+async def test_real_sdk_exact_effective_limit_metadata(streaming, policy):
+    phase = openai.Timeout(None, connect=1, pool=2, read=3, write=4)
+    config, req_kwargs = {}, {}
+    effective = None
+    if policy == "scalar":
+        config, effective = {"timeout": 7}, 7
+    elif policy == "explicit_none":
+        config = {"timeout": 9, "extra_request_params": {"timeout": 8}}
+        req_kwargs = {"timeout": None}
+    elif policy == "extra_none":
+        config = {"timeout": 9, "extra_request_params": {"timeout": None}}
+    elif policy == "phase":
+        config, effective = {"extra_request_params": {"timeout": phase}}, phase
+    elif policy == "request_scalar":
+        config = {"extra_request_params": {"timeout": phase}}
+        req_kwargs, effective = {"timeout": 6}, 6
+    async with Loopback("success", streaming=streaming) as fixture:
+        provider, transport, hooks = provider_for(fixture, **config)
+        try:
+            result = await provider.complete(request(**req_kwargs))
+            assert result.usage.output_tokens == 5
+            events = progress(hooks)
+            assert events[0]["observation"] == "attempt_started"
+            assert events[-1]["observation"] == "response_activity"
+            for data in events:
+                assert_payload(data)
+                limits = data["limits"]
+                assert limits["mode"] == ("phase" if policy == "phase" else (
+                    "elapsed" if effective is not None else "none"))
+                assert limits["elapsed_seconds"] == (effective if isinstance(effective, int) else None)
+                assert {key.removesuffix("_seconds"): value for key, value in limits.items()
+                        if key not in {"mode", "elapsed_seconds"}} == transport.generation_limits[0]
+            assert fixture.posts == fixture.counts == 1
+            assert hooks.events[-2][0] == "llm:progress"
+            assert hooks.events[-1][0] == "llm:response"
+            assert "private-prompt-sentinel" not in json.dumps(events)
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settlement", ["success", "error", "cancel"])
+async def test_real_sdk_pending_actual_flush_before_success_error_cancel(monkeypatch, settlement):
+    now = [0.0]
+    monkeypatch.setattr(observation_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    original = _WaitObserver.response_activity
+    parsed, seen = asyncio.Event(), [0]
+
+    async def observe(self):
+        seen[0] += 1
+        if seen[0] == 2:
+            now[0] = 0.10
+        await original(self)
+        if seen[0] == 2:
+            parsed.set()
+
+    monkeypatch.setattr(_WaitObserver, "response_activity", observe)
+    async with Loopback("observation_" + settlement, streaming=True) as fixture:
+        provider, _, hooks = provider_for(fixture)
+        try:
+            task = asyncio.create_task(provider.complete(request()))
+            await asyncio.wait_for(parsed.wait(), 2)
+            assert len(progress(hooks)) == 2  # attempt + A, B still pending
+            now[0] = 0.11
+            if settlement == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                # A host wrapper settles only after invocation propagates cancel.
+                await hooks.emit("wrapper:cancelled", {})
+            else:
+                fixture.release.set()
+                if settlement == "error":
+                    with pytest.raises(llm_errors.LLMError):
+                        await task
+                else:
+                    await task
+            assert progress(hooks)[-1]["observation"] == "response_activity"
+            assert len(progress(hooks)) == 3
+            assert hooks.events[-2][0] == "llm:progress"
+            assert hooks.events[-1][0] == ("wrapper:cancelled" if settlement == "cancel" else "llm:response")
+            assert fixture.posts == fixture.accepted == fixture.counts == 1
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["refusal", "continuation", "tool_truncation"])
+async def test_real_sdk_logical_throttle_across_physical_generations(monkeypatch, mode):
+    monkeypatch.setattr(observation_module, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    async with Loopback(mode) as fixture:
+        provider, _, hooks = provider_for(fixture, max_output_tokens=1024)
+        try:
+            result = await provider.complete(request())
+            events = progress(hooks)
+            assert [(e["observation"], e["attempt"]) for e in events] == (
+                [("attempt_started", 1), ("attempt_started", 2), ("response_activity", 2)]
+                if mode == "refusal" else [
+                    ("attempt_started", 1), ("response_activity", 1),
+                    ("attempt_started", 2), ("response_activity", 2),
+                ])
+            assert fixture.posts == fixture.counts == 2
+            assert fixture.accepted == (1 if mode == "refusal" else 2)
+            assert result.usage.output_tokens == (5 if mode == "refusal" else 10)
+            assert "private-tool-sentinel" not in json.dumps(events)
+            assert hooks.events[-2][0] == "llm:progress"
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_background_same_id_is_activity_not_new_attempt(monkeypatch):
+    monkeypatch.setattr(observation_module, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    async with Loopback("background") as fixture:
+        provider, _, hooks = provider_for(fixture)
+        try:
+            await provider.complete(request(), background=True, poll_interval=0)
+            assert fixture.posts == fixture.counts == fixture.retrieves == 1
+            assert [(e["observation"], e["attempt"]) for e in progress(hooks)] == [
+                ("attempt_started", 1), ("response_activity", 1), ("response_activity", 1),
+            ]
+            assert "resp_loopback" not in json.dumps(progress(hooks))
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_real_sdk_no_hook_and_failing_progress_hook_preserve_success(streaming):
+    async with Loopback("success", streaming=streaming) as fixture:
+        provider, _, hooks = provider_for(fixture)
+        try:
+            provider.coordinator = None
+            first = await provider.complete(request())
+            assert first.usage.output_tokens == 5
+            assert not hooks.events
+            ordinary_emit = hooks.emit
+
+            async def emit(name, data):
+                if name == "llm:progress":
+                    raise RuntimeError("private-hook-error")
+                await ordinary_emit(name, data)
+
+            hooks.emit = emit
+            provider.coordinator = SimpleNamespace(hooks=hooks)
+            second = await provider.complete(request())
+            assert second.usage == first.usage
+            assert fixture.posts == fixture.counts == fixture.accepted == 2
+            assert hooks.events[-1][0] == "llm:response"
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_concurrent_call_context_not_arrival_order():
+    # The provider must preserve caller task context across its wait_for task.
+    # The host's actual CURRENT_CALL ingestion remains a separate integration gate.
+    current_call = ContextVar("fixture_current_call")
+    attributed = []
+    hooks = Hooks()
+    ordinary_emit = hooks.emit
+
+    async def emit(name, data):
+        if name == "llm:progress":
+            attributed.append((current_call.get(), data))
+        await ordinary_emit(name, data)
+
+    hooks.emit = emit
+    async with Loopback() as slow, Loopback("success") as fast:
+        provider_slow, _, _ = provider_for(slow)
+        provider_fast, _, _ = provider_for(fast, timeout=7)
+        provider_slow.coordinator = provider_fast.coordinator = SimpleNamespace(hooks=hooks)
+
+        async def call(provider, identity):
+            token = current_call.set(identity)
+            try:
+                return await provider.complete(request())
+            finally:
+                current_call.reset(token)
+
+        slow_task = asyncio.create_task(call(provider_slow, "root"))
+        try:
+            await asyncio.wait_for(slow.accepted_event.wait(), 2)
+            await call(provider_fast, "worker")
+            slow.release.set()
+            await slow_task
+            assert [identity for identity, data in attributed
+                    if data["observation"] == "response_activity"] == ["worker", "root"]
+            for identity, data in attributed:
+                assert_payload(data)
+                assert data["limits"]["elapsed_seconds"] == (7 if identity == "worker" else None)
+                assert data["attempt"] == 1
+            assert slow.posts == fast.posts == 1
+        finally:
+            if not slow_task.done():
+                slow_task.cancel()
+                await asyncio.gather(slow_task, return_exceptions=True)
+            await provider_slow.close()
+            await provider_fast.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_response_secrets_tools_and_thinking_absent_from_metadata():
+    async with Loopback("private_payload") as fixture:
+        provider, _, hooks = provider_for(fixture)
+        try:
+            result = await provider.complete(request())
+            # Actual sensitive fixture content survives normal response conversion;
+            # absence from progress cannot be explained by absence from the wire.
+            converted = result.model_dump_json()
+            assert "private-thinking-sentinel" in converted
+            assert "private-encrypted-sentinel" in converted
+            assert "private-tool-sentinel" in converted
+            assert "private-prompt-sentinel" in json.dumps(fixture.payloads)
+            encoded = json.dumps(progress(hooks))
+            for forbidden in ("private-", "resp_loopback", "api.openai.com", "fixture_tool",
+                              "Authorization", "encrypted_content"):
+                assert forbidden not in encoded
+            for data in progress(hooks):
+                assert_payload(data)
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_raw_create_optional_observer_after_guards():
+    async with Loopback("success") as fixture:
+        provider, transport, hooks = provider_for(fixture)
+        observer = _WaitObserver(hooks)
+        try:
+            await provider._create_response({
+                "model": "gpt-6-astra", "input": [],
+                "tools": [{"type": "computer"}],
+            }, timeout=None, observer=observer)
+            await observer.flush()
+            assert [e["observation"] for e in progress(hooks)] == [
+                "attempt_started", "response_activity",
+            ]
+            assert fixture.posts == fixture.counts == 1
+            assert transport.generation_limits == [
+                {"connect": 5.0, "pool": 5.0, "read": None, "write": None},
+            ]
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["reset_after_event", "post_event_error", "background_failure"])
+async def test_real_sdk_activity_before_failure_still_never_replays(mode):
+    async with Loopback(mode, streaming=mode != "background_failure") as fixture:
+        provider, _, hooks = provider_for(fixture)
+        task = asyncio.create_task(provider.complete(
+            request(), background=mode == "background_failure", poll_interval=0))
+        try:
+            await asyncio.wait_for(hooks.activity.wait(), 2)
+            fixture.release.set()
+            with pytest.raises(llm_errors.LLMError) as caught:
+                await asyncio.wait_for(task, 2)
+            assert caught.value.retryable is False
+            assert caught.value.request_outcome == "unknown"
+            assert fixture.posts == fixture.accepted == fixture.counts == 1
+            assert fixture.retrieves == (1 if mode == "background_failure" else 0)
+            assert not [name for name, _ in hooks.events if name == "provider:retry"]
+            assert progress(hooks)[-1]["observation"] == "response_activity"
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_real_sdk_count_guard_precedes_attempt_observation(streaming):
+    async with Loopback("count_overflow", streaming=streaming) as fixture:
+        provider, _, hooks = provider_for(fixture)
+        try:
+            with pytest.raises(llm_errors.ContextLengthError):
+                await provider.complete(request())
+            assert fixture.posts == 0 and fixture.counts == 1
+            assert not progress(hooks)
+        finally:
+            await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_sse_comments_do_not_invent_activity():
+    async with Loopback("comment_only", streaming=True) as fixture:
+        provider, _, hooks = provider_for(fixture)
+        task = asyncio.create_task(provider.complete(request()))
+        try:
+            await asyncio.wait_for(fixture.accepted_event.wait(), 2)
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            assert [e["observation"] for e in progress(hooks)] == ["attempt_started"]
+            fixture.release.set()
+            await task
+            assert progress(hooks)[-1]["observation"] == "response_activity"
+            assert fixture.posts == 1
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             await provider.close()
 
 

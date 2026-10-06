@@ -133,6 +133,25 @@ or other effects are not confirmed rolled back. Unlimited silent waits can still
 remain pending until completion, transport failure, an explicit limit, or Stop;
 this does not establish a repair for OS-specific network-switch stalls.
 
+For ordinary Responses transport with an optional coordinator hook,
+`llm:progress` reports local
+`attempt_started` admission and actual parsed `response_activity`. Its version-1
+payload contains only the physical generation attempt number and effective
+elapsed/connect/pool/read/write limits (seconds or null). A scalar elapsed bound
+is per attempt, not a whole-turn budget; an SDK Timeout object reports phase
+limits instead. Same-ID background retrieval is activity, not a new generation.
+No request/response text, identities, headers, URLs, reasoning, or tool arguments
+are included. Existing call context supplies attribution.
+
+In-wait activity is limited to one publication per second across retries,
+continuations, and truncated-output recovery. One pending actual observation
+flushes immediately before local settlement, even inside that spacing window.
+There are no observation timers, sleeps, or heartbeats: silent waits produce no
+activity. Missing hooks mean observation unavailable; hook errors do not fail
+generation, and cancellation still propagates. These observations establish
+neither model computation nor transport health.
+The optional native WebSocket adapter does not produce this observation hook.
+
 **Deprecated aliases** (still work, warn once, will be removed):
 
 | Old key | Use instead |

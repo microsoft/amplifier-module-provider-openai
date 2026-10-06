@@ -99,6 +99,7 @@ from ._tool_search import (
     validate_tool_search_mode,
     warn_unlisted_tools,
 )
+from ._wait_observation import _WaitObserver
 
 logger = logging.getLogger(__name__)
 
@@ -3190,6 +3191,7 @@ class OpenAIProvider:
     async def _create_response(
         self, params: dict[str, Any], *, native_input_tokens: int | None = None,
         timeout=openai.NOT_GIVEN,
+        observer: _WaitObserver | None = None,
     ) -> Any:
         """Call `client.responses.create(**params)`.
 
@@ -3234,14 +3236,19 @@ class OpenAIProvider:
         else:
             self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         transport_timeout = self._transport_timeout(request_timeout)
+        if observer is not None:
+            await observer.attempt_started(request_timeout, transport_timeout)
         if not _params_declare_computer_tool(params):
-            return await self.client.responses.create(**params, timeout=transport_timeout)
+            response = await self.client.responses.create(**params, timeout=transport_timeout)
+            if observer is not None:
+                await observer.response_activity()
+            return response
 
         raw_response = await self.client.responses.with_raw_response.create(
             **params, timeout=transport_timeout
         )
         try:
-            return await _maybe_await(raw_response.parse())
+            response = await _maybe_await(raw_response.parse())
         except ValidationError as e:
             logger.warning(
                 "[PROVIDER] %s: typed Response model rejected a computer-use "
@@ -3265,7 +3272,10 @@ class OpenAIProvider:
                     f"is missing the expected 'output' field (got: "
                     f"{type(body).__name__})"
                 ) from e
-            return _RawResponseObject(body)
+            response = _RawResponseObject(body)
+        if observer is not None:
+            await observer.response_activity()
+        return response
 
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
@@ -3322,6 +3332,7 @@ class OpenAIProvider:
         # SDK Timeout objects specify phase limits, not a total elapsed budget.
         effective_timeout = None if isinstance(request_timeout, openai.Timeout) else request_timeout
         poll_interval = kwargs.get("poll_interval", self.poll_interval)
+        observer = _WaitObserver(getattr(self.coordinator, "hooks", None))
 
         # Call provider API with shared retry_with_backoff from amplifier-core.
         # Error translation happens inside _do_complete() so that retry_with_backoff
@@ -3420,12 +3431,16 @@ class OpenAIProvider:
 
                     try:
                         async with asyncio.timeout(effective_timeout):
+                            await observer.attempt_started(
+                                request_timeout, self._transport_timeout(request_timeout)
+                            )
                             async with self.client.responses.stream(
                                 **params, timeout=self._transport_timeout(request_timeout)
                             ) as stream:
                                 if emit_stream_events:
                                     async for event in stream:
                                         response_activity = True
+                                        await observer.response_activity()
                                         et = event.type
 
                                         # Capture the terminal response as we stream so a
@@ -3530,6 +3545,7 @@ class OpenAIProvider:
                                     # without emitting stream UI events.
                                     async for event in stream:
                                         response_activity = True
+                                        await observer.response_activity()
                                         et = event.type
                                         if et in (
                                             "response.completed",
@@ -3569,6 +3585,8 @@ class OpenAIProvider:
                                         getattr(final_response, "status", "unknown"),
                                         params.get("model", "unknown"),
                                     )
+                                if not response_activity:
+                                    await observer.response_activity()
                                 # Extract rate limit headers from the underlying HTTP response.
                                 # The OpenAI SDK stores it as stream._response (httpx.Response).
                                 raw_http = getattr(stream, "_response", None)
@@ -3598,6 +3616,7 @@ class OpenAIProvider:
                         self._create_response(
                             params, native_input_tokens=attempt_native_input_tokens,
                             timeout=request_timeout,
+                            observer=observer,
                         ),
                         timeout=effective_timeout,
                     )
@@ -3885,6 +3904,7 @@ class OpenAIProvider:
                             response = await self.client.responses.retrieve(
                                 response_id, timeout=self._transport_timeout(request_timeout)
                             )
+                            await observer.response_activity()
                     except TimeoutError as poll_error:
                         raise unknown_timeout(provider=self.name) from poll_error
                     except Exception as poll_error:
@@ -3970,7 +3990,9 @@ class OpenAIProvider:
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
-                            self._create_response(params, timeout=request_timeout),
+                            self._create_response(
+                                params, timeout=request_timeout, observer=observer
+                            ),
                             timeout=effective_timeout,
                         )
                         self._record_budget_calibration(params, final_response)
@@ -4100,7 +4122,9 @@ class OpenAIProvider:
                 try:
                     continue_start = time.time()
                     final_response = await asyncio.wait_for(
-                        self._create_response(continue_params, timeout=request_timeout),
+                        self._create_response(
+                            continue_params, timeout=request_timeout, observer=observer
+                        ),
                         timeout=effective_timeout,
                     )
                     self._record_budget_calibration(continue_params, final_response)
@@ -4169,6 +4193,7 @@ class OpenAIProvider:
                     )
 
             # Emit llm:response event using canonical usage fields from chat_response
+            await observer.flush()
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 event_usage: dict[str, Any] = {}
                 if chat_response.usage:
@@ -4215,12 +4240,17 @@ class OpenAIProvider:
 
             return chat_response
 
+        except asyncio.CancelledError:
+            await observer.flush()
+            raise
+
         except kernel_errors.LLMError as e:
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
+            await observer.flush()
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "llm:response",
@@ -4245,6 +4275,7 @@ class OpenAIProvider:
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             # Emit error event
+            await observer.flush()
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "llm:response",
