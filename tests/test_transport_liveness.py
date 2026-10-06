@@ -483,7 +483,7 @@ async def test_injected_sdk_subclass_with_retries_fails_locally_before_post():
             with pytest.raises(InjectedClientConfigurationError) as caught:
                 await provider.complete(request())
             assert caught.value.retryable is False
-            assert caught.value.request_outcome == "not_sent" and caught.value.effects == "none"
+            assert caught.value.request_outcome == "not_dispatched" and caught.value.effects == "none"
             assert fixture.posts == fixture.accepted == fixture.counts == transport.dispatches == 0
             assert sdk.max_retries == 2 and not sdk.is_closed()
 
