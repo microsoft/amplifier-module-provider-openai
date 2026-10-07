@@ -2988,11 +2988,13 @@ class OpenAIProvider:
         """Only claim the official endpoint contract, never an inherited proxy."""
         return self._uses_standard_openai_endpoint() and callable(getattr(self.client.responses, "compact", None))
 
-    def validate_compacted_context(self, message: dict[str, Any]) -> bool:
-        """Reject a placeholder whose actual opaque transport is unavailable."""
+    def validate_compacted_context(
+        self, message: dict[str, Any], *, model: str | None = None
+    ) -> bool:
+        """Validate opaque transport for the effective continuation model."""
         from .compaction import canonical_window
 
-        return canonical_window(message, self.default_model) is not None
+        return canonical_window(message, model or self.default_model) is not None
 
     async def compact_context(self, request: ChatRequest) -> dict[str, Any]:
         """Compact a bounded window and retain every returned canonical item.
