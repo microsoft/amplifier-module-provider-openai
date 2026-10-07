@@ -177,6 +177,17 @@ def test_native_transport_validation_rejects_missing_payload_without_changing_wi
     )
 
 
+def test_validation_uses_explicit_continuation_model_without_changing_provider_default():
+    provider, _, window = fixture()
+    default = provider.default_model
+    selected = "gpt-5.6-terra" if default != "gpt-5.6-terra" else "gpt-6-astra"
+    carrier = compacted_message(selected, window)
+    assert provider.validate_compacted_context(carrier, model=selected)
+    with pytest.raises(ValueError, match="different model"):
+        provider.validate_compacted_context(carrier)
+    assert provider.default_model == default
+
+
 @pytest.mark.asyncio
 async def test_sdk_defaults_do_not_become_unknown_input_parameters():
     from pydantic import BaseModel
