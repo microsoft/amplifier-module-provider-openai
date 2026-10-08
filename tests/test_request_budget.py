@@ -17,6 +17,7 @@ from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
 from amplifier_module_provider_openai import OpenAIProvider, _tool_search
+from amplifier_module_provider_openai._token_count import TokenCountError
 
 
 def _wire_params(sdk_kwargs):
@@ -299,18 +300,19 @@ def test_native_count_over_allowance_blocks_generation_dispatch():
 def test_native_count_validates_counter_response(reported, available):
     provider, _ = _native_provider(default_model="gpt-5-mini", input_tokens=reported)
 
-    decision = asyncio.run(provider.request_budget(_request(), context_estimate=10))
-
     if available:
+        decision = asyncio.run(provider.request_budget(_request(), context_estimate=10))
         assert decision["measurement"]["input_tokens"] == reported
     else:
-        assert decision is None
+        with pytest.raises(TokenCountError):
+            asyncio.run(provider.request_budget(_request(), context_estimate=10))
 
 
 def test_native_count_failure_and_cancellation_do_not_become_measurements():
     provider, counter = _native_provider(default_model="gpt-5-mini")
     counter.side_effect = RuntimeError("count response malformed")
-    assert asyncio.run(provider.request_budget(_request(), context_estimate=10)) is None
+    with pytest.raises(TokenCountError):
+        asyncio.run(provider.request_budget(_request(), context_estimate=10))
     assert "request_budget:provider_count" in provider.get_info().capabilities
 
     counter.side_effect = asyncio.CancelledError
@@ -1037,7 +1039,7 @@ def test_typed_images_native_count_remains_authoritative(input_tokens):
     assert provider._budget_calibration == calibration
 
 
-def test_failed_image_counter_falls_back_to_api_validation_without_usage_poisoning():
+def test_failed_image_counter_stops_before_generation_without_usage_poisoning():
     provider, counter = _native_provider(
         default_model="gpt-5.6-terra", enable_long_context=True
     )
@@ -1047,11 +1049,11 @@ def test_failed_image_counter_falls_back_to_api_validation_without_usage_poisoni
     response.output = []
     provider.client.responses.create.return_value = response
     request = _image_request()
-    assert (
-        asyncio.run(provider.request_budget(request, context_estimate=12_000)) is None
-    )
-    asyncio.run(provider.complete(request))
-    assert provider.client.responses.create.await_count == 1
+    with pytest.raises(TokenCountError):
+        asyncio.run(provider.request_budget(request, context_estimate=12_000))
+    with pytest.raises(TokenCountError):
+        asyncio.run(provider.complete(request))
+    provider.client.responses.create.assert_not_called()
     assert provider._budget_calibration == calibration
 
 

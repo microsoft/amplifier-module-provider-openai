@@ -1905,7 +1905,7 @@ class OpenAIProvider:
         return {key: copy.deepcopy(params[key]) for key in self._COUNT_FIELDS if key in params}
 
     async def _native_input_token_count(self, params: dict[str, Any]) -> int | None:
-        """Return a validated native count, or unavailable without side effects."""
+        """Return a count, unavailable capability, or a safe counting failure."""
         if not self._provider_count_available():
             return None
         count_params = self._native_count_params(params)
@@ -1917,7 +1917,7 @@ class OpenAIProvider:
         count_client = self._client
         temporary_client = count_client is None
         if count_client is None:
-            count_client = AsyncOpenAI(api_key=self._api_key, base_url=self.base_url)
+            count_client = AsyncOpenAI(api_key=self._api_key, base_url=self.base_url, max_retries=0)
         counter = getattr(
             getattr(getattr(count_client, "responses", None), "input_tokens", None),
             "count",
@@ -1927,26 +1927,13 @@ class OpenAIProvider:
             if temporary_client:
                 await count_client.close()
             return None
+        from ._token_count import count_tokens
+
         try:
-            result = await counter(**count_params)
-        except asyncio.CancelledError:
-            raise
-        except (openai.APIError, RuntimeError, TypeError, ValueError):
-            # The optional SDK counter can fail in transport or response
-            # decoding; that leaves the measurement unavailable, not invented.
-            # The existing final local guard remains the fallback for dispatch.
-            return None
+            return await count_tokens(count_client, count_params)
         finally:
             if temporary_client:
                 await count_client.close()
-        input_tokens = getattr(result, "input_tokens", None)
-        if (
-            isinstance(input_tokens, bool)
-            or not isinstance(input_tokens, int)
-            or input_tokens < 0
-        ):
-            return None
-        return input_tokens
 
     def _budget_decision(
         self,
@@ -2297,7 +2284,8 @@ class OpenAIProvider:
         """Return an awaitable native decision or a synchronous legacy estimate.
 
         The awaitable resolves to ``None`` when the optional native count is
-        unavailable. This method never emits, dispatches, or mutates state.
+        unsupported. Failed count operations raise a safe TokenCountError after
+        bounded counting-only retries. No model generation or state mutation occurs.
         """
         if isinstance(context_estimate, bool) or not isinstance(context_estimate, int):
             raise ValueError("context_estimate must be a nonnegative integer")
