@@ -18,6 +18,7 @@ from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
+from amplifier_module_provider_openai._generation_errors import OUTCOME_UNKNOWN_MESSAGE
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +100,7 @@ SERVER_ERROR_BODY = {
 
 
 def test_rate_limit_error_message_uses_json_body():
-    """RateLimitError message should be json.dumps(body) when body is present."""
+    """Rate refusal keeps its arbitrary body private."""
     provider = _make_provider()
     native = openai.RateLimitError(
         "Rate limit exceeded",
@@ -112,12 +113,12 @@ def test_rate_limit_error_message_uses_json_body():
         asyncio.run(provider.complete(_simple_request()))
 
     err = exc_info.value
-    expected = json.dumps(RATE_LIMIT_BODY)
+    expected = "Provider refused this request at rate admission."
     assert str(err) == expected, f"Expected {expected!r}, got {str(err)!r}"
 
 
-def test_rate_limit_error_message_falls_back_to_str_when_no_body():
-    """RateLimitError message should fall back to str(e) when body is None."""
+def test_rate_limit_error_without_body_is_unknown():
+    """An unstructured 429 is not proof of nonacceptance."""
     provider = _make_provider()
     native = openai.RateLimitError(
         "Rate limit exceeded",
@@ -126,11 +127,11 @@ def test_rate_limit_error_message_falls_back_to_str_when_no_body():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    with pytest.raises(kernel_errors.RateLimitError) as exc_info:
+    with pytest.raises(kernel_errors.LLMError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
 
     # Should not be empty; should contain the original message
-    assert str(exc_info.value) != ""
+    assert str(exc_info.value) == OUTCOME_UNKNOWN_MESSAGE
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +268,7 @@ def test_api_status_404_uses_json_body():
 
 
 def test_api_status_500_uses_json_body():
-    """ProviderUnavailableError message is json.dumps(body)."""
+    """Bare server failure uses a fixed public uncertainty warning."""
     provider = _make_provider()
     native = openai.APIStatusError(
         "Internal server error",
@@ -276,10 +277,10 @@ def test_api_status_500_uses_json_body():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+    with pytest.raises(kernel_errors.LLMError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
 
-    expected = json.dumps(SERVER_ERROR_BODY)
+    expected = OUTCOME_UNKNOWN_MESSAGE
     assert str(exc_info.value) == expected
 
 
@@ -307,7 +308,7 @@ def test_api_status_other_uses_json_body():
 
 
 def test_generic_exception_with_body_uses_json_body():
-    """Generic Exception with body attr uses json.dumps(body)."""
+    """An arbitrary error body remains in the private cause."""
     provider = _make_provider()
 
     class CustomError(Exception):
@@ -322,12 +323,12 @@ def test_generic_exception_with_body_uses_json_body():
     with pytest.raises(kernel_errors.LLMError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
 
-    expected = json.dumps(body)
+    expected = OUTCOME_UNKNOWN_MESSAGE
     assert str(exc_info.value) == expected
 
 
 def test_generic_exception_without_body_falls_back_to_str():
-    """Generic Exception without body falls back to str(e)."""
+    """An arbitrary error string remains in the private cause."""
     provider = _make_provider()
     native = RuntimeError("Something unexpected")
     provider.client.responses.create = AsyncMock(side_effect=native)
@@ -335,11 +336,11 @@ def test_generic_exception_without_body_falls_back_to_str():
     with pytest.raises(kernel_errors.LLMError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
 
-    assert "Something unexpected" in str(exc_info.value)
+    assert str(exc_info.value) == OUTCOME_UNKNOWN_MESSAGE
 
 
 def test_generic_exception_with_none_body_falls_back_to_str():
-    """Generic Exception with body=None falls back to str(e)."""
+    """A missing body is not safe-retry evidence."""
     provider = _make_provider()
 
     class CustomError(Exception):
@@ -353,4 +354,4 @@ def test_generic_exception_with_none_body_falls_back_to_str():
     with pytest.raises(kernel_errors.LLMError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
 
-    assert "Some error" in str(exc_info.value)
+    assert str(exc_info.value) == OUTCOME_UNKNOWN_MESSAGE

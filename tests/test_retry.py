@@ -88,7 +88,7 @@ def test_retryable_error_retried_then_succeeds():
     native_error = openai.RateLimitError(
         "Rate limit",
         response=_mock_httpx_response(429),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
 
     # Fail twice, succeed on third
@@ -128,7 +128,7 @@ def test_retry_after_exceeds_max_delay_raises_immediately():
     native = openai.RateLimitError(
         "Rate limit",
         response=_mock_httpx_response(429, headers={"retry-after": "120"}),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
@@ -148,7 +148,7 @@ def test_provider_retry_event_emitted():
     native = openai.RateLimitError(
         "Rate limit",
         response=_mock_httpx_response(429),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     # Fail twice, succeed on third
     provider.client.responses.create = AsyncMock(
@@ -187,7 +187,7 @@ def test_exponential_backoff_delays():
     native = openai.RateLimitError(
         "Rate limit",
         response=_mock_httpx_response(429),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     # Fail 3 times, succeed on 4th
     provider.client.responses.create = AsyncMock(
@@ -216,7 +216,7 @@ def test_max_retries_exhausted_raises_kernel_error():
     native = openai.RateLimitError(
         "Rate limit",
         response=_mock_httpx_response(429),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
@@ -228,8 +228,8 @@ def test_max_retries_exhausted_raises_kernel_error():
     assert provider.client.responses.create.await_count == 3
 
 
-def test_timeout_error_retried():
-    """LLMTimeoutError (from asyncio.TimeoutError) is retried."""
+def test_timeout_error_not_retried():
+    """A timed-out dispatched generation may have been accepted."""
     provider = _make_provider(max_retries=2)
 
     # Timeout once, then succeed
@@ -238,14 +238,17 @@ def test_timeout_error_retried():
     )
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        result = asyncio.run(provider.complete(_simple_request()))
+        with pytest.raises(kernel_errors.LLMTimeoutError) as caught:
+            asyncio.run(provider.complete(_simple_request()))
 
-    assert result is not None
-    assert provider.client.responses.create.await_count == 2
+    assert caught.value.retryable is False
+    assert caught.value.request_outcome == "unknown"
+    assert caught.value.effects == "may_have_occurred"
+    assert provider.client.responses.create.await_count == 1
 
 
-def test_provider_unavailable_retried():
-    """ProviderUnavailableError (from 5xx) is retried."""
+def test_bare_500_not_retried():
+    """A bare 500 does not prove generation nonacceptance."""
     provider = _make_provider(max_retries=2)
 
     native_500 = openai.APIStatusError(
@@ -258,10 +261,13 @@ def test_provider_unavailable_retried():
     )
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        result = asyncio.run(provider.complete(_simple_request()))
+        with pytest.raises(kernel_errors.LLMError) as caught:
+            asyncio.run(provider.complete(_simple_request()))
 
-    assert result is not None
-    assert provider.client.responses.create.await_count == 2
+    assert caught.value.retryable is False
+    assert caught.value.request_outcome == "unknown"
+    assert caught.value.__cause__ is native_500
+    assert provider.client.responses.create.await_count == 1
 
 
 def test_sdk_retries_disabled():
@@ -395,7 +401,7 @@ class TestRetryEventPayloadHasMaxRetries:
         native = openai.RateLimitError(
             "Rate limit",
             response=_mock_httpx_response(429),
-            body=None,
+            body={"code": "rate_limit_exceeded"},
         )
         provider.client.responses.create = AsyncMock(
             side_effect=[native, DummyResponse()]

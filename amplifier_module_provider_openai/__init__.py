@@ -71,6 +71,17 @@ from ._constants import (
     NATIVE_TOOL_TYPES,
 )
 from ._cost import compute_cost
+from ._generation_errors import (
+    OUTCOME_UNKNOWN_MESSAGE,
+    InjectedClientConfigurationError,
+    LocalRequestError,
+    RequestOutcomeUnknownError,
+    proven_before_send,
+    proven_quota_refusal,
+    proven_rate_refusal,
+    quota_refusal,
+    unknown_timeout,
+)
 from ._response_handling import (
     FunctionCallTruncationError,
     convert_response_with_accumulated_output,
@@ -79,6 +90,7 @@ from ._response_handling import (
     merge_discarded_usage,
     parse_function_call_block,
 )
+from ._terminal_settlement import _caller_cancellations, _settle_optional
 from ._tool_search import (
     DEFAULT_ALWAYS_LOADED,
     TOOL_SEARCH_MODE_NAMESPACED,
@@ -92,6 +104,7 @@ from ._tool_search import (
     validate_tool_search_mode,
     warn_unlisted_tools,
 )
+from ._wait_observation import _WaitObserver
 
 logger = logging.getLogger(__name__)
 
@@ -2446,6 +2459,22 @@ class OpenAIProvider:
             self._client = AsyncOpenAI(
                 api_key=self._api_key, base_url=self.base_url, max_retries=0
             )
+        client = self._client
+        # Actual SDK clients can replay beneath our generation guards. The
+        # public copy preserves transport/options without mutating the embedder's
+        # client; close() retains its existing shared-HTTP-client lifecycle.
+        # Test doubles are not SDK clients and do not establish SDK retry safety.
+        if (issubclass(type(client), openai.AsyncOpenAI)
+                and client.max_retries != 0):
+            if type(client) is not openai.AsyncOpenAI:
+                raise InjectedClientConfigurationError(provider=self.name)
+            try:
+                client = client.with_options(max_retries=0)
+            except Exception as error:
+                raise InjectedClientConfigurationError(provider=self.name) from error
+            if client.max_retries != 0:
+                raise InjectedClientConfigurationError(provider=self.name)
+            self._client = client
         return self._client
 
     @staticmethod
@@ -3045,6 +3074,12 @@ class OpenAIProvider:
             if single_attempt:
                 return await complete(self, request, kwargs, version=version)
 
+        # Admit injected SDK options before ordinary count/generation activity.
+        # The strict single-attempt path above must still refuse an injected
+        # client without replacing or closing it.
+        if self._client is not None and issubclass(type(self._client), openai.AsyncOpenAI):
+            _ = self.client
+
         # This controls output continuation, not elapsed time. Bounded callers
         # must be able to receive an incomplete result without paying for repeated
         # full-input requests. Do not replace this with a completion deadline.
@@ -3173,6 +3208,7 @@ class OpenAIProvider:
     async def _create_response(
         self, params: dict[str, Any], *, native_input_tokens: int | None = None,
         timeout=openai.NOT_GIVEN,
+        observer: _WaitObserver | None = None,
     ) -> Any:
         """Call `client.responses.create(**params)`.
 
@@ -3217,14 +3253,19 @@ class OpenAIProvider:
         else:
             self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         transport_timeout = self._transport_timeout(request_timeout)
+        if observer is not None:
+            await observer.attempt_started(request_timeout, transport_timeout)
         if not _params_declare_computer_tool(params):
-            return await self.client.responses.create(**params, timeout=transport_timeout)
+            response = await self.client.responses.create(**params, timeout=transport_timeout)
+            if observer is not None:
+                await observer.response_activity()
+            return response
 
         raw_response = await self.client.responses.with_raw_response.create(
             **params, timeout=transport_timeout
         )
         try:
-            return await _maybe_await(raw_response.parse())
+            response = await _maybe_await(raw_response.parse())
         except ValidationError as e:
             logger.warning(
                 "[PROVIDER] %s: typed Response model rejected a computer-use "
@@ -3248,7 +3289,10 @@ class OpenAIProvider:
                     f"is missing the expected 'output' field (got: "
                     f"{type(body).__name__})"
                 ) from e
-            return _RawResponseObject(body)
+            response = _RawResponseObject(body)
+        if observer is not None:
+            await observer.response_activity()
+        return response
 
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
@@ -3305,6 +3349,18 @@ class OpenAIProvider:
         # SDK Timeout objects specify phase limits, not a total elapsed budget.
         effective_timeout = None if isinstance(request_timeout, openai.Timeout) else request_timeout
         poll_interval = kwargs.get("poll_interval", self.poll_interval)
+        unsettled_generation = False
+        response_received = False
+
+        class _AccountingObserver(_WaitObserver):
+            async def attempt_started(self, timeout: Any, transport_timeout: Any) -> None:
+                nonlocal unsettled_generation
+                await super().attempt_started(timeout, transport_timeout)
+                # The existing create/stream seam calls this after preflight,
+                # immediately before dispatch. No new timer or SDK option.
+                unsettled_generation = True
+
+        observer = _AccountingObserver(getattr(self.coordinator, "hooks", None))
 
         # Call provider API with shared retry_with_backoff from amplifier-core.
         # Error translation happens inside _do_complete() so that retry_with_backoff
@@ -3315,18 +3371,77 @@ class OpenAIProvider:
         captured_rate_limit_info: dict[str, Any] = {}
         # A streaming `response.failed` terminal contains a vendor response that
         # may already have billable usage, even though the SDK subsequently
-        # raises and retry_with_backoff retries. Record only those explicit
+        # raises. It does not authorize replay. Record only those explicit
         # terminal failures: network exceptions provide no server evidence, and
         # completed/incomplete responses are recorded when returned so they
         # cannot be counted twice from both SSE and get_final_response().
         failed_stream_responses: list[Any] = []
-        failed_stream_response_ids: set[int] = set()
+        failed_stream_attempts: set[int] = set()
+        billed_responses: list[Any] = []
+        costs_accounted = False
+        cost_commit: str | None = None
         generation_attempt = 0
 
         def _record_failed_stream_response(response: Any) -> None:
-            if response is not None and id(response) not in failed_stream_response_ids:
-                failed_stream_response_ids.add(id(response))
+            # Repeated terminal events cannot charge the same physical attempt
+            # twice, even if the SDK produces distinct response objects.
+            if response is not None and generation_attempt not in failed_stream_attempts:
+                failed_stream_attempts.add(generation_attempt)
                 failed_stream_responses.append(response)
+
+        def _settle_error_usage(error: BaseException) -> dict[str, Any] | None:
+            nonlocal costs_accounted, cost_commit
+            responses = [*billed_responses, *failed_stream_responses]
+            if unsettled_generation and not failed_stream_responses:
+                responses.append(None)
+            if not responses:
+                return None  # Proven admission refusals are not billable evidence.
+            # Terminal notification may fail after the normal cost callback.
+            # Construct the same receipt without committing those costs twice.
+            add_cost = not costs_accounted
+            # Commit is attempted at most once even if a callback partially
+            # updates state before raising. A failed callback is not replayable.
+            costs_accounted = True
+            cancellations = _caller_cancellations()
+            try:
+                accounting = self._account_failed_responses(responses, add_cost=add_cost)
+            except (Exception, asyncio.CancelledError) as secondary:
+                if (isinstance(secondary, asyncio.CancelledError)
+                        and _caller_cancellations() > cancellations):
+                    raise
+                # Malformed accounting evidence is unavailable, never a reason
+                # to replace the original terminal failure or replay generation.
+                error.usage = None
+                logger.debug("Terminal usage receipt unavailable")
+                return None
+            if not add_cost and cost_commit is not None:
+                accounting["cost_commit"] = cost_commit
+            cost_commit = accounting["cost_commit"]
+            error.usage = accounting
+            return accounting
+
+        async def _settle_notification(
+            status: str, usage: dict[str, Any] | None, error_msg: str | None = None,
+        ) -> None:
+            try:
+                await _settle_optional(observer.flush)
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await _settle_optional(lambda: self.coordinator.hooks.emit(
+                        "llm:response",
+                        {
+                            "status": status,
+                            "duration_ms": int((time.time() - start_time) * 1000),
+                            "provider": self.name,
+                            "model": params["model"],
+                            **({"usage": usage} if usage is not None else {}),
+                            **({"error": error_msg} if error_msg is not None else {}),
+                        },
+                    ))
+            except asyncio.CancelledError as cancellation:
+                # A newer real Stop wins, but cannot discard the usage already
+                # measured/settled on the terminal path it interrupted.
+                cancellation.usage = usage
+                raise
 
         # Per-request streaming override (does NOT mutate self.use_streaming).
         # Callers like session-namer pass metadata={"stream": False} to force
@@ -3342,7 +3457,7 @@ class OpenAIProvider:
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
-            nonlocal captured_rate_limit_info, generation_attempt
+            nonlocal captured_rate_limit_info, generation_attempt, unsettled_generation
 
             # The initial count guarded the completed wire payload before the
             # request event. Reuse it for this first physical dispatch only.
@@ -3355,6 +3470,7 @@ class OpenAIProvider:
                     await self._guard_assembled_params_with_provider_count(params)
                 )
             generation_attempt += 1
+            response_activity = False
 
             async def _handle_context_overflow(e: Exception, error_msg: str):
                 """Raise ContextLengthError. Shared by the 400 path and the
@@ -3402,11 +3518,16 @@ class OpenAIProvider:
 
                     try:
                         async with asyncio.timeout(effective_timeout):
+                            await observer.attempt_started(
+                                request_timeout, self._transport_timeout(request_timeout)
+                            )
                             async with self.client.responses.stream(
                                 **params, timeout=self._transport_timeout(request_timeout)
                             ) as stream:
                                 if emit_stream_events:
                                     async for event in stream:
+                                        response_activity = True
+                                        await observer.response_activity()
                                         et = event.type
 
                                         # Capture the terminal response as we stream so a
@@ -3456,6 +3577,7 @@ class OpenAIProvider:
                                             text = event.delta
                                             if text:
                                                 idx = event.output_index
+                                                partial_emitted = True
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
                                                     {
@@ -3469,7 +3591,6 @@ class OpenAIProvider:
                                                     },
                                                 )
                                                 seq[idx] = seq.get(idx, 0) + 1
-                                                partial_emitted = True
 
                                         elif et in (
                                             "response.reasoning_summary_text.delta",
@@ -3478,6 +3599,7 @@ class OpenAIProvider:
                                             text = event.delta
                                             if text:
                                                 idx = event.output_index
+                                                partial_emitted = True
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
                                                     {
@@ -3491,7 +3613,6 @@ class OpenAIProvider:
                                                     },
                                                 )
                                                 seq[idx] = seq.get(idx, 0) + 1
-                                                partial_emitted = True
 
                                         elif et == "response.output_item.done":
                                             idx = event.output_index
@@ -3510,6 +3631,8 @@ class OpenAIProvider:
                                     # their accounting/recovery semantics identical
                                     # without emitting stream UI events.
                                     async for event in stream:
+                                        response_activity = True
+                                        await observer.response_activity()
                                         et = event.type
                                         if et in (
                                             "response.completed",
@@ -3523,6 +3646,8 @@ class OpenAIProvider:
                                                 getattr(event, "response", None)
                                             )
 
+                                if generation_attempt in failed_stream_attempts:
+                                    raise RequestOutcomeUnknownError(provider=self.name)
                                 try:
                                     response = await stream.get_final_response()
                                 except RuntimeError as e:
@@ -3549,6 +3674,8 @@ class OpenAIProvider:
                                         getattr(final_response, "status", "unknown"),
                                         params.get("model", "unknown"),
                                     )
+                                if not response_activity:
+                                    await observer.response_activity()
                                 # Extract rate limit headers from the underlying HTTP response.
                                 # The OpenAI SDK stores it as stream._response (httpx.Response).
                                 raw_http = getattr(stream, "_response", None)
@@ -3556,32 +3683,48 @@ class OpenAIProvider:
                                 captured_rate_limit_info = (
                                     self._extract_rate_limit_headers(headers)
                                 )
+                                unsettled_generation = False
                                 return response
-                    except Exception as e:
+                    except (Exception, asyncio.CancelledError) as primary:
                         # If a partial stream was already emitted, signal abort to
                         # consumers before re-raising for normal error translation.
                         if partial_emitted and hooks_available:
-                            await self.coordinator.hooks.emit(
+                            cancelled = isinstance(primary, asyncio.CancelledError)
+                            await _settle_optional(lambda: self.coordinator.hooks.emit(
                                 "llm:stream_aborted",
                                 {
                                     "request_id": request_id,
                                     "error": {
-                                        "type": type(e).__name__,
-                                        "msg": str(e),
+                                        "type": "CancelledError" if cancelled else "RequestOutcomeUnknown",
+                                        "msg": (
+                                            "Local wait cancelled; provider effects are not confirmed rolled back."
+                                            if cancelled else OUTCOME_UNKNOWN_MESSAGE
+                                        ),
                                     },
                                 },
-                            )
+                            ))
                         raise
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
-                    return await asyncio.wait_for(
+                    response = await asyncio.wait_for(
                         self._create_response(
                             params, native_input_tokens=attempt_native_input_tokens,
                             timeout=request_timeout,
+                            observer=observer,
                         ),
                         timeout=effective_timeout,
                     )
+                    unsettled_generation = False
+                    return response
             except openai.RateLimitError as e:
+                if not response_activity and proven_quota_refusal(e):
+                    unsettled_generation = False
+                    raise quota_refusal(provider=self.name) from e
+                if response_activity or not proven_rate_refusal(e):
+                    raise RequestOutcomeUnknownError(
+                        provider=self.name, status_code=429,
+                    ) from e
+                unsettled_generation = False
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:
                     # Standard header (seconds)
@@ -3609,10 +3752,8 @@ class OpenAIProvider:
                     and retry_after > self._retry_config.max_delay
                 ):
                     retryable = False
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.RateLimitError(
-                    error_msg,
+                    "Provider refused this request at rate admission.",
                     provider=self.name,
                     status_code=429,
                     retryable=retryable,
@@ -3655,16 +3796,9 @@ class OpenAIProvider:
                 error_msg = json.dumps(body) if body is not None else str(e)
                 if status == 403:
                     if self._is_cloudflare_challenge(e):
-                        logger.warning(
-                            "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-                            "with HTML body). Treating as transient — will retry."
-                        )
-                        raise kernel_errors.ProviderUnavailableError(
-                            "Cloudflare bot challenge (transient 403 with HTML body). "
-                            "This typically resolves on retry.",
-                            provider=self.name,
-                            status_code=403,
-                            retryable=True,
+                        # HTML/marker heuristics do not prove nonacceptance.
+                        raise RequestOutcomeUnknownError(
+                            provider=self.name, status_code=403,
                         ) from e
                     raise kernel_errors.AccessDeniedError(
                         error_msg,
@@ -3681,11 +3815,8 @@ class OpenAIProvider:
                         status_code=404,
                     ) from e
                 if status >= 500:
-                    raise kernel_errors.ProviderUnavailableError(
-                        error_msg,
-                        provider=self.name,
-                        status_code=status,
-                        retryable=True,
+                    raise RequestOutcomeUnknownError(
+                        provider=self.name, status_code=status,
                     ) from e
                 raise kernel_errors.LLMError(
                     error_msg,
@@ -3694,11 +3825,7 @@ class OpenAIProvider:
                     retryable=False,
                 ) from e
             except asyncio.TimeoutError as e:
-                raise kernel_errors.LLMTimeoutError(
-                    f"Request timed out after {effective_timeout}s",
-                    provider=self.name,
-                    retryable=True,
-                ) from e
+                raise unknown_timeout(provider=self.name) from e
             except kernel_errors.LLMError:
                 raise  # Already translated, don't double-wrap
             except openai.APIError as e:
@@ -3711,12 +3838,15 @@ class OpenAIProvider:
                 # deterministic 400 (context overflow, invalid params) was retried
                 # max_retries times before surfacing.
                 if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
-                    # Transport-level failures are genuinely transient.
-                    raise kernel_errors.LLMError(
-                        str(e) or f"{type(e).__name__}: (no message)",
-                        provider=self.name,
-                        retryable=True,
-                    ) from e
+                    if not response_activity and proven_before_send(e):
+                        unsettled_generation = False
+                        raise kernel_errors.LLMError(
+                            "Provider connection setup failed before request send.",
+                            provider=self.name, retryable=True,
+                        ) from e
+                    if isinstance(e, openai.APITimeoutError):
+                        raise unknown_timeout(provider=self.name) from e
+                    raise RequestOutcomeUnknownError(provider=self.name) from e
                 body = getattr(e, "body", None)
                 error_msg = (
                     json.dumps(body)
@@ -3742,23 +3872,9 @@ class OpenAIProvider:
                         provider=self.name,
                         status_code=400,
                     ) from e
-                # Unclassifiable -- preserve the prior conservative default.
-                raise kernel_errors.LLMError(
-                    error_msg,
-                    provider=self.name,
-                    retryable=True,
-                ) from e
+                raise RequestOutcomeUnknownError(provider=self.name) from e
             except Exception as e:
-                body = getattr(e, "body", None)
-                if body is not None:
-                    error_msg = json.dumps(body)
-                else:
-                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
-                raise kernel_errors.LLMError(
-                    error_msg,
-                    provider=self.name,
-                    retryable=True,
-                ) from e
+                raise RequestOutcomeUnknownError(provider=self.name) from e
 
         async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
             """Callback invoked before each retry sleep."""
@@ -3835,6 +3951,7 @@ class OpenAIProvider:
                 self._retry_config,
                 on_retry=_on_retry,
             )
+            response_received = getattr(response, "status", None) in {"completed", "incomplete"}
             self._record_budget_calibration(params, response)
 
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -3858,10 +3975,7 @@ class OpenAIProvider:
                     # Check timeout
                     elapsed_total = time.time() - start_time
                     if effective_timeout is not None and elapsed_total >= effective_timeout:
-                        raise kernel_errors.LLMTimeoutError(
-                            f"Background request exceeded the configured {effective_timeout}s deadline",
-                            provider=self.name, retryable=False,
-                        )
+                        raise unknown_timeout(provider=self.name)
 
                     # Emit status update event
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3892,16 +4006,11 @@ class OpenAIProvider:
                             response = await self.client.responses.retrieve(
                                 response_id, timeout=self._transport_timeout(request_timeout)
                             )
+                            await observer.response_activity()
                     except TimeoutError as poll_error:
-                        raise kernel_errors.LLMTimeoutError(
-                            "Background response wait timed out", provider=self.name,
-                            retryable=False,
-                        ) from poll_error
+                        raise unknown_timeout(provider=self.name) from poll_error
                     except Exception as poll_error:
-                        raise kernel_errors.LLMError(
-                            "Could not retrieve the existing background response",
-                            provider=self.name, retryable=False,
-                        ) from poll_error
+                        raise RequestOutcomeUnknownError(provider=self.name) from poll_error
 
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 logger.info(
@@ -3931,7 +4040,7 @@ class OpenAIProvider:
             final_response = response
             continuation_count = 0
             truncation_retry_done = False
-            billed_responses: list[Any] = [*failed_stream_responses, response]
+            billed_responses.append(response)
 
             while (
                 hasattr(final_response, "status")
@@ -3983,9 +4092,12 @@ class OpenAIProvider:
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
-                            self._create_response(params, timeout=request_timeout),
+                            self._create_response(
+                                params, timeout=request_timeout, observer=observer
+                            ),
                             timeout=effective_timeout,
                         )
+                        unsettled_generation = False
                         self._record_budget_calibration(params, final_response)
                         billed_responses.append(final_response)
                         elapsed_ms += int((time.time() - retry_start) * 1000)
@@ -4113,9 +4225,12 @@ class OpenAIProvider:
                 try:
                     continue_start = time.time()
                     final_response = await asyncio.wait_for(
-                        self._create_response(continue_params, timeout=request_timeout),
+                        self._create_response(
+                            continue_params, timeout=request_timeout, observer=observer
+                        ),
                         timeout=effective_timeout,
                     )
+                    unsettled_generation = False
                     self._record_budget_calibration(continue_params, final_response)
                     billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
@@ -4126,13 +4241,11 @@ class OpenAIProvider:
                         accumulated_output.extend(final_response.output)
 
                 except Exception as e:
-                    if isinstance(e, kernel_errors.ContextLengthError):
+                    if isinstance(e, kernel_errors.LLMError):
                         raise
-                    logger.error(
-                        f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
-                        f"Returning partial response from {continuation_count} continuation(s)"
-                    )
-                    break  # Return what we have so far
+                    if isinstance(e, (TimeoutError, openai.APITimeoutError)):
+                        raise unknown_timeout(provider=self.name) from e
+                    raise RequestOutcomeUnknownError(provider=self.name) from e
 
             # Log completion summary
             if continuation_count > 0:
@@ -4177,13 +4290,17 @@ class OpenAIProvider:
                     chat_response.usage = chat_response.usage.model_copy(
                         update={"cost_usd": total_cost}
                     )
+                    costs_accounted = True
+                    cost_commit = "unknown"
                     self._add_cost(total_cost)
+                    cost_commit = "committed"
                 else:
                     chat_response.usage = chat_response.usage.model_copy(
                         update={"cost_usd": None}
                     )
 
             # Emit llm:response event using canonical usage fields from chat_response
+            await _settle_optional(observer.flush)
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 event_usage: dict[str, Any] = {}
                 if chat_response.usage:
@@ -4230,47 +4347,38 @@ class OpenAIProvider:
 
             return chat_response
 
+        except asyncio.CancelledError as e:
+            error_usage = _settle_error_usage(e)
+            await _settle_notification("cancelled", error_usage)
+            raise
+
         except kernel_errors.LLMError as e:
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
-
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": error_msg,
-                        "provider": self.name,
-                        "model": params["model"],
-                    },
-                )
+            error_usage = _settle_error_usage(e)
+            await _settle_notification("error", error_usage, error_msg)
             raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error = (
+                LocalRequestError(provider=self.name, received=True)
+                if not unsettled_generation and (response_received or billed_responses)
+                else LocalRequestError(provider=self.name)
+                if generation_attempt == 0 and not unsettled_generation
+                else unknown_timeout(provider=self.name)
+                if isinstance(e, (TimeoutError, openai.APITimeoutError))
+                else RequestOutcomeUnknownError(provider=self.name)
+            )
+            error_msg = str(error)
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
+            error_usage = _settle_error_usage(error)
 
             # Emit error event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": error_msg,
-                        "provider": self.name,
-                        "model": params["model"],
-                    },
-                )
-            # Re-raise with meaningful message if original was empty
-            if not str(e):
-                raise type(e)(error_msg) from e
-            raise
+            await _settle_notification("error", error_usage, error_msg)
+            raise error from e
 
     def _extract_rate_limit_headers(self, headers: Any) -> dict[str, Any]:
         """Extract rate limit information from OpenAI response headers.
@@ -5276,6 +5384,102 @@ class OpenAIProvider:
             cache_write_tokens=getattr(input_details, "cache_write_tokens", 0) or 0,
             service_tier=getattr(response, "service_tier", None),
         )
+
+    def _account_failed_responses(
+        self, responses: list[Any], *, add_cost: bool = True,
+    ) -> dict[str, Any]:
+        """Usage-only error receipt; never convert failed content or tool calls.
+
+        Core Usage requires integer counts. This bounded dict uses its field
+        names but retains null for missing measurements, distinct from measured
+        zero. Costs are existing-calculator estimates, not invoices. Known
+        subtotals remain visible when another attempt is unmeasured/unpriceable.
+        """
+        def count(obj: Any, name: str) -> int | None:
+            value = getattr(obj, name, None)
+            return value if type(value) is int and value >= 0 else None
+
+        attempts = []
+        costs: list[Decimal] = []
+        for response in responses:
+            usage = getattr(response, "usage", None)
+            inputs = count(usage, "input_tokens")
+            outputs = count(usage, "output_tokens")
+            input_details = getattr(usage, "input_tokens_details", None)
+            writes = count(input_details, "cache_write_tokens")
+            reads = count(input_details, "cached_tokens")
+            reasoning = count(getattr(usage, "output_tokens_details", None), "reasoning_tokens")
+            tier = getattr(response, "service_tier", None)
+            tier = tier if tier in ("default", "priority", "fast", "flex", "auto", "scale") else None
+            cost = None
+            details_valid = all(
+                getattr(input_details, field, None) is None
+                or count(input_details, field) is not None
+                for field in ("cache_write_tokens", "cached_tokens")
+            )
+            buckets_valid = details_valid and (
+                inputs is None or (writes or 0) + (reads or 0) <= inputs
+            )
+            normalized = (
+                inputs - (writes or 0) if inputs is not None and buckets_valid else None
+            )
+            if (inputs is not None and outputs is not None and buckets_valid
+                    and isinstance(getattr(response, "model", None), str)
+                    and (getattr(response, "service_tier", None) is None or tier is not None)):
+                cancellations = _caller_cancellations()
+                try:
+                    cost = self._compute_attempt_cost(response)
+                except (Exception, asyncio.CancelledError) as secondary:
+                    if (isinstance(secondary, asyncio.CancelledError)
+                            and _caller_cancellations() > cancellations):
+                        raise
+                    # Pricing is secondary evidence, never the primary failure.
+                    logger.debug("Failure usage pricing unavailable")
+            if cost is not None:
+                costs.append(cost)
+            attempts.append({
+                "input_tokens": normalized,
+                "output_tokens": outputs,
+                "total_tokens": normalized + outputs
+                if normalized is not None and outputs is not None else None,
+                "cache_read_tokens": reads,
+                "cache_write_tokens": writes,
+                "reasoning_tokens": reasoning,
+                "service_tier": tier,
+                "cost_usd": str(cost) if cost is not None else None,
+            })
+
+        summary: dict[str, Any] = {}
+        for field in ("input_tokens", "output_tokens", "total_tokens",
+                      "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"):
+            values = [attempt[field] for attempt in attempts]
+            summary[field] = sum(values) if values and all(v is not None for v in values) else None
+        complete = bool(attempts) and len(costs) == len(attempts)
+        subtotal = sum(costs, Decimal(0)) if costs else None
+        summary.update({
+            "cost_usd": str(subtotal) if complete else None,
+            "cost_known_subtotal_usd": str(subtotal) if subtotal is not None else None,
+            "cost_scope": "reported_attempts" if complete else "known_attempts",
+            "cost_is_estimate": True,
+            "cost_complete": complete,
+            "attempts": attempts,
+        })
+        summary["cost_commit"] = "not_attempted"
+        if add_cost and costs:
+            summary["cost_commit"] = "committed"
+            for cost in costs:
+                cancellations = _caller_cancellations()
+                try:
+                    self._add_cost(cost)
+                except (Exception, asyncio.CancelledError) as secondary:
+                    if (isinstance(secondary, asyncio.CancelledError)
+                            and _caller_cancellations() > cancellations):
+                        raise
+                    # It may have committed before raising. Do not call again,
+                    # and do not claim the session ledger contains the estimate.
+                    summary["cost_commit"] = "unknown"
+                    logger.debug("Failure usage cost callback unavailable")
+        return summary
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
         """Convert OpenAI response to ChatResponse format.
