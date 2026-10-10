@@ -6,6 +6,38 @@ import base64
 import math
 
 
+def image_generation_info():
+    """Public setup contract; describes wire support, not account entitlement."""
+    return {
+        "schemaVersion": 1,
+        "configKey": "image_generation",
+        "defaultBackendId": "openai",
+        "operations": ["generate", "edit"],
+        "outputFormats": ["png"],
+        "modelDiscovery": True,
+        "entitlement": "unverified",
+    }
+
+
+async def list_image_models(provider):
+    """Read this account's catalog without issuing a generation request.
+
+    The current image adapter uses the GPT Image wire format. Older image
+    families and chat models must not be offered as compatible image choices.
+    Catalog visibility alone does not prove permission to generate an image.
+    """
+    client = provider.client.with_options(timeout=30, max_retries=0)
+    result = await client.models.list()
+    ids = {
+        model.id for model in result.data
+        if isinstance(model.id, str) and model.id.startswith("gpt-image-")
+    }
+    return [
+        {"id": model, "display_name": model, "entitlement": "unverified"}
+        for model in sorted(ids)
+    ]
+
+
 class OpenAIImageBackend:
     """Duck-typed image backend, selected explicitly by the consuming host/tool.
 

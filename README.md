@@ -195,6 +195,13 @@ or permission to retry. Ordinary completion defaults and cleanup are unchanged.
 ### Image backend
 
 Image generation is disabled unless `image_generation.enabled` is exactly `true`.
+
+Setup clients can call `get_image_generation_info()` for the optional image
+configuration contract and `await list_image_models()` for compatible GPT Image
+models returned by this connection's account catalog. Discovery uses the saved
+endpoint and credential; it does not generate an image or change configuration.
+Catalog visibility does not verify generation entitlement. Empty catalogs and
+discovery errors remain explicit; no replacement model is selected automatically.
 Configure it on the ordinary API provider instance whose credential and endpoint
 should serve image requests; the chat model and provider selection remain separate:
 
