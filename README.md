@@ -232,7 +232,13 @@ these separate calls.
 
 Choose an image model supported by the account and endpoint using the current
 [image generation guide](https://developers.openai.com/api/docs/guides/image-generation).
-No default image model or automatic account fallback is supplied.
+Set `image_generation.model: auto` to resolve the latest stable GPT Image model
+from this account’s catalog on each new generation or edit. Numeric family
+versions determine order; the full model wins over mini in the same family.
+Preview models require an explicit choice. Explicit model names remain pinned.
+Catalog failures stop the request; there is no account or model fallback.
+`describe().model` retains the configured selector, while generation results
+include the actual model used for receipt provenance.
 
 ### Unrecognized config keys
 

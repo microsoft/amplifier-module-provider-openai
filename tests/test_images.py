@@ -8,6 +8,7 @@ from amplifier_module_provider_openai.images import (
     OpenAIImageBackend,
     image_generation_info,
     list_image_models,
+    latest_image_model,
     register_image_backend,
 )
 
@@ -18,6 +19,19 @@ def test_setup_metadata_does_not_claim_account_entitlement():
     assert info["configKey"] == "image_generation"
     assert info["entitlement"] == "unverified"
     assert info["operations"] == ["generate", "edit"]
+    assert info["automaticModel"] == "auto"
+
+
+def test_latest_image_model_is_numeric_stable_and_account_scoped():
+    rows = [{"id": model} for model in [
+        "gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5", "gpt-image-1.10",
+        "gpt-image-2-preview", "gpt-image-2-experimental",
+    ]]
+    assert latest_image_model(rows) == "gpt-image-1.10"
+    assert latest_image_model([{"id": "gpt-image-1-mini"}]) == "gpt-image-1-mini"
+    assert latest_image_model(rows[:2]) == "gpt-image-1"
+    with pytest.raises(ValueError, match="No stable image model"):
+        latest_image_model([{"id": "gpt-image-2-preview"}])
 
 
 @pytest.mark.asyncio
@@ -101,6 +115,27 @@ def fixture(config=None):
         provider,
         client,
     )
+
+
+@pytest.mark.asyncio
+async def test_automatic_image_model_follows_current_catalog_without_retrying_generation():
+    backend, provider, client = fixture({"model": "auto"})
+    client.models = SimpleNamespace(list=AsyncMock(return_value=SimpleNamespace(
+        data=[SimpleNamespace(id="gpt-image-1"), SimpleNamespace(id="gpt-image-1.5")]
+    )))
+    args = {"action": "generate", "prompt": "one", "images": [],
+            "size": "1024x1024", "quality": "low", "background": "opaque"}
+    result = await backend.generate(**args)
+    assert result["model"] == "gpt-image-1.5"
+    assert client.images.generate.call_args.kwargs["model"] == "gpt-image-1.5"
+    assert backend.describe()["model"] == "auto"
+    client.models.list.return_value.data = [SimpleNamespace(id="gpt-image-2")]
+    await backend.generate(**args)
+    assert client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
+    client.models.list.side_effect = PermissionError("no catalog")
+    with pytest.raises(PermissionError, match="no catalog"):
+        await backend.generate(**args)
+    assert client.images.generate.await_count == 2
 
 
 @pytest.mark.asyncio

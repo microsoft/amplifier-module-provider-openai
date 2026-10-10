@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import math
+import re
 
 
 def image_generation_info():
@@ -15,6 +16,7 @@ def image_generation_info():
         "operations": ["generate", "edit"],
         "outputFormats": ["png"],
         "modelDiscovery": True,
+        "automaticModel": "auto",
         "entitlement": "unverified",
     }
 
@@ -36,6 +38,24 @@ async def list_image_models(provider):
         {"id": model, "display_name": model, "entitlement": "unverified"}
         for model in sorted(ids)
     ]
+
+
+def latest_image_model(rows):
+    """Prefer the latest stable GPT Image family; never opt into previews.
+
+    Version numbers, not lexical ordering, select the family. The full model
+    wins over mini in the same family; an explicitly pinned mini stays pinned.
+    Only models returned by the selected account's catalog are eligible.
+    """
+    candidates = []
+    for row in rows:
+        match = re.fullmatch(r"gpt-image-(\d+(?:\.\d+)*)(-mini)?", row["id"])
+        if match:
+            version = tuple(int(part) for part in match[1].split("."))
+            candidates.append((version, not bool(match[2]), row["id"]))
+    if not candidates:
+        raise ValueError("No stable image model is available through this connection. Choose an image model explicitly.")
+    return max(candidates)[2]
 
 
 class OpenAIImageBackend:
@@ -66,6 +86,7 @@ class OpenAIImageBackend:
         return {
             "provider": "openai",
             "model": self.model if configured else None,
+            "modelSelection": "automatic" if self.model == "auto" else "explicit",
             "configured": configured,
             "missing": [] if configured else ["image_model"],
             "operations": ["generate", "edit"],
@@ -81,9 +102,12 @@ class OpenAIImageBackend:
             raise ValueError(
                 "Generation takes no image inputs; edit needs image inputs."
             )
+        model = self.model
+        if model == "auto":
+            model = latest_image_model(await list_image_models(self.provider))
         client = self.provider.client.with_options(timeout=self.timeout, max_retries=0)
         params = {
-            "model": self.model,
+            "model": model,
             "prompt": prompt,
             "n": 1,
             "size": size,
@@ -108,6 +132,7 @@ class OpenAIImageBackend:
             raise ValueError("Images API output exceeds the bounded artifact limit.")
         return {
             "data": base64.b64decode(result.data[0].b64_json, validate=True),
+            "model": model,
             "request_id": getattr(result, "_request_id", None),
             "usage": result.usage.model_dump() if result.usage is not None else None,
         }
