@@ -6,8 +6,81 @@ import pytest
 
 from amplifier_module_provider_openai.images import (
     OpenAIImageBackend,
+    image_generation_info,
+    list_image_models,
     register_image_backend,
 )
+
+
+def test_setup_metadata_does_not_claim_account_entitlement():
+    info = image_generation_info()
+    assert info["schemaVersion"] == 1
+    assert info["configKey"] == "image_generation"
+    assert info["entitlement"] == "unverified"
+    assert info["operations"] == ["generate", "edit"]
+
+
+@pytest.mark.asyncio
+async def test_image_discovery_uses_account_catalog_without_generating_or_mutating():
+    client = SimpleNamespace(
+        models=SimpleNamespace(list=AsyncMock(return_value=SimpleNamespace(data=[
+            SimpleNamespace(id=value) for value in [
+                "gpt-image-fixture", "gpt-chat-fixture", "dall-e-fixture",
+                "gpt-image-other", "gpt-image-fixture",
+            ]
+        ]))),
+        images=SimpleNamespace(generate=AsyncMock(), edit=AsyncMock()),
+    )
+    provider = SimpleNamespace(client=Mock())
+    provider.client.with_options.return_value = client
+    rows = await list_image_models(provider)
+    assert [row["id"] for row in rows] == ["gpt-image-fixture", "gpt-image-other"]
+    assert all(row["entitlement"] == "unverified" for row in rows)
+    provider.client.with_options.assert_called_once_with(timeout=30, max_retries=0)
+    client.models.list.assert_awaited_once_with()
+    client.images.generate.assert_not_called()
+    client.images.edit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_image_discovery_preserves_empty_catalog_and_provider_errors():
+    client = SimpleNamespace(models=SimpleNamespace(list=AsyncMock(
+        return_value=SimpleNamespace(data=[]))))
+    provider = SimpleNamespace(client=Mock())
+    provider.client.with_options.return_value = client
+    assert await list_image_models(provider) == []
+    client.models.list.side_effect = PermissionError("catalog unavailable")
+    with pytest.raises(PermissionError, match="catalog unavailable"):
+        await list_image_models(provider)
+
+
+@pytest.mark.asyncio
+async def test_public_image_discovery_uses_saved_endpoint_and_account():
+    import httpx
+    from openai import AsyncOpenAI
+
+    from amplifier_module_provider_openai import OpenAIProvider
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        assert request.method == "GET"
+        assert str(request.url) == "https://images.example.invalid/v1/models"
+        assert request.headers["authorization"] == "Bearer fixture-image-account"
+        return httpx.Response(200, json={"object": "list", "data": [
+            {"id": "gpt-image-fixture", "object": "model", "created": 0, "owned_by": "fixture"},
+        ]})
+
+    async with AsyncOpenAI(
+        api_key="fixture-image-account", base_url="https://images.example.invalid/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    ) as client:
+        provider = OpenAIProvider(api_key="fixture-image-account", client=client)
+        assert provider.get_image_generation_info()["modelDiscovery"] is True
+        assert requests == []
+        assert [row["id"] for row in await provider.list_image_models()] == ["gpt-image-fixture"]
+        assert len(requests) == 1
 
 
 def fixture(config=None):

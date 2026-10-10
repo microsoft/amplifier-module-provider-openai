@@ -2596,6 +2596,18 @@ class OpenAIProvider:
             ],
         )
 
+    def get_image_generation_info(self) -> dict:
+        """Describe optional image setup without mounting or contacting the API."""
+        from .images import image_generation_info
+
+        return image_generation_info()
+
+    async def list_image_models(self) -> list[dict]:
+        """Discover compatible image models without generating an image."""
+        from .images import list_image_models
+
+        return await list_image_models(self)
+
     async def list_models(self) -> list[ModelInfo]:
         """
         List available OpenAI models.
