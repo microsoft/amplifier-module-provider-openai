@@ -117,6 +117,16 @@ bounded. An explicit request `timeout` (including `None`) takes precedence over
 HTTP transports also accept an SDK `Timeout` object for individual phase limits;
 the optional WebSocket transport accepts scalar deadlines or `None`.
 
+Provider-owned HTTP clients enable TCP keepalive, including proxy connections.
+Where supported by the OS, probes start after 30 seconds of TCP inactivity,
+repeat every 10 seconds, and fail after three unanswered probes. A quiet model
+whose peer still acknowledges TCP remains connected; this is not a reasoning
+or read deadline. Transport errors enter the existing retry policy, while
+background retrieval never starts a replacement generation. Injected clients
+keep their own transport policy. Physical network switching on macOS/Windows
+still requires platform acceptance; a responsive proxy cannot prove that its
+upstream model is healthy.
+
 **Deprecated aliases** (still work, warn once, will be removed):
 
 | Old key | Use instead |
