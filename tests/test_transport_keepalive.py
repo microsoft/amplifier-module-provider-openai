@@ -1,6 +1,7 @@
 """Exercise provider-owned HTTP sockets, not only mocked SDK calls."""
 import asyncio
 import json
+import socket
 
 import pytest
 
@@ -51,7 +52,16 @@ async def test_owned_sdk_connection_enables_keepalive_and_allows_quiet_response(
         async with server:
             result = await provider.client.models.list(timeout=None)
         assert result.data == []
-        assert inspected == [[value for _, _, value in _transport.keepalive_options()]]
+        assert len(inspected) == 1
+        for actual, (level, option, expected) in zip(
+            inspected[0], _transport.keepalive_options(), strict=True
+        ):
+            # Boolean socket options can return a nonzero flag (8 on Darwin),
+            # rather than the literal 1 supplied to setsockopt.
+            if (level, option) == (socket.SOL_SOCKET, socket.SO_KEEPALIVE):
+                assert actual != 0
+            else:
+                assert actual == expected
     finally:
         await provider.close()
         server.close()
