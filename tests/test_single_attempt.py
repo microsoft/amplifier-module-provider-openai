@@ -122,6 +122,9 @@ def wire(monkeypatch):
 
     value = Wire()
     monkeypatch.setattr(module, "AsyncOpenAI", value.factory)
+    # Normal generation now supplies a provider-owned keepalive client. Keep
+    # every HTTP path in this wire fixture offline, including that client.
+    monkeypatch.setattr("openai.DefaultAsyncHttpxClient", lambda **kwargs: value.http_client(45))
     monkeypatch.setattr(bounded, "_http_client", value.http_client)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     return value

@@ -2443,8 +2443,14 @@ class OpenAIProvider:
         if self._client is None:
             if self._api_key is None:
                 raise ValueError("api_key or client must be provided for API calls")
+            from openai import DefaultAsyncHttpxClient
+            from ._transport import configure_request
+
             self._client = AsyncOpenAI(
-                api_key=self._api_key, base_url=self.base_url, max_retries=0
+                api_key=self._api_key, base_url=self.base_url, max_retries=0,
+                http_client=DefaultAsyncHttpxClient(
+                    event_hooks={"request": [configure_request]},
+                ),
             )
         return self._client
 
