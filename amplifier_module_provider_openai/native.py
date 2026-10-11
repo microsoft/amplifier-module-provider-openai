@@ -10,6 +10,7 @@ import contextvars
 import copy
 import inspect
 import json
+import os
 import time
 import uuid
 from collections import Counter
@@ -91,10 +92,12 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         if self.owner is not None:
             await self.owner.runtime.emit(kind, **data)
 
-    def _prepare_native_messages(self, messages):
+    def _prepare_native_messages(self, messages, *, ordinary_names=frozenset()):
         from .computer_history import project_failed_computer_history
 
-        return project_failed_computer_history(messages, self._native_call_types)
+        return project_failed_computer_history(
+            messages, self._native_call_types, ordinary_names=ordinary_names
+        )
 
     def _validate_native_items(self, items):
         return items
@@ -181,6 +184,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         super()._commit_initial_assembly_state(state)
         if NATIVE_REQUEST.get() is self:
             self._native_full_params = state.get("native_full_params")
+            self._native_computer_context = state["neutral_computer_context"]
 
     async def complete(self, request, **kwargs):
         kwargs = self._merge_request_options(
@@ -243,6 +247,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             NATIVE_REQUEST.reset(token)
             self.owner = None
             self.response_id = None
+            self._native_computer_context = {}
             self.full_messages = []
 
     def _find_missing_tool_results(self, messages):
@@ -260,7 +265,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         return missing
 
     def _convert_messages(self, messages, **kwargs):
-        messages = self._prepare_native_messages(messages)
+        messages = self._prepare_native_messages(
+            messages, ordinary_names=kwargs.get("ordinary_computer_names", frozenset())
+        )
         if NATIVE_REQUEST.get() is not self:
             return self._validate_native_items(
                 super()._convert_messages(messages, **kwargs)
@@ -500,13 +507,22 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             full_params = copy.deepcopy(
                 getattr(self, "_native_full_params", None) or params
             )
+            context = getattr(self, "_native_computer_context", {})
+            ordinary_names = frozenset(
+                name for name in context.get("ordinary_names", []) if name == "computer"
+            )
             ordinary = super()._convert_messages(
-                self._prepare_native_messages(self._request_messages)
+                self._prepare_native_messages(
+                    self._request_messages, ordinary_names=ordinary_names
+                ),
+                ordinary_computer_names=ordinary_names,
             )
             from .computer_images import prepare_computer_images
 
+            alias = next(iter(context.get("declarations", {})), "computer")
+            ordinary = self._compile_neutral_input(full_params, ordinary)
             function_computer = any(
-                tool.get("type") == "function" and tool.get("name") == "computer"
+                tool.get("type") == "function" and tool.get("name") == alias
                 for tool in full_params.get("tools", [])
             ) and not any(
                 tool.get("type") == "computer" for tool in full_params.get("tools", [])
@@ -538,7 +554,14 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 self.previous_response_id = None
                 self.seen.clear()
                 self.epoch = str(uuid.uuid4())
-            params = {**params, "input": self._convert_messages(self._request_messages)}
+            params = {
+                **params, "input": self._convert_messages(
+                    self._request_messages, ordinary_computer_names=ordinary_names
+                )
+            }
+            params = {
+                **params, "input": self._compile_neutral_input(full_params, params["input"])
+            }
             params = self._apply_checkpoint(params, full_params)
             params = prepare_computer_images(
                 params,
@@ -548,7 +571,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     item["call_id"]
                     for item in ordinary
                     if item.get("type") == "function_call"
-                    and item.get("name") == "computer"
+                    and item.get("name") == alias
                     and self.previous_response_id
                     and self._computer_function_lineage
                 ),
@@ -579,6 +602,37 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 provider=self.name,
                 retryable=False,
             ) from exc
+
+    def _compile_neutral_input(self, full_params, items):
+        """Compile full and delta request views with the same explicit binding."""
+        context = getattr(self, "_native_computer_context", {})
+        if not context.get("neutral"):
+            return items
+        from .neutral_computer import compile_request, replay_calls
+
+        binding = context.get("binding")
+        tools = [
+            copy.deepcopy(binding["function"])
+            if binding and tool.get("type") == "computer" else copy.deepcopy(tool)
+            for tool in full_params.get("tools", [])
+        ]
+        endpoint = (
+            getattr(self._client, "base_url", "unknown") if self._client is not None
+            else self.base_url or os.environ.get("OPENAI_BASE_URL")
+        )
+        params, _ = compile_request(
+            {**full_params, "tools": tools, "input": items},
+            [
+                {**declaration["function"], "computer_use": {
+                    "version": 1, "operations": declaration["operations"],
+                    "image_space": declaration["image_space"],
+                }}
+                for declaration in context["declarations"].values()
+            ],
+            endpoint,
+            replay_calls(self._request_messages),
+        )
+        return params["input"]
 
     async def _native_response(self, params, *, timeout=NOT_GIVEN):
         if isinstance(timeout, Timeout):
@@ -625,6 +679,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                         "Pending native steering continuation is missing a required input"
                     )
         async_names = set()
+        neutral_aliases = set(
+            getattr(self, "_native_computer_context", {}).get("declarations", {})
+        )
 
         def mark(tools):
             for tool in tools:
@@ -634,6 +691,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     self.owner.config.get("background_delegate")
                     and tool.get("type") == "function"
                     and tool.get("name") == "delegate"
+                    and tool.get("name") not in neutral_aliases
                 ):
                     tool["async"] = True
                     async_names.add("delegate")
@@ -688,6 +746,13 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 elif kind == "response.output_item.done":
                     item = event["item"]
                     if item.get("type") == "function_call" and item.get("async"):
+                        if item.get("name") in neutral_aliases:
+                            from .neutral_computer import refuse
+
+                            refuse(
+                                "neutral computer calls cannot enter asynchronous delegation",
+                                "computer_use_response_invalid",
+                            )
                         if item.get("name") not in async_names:
                             raise RuntimeError("Unexpected native async tool")
                         call_id = item["call_id"]

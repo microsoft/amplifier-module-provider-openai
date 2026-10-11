@@ -40,19 +40,26 @@ def _native(call):
     )
 
 
-def project_failed_computer_history(messages, native_call_types=None):
+def project_failed_computer_history(
+    messages, native_call_types=None, *, ordinary_names=frozenset()
+):
     """Return the original list or a deep-copied safe request view, never replay."""
     native = {
         identity
         for identity, kind in (native_call_types or {}).items()
         if kind == "computer"
     }
+    from amplifier_core.llm_errors import InvalidRequestError
+
+    from .neutral_computer import neutral_screenshot, replay_calls
+    neutral = replay_calls(messages)
+    native.update(neutral)
     for message in messages:
         if message.get("role") == "assistant":
             native.update(
                 call.get("id") or call.get("tool_call_id")
                 for call in _calls(message)
-                if _native(call)
+                if _native(call) and (call.get("name") or call.get("tool")) not in ordinary_names
             )
     last_user = max(
         (
@@ -71,8 +78,14 @@ def project_failed_computer_history(messages, native_call_types=None):
         if message.get("role") != "tool" or identity not in native or i >= last_user:
             continue
         try:
-            screenshot_data_url(message.get("content"))
-        except ValueError:
+            if identity in neutral:
+                neutral_screenshot(
+                    message.get("content"),
+                    image_space=neutral[identity]["binding"]["image_space"],
+                )
+            else:
+                screenshot_data_url(message.get("content"))
+        except (ValueError, InvalidRequestError):
             failures[identity] = message.get("content")
     if not failures:
         return messages
