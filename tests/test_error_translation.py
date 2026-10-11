@@ -60,7 +60,7 @@ def test_rate_limit_error_translated():
     native = openai.RateLimitError(
         "Rate limit exceeded",
         response=_mock_httpx_response(429),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
@@ -80,7 +80,7 @@ def test_rate_limit_error_parses_retry_after_header():
     native = openai.RateLimitError(
         "Rate limit exceeded",
         response=_mock_httpx_response(429, headers={"retry-after": "30"}),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
@@ -165,7 +165,7 @@ def test_bad_request_invalid_request():
 
 
 def test_api_status_error_5xx_translated():
-    """openai.APIStatusError with status >= 500 -> kernel ProviderUnavailableError."""
+    """Bare 5xx has unknown outcome, not permission to replay."""
     provider = _make_provider()
     native = openai.APIStatusError(
         "Internal server error",
@@ -174,18 +174,19 @@ def test_api_status_error_5xx_translated():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+    with pytest.raises(kernel_errors.LLMError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
 
     err = exc_info.value
     assert err.provider == "openai"
     assert err.status_code == 500
-    assert err.retryable is True
+    assert err.retryable is False
+    assert err.request_outcome == "unknown"
     assert err.__cause__ is native
 
 
 def test_timeout_error_translated():
-    """asyncio.TimeoutError -> kernel LLMTimeoutError (retryable=True)."""
+    """asyncio.TimeoutError -> nonretryable kernel timeout with uncertainty."""
     provider = _make_provider()
     native = asyncio.TimeoutError()
     provider.client.responses.create = AsyncMock(side_effect=native)
@@ -195,12 +196,12 @@ def test_timeout_error_translated():
 
     err = exc_info.value
     assert err.provider == "openai"
-    assert err.retryable is True
+    assert err.retryable is False
     assert err.__cause__ is native
 
 
 def test_generic_exception_translated():
-    """Unknown Exception -> kernel LLMError (retryable=True, unknown defaults to retryable)."""
+    """Unknown dispatch exceptions never authorize automatic replay."""
     provider = _make_provider()
     native = RuntimeError("Something unexpected")
     provider.client.responses.create = AsyncMock(side_effect=native)
@@ -210,9 +211,10 @@ def test_generic_exception_translated():
 
     err = exc_info.value
     assert err.provider == "openai"
-    assert err.retryable is True
+    assert err.retryable is False
     assert err.__cause__ is native
-    assert "Something unexpected" in str(err)
+    assert "Something unexpected" not in str(err)
+    assert err.request_outcome == "unknown"
 
 
 def test_llm_response_error_event_emitted_on_kernel_error():
@@ -259,7 +261,7 @@ def test_azure_retry_after_ms_header_parsed():
     native = openai.RateLimitError(
         "Rate limit exceeded",
         response=_mock_httpx_response(429, headers={"x-ms-retry-after-ms": "3000"}),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
@@ -281,7 +283,7 @@ def test_standard_retry_after_takes_precedence_over_azure_ms_header():
                 "x-ms-retry-after-ms": "3000",
             },
         ),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
@@ -300,7 +302,7 @@ def test_azure_retry_after_ms_invalid_value_ignored():
         response=_mock_httpx_response(
             429, headers={"x-ms-retry-after-ms": "not-a-number"}
         ),
-        body=None,
+        body={"code": "rate_limit_exceeded"},
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
@@ -310,8 +312,8 @@ def test_azure_retry_after_ms_invalid_value_ignored():
     assert exc_info.value.retry_after is None
 
 
-def test_cloudflare_403_raises_provider_unavailable():
-    """403 with body=None + text/html (Cloudflare challenge) -> ProviderUnavailableError (retryable)."""
+def test_cloudflare_403_has_unknown_outcome():
+    """Challenge-page heuristics do not prove safe generation replay."""
     provider = _make_provider()
     native = openai.APIStatusError(
         "Forbidden",
@@ -320,18 +322,19 @@ def test_cloudflare_403_raises_provider_unavailable():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+    with pytest.raises(kernel_errors.LLMError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
 
     err = exc_info.value
     assert err.provider == "openai"
     assert err.status_code == 403
-    assert err.retryable is True
+    assert err.retryable is False
+    assert err.request_outcome == "unknown"
     assert err.__cause__ is native
 
 
-def test_cloudflare_403_text_fallback_raises_provider_unavailable():
-    """403 with body=None + Cloudflare markers in text (no text/html header) -> ProviderUnavailableError.
+def test_cloudflare_403_text_fallback_has_unknown_outcome():
+    """Cloudflare marker text is not proof of nonacceptance.
 
     Exercises the marker-scanning fallback path when content-type is not text/html.
     Uses mixed-case 'Cloudflare' to verify case-insensitive matching.
@@ -348,13 +351,14 @@ def test_cloudflare_403_text_fallback_raises_provider_unavailable():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+    with pytest.raises(kernel_errors.LLMError) as exc_info:
         asyncio.run(provider.complete(_simple_request()))
 
     err = exc_info.value
     assert err.provider == "openai"
     assert err.status_code == 403
-    assert err.retryable is True
+    assert err.retryable is False
+    assert err.request_outcome == "unknown"
     assert err.__cause__ is native
 
 

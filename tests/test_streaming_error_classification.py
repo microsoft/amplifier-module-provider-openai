@@ -149,11 +149,8 @@ def test_bare_api_error_invalid_value_raises_invalid_request_error():
 # ---------------------------------------------------------------------------
 
 
-def test_api_connection_error_still_retryable():
-    """openai.APIConnectionError is a subclass of openai.APIError but must
-    remain retryable -- transport-level failures are genuinely transient.
-    Regression guard for the blast-radius constraint: the new APIError
-    branch must not swallow this into a non-retryable classification."""
+def test_generic_api_connection_error_not_retryable():
+    """A generic SDK connection wrapper proves no safe dispatch stage."""
     provider = _make_provider()
     native = openai.APIConnectionError(
         message="Connection failed", request=_mock_httpx_request()
@@ -165,7 +162,7 @@ def test_api_connection_error_still_retryable():
 
     err = exc_info.value
     assert err.provider == "openai"
-    assert err.retryable is True
+    assert err.retryable is False
     assert err.__cause__ is native
 
 
@@ -174,9 +171,9 @@ def test_api_connection_error_still_retryable():
 # ---------------------------------------------------------------------------
 
 
-def test_bare_api_error_unclassifiable_preserves_prior_default():
+def test_bare_api_error_unclassifiable_is_unknown():
     """bare openai.APIError with body=None and no classifiable signal must
-    preserve the pre-fix conservative default: LLMError, retryable=True."""
+    use conservative outcome unknown, without replacement generation."""
     provider = _make_provider()
     native = _make_bare_api_error("Something went wrong mid-stream", body=None)
     provider.client.responses.create = AsyncMock(side_effect=native)
@@ -188,7 +185,7 @@ def test_bare_api_error_unclassifiable_preserves_prior_default():
     assert not isinstance(err, kernel_errors.ContextLengthError)
     assert not isinstance(err, kernel_errors.InvalidRequestError)
     assert err.provider == "openai"
-    assert err.retryable is True
+    assert err.retryable is False
     assert err.__cause__ is native
 
 
@@ -384,14 +381,8 @@ def test_streaming_path_sse_error_during_event_iteration_is_classified():
     assert stream_mock.call_count == 1
 
 
-def test_streaming_path_transient_sse_error_stays_retryable():
-    """A mid-stream server error must remain retryable.
-
-    Guards the classification boundary from the opposite side: the fix must not
-    make transient streaming failures permanent. server_error and
-    rate_limit_exceeded are the first two codes documented for this API in
-    openai.types.responses.ResponseError.
-    """
+def test_streaming_path_server_error_is_unknown():
+    """A server error after SSE admission is not proof of nonacceptance."""
     provider = OpenAIProvider(
         api_key="test-key",
         config={"use_streaming": True, "max_retries": 2},
@@ -410,8 +401,6 @@ def test_streaming_path_transient_sse_error_stays_retryable():
             asyncio.run(provider.complete(_simple_request()))
 
     assert not isinstance(exc_info.value, kernel_errors.InvalidRequestError)
-    assert exc_info.value.retryable is True
-    assert stream_mock.call_count == 3, (
-        f"transient streaming error should exhaust retries (3 attempts), "
-        f"got {stream_mock.call_count}"
-    )
+    assert exc_info.value.retryable is False
+    assert exc_info.value.request_outcome == "unknown"
+    assert stream_mock.call_count == 1

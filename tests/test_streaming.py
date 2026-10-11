@@ -15,6 +15,10 @@ from amplifier_core import ModuleCoordinator, llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
+from amplifier_module_provider_openai._generation_errors import (
+    OUTCOME_UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +641,7 @@ def test_stream_aborted_after_partial_emit():
     """After a delta is emitted, a mid-stream error triggers llm:stream_aborted."""
     provider = OpenAIProvider(
         api_key="test-key",
-        config={"use_streaming": True, "max_retries": 0},
+        config={"use_streaming": True, "max_retries": 1},
     )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -655,11 +659,16 @@ def test_stream_aborted_after_partial_emit():
             delta="partial text",
         ),
     ]
-    stream = ErrorMidStream(events_before_error)
+    stream = ErrorMidStream(events_before_error, error=RuntimeError("private-exception-sentinel"))
     provider.client.responses.stream = MagicMock(return_value=MockStreamContext(stream))
 
-    with pytest.raises(kernel_errors.LLMError):
+    with pytest.raises(RequestOutcomeUnknownError) as caught:
         asyncio.run(provider.complete(_simple_request()))
+    assert str(caught.value) == OUTCOME_UNKNOWN_MESSAGE
+    assert caught.value.retryable is False
+    assert caught.value.effects == "may_have_occurred"
+    assert caught.value.usage["input_tokens"] is None
+    assert provider.client.responses.stream.call_count == 1
 
     aborted = [
         payload
@@ -668,8 +677,20 @@ def test_stream_aborted_after_partial_emit():
     ]
     assert len(aborted) == 1, f"Expected 1 stream_aborted, got {len(aborted)}"
     assert "request_id" in aborted[0]
-    assert aborted[0]["error"]["type"] == "RuntimeError"
-    assert aborted[0]["error"]["msg"] == "mid-stream error"
+    assert aborted[0]["error"]["type"] == "RequestOutcomeUnknown"
+    assert aborted[0]["error"]["msg"] == OUTCOME_UNKNOWN_MESSAGE
+    stream_events = [(name, payload) for name, payload in fake_coordinator.hooks.events
+                     if name.startswith("llm:stream_")]
+    assert [name for name, _ in stream_events] == [
+        "llm:stream_block_start", "llm:stream_block_delta", "llm:stream_aborted",
+    ]
+    assert len({payload["request_id"] for _, payload in stream_events}) == 1
+    assert stream_events[1][1]["sequence"] == 0
+    responses = [payload for name, payload in fake_coordinator.hooks.events if name == "llm:response"]
+    assert len(responses) == 1 and responses[0]["status"] == "error"
+    assert responses[0]["usage"] == caught.value.usage
+    assert "partial text" not in repr(responses)
+    assert "private-exception-sentinel" not in repr(fake_coordinator.hooks.events)
 
 
 # ---------------------------------------------------------------------------

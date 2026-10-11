@@ -482,11 +482,12 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         return True
 
     async def _create_response(
-        self, params, *, native_input_tokens=None, timeout=NOT_GIVEN
+        self, params, *, native_input_tokens=None, timeout=NOT_GIVEN, observer=None
     ):
         if NATIVE_REQUEST.get() is not self:
             return await super()._create_response(
-                params, native_input_tokens=native_input_tokens, timeout=timeout
+                params, native_input_tokens=native_input_tokens, timeout=timeout,
+                observer=observer,
             )
         try:
             if getattr(self, "_native_request_attempted", False):

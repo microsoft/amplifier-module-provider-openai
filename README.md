@@ -117,6 +117,103 @@ bounded. An explicit request `timeout` (including `None`) takes precedence over
 HTTP transports also accept an SDK `Timeout` object for individual phase limits;
 the optional WebSocket transport accepts scalar deadlines or `None`.
 
+Ordinary generation never automatically replays an ambiguous failure: elapsed,
+read/write timeouts, resets, unknown EOF, malformed responses, generic SDK errors,
+and bare 5xx settle locally with a nonretryable outcome-unknown warning. The
+private exception cause is retained, not included in that warning. This
+conservative 5xx policy trades some formerly successful automatic retries for
+explicit failures rather than risking duplicate accepted generation.
+Bounded backoff remains only for an exact SDK/httpx/httpcore connect/pool failure
+chain before send (and before response activity), or an explicit pre-response
+rate-admission refusal (`rate_limit_exceeded`, or typed `slow_down`). An arbitrary
+429, challenge HTML, or missing output is not that proof. Read-only count and
+model-list retries retain their existing policy; SDK retries remain disabled.
+An exact structured HTTP 429 `insufficient_quota` billing refusal, with no
+redirect history or earlier parsed activity, is separately nonretryable:
+`request_outcome: "not_accepted"`, `effects: "none"`, and no unmeasured usage
+attempt. Its public message is fixed, not the vendor body. Unknown/unstructured
+429s and quota errors after stream acceptance remain outcome-unknown.
+For an injected standard `AsyncOpenAI`, the provider uses the SDK's public
+`with_options(max_retries=0)` copy when needed, without changing the original's
+retry setting. The copy retains endpoint, authentication, timeout and HTTP
+transport options. It shares the HTTP client: provider `close()` still closes
+that transport, just as it did for direct injection; embedders must not use it
+after closure. If retry disabling fails, or an injected SDK subclass has nonzero
+retries, ordinary client admission fails locally before any POST. The separate
+bounded single-attempt mode still refuses injection without replacing or closing
+the injected client. Custom clients/test doubles
+are not proof of SDK retry safety and must enforce their own no-replay behavior.
+SDK subclasses, including an injected Azure SDK client, must be configured with
+`max_retries=0` before injection; the provider refuses an unsafe subclass rather
+than assuming its copy preserves subclass-specific authentication.
+The automatic-replacement guarantee concerns provider and SDK retry behavior.
+An injected HTTP transport that follows redirects may forward a POST to another
+hop; this inherited behavior is not qualified as a single-wire-POST guarantee.
+Known local concurrency/admission failures report `not_dispatched`/`none`;
+a received response followed by local processing failure reports
+`received`/`occurred`. Neither case authorizes generation replay.
+Cancellation stops the local wait without replay: provider-side work, billing,
+or other effects are not confirmed rolled back. Unlimited silent waits can still
+remain pending until completion, transport failure, an explicit limit, or Stop;
+this does not establish a repair for OS-specific network-switch stalls.
+
+For ordinary Responses transport with an optional coordinator hook,
+`llm:progress` reports local
+`attempt_started` admission and actual parsed `response_activity`. Its version-1
+payload contains only the physical generation attempt number and effective
+elapsed/connect/pool/read/write limits (seconds or null). A scalar elapsed bound
+is per attempt, not a whole-turn budget; an SDK Timeout object reports phase
+limits instead. Same-ID background retrieval is activity, not a new generation.
+No request/response text, identities, headers, URLs, reasoning, or tool arguments
+are included. Existing call context supplies attribution.
+
+In-wait activity is limited to one publication per second across retries,
+continuations, and truncated-output recovery. One pending actual observation
+is attempted immediately before local settlement, even inside that spacing window.
+There are no observation timers, sleeps, or heartbeats: silent waits produce no
+activity. Missing hooks mean observation unavailable; hook errors do not fail
+generation, and cancellation still propagates. These observations establish
+neither model computation nor transport health.
+The optional native WebSocket adapter does not produce this observation hook.
+
+#### Ordinary terminal settlement contract
+
+Terminal progress, partial-display abort, and error/cancellation notifications
+are best-effort local delivery, not generation work. Each has a 50ms delivery
+allowance (at most three deliveries, 150ms plus cooperative task drain), so a
+blocked optional hook cannot hold Stop merely to publish pending progress.
+Provider-created delivery tasks are cancelled and awaited, never detached; hooks must
+yield to asyncio and honor cancellation. Synchronous blocking or hooks that
+suppress cancellation cannot be forcibly bounded by asyncio.
+This drain covers only tasks created by the provider. A hook dispatcher such as
+Core's native registry owns its separate callback tasks and returns no awaitable
+callback-drain handle to the provider. Dispatcher-owned callback cleanup may
+continue after local provider settlement. This is not an all-callback drain or
+a guarantee of no post-settlement callback work.
+An available responsive consumer receives exactly one sanitized abort with the
+matching display request ID when a partial display is cancelled. Delivery cannot
+be guaranteed to an unresponsive consumer. Hook errors or hook-internal
+cancellation cannot replace a primary provider error or caller cancellation.
+New caller cancellation takes precedence; its count and message are retained.
+This does not confirm remote cancellation or reverse billing.
+
+Cancelled ordinary calls after generation admission retain the same bounded usage-only dictionary on the
+typed `CancelledError` as failed calls, and attempt a `status: "cancelled"`
+`llm:response` event with that receipt. Measured prior attempts remain visible;
+unfinished or absent usage is null, not zero. `cost_known_subtotal_usd` covers
+only priceable reported attempts, not the unmeasured attempt or an account invoice.
+Pricing failures retain tokens with unknown cost. A cost callback is attempted
+at most once per known attempt; if it raises after possibly committing,
+`cost_commit: "unknown"` says the session ledger commit is unverified, not zero.
+Terminal delivery after normal cost commit never adds the cost again.
+
+Assembly and initial count guards fail locally before dispatch with their
+original typed exception; no retry or outcome-unknown claim is added. Dispatched
+failures keep the existing conservative exact-type refusal/connect mapping:
+arbitrary status codes or generic SDK failures are not proof of pre-send refusal.
+No new completion deadline, heartbeat, generation replay, or inherited
+non-streaming failed-status behavior is introduced by terminal settlement.
+
 **Deprecated aliases** (still work, warn once, will be removed):
 
 | Old key | Use instead |

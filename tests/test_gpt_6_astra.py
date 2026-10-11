@@ -16,6 +16,10 @@ from pydantic import ValidationError
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._capabilities import get_capabilities
 from amplifier_module_provider_openai._cost import compute_cost
+from amplifier_module_provider_openai._generation_errors import (
+    OUTCOME_UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
 
 
 def _provider(**config: object) -> OpenAIProvider:
@@ -523,8 +527,34 @@ def test_astra_computer_raw_fallback_emits_raw_response_with_coordinator() -> No
     assert response_events[0]["raw"] == raw_body
 
 
-def test_astra_stream_failed_response_usage_is_billed_once_after_retry() -> None:
-    """A failed SSE terminal is billed once even when the SDK then retries."""
+def _failed_settlement(provider: OpenAIProvider) -> tuple[dict, MagicMock]:
+    coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=AsyncMock()))
+    provider.coordinator = coordinator
+    add_cost = MagicMock()
+    provider._add_cost = add_cost
+    # Accounting must not parse any failed content or executable tool calls.
+    provider._convert_to_chat_response = MagicMock(side_effect=AssertionError("content conversion"))
+    with pytest.raises(RequestOutcomeUnknownError) as caught:
+        asyncio.run(provider.complete(_request()))
+    error = caught.value
+    assert str(error) == OUTCOME_UNKNOWN_MESSAGE
+    assert error.retryable is False
+    assert error.request_outcome == "unknown"
+    assert error.effects == "may_have_occurred"
+    assert provider.client.responses.stream.call_count == 1
+    provider._convert_to_chat_response.assert_not_called()
+    events = [call.args for call in coordinator.hooks.emit.await_args_list]
+    responses = [payload for name, payload in events if name == "llm:response"]
+    assert len(responses) == 1 and responses[0]["status"] == "error"
+    assert responses[0]["usage"] == error.usage
+    assert not any(name == "provider:retry" for name, _ in events)
+    assert "resp_astra" not in repr(responses)
+    assert "Hi" not in repr(responses)
+    return error.usage, add_cost
+
+
+def test_astra_stream_failed_response_usage_is_billed_once_without_replay() -> None:
+    """Retain the measured estimate, never consume the queued flex success."""
     provider = _provider(
         use_streaming=True,
         max_retries=1,
@@ -550,12 +580,16 @@ def test_astra_stream_failed_response_usage_is_billed_once_after_retry() -> None
         ]
     )
 
-    result = asyncio.run(provider.complete(_request()))
-
-    assert provider.client.responses.stream.call_count == 2
-    assert result.usage.input_tokens == 544_001
-    assert result.usage.output_tokens == 2
-    assert result.usage.cost_usd == Decimal("12.240215")
+    usage, add_cost = _failed_settlement(provider)
+    assert usage["input_tokens"] == 272_001
+    assert usage["output_tokens"] == 1
+    assert usage["total_tokens"] == 272_002
+    assert usage["cost_usd"] == "10.880190"
+    assert usage["cost_complete"] is True
+    assert usage["cost_is_estimate"] is True
+    assert len(usage["attempts"]) == 1
+    assert usage["attempts"][0]["service_tier"] == "priority"
+    add_cost.assert_called_once_with(Decimal("10.880190"))
 
 
 def test_astra_stream_failed_response_without_priceable_usage_leaves_cost_unknown() -> None:
@@ -575,9 +609,13 @@ def test_astra_stream_failed_response_without_priceable_usage_leaves_cost_unknow
         ]
     )
 
-    result = asyncio.run(provider.complete(_request()))
-
-    assert result.usage.cost_usd is None
+    usage, add_cost = _failed_settlement(provider)
+    assert usage["input_tokens"] == 100 and usage["output_tokens"] == 10
+    assert usage["cost_usd"] is None
+    assert usage["cost_known_subtotal_usd"] is None
+    assert usage["cost_complete"] is False
+    assert usage["attempts"][0]["service_tier"] is None
+    add_cost.assert_not_called()
 
 
 def test_astra_stream_failed_response_without_usage_leaves_cost_unknown() -> None:
@@ -598,9 +636,13 @@ def test_astra_stream_failed_response_without_usage_leaves_cost_unknown() -> Non
         ]
     )
 
-    result = asyncio.run(provider.complete(_request()))
-
-    assert result.usage.cost_usd is None
+    usage, add_cost = _failed_settlement(provider)
+    assert usage["input_tokens"] is None
+    assert usage["output_tokens"] is None
+    assert usage["total_tokens"] is None
+    assert usage["cost_usd"] is None
+    assert usage["cost_complete"] is False
+    add_cost.assert_not_called()
 
 
 def test_astra_continuation_sums_each_actual_response_tier() -> None:
