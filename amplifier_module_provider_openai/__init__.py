@@ -2003,6 +2003,13 @@ class OpenAIProvider:
                 *(m.model_dump() for m in conversation),
             ]
             model_name = kwargs.get("model") or request.model or self.default_model
+            from .neutral_computer import ordinary_names
+
+            history_tools = self.extra_request_params.get(
+                "tools", [*(request.tools or []), *(kwargs.get("tools") or [])]
+            )
+            if isinstance(self.extra_request_params.get("extra_body"), dict):
+                history_tools = self.extra_request_params["extra_body"].get("tools", history_tools)
             background_mode = kwargs.get("background", False)
             if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
                 ("o3-deep-research", "o4-mini-deep-research")
@@ -2011,7 +2018,12 @@ class OpenAIProvider:
 
             params: dict[str, Any] = {
                 "model": model_name,
-                "input": self._convert_messages(messages, model=model_name),
+                "input": self._convert_messages(
+                    messages, model=model_name,
+                    ordinary_computer_names=frozenset(
+                        name for name in ordinary_names(history_tools) if name == "computer"
+                    ),
+                ),
                 "store": bool(background_mode),
             }
             if instructions:
@@ -2110,6 +2122,12 @@ class OpenAIProvider:
                 if (
                     self.tool_search_mode == TOOL_SEARCH_MODE_NAMESPACED
                     and params["tool_choice"] not in ("auto", "none")
+                    and not any(
+                        isinstance(getattr(tool, "model_extra", None), dict)
+                        and "computer_use" in tool.model_extra
+                        or isinstance(tool, dict) and "computer_use" in tool
+                        for tool in tools
+                    )
                 ):
                     self._assembly_log(
                         "warning",
@@ -2172,9 +2190,12 @@ class OpenAIProvider:
                     or self.config.get("reasoning_effort", "high"),
                     "summary": self.reasoning_summary,
                 }
-            if self._model_may_reason(model_name) and "reasoning" not in params:
-                if get_capabilities(model_name).default_reasoning_effort is not None:
-                    params["reasoning"] = {"summary": "auto"}
+            if (
+                self._model_may_reason(model_name)
+                and "reasoning" not in params
+                and get_capabilities(model_name).default_reasoning_effort is not None
+            ):
+                params["reasoning"] = {"summary": "auto"}
             if context := kwargs.get("reasoning_context", self.reasoning_context):
                 _validate_reasoning_context({"context": context})
                 if isinstance(params.get("reasoning"), dict):
@@ -2193,6 +2214,21 @@ class OpenAIProvider:
             # A request-level cap is an explicit caller safety boundary. Keep
             # it authoritative over provider-wide extra params so a degraded
             # context request cannot silently regain its original reserve.
+            if request.max_output_tokens is not None:
+                params["max_output_tokens"] = request.max_output_tokens
+            from .neutral_computer import compile_request, replay_calls
+            endpoint = (
+                getattr(self._client, "base_url", None)
+                if self._client is not None
+                else self.base_url or os.environ.get("OPENAI_BASE_URL")
+            )
+            # Unknown injected endpoints cannot inherit native vendor support.
+            if self._client is not None and endpoint is None:
+                endpoint = "unknown"
+            params, self._neutral_computer_context = compile_request(
+                params, tools, endpoint, replay_calls(messages)
+            )
+            self._neutral_computer_context["observations"] = self._staged_computer_images
             if request.max_output_tokens is not None:
                 params["max_output_tokens"] = request.max_output_tokens
             params = self._prepare_computer_images(params, request, **kwargs)
@@ -2238,11 +2274,17 @@ class OpenAIProvider:
         planner._astra_legacy_retention_warned = self._astra_legacy_retention_warned
         planner._assembly_log_records: list[tuple[str, str, tuple[Any, ...]]] = []
         planner._deferred_namespace_warnings: list[tuple[str, ...]] = []
+        # Repair receipts deduplicate live events, never the request projection.
+        planner._repaired_tool_ids = set()
+        request, repairs = planner._plan_tool_repairs(request)
 
         params = planner._assemble_initial_responses_params_stateful(
             request, restore_state=False, **kwargs
         )
         state = {
+            "repairs": repairs,
+            "computer_images": planner._staged_computer_images,
+            "neutral_computer_context": planner._neutral_computer_context,
             "pending_additional_tools_item": planner._pending_additional_tools_item,
             "tool_search_roster": planner._tool_search_roster,
             "tool_search_extra": planner._tool_search_extra,
@@ -2265,6 +2307,10 @@ class OpenAIProvider:
         self._native_call_types = state["native_call_types"]
         self._extra_params_warned_keys = state["extra_params_warned_keys"]
         self._astra_legacy_retention_warned = state["astra_legacy_retention_warned"]
+        if state["repairs"]:
+            self._repaired_tool_ids.update(
+                repair["tool_call_id"] for repair in state["repairs"]["repairs"]
+            )
         for unlisted in state["namespace_warnings"]:
             warn_unlisted_tools(unlisted)
 
@@ -2288,7 +2334,8 @@ class OpenAIProvider:
         bounded counting-only retries. No model generation or state mutation occurs.
         """
         if isinstance(context_estimate, bool) or not isinstance(context_estimate, int):
-            raise ValueError("context_estimate must be a nonnegative integer")
+            # Keep the established ValueError contract for every invalid estimate.
+            raise ValueError("context_estimate must be a nonnegative integer")  # noqa: TRY004
         if context_estimate < 0:
             raise ValueError("context_estimate must be a nonnegative integer")
         params = self._budget_params(
@@ -2444,6 +2491,7 @@ class OpenAIProvider:
             if self._api_key is None:
                 raise ValueError("api_key or client must be provided for API calls")
             from openai import DefaultAsyncHttpxClient
+
             from ._transport import configure_request
 
             self._client = AsyncOpenAI(
@@ -3070,11 +3118,21 @@ class OpenAIProvider:
         if type(auto_continue) is not bool:
             raise ValueError("auto_continue must be a boolean")
 
-        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
-        missing = self._find_missing_tool_results(request.messages)
+        return await self._complete_chat_request(request, **kwargs)
 
+    def _plan_tool_repairs(self, request: ChatRequest):
+        """Validate originals first; repair only an isolated request copy."""
+        from .neutral_computer import plan_observations, replay_calls
+
+        original = [m.model_dump() for m in request.messages]
+        replay = replay_calls(original)
+        plan_observations(original, replay)
+        request = request.model_copy(deep=True)
+        missing = self._find_missing_tool_results(request.messages)
+        event_data = None
         if missing:
-            logger.warning(
+            self._assembly_log(
+                "warning",
                 f"[PROVIDER] OpenAI: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
                 f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
@@ -3094,8 +3152,6 @@ class OpenAIProvider:
                 synthetics = []
                 for call_id, tool_name in by_msg_idx[msg_idx]:
                     synthetics.append(self._create_synthetic_result(call_id, tool_name))
-                    # Track this ID so we don't detect it as missing again in future iterations
-                    self._repaired_tool_ids.add(call_id)
 
                 insert_pos = msg_idx + 1
                 for i, synthetic in enumerate(synthetics):
@@ -3133,9 +3189,7 @@ class OpenAIProvider:
                         request.messages.insert(next_pos, synthetic_assistant)
                         synthetic_assistant_count += 1
 
-            # Emit observability event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                event_data: dict[str, Any] = {
+            event_data = {
                     "provider": self.name,
                     "repair_count": len(missing),
                     "repairs": [
@@ -3148,15 +3202,10 @@ class OpenAIProvider:
                     # consumer would have to read its ABSENCE as "the other
                     # site" — an implicit convention nobody declared.
                     "repair_site": "message_level",
-                }
-                if synthetic_assistant_count > 0:
-                    event_data["synthetic_assistant_count"] = synthetic_assistant_count
-                await self.coordinator.hooks.emit(
-                    "provider:tool_sequence_repaired",
-                    event_data,
-                )
-
-        return await self._complete_chat_request(request, **kwargs)
+            }
+            if synthetic_assistant_count > 0:
+                event_data["synthetic_assistant_count"] = synthetic_assistant_count
+        return request, event_data
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """
@@ -3298,8 +3347,19 @@ class OpenAIProvider:
         # `_create_response` repeats this guard for direct continuation and
         # truncation-retry dispatches; stream() bypasses that helper.
         native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
+        repair_event = copy.deepcopy(assembly_state["repairs"])
+        if repair_event:
+            repair_event["repairs"] = [
+                repair for repair in repair_event["repairs"]
+                if repair["tool_call_id"] not in self._repaired_tool_ids
+            ]
+            repair_event["repair_count"] = len(repair_event["repairs"])
         self._commit_initial_assembly_state(assembly_state)
         self._emit_assembly_logs(assembly_logs)
+        if repair_event and repair_event["repair_count"] and self.coordinator and hasattr(self.coordinator, "hooks"):
+            await self.coordinator.hooks.emit(
+                "provider:tool_sequence_repaired", repair_event
+            )
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3711,7 +3771,7 @@ class OpenAIProvider:
                     status_code=status,
                     retryable=False,
                 ) from e
-            except asyncio.TimeoutError as e:
+            except TimeoutError as e:
                 raise kernel_errors.LLMTimeoutError(
                     f"Request timed out after {effective_timeout}s",
                     provider=self.name,
@@ -3950,6 +4010,21 @@ class OpenAIProvider:
             continuation_count = 0
             truncation_retry_done = False
             billed_responses: list[Any] = [*failed_stream_responses, response]
+            if (
+                assembly_state["neutral_computer_context"]["neutral"]
+                and getattr(final_response, "status", None) == "incomplete"
+                and any(
+                    (item.get("type") if isinstance(item, dict) else getattr(item, "type", None))
+                    in {"computer_call", "function_call", "tool_call", "apply_patch_call"}
+                    for item in getattr(final_response, "output", []) or []
+                )
+            ):
+                from .neutral_computer import refuse
+
+                refuse(
+                    "incomplete neutral response cannot authorize continuation or tool replay",
+                    "computer_use_response_invalid",
+                )
 
             while (
                 hasattr(final_response, "status")
@@ -3957,6 +4032,17 @@ class OpenAIProvider:
                 and kwargs.get("auto_continue", self.auto_continue)
                 and continuation_count < MAX_CONTINUATION_ATTEMPTS
             ):
+                if assembly_state["neutral_computer_context"]["neutral"] and any(
+                    (item.get("type") if isinstance(item, dict) else getattr(item, "type", None))
+                    in {"computer_call", "function_call", "tool_call", "apply_patch_call"}
+                    for item in getattr(final_response, "output", []) or []
+                ):
+                    from .neutral_computer import refuse
+
+                    refuse(
+                        "incomplete neutral tool calls cannot be replayed by continuation",
+                        "computer_use_response_invalid",
+                    )
                 # P4: a response that ended INSIDE a function_call cannot be
                 # resumed by continuation — arguments are not resumable, so
                 # each continuation restarts and truncates again (observed
@@ -4088,7 +4174,13 @@ class OpenAIProvider:
                 if "include" in params:
                     continue_params["include"] = params["include"]
                 if "tools" in params:
-                    continue_params["tools"] = params["tools"]
+                    binding = assembly_state["neutral_computer_context"]["binding"]
+                    continue_params["tools"] = [
+                        copy.deepcopy(binding["function"])
+                        if binding and tool.get("type") == "computer"
+                        else copy.deepcopy(tool)
+                        for tool in params["tools"]
+                    ]
                     continue_params["tool_choice"] = params.get("tool_choice", "auto")
                     continue_params["parallel_tool_calls"] = params.get(
                         "parallel_tool_calls", True
@@ -4116,6 +4208,23 @@ class OpenAIProvider:
                 # issues, not just the first. Merged last here too, for the
                 # same reason and with the same owner-beware semantics.
                 self._merge_extra_request_params(continue_params)
+                if assembly_state["neutral_computer_context"]["neutral"]:
+                    from .neutral_computer import compile_request, replay_calls
+
+                    endpoint = (
+                        getattr(self._client, "base_url", "unknown")
+                        if self._client is not None
+                        else self.base_url or os.environ.get("OPENAI_BASE_URL")
+                    )
+                    continue_params, continuation_context = compile_request(
+                        continue_params,
+                        [*(request.tools or []), *(kwargs.get("tools") or [])],
+                        endpoint,
+                        replay_calls([m.model_dump() for m in request.messages]),
+                    )
+                    assembly_state["neutral_computer_context"] = continuation_context
+                    if request.max_output_tokens is not None:
+                        continue_params["max_output_tokens"] = request.max_output_tokens
                 continue_params = self._prepare_computer_images(
                     continue_params, request, **kwargs
                 )
@@ -4165,14 +4274,36 @@ class OpenAIProvider:
 
             # Convert to ChatResponse FIRST (before emitting llm:response)
             # so event usage fields come from the canonical ChatResponse
-            if continuation_count > 0:
+            if continuation_count > 0 and assembly_state["neutral_computer_context"]["neutral"]:
+                view = copy.copy(response)
+                view.output = accumulated_output
+                chat_response = self._convert_to_chat_response(
+                    view, computer_context=assembly_state["neutral_computer_context"]
+                )
+                chat_response.metadata = {
+                    **(chat_response.metadata or {}),
+                    "openai:continuation_count": continuation_count,
+                }
+            elif continuation_count > 0:
                 # Use new helper for accumulated output
                 chat_response = convert_response_with_accumulated_output(
                     response, accumulated_output, continuation_count, OpenAIChatResponse
                 )
             else:
                 # Use existing conversion for normal (non-continued) responses
-                chat_response = self._convert_to_chat_response(response)
+                chat_response = self._convert_to_chat_response(
+                    response, computer_context=assembly_state["neutral_computer_context"]
+                )
+
+            # Publish only after HTTP success and validated response conversion.
+            # Counts never commit these staged, request-local observations.
+            if assembly_state["computer_images"] and getattr(response, "status", None) == "completed":
+                from .neutral_computer import IMAGES
+
+                chat_response.metadata = {
+                    **(chat_response.metadata or {}),
+                    IMAGES: copy.deepcopy(assembly_state["computer_images"]),
+                }
 
             # Every preceding attempt was billed, including incomplete
             # continuations and truncation retries whose output was discarded.
@@ -4351,6 +4482,7 @@ class OpenAIProvider:
         *,
         reasoning_replay_scope: str | None = None,
         model: str | None = None,
+        ordinary_computer_names: frozenset[str] = frozenset(),
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
@@ -4368,9 +4500,53 @@ class OpenAIProvider:
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
         """
-        from .computer_history import project_failed_computer_history
         from .compaction import canonical_window
-        messages = project_failed_computer_history(messages, self._native_call_types)
+        from .computer_history import project_failed_computer_history
+        from .neutral_computer import CALLS, KEY, plan_observations, replay_calls
+
+        original_replay = replay_calls(messages)
+        messages, self._staged_computer_images = plan_observations(messages, original_replay)
+
+        # An explicit ordinary roster wins over legacy name/shape inference,
+        # including tracked IDs retained from a previous request.
+        if ordinary_computer_names:
+            for message in messages:
+                content = message.get("content")
+                calls = [
+                    *(message.get("tool_calls") or []),
+                    *(content if isinstance(content, list) else []),
+                ]
+                for call in calls:
+                    if hasattr(call, "model_dump"):
+                        call = call.model_dump()
+                    if not isinstance(call, dict):
+                        continue
+                    identity = call.get("id") or call.get("tool_call_id")
+                    neutral = (call.get("metadata") or {}).get(KEY) or (
+                        (message.get("metadata") or {}).get(CALLS, {}).get(identity)
+                    )
+                    if call.get("name") in ordinary_computer_names and not neutral:
+                        self._native_call_ids.discard(identity)
+                        self._native_call_types.pop(identity, None)
+        messages = project_failed_computer_history(
+            messages, self._native_call_types,
+            ordinary_names=ordinary_computer_names,
+        )
+        # The failure projector removes call blocks but retains other message
+        # metadata. Originals were validated above; strip only removed call
+        # provenance from this derived failure view before revalidating it.
+        for message in messages:
+            metadata = message.get("metadata") or {}
+            if CALLS in metadata:
+                ids = {
+                    (b.get("id") or b.get("tool_call_id"))
+                    for b in [
+                        *(message.get("tool_calls") or []),
+                        *(message.get("content") if isinstance(message.get("content"), list) else []),
+                    ] if isinstance(b, dict)
+                }
+                metadata[CALLS] = {k: v for k, v in metadata[CALLS].items() if k in ids}
+        replay_calls(messages)
         openai_messages = []
         canonical_item_ids = set()
         i = 0
@@ -4579,8 +4755,26 @@ class OpenAIProvider:
                 tool_calls_field = msg.get("tool_calls", [])
                 for tc in tool_calls_field:
                     tc_id = tc.get("id") or tc.get("tool_call_id", "")
-                    tc_name = tc.get("name", "")
+                    tc_name = tc.get("name", tc.get("tool", ""))
                     tc_args = tc.get("arguments") or tc.get("input", {})
+                    def equivalent_block(block, identity=tc_id, name=tc_name, arguments=tc_args):
+                        if not isinstance(block, dict) or block.get("type") != "tool_call":
+                            return False
+                        if block.get("id") != identity or block.get("name") != name:
+                            return False
+                        try:
+                            left = json.loads(arguments) if isinstance(arguments, str) else arguments
+                            right = block.get("input")
+                            right = json.loads(right) if isinstance(right, str) else right
+                        except ValueError:
+                            return False
+                        return left == right
+                    if isinstance(content, list) and any(
+                        equivalent_block(block) for block in content
+                    ):
+                        # Core permits both equivalent storage representations.
+                        # They are one neutral call, not two wire executions.
+                        continue
                     if isinstance(tc_args, str):
                         tc_args_str = tc_args
                     else:
@@ -4656,7 +4850,7 @@ class OpenAIProvider:
                                                 "status": "completed",
                                             }
                                         )
-                                    elif tc_name == "computer" and isinstance(
+                                    elif tc_name == "computer" and tc_name not in ordinary_computer_names and not tc_input.get("version") and isinstance(
                                         tc_input.get("actions"), list
                                     ):
                                         # Detect historical native computer_call by input
@@ -4747,7 +4941,7 @@ class OpenAIProvider:
                                         "delete_file",
                                         "rename_file",
                                     }
-                                    if tc_name == "computer" and isinstance(
+                                    if tc_name == "computer" and tc_name not in ordinary_computer_names and not tc_input.get("version") and isinstance(
                                         tc_input.get("actions"), list
                                     ):
                                         # Detect historical native computer_call by input
@@ -4896,8 +5090,7 @@ class OpenAIProvider:
                         i > _reasoning_cutoff,
                     )
                 if i > _reasoning_cutoff:
-                    for reasoning_item in reasoning_items_to_add:
-                        openai_messages.append(reasoning_item)
+                    openai_messages.extend(reasoning_items_to_add)
 
                 # BREAK 3, second half -- hosted tool-search items replayed
                 # VERBATIM and in wire order (reasoning -> tool_search_call ->
@@ -5109,6 +5302,13 @@ class OpenAIProvider:
                 self._apply_patch_native = True
 
         for tool in tools:
+            from .neutral_computer import has_intent, ordinary, validate_intent
+            if has_intent(tool):
+                validate_intent(tool)
+                # Keep a clean function declaration until final overrides and
+                # endpoint/model selection have been resolved by the compiler.
+                openai_tools.append(ordinary(tool))
+                continue
             # Check if this is a native OpenAI tool (dict with recognized type)
             if isinstance(tool, dict):
                 tool_type = tool.get("type", "")
@@ -5295,7 +5495,9 @@ class OpenAIProvider:
             service_tier=getattr(response, "service_tier", None),
         )
 
-    def _convert_to_chat_response(self, response: Any) -> ChatResponse:
+    def _convert_to_chat_response(
+        self, response: Any, *, computer_context: dict[str, Any] | None = None
+    ) -> ChatResponse:
         """Convert OpenAI response to ChatResponse format.
 
         Args:
@@ -5310,6 +5512,18 @@ class OpenAIProvider:
             ToolCall,
             ToolCallBlock,
             Usage,
+        )
+
+        from .neutral_computer import CALLS, KEY, response_calls
+
+        # Validate the entire native batch before returning any executable call.
+        # A safety requirement is not an acknowledgement or a tool argument.
+        neutral_calls = (
+            response_calls(
+                response.output, computer_context,
+                getattr(response, "model", None), getattr(response, "status", None),
+            )
+            if computer_context is not None else {}
         )
 
         content_blocks = []
@@ -5449,17 +5663,20 @@ class OpenAIProvider:
 
                 elif block_type == "computer_call":
                     call_id = getattr(block, "call_id", "")
-                    args = {"actions": _extract_computer_actions(block)}
+                    record = neutral_calls.get(call_id)
+                    args = record["canonical"] if record else {"actions": _extract_computer_actions(block)}
+                    alias = record["alias"] if record else "computer"
                     content_blocks.append(
-                        ToolCallBlock(id=call_id, name="computer", input=args)
+                        ToolCallBlock(id=call_id, name=alias, input=args, **({"metadata": {KEY: record}} if record else {}))
                     )
                     tool_calls.append(
-                        ToolCall(id=call_id, name="computer", arguments=args)
+                        ToolCall(id=call_id, name=alias, arguments=args, **({"metadata": {KEY: record}} if record else {}))
                     )
                     # Track for round-trip output format (computer_call_output,
                     # not apply_patch_call_output -- see _native_call_types).
-                    self._native_call_ids.add(call_id)
-                    self._native_call_types[call_id] = "computer"
+                    if record is None:
+                        self._native_call_ids.add(call_id)
+                        self._native_call_types[call_id] = "computer"
 
             else:
                 # Dictionary format
@@ -5585,15 +5802,18 @@ class OpenAIProvider:
 
                 elif block_type == "computer_call":
                     call_id = block.get("call_id", "")
-                    args = {"actions": _extract_computer_actions(block)}
+                    record = neutral_calls.get(call_id)
+                    args = record["canonical"] if record else {"actions": _extract_computer_actions(block)}
+                    alias = record["alias"] if record else "computer"
                     content_blocks.append(
-                        ToolCallBlock(id=call_id, name="computer", input=args)
+                        ToolCallBlock(id=call_id, name=alias, input=args, **({"metadata": {KEY: record}} if record else {}))
                     )
                     tool_calls.append(
-                        ToolCall(id=call_id, name="computer", arguments=args)
+                        ToolCall(id=call_id, name=alias, arguments=args, **({"metadata": {KEY: record}} if record else {}))
                     )
-                    self._native_call_ids.add(call_id)
-                    self._native_call_types[call_id] = "computer"
+                    if record is None:
+                        self._native_call_ids.add(call_id)
+                        self._native_call_types[call_id] = "computer"
 
         # Extract usage counts.
         #
@@ -5678,6 +5898,8 @@ class OpenAIProvider:
 
         # Build metadata with provider-specific state
         metadata = {}
+        if neutral_calls:
+            metadata[CALLS] = copy.deepcopy(neutral_calls)
 
         # Response ID -- captured for correlating a stored transcript turn to
         # an OpenAI response (support/debug). Never read back into a later
@@ -5743,6 +5965,17 @@ class OpenAIProvider:
             metadata=metadata if metadata else None,
         )
 
+        # Shared conversion also serves the unchanged optional native adapter.
+        # Request-local observations are returned only after response validation,
+        # never committed to the mounted provider or emitted by a count.
+        if (computer_context and computer_context.get("observations")
+                and getattr(response, "status", None) == "completed"):
+            from .neutral_computer import IMAGES
+
+            chat_response.metadata = {
+                **(chat_response.metadata or {}),
+                IMAGES: copy.deepcopy(computer_context["observations"]),
+            }
         return chat_response
 
     async def close(self) -> None:

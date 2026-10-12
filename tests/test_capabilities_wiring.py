@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, patch
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._capabilities import get_capabilities
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

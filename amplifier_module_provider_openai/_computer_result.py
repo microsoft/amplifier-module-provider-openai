@@ -21,7 +21,7 @@ def _dimensions(width: int, height: int) -> None:
         raise ValueError("Screenshot dimensions are missing or exceed the pixel limit.")
 
 
-def _png(data: bytes) -> None:
+def _png(data: bytes) -> tuple[int, int]:
     offset, found_header, found_data = 8, False, False
     compressed = bytearray()
     while offset + 12 <= len(data):
@@ -79,23 +79,41 @@ def _png(data: bytes) -> None:
                 or decoder.unused_data
             ):
                 raise ValueError("Invalid or oversized PNG pixel stream.")
-            return
+            channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
+            passes = [(0, 0, 1, 1)] if not interlace else [
+                (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8),
+                (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2),
+            ]
+            cursor = 0
+            for start_x, start_y, stride_x, stride_y in passes:
+                columns = max(0, (width - start_x + stride_x - 1) // stride_x)
+                rows = max(0, (height - start_y + stride_y - 1) // stride_y)
+                if not columns or not rows:
+                    continue
+                row_size = (columns * channels * depth + 7) // 8 + 1
+                for _ in range(rows):
+                    if cursor + row_size > len(decoded) or decoded[cursor] > 4:
+                        raise ValueError("PNG screenshot has invalid or missing pixel rows.")
+                    cursor += row_size
+            if cursor != len(decoded):
+                raise ValueError("PNG screenshot contains extra pixel data.")
+            return width, height
         offset = end
     raise ValueError("PNG screenshot is incomplete.")
 
 
-def validate_image(data: bytes, mime: str) -> None:
+def validate_image(data: bytes, mime: str) -> tuple[int, int]:
     if not data or len(data) > MAX_IMAGE_BYTES:
         raise ValueError("Screenshot byte limit exceeded or image is empty.")
     if mime == "image/png" and data.startswith(b"\x89PNG\r\n\x1a\n"):
-        _png(data)
-        return
+        return _png(data)
     if (
         mime == "image/jpeg"
         and data.startswith(b"\xff\xd8")
         and data.endswith(b"\xff\xd9")
     ):
         offset, dimensions = 2, False
+        width, height = 0, 0
         while offset + 4 <= len(data):
             if data[offset] != 255:
                 break
@@ -105,7 +123,7 @@ def validate_image(data: bytes, mime: str) -> None:
             offset += 1
             if marker == 0xDA:  # Scan data follows a checked frame header.
                 if dimensions:
-                    return
+                    return width, height
                 break
             size = int.from_bytes(data[offset : offset + 2], "big")
             if size < 2 or offset + size > len(data):
@@ -129,10 +147,9 @@ def validate_image(data: bytes, mime: str) -> None:
                 }
                 and size >= 8
             ):
-                _dimensions(
-                    int.from_bytes(data[offset + 5 : offset + 7], "big"),
-                    int.from_bytes(data[offset + 3 : offset + 5], "big"),
-                )
+                width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+                height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+                _dimensions(width, height)
                 dimensions = True
             offset += size
     elif (
@@ -142,8 +159,9 @@ def validate_image(data: bytes, mime: str) -> None:
         and data[-1:] == b";"
         and b"," in data[13:]
     ):
-        _dimensions(*struct.unpack("<HH", data[6:10]))
-        return
+        width, height = struct.unpack("<HH", data[6:10])
+        _dimensions(width, height)
+        return width, height
     elif (
         mime == "image/webp"
         and len(data) >= 30
@@ -154,22 +172,21 @@ def validate_image(data: bytes, mime: str) -> None:
         kind, size = data[12:16], int.from_bytes(data[16:20], "little")
         if size + 20 <= len(data):
             if kind == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
-                _dimensions(
-                    int.from_bytes(data[26:28], "little") & 0x3FFF,
-                    int.from_bytes(data[28:30], "little") & 0x3FFF,
-                )
-                return
+                width = int.from_bytes(data[26:28], "little") & 0x3FFF
+                height = int.from_bytes(data[28:30], "little") & 0x3FFF
+                _dimensions(width, height)
+                return width, height
             if kind == b"VP8L" and data[20] == 0x2F:
                 value = int.from_bytes(data[21:25], "little")
-                _dimensions((value & 0x3FFF) + 1, ((value >> 14) & 0x3FFF) + 1)
-                return
+                width, height = (value & 0x3FFF) + 1, ((value >> 14) & 0x3FFF) + 1
+                _dimensions(width, height)
+                return width, height
             if kind == b"VP8X" and size == 10:
-                _dimensions(
-                    int.from_bytes(data[24:27], "little") + 1,
-                    int.from_bytes(data[27:30], "little") + 1,
-                )
+                width = int.from_bytes(data[24:27], "little") + 1
+                height = int.from_bytes(data[27:30], "little") + 1
+                _dimensions(width, height)
                 if b"VP8 " in data[30:] or b"VP8L" in data[30:]:
-                    return
+                    return width, height
     raise ValueError(
         "Screenshot bytes do not match a supported image container and declared MIME type."
     )

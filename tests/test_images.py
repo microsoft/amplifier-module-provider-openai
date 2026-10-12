@@ -7,8 +7,8 @@ import pytest
 from amplifier_module_provider_openai.images import (
     OpenAIImageBackend,
     image_generation_info,
-    list_image_models,
     latest_image_model,
+    list_image_models,
     register_image_backend,
 )
 
@@ -119,7 +119,7 @@ def fixture(config=None):
 
 @pytest.mark.asyncio
 async def test_automatic_image_model_follows_current_catalog_without_retrying_generation():
-    backend, provider, client = fixture({"model": "auto"})
+    backend, _provider, client = fixture({"model": "auto"})
     client.models = SimpleNamespace(list=AsyncMock(return_value=SimpleNamespace(
         data=[SimpleNamespace(id="gpt-image-1"), SimpleNamespace(id="gpt-image-1.5")]
     )))

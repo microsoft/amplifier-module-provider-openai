@@ -641,6 +641,90 @@ base64-image blocks. The provider sends these directly as `input_text` and
 `input_image` items in the matching `function_call_output`; known
 non-vision models retain the text and receive an explicit image-omitted notice.
 
+#### Neutral computer-use v1
+
+A neutral-enabled executor can carry provider-independent intent in the existing
+`ToolSpec` extras transport. `ToolSpec.name` is its actual local alias and
+`ToolSpec.parameters` is its canonical, flat action schema:
+
+```python
+native_tool_spec = {
+    "type": "function",
+    "computer_use": {
+        "version": 1,
+        "operations": ["screenshot", "mouse_move", "left_click", "key"],
+        "image_space": {"width": 1280, "height": 720, "unit": "pixel"},
+        "unavailable_operations": {},
+    },
+}
+```
+
+Dimensions must be real cached screenshot facts, not guessed display sizes.
+Compilation happens after effective model, endpoint, and request overrides,
+including SDK `extra_body`, are finalized. Intent and provider-local diagnostics
+never go into the SDK payload. Ordinary tools named `computer` or `screenshot`
+without intent remain ordinary functions.
+
+The evidenced native subset is screenshot, mouse movement, left/right/middle
+click, double-click, typing, and supported single-key chords. Coordinates remain
+screenshot pixels. A native call becomes one ordered canonical batch:
+`{"version": 1, "actions": [...], "capture_after": true}`, bound to the local
+alias. Keys retain a single press (`repeat: 1`); pointer modifiers, unknown key
+tokens, multiple ordinary keys, unknown buttons and disabled actions are refused,
+never silently discarded.
+
+Unsupported models/endpoints, unknown image dimensions, multiple ordinary
+attachments, or declared operations outside that subset use the supplied ordinary
+function schema. Scroll distances, drag paths and vendor wait timing have no
+verified lossless native conversion here; their ordinary canonical interface
+remains available. Explicit native-required choices fail instead of being relaxed.
+Malformed, conflicting or nested intent is refused before SDK dispatch.
+
+Neutral replay uses JSON-safe `openai:computer_calls` response/message metadata
+and `openai:computer_use` block metadata. Both copies must agree with the canonical
+call and original vendor actions. Duplicate identities cannot authorize another
+execution, including after historical failure projection. Count, complete,
+stream, text-only continuation, and the optional native adapter use the same
+binding/projection. Incomplete tool batches are not internally replayed.
+
+Successful native observations are retained once in returned
+`openai:computer_images` metadata, including on terminal assistant replies. Each
+record binds the original call/actions, full validated PNG, its SHA-256 digest,
+and accompanying reference text. Counts may read these records but never publish
+them. Later requests reconstruct only a derived wire result for a surviving
+original call and unique result whose pixels/references agree. Only the generic
+recency hook's exact superseded-screenshot text transformation permits recovery
+of omitted pixels; arbitrary text, files, errors, missing calls/results, conflicting
+records, or lost carriers fail closed. No paths are reopened, actions replayed,
+or compacted calls resurrected.
+
+The aggregate serialized persisted-plus-new observation records are limited to
+64MiB before dispatch, with unchanged per-image limits and explicit overflow
+refusal (no silent eviction). Screenshot bytes now live longer in serialized
+context/transcripts: this is an intentional provider-replay privacy trade-off,
+not a generic tool-retention increase or new external vendor storage.
+Provider restart can replay public history; removal of required records/pixels
+cannot. Digests prove consistency, not cryptographic trust or resistance to
+wholesale internally consistent forged transcripts.
+
+Neutral native results require one full final PNG with validated pixel rows.
+Other formats retain ordinary/legacy image handling, but are explicitly refused
+as neutral native final observations until their pixel integrity can be checked.
+Accompanying text
+and provenance are retained as untrusted reference data; errors, multiple images,
+missing pixels, and image-space mismatches cannot become success screenshots.
+Providers never open screenshot paths or recapture images. Generic tool hooks
+own byte projection, and the executor owns final capture, physical-coordinate
+mapping, approvals, cancellation, read-only and halt guards. Nonempty vendor
+safety requirements are refused because this adapter has no enforced approval
+path for them; it never manufactures acknowledgement.
+
+Legacy `{"type": "computer"}` declarations and vendor-action inputs retain their
+old installed-tool conversion. They do not receive the new batch interface.
+Neutral v1 requires an executor implementing that batch contract. Offline SDK/Core
+tests do not establish live vendor, desktop/platform or combined installed-session
+acceptance; those require separate qualification.
+
 ### Incomplete Response Auto-Continuation
 
 When OpenAI returns `status: "incomplete"` (e.g. `max_output_tokens` reached),

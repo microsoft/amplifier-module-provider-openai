@@ -9,6 +9,7 @@ import subprocess
 import time
 
 import openai
+
 from amplifier_module_provider_openai import OpenAIProvider
 
 RULE = ['INPUT', '-p', 'tcp', '--sport', '18980', '-m', 'comment',
@@ -25,7 +26,8 @@ async def main():
         try:
             await reader.readuntil(b'\r\n\r\n')
             if blackhole:
-                subprocess.run(['iptables', '-I', *RULE], check=True)
+                # Intentional blocking: no await between insertion and ownership.
+                subprocess.run(['iptables', '-I', *RULE], check=True)  # noqa: ASYNC221
                 dropped = True
                 await asyncio.Event().wait()
             else:
@@ -36,7 +38,8 @@ async def main():
                 await writer.drain()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        # Collect unexpected failures so the final diagnostic assertion fails.
+        except Exception as exc:  # noqa: BLE001
             errors.append(type(exc).__name__)
         finally:
             writer.close()
@@ -68,7 +71,8 @@ async def main():
         print(json.dumps({'results': results, 'modelRequests': 0, 'realCredentials': False}), flush=True)
     finally:
         if dropped:
-            subprocess.run(['iptables', '-D', *RULE], check=True)
+            # Intentional blocking: exact-rule deletion precedes resource cleanup.
+            subprocess.run(['iptables', '-D', *RULE], check=True)  # noqa: ASYNC221
         for server in servers:
             server.close()
             await server.wait_closed()

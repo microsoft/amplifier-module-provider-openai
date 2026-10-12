@@ -4,8 +4,7 @@ import json
 
 import pytest
 
-from amplifier_module_provider_openai import OpenAIProvider
-from amplifier_module_provider_openai import _transport
+from amplifier_module_provider_openai import OpenAIProvider, _transport
 
 
 @pytest.mark.asyncio

@@ -28,9 +28,11 @@ def legacy_generation_counter(monkeypatch):
     fell back. Dedicated count mocks and real SDK MockTransport tests retain
     their own counting behavior.
     """
-    from unittest.mock import Mock
     import inspect
+    from unittest.mock import Mock
+
     import openai
+
     from amplifier_module_provider_openai import OpenAIProvider
     original = OpenAIProvider._native_input_token_count
 

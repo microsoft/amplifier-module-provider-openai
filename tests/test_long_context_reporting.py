@@ -19,7 +19,6 @@ from unittest.mock import AsyncMock
 
 from amplifier_module_provider_openai import OpenAIProvider
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

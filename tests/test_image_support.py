@@ -7,10 +7,7 @@ import base64
 from pathlib import Path
 
 import pytest
-from amplifier_core.message_models import ChatRequest
-from amplifier_core.message_models import ImageBlock
-from amplifier_core.message_models import Message
-from amplifier_core.message_models import TextBlock
+from amplifier_core.message_models import ChatRequest, ImageBlock, Message, TextBlock
 
 from amplifier_module_provider_openai import OpenAIProvider
 

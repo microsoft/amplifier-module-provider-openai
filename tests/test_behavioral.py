@@ -3,10 +3,10 @@
 Inherits authoritative tests from amplifier-core.
 """
 
-import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from amplifier_core.validation.behavioral import ProviderBehaviorTests
 
 

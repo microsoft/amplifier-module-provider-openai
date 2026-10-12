@@ -11,25 +11,29 @@ import json
 import logging
 from typing import Any
 
-from amplifier_core import TextContent
-from amplifier_core import ThinkingContent
-from amplifier_core import ToolCallContent
+from amplifier_core import TextContent, ThinkingContent, ToolCallContent
 from amplifier_core import llm_errors as kernel_errors
-from amplifier_core.message_models import TextBlock
-from amplifier_core.message_models import ThinkingBlock
-from amplifier_core.message_models import ToolCall
-from amplifier_core.message_models import ToolCallBlock
-from amplifier_core.message_models import Usage
+from amplifier_core.message_models import (
+    TextBlock,
+    ThinkingBlock,
+    ToolCall,
+    ToolCallBlock,
+    Usage,
+)
 
-from ._constants import METADATA_CONTINUATION_COUNT
-from ._constants import METADATA_INCOMPLETE_REASON
-from ._constants import METADATA_REASONING_ITEMS
-from ._constants import METADATA_RESPONSE_ID
-from ._constants import METADATA_STATUS
-from ._constants import METADATA_TOOL_CALL_NAMESPACES
-from ._constants import METADATA_TOOL_SEARCH_ITEMS
-from ._tool_search import extract_function_call_namespaces
-from ._tool_search import extract_hosted_tool_search_items
+from ._constants import (
+    METADATA_CONTINUATION_COUNT,
+    METADATA_INCOMPLETE_REASON,
+    METADATA_REASONING_ITEMS,
+    METADATA_RESPONSE_ID,
+    METADATA_STATUS,
+    METADATA_TOOL_CALL_NAMESPACES,
+    METADATA_TOOL_SEARCH_ITEMS,
+)
+from ._tool_search import (
+    extract_function_call_namespaces,
+    extract_hosted_tool_search_items,
+)
 
 logger = logging.getLogger(__name__)
 

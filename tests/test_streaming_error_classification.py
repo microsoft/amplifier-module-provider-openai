@@ -25,11 +25,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import openai
 import pytest
-from amplifier_core import ModuleCoordinator, llm_errors as kernel_errors
+from amplifier_core import ModuleCoordinator
+from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -211,9 +211,11 @@ def test_context_overflow_api_error_is_not_retried():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        with pytest.raises(kernel_errors.ContextLengthError):
-            asyncio.run(provider.complete(_simple_request()))
+    with (
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        pytest.raises(kernel_errors.ContextLengthError),
+    ):
+        asyncio.run(provider.complete(_simple_request()))
 
     assert provider.client.responses.create.await_count == 1, (
         "Context overflow is a deterministic 400 -- it must not be retried. "
@@ -405,9 +407,11 @@ def test_streaming_path_transient_sse_error_stays_retryable():
     )
     provider.client.responses.stream = stream_mock
 
-    with patch("asyncio.sleep", new=AsyncMock()):
-        with pytest.raises(kernel_errors.LLMError) as exc_info:
-            asyncio.run(provider.complete(_simple_request()))
+    with (
+        patch("asyncio.sleep", new=AsyncMock()),
+        pytest.raises(kernel_errors.LLMError) as exc_info,
+    ):
+        asyncio.run(provider.complete(_simple_request()))
 
     assert not isinstance(exc_info.value, kernel_errors.InvalidRequestError)
     assert exc_info.value.retryable is True

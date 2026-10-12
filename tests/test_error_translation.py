@@ -16,7 +16,6 @@ from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -187,7 +186,7 @@ def test_api_status_error_5xx_translated():
 def test_timeout_error_translated():
     """asyncio.TimeoutError -> kernel LLMTimeoutError (retryable=True)."""
     provider = _make_provider()
-    native = asyncio.TimeoutError()
+    native = TimeoutError()
     provider.client.responses.create = AsyncMock(side_effect=native)
 
     with pytest.raises(kernel_errors.LLMTimeoutError) as exc_info:
@@ -218,6 +217,7 @@ def test_generic_exception_translated():
 def test_llm_response_error_event_emitted_on_kernel_error():
     """llm:response error event is still emitted when a kernel error is raised."""
     from typing import cast
+
     from amplifier_core import ModuleCoordinator
 
     class FakeHooks:
