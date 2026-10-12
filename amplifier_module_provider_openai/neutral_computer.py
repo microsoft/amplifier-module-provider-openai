@@ -627,20 +627,20 @@ def replay_calls(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         seen = set()
         for source, block in _stored_blocks(message):
             identity = block.get("id") or block.get("tool_call_id")
+            identities = [block[key] for key in ("id", "tool_call_id", "call_id") if key in block]
             local_metadata = _metadata(block)
             local_present = KEY in local_metadata
             persisted_present = identity in saved if isinstance(identity, str) else False
             local = local_metadata.get(KEY)
             persisted = saved.get(identity) if isinstance(identity, str) else None
-            if not local_present and not persisted_present and (
-                not isinstance(identity, str) or identity not in available
+            if not local_present and not persisted_present and not any(
+                isinstance(value, str) and value in available for value in identities
             ):
                 continue
             if message.get("role") != "assistant" or (
                 source == "structured" and block.get("type") != "tool_call"
             ):
                 refuse("orphaned native block provenance")
-            identities = [block[key] for key in ("id", "tool_call_id", "call_id") if key in block]
             if not isinstance(identity, str) or not identity or any(v != identity for v in identities):
                 refuse("conflicting or malformed replay identity")
             if (source, identity) in seen:
@@ -700,8 +700,8 @@ def replay_calls(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     # A second ordinary/otherwise unmarked copy cannot steal a native identity.
     for index, message in enumerate(messages):
         for _, block in _stored_blocks(message):
-            identity = block.get("id") or block.get("tool_call_id")
-            if isinstance(identity, str) and identity in found and owners[identity] != index:
+            identities = [block[key] for key in ("id", "tool_call_id", "call_id") if key in block]
+            if any(isinstance(value, str) and value in found and owners[value] != index for value in identities):
                 refuse("duplicate computer call across historical turns")
     return found
 
@@ -712,12 +712,15 @@ def _png_digest(url: str) -> str:
 
 def _omitted_references(content: Any) -> list[str] | None:
     """Only the generic recency hook's exact transformation is recognized."""
-    if not isinstance(content, list) or not content:
-        return None
-    if any(not isinstance(b, dict) or b.get("type") not in {"text", "input_text"}
-           or not isinstance(b.get("text"), str) for b in content):
-        return None
-    texts = [b["text"] for b in content]
+    if isinstance(content, str):
+        texts = [content]
+    else:
+        if not isinstance(content, list) or not content:
+            return None
+        if any(not isinstance(b, dict) or b.get("type") not in {"text", "input_text"}
+               or not isinstance(b.get("text"), str) for b in content):
+            return None
+        texts = [b["text"] for b in content]
     if not texts[-1].endswith(IMAGE_DROPPED):
         return None
     return [*texts[:-1], texts[-1][:-len(IMAGE_DROPPED)]]

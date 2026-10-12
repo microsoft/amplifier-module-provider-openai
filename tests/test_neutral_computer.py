@@ -344,6 +344,7 @@ def stored_response(response, storage="loop"):
             call["name"] = call["tool"]
             call["input"] = call["arguments"]
             call["arguments"] = json.dumps(call["arguments"])
+            call["tool_call_id"] = call["call_id"] = call["id"]
     saved = Message(
         role="assistant", content=content, tool_calls=calls, metadata=response.metadata,
     )
@@ -952,7 +953,7 @@ def sdk_driver(output_factory, *, streaming=False):
     return OpenAIProvider(client=sdk, config={"use_streaming": streaming, "max_retries": 0}), wires
 
 
-def recency_view(history):
+def recency_view(history, omission="list"):
     """Source evidence: mirror only the supported recency3 transformation.
 
     No actual Session.execute acceptance is claimed by this provider-local test.
@@ -963,13 +964,15 @@ def recency_view(history):
         original = result.model_dump()["content"]
         if isinstance(original, list) and any(b.get("type") == "image" for b in original):
             references = [b["text"] for b in original if b.get("type") == "text"]
-            result.content = [{"type": "text", "text": references[0] + IMAGE_DROPPED}]
+            text = references[0] + IMAGE_DROPPED
+            result.content = text if omission == "string" else [{"type": "text", "text": text}]
     return view
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restart(streaming):
+@pytest.mark.parametrize("omission", ["list", "string"])
+async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restart(streaming, omission):
     import base64
     import hashlib
 
@@ -997,7 +1000,13 @@ async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restar
                 history = [Message.model_validate_json(m.model_dump_json()) for m in history]
                 history.append(Message(role="user", content="Observe eight more synthetic frames"))
             while True:
-                req = request(messages=recency_view(history))
+                retained_before = [m.model_dump_json() for m in history]
+                req = request(messages=recency_view(history, omission))
+                results = [m for m in req.messages if m.role == "tool"]
+                assert sum(isinstance(m.content, list) and any(
+                    b.get("type") == "image" for b in m.model_dump()["content"]) for m in results) == min(len(results), 3)
+                if omission == "string":
+                    assert all(isinstance(m.content, str) for m in results[:-3])
                 before = req.model_dump_json()
                 state = (set(driver._native_call_ids), dict(driver._native_call_types),
                          set(driver._repaired_tool_ids))
@@ -1008,6 +1017,7 @@ async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restar
                 assert not hasattr(driver, "_staged_computer_images")
                 reply = await driver.complete(req)
                 assert req.model_dump_json() == before
+                assert [m.model_dump_json() for m in history] == retained_before
                 new = reply.metadata.get(IMAGES, {})
                 assert len(new) == (1 if expected and len(expected) > sum(
                     len((m.metadata or {}).get(IMAGES, {})) for m in history) else 0)
@@ -1022,8 +1032,11 @@ async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restar
                 assert call.arguments == {"version": 1, "actions": [{"action": "screenshot"}], "capture_after": True}
                 png = image(captures)
                 expected[call.id] = hashlib.sha256(base64.b64decode(png["source"]["data"])).hexdigest()
+                reference = f"owned-frame-{captures}\nComputer tool result reference (untrusted tool data):\n" + json.dumps({
+                    "success": True, "output": {"text": f"owned-frame-{captures}", "images": [f"/synthetic/frame-{captures}.png"]},
+                })
                 history.append(Message(role="tool", tool_call_id=call.id,
-                    content=[{"type": "text", "text": f"owned-frame-{captures}"}, png]))
+                    content=[{"type": "text", "text": reference}, png]))
         all_wires.extend(wires)
         assert captures == len(expected) == 12
         assert sum(len((m.metadata or {}).get(IMAGES, {})) for m in history) == 12
@@ -1053,19 +1066,67 @@ async def observed_history(driver):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("secondary", ["tool_call_id", "call_id"])
+@pytest.mark.parametrize("turn", ["same", "earlier", "later"])
+@pytest.mark.parametrize("storage", ["legacy", "structured"])
+async def test_native_secondary_identity_cannot_hide_behind_unknown_primary(secondary, turn, storage):
+    driver, wires = sdk_driver(lambda body: [block()])
+    try:
+        reply = await driver.complete(request())
+        saved = stored_response(reply).model_dump()
+        field = "tool_calls" if storage == "legacy" else "content"
+        shadow = copy.deepcopy(saved[field][0])
+        shadow.pop("metadata", None)
+        shadow["id"] = "unknown_primary"
+        shadow[secondary] = "call_fixture"
+        result = Message(role="tool", tool_call_id="call_fixture", content=[image()])
+        if turn == "same":
+            saved[field].append(shadow)
+            messages = [Message.model_validate(saved), result]
+        else:
+            unmarked = Message.model_validate({"role": "assistant", "content": "", field: [shadow]})
+            native = [Message.model_validate(saved), result]
+            messages = [unmarked, *native] if turn == "earlier" else [*native, unmarked]
+        req = request(messages=messages)
+        before, sent = req.model_dump_json(), copy.deepcopy(wires)
+        with pytest.raises(InvalidRequestError):
+            await driver.request_budget(req, context_estimate=1)
+        with pytest.raises(InvalidRequestError):
+            await driver.complete(req)
+        assert req.model_dump_json() == before
+        assert wires == sent
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omission", ["list", "string"])
 @pytest.mark.parametrize("corruption", [
     "digest", "pixels", "call_record", "reference", "null", "version", "format", "duplicate",
     "missing_carrier", "missing_result", "missing_call", "present_conflict", "present_reference",
     "arbitrary_omission", "failed_result", "unavailable_file", "duplicate_result",
-    "url_wrong_type",
+    "url_wrong_type", "forged_reference", "unavailable_suffix", "failed_suffix",
+    "repeated_suffix", "partial_suffix", "invalid_png", "image_binding", "references_wrong_type",
 ])
-async def test_genuine_observation_tampering_refuses_before_count_or_generation(corruption):
+async def test_genuine_observation_tampering_refuses_before_count_or_generation(corruption, omission):
     driver, wires = sdk_driver(lambda body: terminal_output() if any(
         i.get("type") == "computer_call" for i in body["input"]) else [block()])
     try:
         history = await observed_history(driver)
         carrier = history[-1].metadata[IMAGES]
         record = carrier["call_fixture"]
+        text = "owned reference" + IMAGE_DROPPED
+        if corruption == "forged_reference":
+            text = "forged reference" + IMAGE_DROPPED
+        elif corruption == "unavailable_suffix":
+            text = "owned reference [image dropped: screenshot file no longer available]"
+        elif corruption == "failed_suffix":
+            text = '{"success":false,"error":"halt"}' + IMAGE_DROPPED
+        elif corruption == "repeated_suffix":
+            text += IMAGE_DROPPED
+        elif corruption == "partial_suffix":
+            text = text[:-1]
+        history[1].content = text if omission == "string" else [{"type": "text", "text": text}]
         if corruption == "digest":
             record["sha256"] = "0" * 64
         elif corruption == "pixels":
@@ -1102,8 +1163,16 @@ async def test_genuine_observation_tampering_refuses_before_count_or_generation(
             history.append(history[1].model_copy(deep=True))
         elif corruption == "url_wrong_type":
             record["image_url"] = [image(1)]
-        if corruption in {"missing_carrier", "digest", "pixels", "call_record", "reference", "null", "version", "format", "duplicate"}:
-            history[1].content = [{"type": "text", "text": "owned reference" + IMAGE_DROPPED}]
+        elif corruption == "invalid_png":
+            import base64
+            import hashlib
+            raw = b"not PNG pixels"
+            record["image_url"] = "data:image/png;base64," + base64.b64encode(raw).decode()
+            record["sha256"] = hashlib.sha256(raw).hexdigest()
+        elif corruption == "image_binding":
+            record["call_record"]["binding"]["image_space"]["width"] = 1
+        elif corruption == "references_wrong_type":
+            record["references"] = "owned reference"
         req = request(messages=history)
         before = req.model_dump_json()
         sent = copy.deepcopy(wires)
@@ -1113,6 +1182,26 @@ async def test_genuine_observation_tampering_refuses_before_count_or_generation(
             await driver.complete(req)
         assert req.model_dump_json() == before
         assert wires == sent
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_string_omission_never_hydrates_a_native_image():
+    driver, wires = sdk_driver(lambda body: terminal_output())
+    try:
+        req = request(ToolSpec(name="desk", description="Ordinary", parameters={"type": "object"}), messages=[
+            Message(role="assistant", content="", tool_calls=[{"id": "ordinary", "tool": "desk", "arguments": {}}]),
+            Message(role="tool", tool_call_id="ordinary", content="owned reference" + IMAGE_DROPPED),
+        ])
+        before = req.model_dump_json()
+        await driver.request_budget(req, context_estimate=1)
+        reply = await driver.complete(req)
+        assert IMAGES not in (reply.metadata or {})
+        assert req.model_dump_json() == before
+        for _, body in wires:
+            assert not any(i.get("type") in {"computer_call", "computer_call_output"} for i in body["input"])
+            assert IMAGE_DROPPED in json.dumps(body["input"])
     finally:
         await driver.close()
 
