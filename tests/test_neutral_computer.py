@@ -19,11 +19,13 @@ from amplifier_module_provider_openai.neutral_computer import (
     IMAGES,
     KEY,
     _response_model_matches,
+    json_agrees,
     neutral_screenshot,
     replay_calls,
     response_calls,
     translate,
     validate_intent,
+    validate_schema,
 )
 
 PNG = Path(__file__).parent / "fixtures/computer_use/valid-red-pixel.png"
@@ -700,6 +702,142 @@ def test_fallback_validates_disabled_operation_schema_and_repeat(arguments):
             "type": "function_call", "call_id": "ordinary",
             "name": "desk", "arguments": json.dumps(arguments),
         }], state["neutral_computer_context"], "gpt-4o", "completed")
+
+
+@pytest.mark.parametrize("keyword", ["enum", "const"])
+@pytest.mark.parametrize("left,right,agrees", [
+    (True, 1, False), (False, 0, False), (True, 1.0, False),
+    (False, 0.0, False), (True, True, True), (False, False, True),
+    (1, 1.0, True), (0, 0.0, True), (None, None, True),
+    ([True], [1], False), ({"value": False}, {"value": 0}, False),
+    ({"nested": [{"value": True}]}, {"nested": [{"value": 1.0}]}, False),
+    ([{"nested": [False]}], [{"nested": [0]}], False),
+    ({"nested": [True, {"value": False}]}, {"nested": [True, {"value": False}]}, True),
+    ({"nested": [1, {"value": 0.0}]}, {"nested": [1.0, {"value": 0}]}, True),
+    ([1, 2], [1], False), ({"value": 1}, {"other": 1}, False),
+])
+def test_schema_json_comparison_recursive_semantics(keyword, left, right, agrees):
+    # Arbitrary nested JSON is not structurally reachable through flat actions.
+    # Check both comparison directions without relaxing the action contract.
+    frozen = json.dumps([left, right])
+    for value, constraint in ((left, right), (right, left)):
+        assert json_agrees(value, constraint) is agrees
+        schema = {keyword: [constraint] if keyword == "enum" else constraint}
+        if agrees:
+            validate_schema(value, schema)
+        else:
+            with pytest.raises(InvalidRequestError) as caught:
+                validate_schema(value, schema)
+            assert caught.value.code == "computer_use_response_invalid"
+            assert caught.value.retryable is False
+    assert json.dumps([left, right]) == frozen
+
+
+@pytest.mark.parametrize("kind,value,valid", [
+    ("integer", True, False), ("integer", 1.0, False), ("integer", 1, True),
+    ("number", True, False), ("number", 1.0, True),
+    ("boolean", 1, False), ("boolean", True, True),
+])
+def test_schema_json_comparison_does_not_relax_parameter_types(kind, value, valid):
+    schema = {"type": kind, "enum": [True, 1.0], "const": value}
+    if valid:
+        validate_schema(value, schema)
+    else:
+        with pytest.raises(InvalidRequestError):
+            validate_schema(value, schema)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True], ids=["ordinary", "native-batch"])
+@pytest.mark.parametrize("keyword", ["enum", "const"])
+@pytest.mark.parametrize("target", ["repeat", "action-object", "coordinate-list"])
+@pytest.mark.parametrize("constraint", [True, 1, 1.0], ids=["boolean-mismatch", "integer", "float-equivalent"])
+async def test_schema_json_comparison_public_sdk_response(native, keyword, target, constraint):
+    tool = spec(operations=["screenshot", "key", "mouse_move"], image_space=native)
+    canonical = {"action": "key", "text": "enter", "repeat": 1}
+    vendor = {"type": "keypress", "keys": ["ENTER"]}
+    if target == "coordinate-list":
+        canonical = {"action": "mouse_move", "coordinate": [1, 2]}
+        vendor = {"type": "move", "x": 1, "y": 2}
+        schema = tool.parameters["properties"]["coordinate"]
+        constant = [constraint, 2]
+    elif target == "action-object":
+        schema = tool.parameters
+        constant = {**canonical, "repeat": constraint}
+    else:
+        schema = tool.parameters["properties"]["repeat"]
+        constant = constraint
+    schema[keyword] = [constant] if keyword == "enum" else constant
+    output = [block([vendor])] if native else [{
+        "type": "function_call", "id": "fc_schema", "call_id": "call_fixture",
+        "name": tool.name, "arguments": json.dumps(canonical), "status": "completed",
+    }]
+    driver, wires = sdk_driver(lambda body: output)
+    req = request(tool)
+    options = {"auto_continue": False}
+    frozen = req.model_dump_json()
+    frozen_options = copy.deepcopy(options)
+    returned = None
+    try:
+        budget = await driver.request_budget(req, context_estimate=20)
+        assert budget is not None
+        assert CALLS not in json.dumps(budget) and IMAGES not in json.dumps(budget)
+        assert len(wires) == 1 and wires[0][0].endswith("/input_tokens")
+        assert req.model_dump_json() == frozen
+        if type(constraint) is bool:
+            with pytest.raises(InvalidRequestError) as caught:
+                returned = await driver.complete(req, request_options=options)
+            assert caught.value.code == "computer_use_response_invalid"
+            assert caught.value.retryable is False
+            assert returned is None  # No invalid dispatchable call is returned.
+        else:
+            returned = await driver.complete(req, request_options=options)
+            assert len(returned.tool_calls) == 1
+            call = returned.tool_calls[0]
+            assert call.name == tool.name and call.id == "call_fixture"
+            expected = {"version": 1, "actions": [canonical], "capture_after": True} if native else canonical
+            assert json_agrees(call.arguments, expected)
+        # Schema validation follows generation: count + generation did happen.
+        # An invalid reply must not be mistaken for a pre-HTTP refusal.
+        assert [path for path, _ in wires] == [
+            "/v1/responses/input_tokens", "/v1/responses/input_tokens", "/v1/responses",
+        ]
+        expected_type = "computer" if native else "function"
+        assert all(body["tools"][0]["type"] == expected_type for _, body in wires)
+        assert all(CALLS not in json.dumps(body) and IMAGES not in json.dumps(body) for _, body in wires)
+    finally:
+        await driver.close()
+    assert req.model_dump_json() == frozen  # Includes caller tools and history.
+    assert options == frozen_options
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyword", ["enum", "const"])
+@pytest.mark.parametrize("value", [True, 1, 1.0], ids=["boolean", "integer", "float"])
+async def test_schema_json_comparison_public_boolean_control(keyword, value):
+    tool = spec(image_space=False)
+    tool.parameters["properties"]["confirmed"] = {
+        "type": "boolean", keyword: [True] if keyword == "enum" else True,
+    }
+    canonical = {"action": "screenshot", "confirmed": value}
+    driver, wires = sdk_driver(lambda body: [{
+        "type": "function_call", "id": "fc_boolean", "call_id": "boolean",
+        "name": tool.name, "arguments": json.dumps(canonical), "status": "completed",
+    }])
+    req = request(tool)
+    frozen = req.model_dump_json()
+    try:
+        if type(value) is bool:
+            response = await driver.complete(req)
+            assert len(response.tool_calls) == 1
+            assert json_agrees(response.tool_calls[0].arguments, canonical)
+        else:
+            with pytest.raises(InvalidRequestError):
+                await driver.complete(req)
+        assert [path for path, _ in wires] == ["/v1/responses/input_tokens", "/v1/responses"]
+    finally:
+        await driver.close()
+    assert req.model_dump_json() == frozen
 
 
 def test_crc_valid_png_without_pixel_rows_cannot_be_a_screenshot():

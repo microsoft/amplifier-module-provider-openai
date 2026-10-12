@@ -419,9 +419,10 @@ def validate_schema(value: Any, schema: dict[str, Any]) -> None:
         valid = any(k in types and types[k](value) for k in kind)
     else:
         valid = kind is None or kind in types and types[kind](value)
-    if not valid or "enum" in schema and value not in schema["enum"]:
+    # Python equality aliases True/1 and False/0, including inside containers.
+    if not valid or "enum" in schema and not any(json_agrees(value, item) for item in schema["enum"]):
         refuse("arguments do not satisfy the declared schema", "computer_use_response_invalid")
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not json_agrees(value, schema["const"]):
         refuse("arguments violate a schema constant", "computer_use_response_invalid")
     if isinstance(value, dict):
         if set(schema.get("required", [])) - value.keys():
