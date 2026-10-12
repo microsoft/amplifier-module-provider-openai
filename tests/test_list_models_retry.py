@@ -18,6 +18,7 @@ import httpx
 import openai
 import pytest
 from amplifier_core import llm_errors as kernel_errors
+
 from amplifier_module_provider_openai import OpenAIProvider
 
 # ---------------------------------------------------------------------------

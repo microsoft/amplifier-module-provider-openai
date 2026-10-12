@@ -69,7 +69,7 @@ def test_unknown_distinct_from_zero():
     """None returned for unknown model must not equal Decimal('0')."""
     result = compute_cost("gpt-unknown-9999", prompt_tokens=0)
     assert result is None
-    assert result != Decimal("0")
+    assert result != Decimal(0)
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ def test_result_type_is_decimal():
 def test_cache_only_no_fresh_input():
     """When prompt_tokens == cached_tokens, fresh cost is 0, only cache_read cost."""
     result = compute_cost("gpt-5.5", prompt_tokens=500_000, cached_tokens=500_000)
-    expected = Decimal("500000") * Decimal("0.50") / Decimal("1000000")
+    expected = Decimal(500000) * Decimal("0.50") / Decimal(1000000)
     assert result == expected
 
 
@@ -128,7 +128,7 @@ def test_gpt_55_pricing():
 def test_gpt_55_pro_no_cache_discount():
     """gpt-5.5-pro: cached_tokens=1M → $0 (no cache discount)."""
     result = compute_cost("gpt-5.5-pro", cached_tokens=1_000_000)
-    assert result == Decimal("0"), f"Expected Decimal('0'), got {result!r}"
+    assert result == Decimal(0), f"Expected Decimal('0'), got {result!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +473,7 @@ def test_cache_write_ignored_for_models_without_write_rate():
     # gpt-5.5 has no cache_write rate; passing cache_write_tokens must not error and
     # bills the full prompt as input (fresh = prompt - cached, write ignored).
     result = compute_cost("gpt-5.5", prompt_tokens=1_000, cache_write_tokens=300)
-    assert result == Decimal("1000") * Decimal("5") / Decimal("1000000")
+    assert result == Decimal(1000) * Decimal(5) / Decimal(1000000)
 
 
 # ---------------------------------------------------------------------------

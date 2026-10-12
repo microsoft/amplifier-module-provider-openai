@@ -19,7 +19,6 @@ from openai.types.responses import Response
 
 from amplifier_module_provider_openai import OpenAIProvider
 
-
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "responses"
 
 

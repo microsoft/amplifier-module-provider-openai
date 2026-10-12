@@ -2190,9 +2190,12 @@ class OpenAIProvider:
                     or self.config.get("reasoning_effort", "high"),
                     "summary": self.reasoning_summary,
                 }
-            if self._model_may_reason(model_name) and "reasoning" not in params:
-                if get_capabilities(model_name).default_reasoning_effort is not None:
-                    params["reasoning"] = {"summary": "auto"}
+            if (
+                self._model_may_reason(model_name)
+                and "reasoning" not in params
+                and get_capabilities(model_name).default_reasoning_effort is not None
+            ):
+                params["reasoning"] = {"summary": "auto"}
             if context := kwargs.get("reasoning_context", self.reasoning_context):
                 _validate_reasoning_context({"context": context})
                 if isinstance(params.get("reasoning"), dict):
@@ -2321,7 +2324,8 @@ class OpenAIProvider:
         bounded counting-only retries. No model generation or state mutation occurs.
         """
         if isinstance(context_estimate, bool) or not isinstance(context_estimate, int):
-            raise ValueError("context_estimate must be a nonnegative integer")
+            # Keep the established ValueError contract for every invalid estimate.
+            raise ValueError("context_estimate must be a nonnegative integer")  # noqa: TRY004
         if context_estimate < 0:
             raise ValueError("context_estimate must be a nonnegative integer")
         params = self._budget_params(
@@ -2477,6 +2481,7 @@ class OpenAIProvider:
             if self._api_key is None:
                 raise ValueError("api_key or client must be provided for API calls")
             from openai import DefaultAsyncHttpxClient
+
             from ._transport import configure_request
 
             self._client = AsyncOpenAI(
@@ -3744,7 +3749,7 @@ class OpenAIProvider:
                     status_code=status,
                     retryable=False,
                 ) from e
-            except asyncio.TimeoutError as e:
+            except TimeoutError as e:
                 raise kernel_errors.LLMTimeoutError(
                     f"Request timed out after {effective_timeout}s",
                     provider=self.name,
@@ -5025,8 +5030,7 @@ class OpenAIProvider:
                         i > _reasoning_cutoff,
                     )
                 if i > _reasoning_cutoff:
-                    for reasoning_item in reasoning_items_to_add:
-                        openai_messages.append(reasoning_item)
+                    openai_messages.extend(reasoning_items_to_add)
 
                 # BREAK 3, second half -- hosted tool-search items replayed
                 # VERBATIM and in wire order (reasoning -> tool_search_call ->

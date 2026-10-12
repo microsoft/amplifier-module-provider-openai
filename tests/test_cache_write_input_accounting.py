@@ -38,9 +38,9 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 from amplifier_core import ModuleCoordinator
-from amplifier_core.message_models import ChatRequest, Message
+from amplifier_core.message_models import ChatRequest, Message, Usage
+
 from amplifier_module_provider_openai import OpenAIProvider
-from amplifier_core.message_models import Usage
 from amplifier_module_provider_openai._response_handling import (
     convert_response_with_accumulated_output,
     merge_discarded_usage,

@@ -114,6 +114,20 @@ def _count_projection(params):
     }
 
 
+@pytest.mark.parametrize("estimate", [True, False, 1.5, "1", None, -1])
+def test_invalid_context_estimate_keeps_value_error_without_dispatch(estimate):
+    provider, counter = _native_provider()
+    request = _request()
+    original = request.model_dump()
+
+    with pytest.raises(ValueError, match="context_estimate must be a nonnegative integer"):
+        provider.request_budget(request, context_estimate=estimate)
+
+    counter.assert_not_called()
+    provider.client.responses.create.assert_not_called()
+    assert request.model_dump() == original
+
+
 def test_gpt_5_mini_native_budget_uses_published_limits():
     """A native count above the old 59,904 allowance still fits mini."""
     provider, counter = _native_provider(input_tokens=100_000, default_model="gpt-5-mini")

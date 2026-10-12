@@ -22,7 +22,6 @@ from amplifier_core.utils.retry import RetryConfig
 
 from amplifier_module_provider_openai import OpenAIProvider
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -220,9 +219,11 @@ def test_max_retries_exhausted_raises_kernel_error():
     )
     provider.client.responses.create = AsyncMock(side_effect=native)
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        with pytest.raises(kernel_errors.RateLimitError):
-            asyncio.run(provider.complete(_simple_request()))
+    with (
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        pytest.raises(kernel_errors.RateLimitError),
+    ):
+        asyncio.run(provider.complete(_simple_request()))
 
     # 1 initial + 2 retries = 3 total attempts
     assert provider.client.responses.create.await_count == 3
@@ -234,7 +235,7 @@ def test_timeout_error_retried():
 
     # Timeout once, then succeed
     provider.client.responses.create = AsyncMock(
-        side_effect=[asyncio.TimeoutError(), DummyResponse()]
+        side_effect=[TimeoutError(), DummyResponse()]
     )
 
     with patch("asyncio.sleep", new_callable=AsyncMock):

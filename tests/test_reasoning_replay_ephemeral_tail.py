@@ -31,6 +31,7 @@ from amplifier_core.message_models import (
     ThinkingBlock,
     ToolCallBlock,
 )
+
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._constants import METADATA_RESPONSE_ID
 
