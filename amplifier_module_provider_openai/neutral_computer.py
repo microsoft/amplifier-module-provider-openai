@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import re
+from datetime import date
 from typing import Any
 from urllib.parse import urlparse
 
@@ -456,6 +457,24 @@ def validate_schema(value: Any, schema: dict[str, Any]) -> None:
         refuse("unsupported canonical schema constraint", "computer_use_response_invalid")
 
 
+def _response_model_matches(requested: str, returned: object) -> bool:
+    """Keep pins exact; only the evidenced native GPT-5.5 alias may resolve."""
+    if not isinstance(requested, str) or not requested or not isinstance(returned, str) or not returned:
+        return False
+    if requested == returned:
+        return True
+    if requested != "gpt-5.5" or not get_capabilities(requested).supports_native_computer_use:
+        return False
+    snapshot = re.fullmatch(r"gpt-5\.5-([0-9]{4}-[0-9]{2}-[0-9]{2})", returned)
+    if snapshot is None:
+        return False
+    try:
+        date.fromisoformat(snapshot[1])
+    except ValueError:
+        return False
+    return True
+
+
 def response_calls(output: list[Any], context: dict[str, Any], model: Any,
                    status: Any) -> dict[str, dict[str, Any]]:
     calls = {}
@@ -495,7 +514,7 @@ def response_calls(output: list[Any], context: dict[str, Any], model: Any,
             if not context["legacy"]:
                 refuse("undeclared native computer reply", "computer_use_response_invalid")
             continue
-        if model != binding["model"] or status != "completed":
+        if not _response_model_matches(binding["model"], model) or status != "completed":
             refuse("native reply changed model or is incomplete", "computer_use_response_invalid")
         identity = block.get("call_id")
         if not isinstance(identity, str) or not identity or identity in calls:

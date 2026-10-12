@@ -18,6 +18,7 @@ from amplifier_module_provider_openai.neutral_computer import (
     IMAGE_DROPPED,
     IMAGES,
     KEY,
+    _response_model_matches,
     neutral_screenshot,
     replay_calls,
     response_calls,
@@ -932,7 +933,7 @@ def terminal_output():
              "content": [{"type": "output_text", "text": "Observed.", "annotations": []}]}]
 
 
-def sdk_driver(output_factory, *, streaming=False):
+def sdk_driver(output_factory, *, streaming=False, response_factory=None):
     """Real SDK transport with an inspectable sequence, never a private replay seed."""
     wires = []
 
@@ -941,7 +942,7 @@ def sdk_driver(output_factory, *, streaming=False):
         wires.append((req.url.path, body))
         if req.url.path.endswith("input_tokens"):
             return httpx.Response(200, json={"input_tokens": 100})
-        payload = envelope(output_factory(body))
+        payload = response_factory(body) if response_factory else envelope(output_factory(body))
         if body.get("stream"):
             sse = "".join("data: " + json.dumps({"type": kind, "sequence_number": seq, "response": payload}) + "\n\n"
                           for seq, kind in enumerate(["response.created", "response.completed"]))
@@ -951,6 +952,141 @@ def sdk_driver(output_factory, *, streaming=False):
     sdk = openai.AsyncOpenAI(api_key="offline", max_retries=0,
                             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)))
     return OpenAIProvider(client=sdk, config={"use_streaming": streaming, "max_retries": 0}), wires
+
+
+@pytest.mark.parametrize("requested,returned", [
+    ("", ""), (None, None), (55, 55), ([], []),
+    ("gpt-5.5", None), ("gpt-5.5", False), ("gpt-5.5", {}),
+])
+def test_response_model_matches_requires_nonempty_strings(requested, returned):
+    assert _response_model_matches(requested, returned) is False
+
+
+def test_response_model_alias_resolution_requires_native_capability(monkeypatch):
+    from amplifier_module_provider_openai import neutral_computer
+    monkeypatch.setattr(neutral_computer, "get_capabilities",
+                        lambda model: SimpleNamespace(supports_native_computer_use=False))
+    assert _response_model_matches("gpt-5.5", "gpt-5.5-2026-04-23") is False
+    assert _response_model_matches("gpt-5.5", "gpt-5.5") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("reasoning", [False, True])
+@pytest.mark.parametrize("requested,returned", [
+    ("gpt-5.5", "gpt-5.5-2026-04-23"),
+    ("gpt-5.5", "gpt-5.5-2024-02-29"),
+    ("gpt-5.5", "gpt-5.5"),
+    ("gpt-5.5-2026-04-23", "gpt-5.5-2026-04-23"),
+])
+async def test_actual_sdk_model_alias_snapshot_reply(streaming, reasoning, requested, returned):
+    output = [block()]
+    assert "pending_safety_checks" not in output[0]
+    if reasoning:
+        output.insert(0, {"type": "reasoning", "id": "rs_synthetic", "summary": [],
+                          "encrypted_content": "synthetic-offline-opaque"})
+    payload = envelope(output, model=returned)
+    payload["incomplete_details"] = None
+    driver, wires = sdk_driver(None, streaming=streaming, response_factory=lambda body: payload)
+    req = request().model_copy(update={"model": requested})
+    before = req.model_dump()
+    try:
+        response = await driver.complete(req)
+        assert len(response.tool_calls) == 1
+        call = response.tool_calls[0]
+        assert (call.id, call.name, call.arguments) == (
+            "call_fixture", "desk",
+            {"version": 1, "actions": [{"action": "screenshot"}], "capture_after": True},
+        )
+        saved = stored_response(response)
+        record = replay_calls([saved.model_dump()])["call_fixture"]
+        assert record["binding"]["model"] == requested
+        assert record["vendor_actions"] == [{"type": "screenshot"}]
+        assert len(wires) == 2  # mandatory count, then one generation
+        assert all(body["model"] == requested for _, body in wires)
+        assert all(body["tools"] == [{"type": "computer"}] for _, body in wires)
+    finally:
+        await driver.close()
+    assert req.model_dump() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("requested,model_fields", [
+    ("gpt-5.5-2026-04-23", {"model": "gpt-5.5-2026-04-24"}),
+    ("gpt-5.5-2026-04-23", {"model": "gpt-5.5"}),
+    ("gpt-5.5", {"model": "gpt-5.5-pro-2026-04-23"}),
+    ("gpt-5.5", {"model": "gpt-5.5-mini-2026-04-23"}),
+    ("gpt-5.5", {"model": "gpt-5.5-chat-2026-04-23"}),
+    ("gpt-5.5", {"model": "gpt-5.4-2026-04-23"}),
+    ("gpt-5.5", {"model": "gpt-6.1-sol"}),
+    ("gpt-5.5", {"model": "gpt-5.50-2026-04-23"}),
+    ("gpt-5.5", {"model": "xgpt-5.5-2026-04-23"}),
+    ("gpt-5.5", {"model": "gpt-5.5-2026-02-29"}),
+    ("gpt-5.5", {"model": "gpt-5.5-2026-04-31"}),
+    ("gpt-5.5", {"model": "gpt-5.5-0000-01-01"}),
+    ("gpt-5.5", {"model": "gpt-5.5-2026-00-23"}),
+    ("gpt-5.5", {"model": "gpt-5.5-2026-04-00"}),
+    ("gpt-5.5", {"model": "gpt-5.5-20260423"}),
+    ("gpt-5.5", {"model": "gpt-5.5-2026/04/23"}),
+    ("gpt-5.5", {"model": "gpt-5.5-2026-4-23"}),
+    ("gpt-5.5", {"model": "gpt-5.5-２０２６-０４-２３"}),
+    ("gpt-5.5", {"model": "gpt-5.5-2026-04-23\n"}),
+    ("gpt-5.5", {"model": "gpt-5.5-2026-04-23-pro"}),
+    ("gpt-5.5", {"model": ""}),
+    ("gpt-5.5", {}),
+    ("gpt-5.5", {"model": None}),
+    ("gpt-5.5", {"model": 55}),
+    ("gpt-5.4", {"model": "gpt-5.4-2026-04-23"}),
+    ("gpt-4o", {"model": "gpt-5.5-2026-04-23"}),
+])
+async def test_actual_sdk_model_alias_snapshot_invalid_reply(streaming, requested, model_fields):
+    payload = envelope([block()])
+    payload.pop("model")
+    payload.update(model_fields)
+    driver, wires = sdk_driver(None, streaming=streaming, response_factory=lambda body: payload)
+    req = request().model_copy(update={"model": requested})
+    before = req.model_dump()
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await driver.complete(req)
+        assert caught.value.retryable is False
+        assert caught.value.code == "computer_use_response_invalid"
+        assert len(wires) == 2
+    finally:
+        await driver.close()
+    assert req.model_dump() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("status,overrides", [
+    ("incomplete", {}),
+    ("in_progress", {}),
+    ("failed", {}),
+    ("cancelled", {}),
+    ("completed", {"status": "in_progress"}),
+    ("completed", {"actions": []}),
+    ("completed", {"action": {"type": "screenshot"}}),
+    ("completed", {"pending_safety_checks": [
+        {"id": "s", "code": "malicious_instructions", "message": "confirm"},
+    ]}),
+])
+async def test_actual_sdk_model_alias_snapshot_keeps_status_batch_safety_guards(streaming, status, overrides):
+    payload = envelope([block(**overrides)], model="gpt-5.5-2026-04-23", status=status)
+    if status == "incomplete":
+        payload["incomplete_details"] = {"reason": "max_output_tokens"}
+    driver, wires = sdk_driver(None, streaming=streaming, response_factory=lambda body: payload)
+    req = request().model_copy(update={"model": "gpt-5.5"})
+    before = req.model_dump()
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await driver.complete(req)
+        assert caught.value.retryable is False
+        assert len(wires) == 2  # no continuation/retry of an invalid native batch
+    finally:
+        await driver.close()
+    assert req.model_dump() == before
 
 
 def recency_view(history, omission="list"):
