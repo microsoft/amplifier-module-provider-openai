@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -558,13 +559,103 @@ async def test_v2_healthy_call_waits_until_explicit_cancellation_then_closes(wir
 
 
 @pytest.mark.asyncio
-async def test_v2_explicit_experiment_expiry_closes_without_replay(wire):
-    wire.hold = asyncio.Event()
-    with pytest.raises(bounded.SingleAttemptError, match="timeout"):
-        await OpenAIProvider(api_key="offline-dummy").complete(
-            request(timeout=0.01), request_options={"single_attempt": True, "single_attempt_version": 2},
+async def test_v2_explicit_experiment_expiry_closes_without_replay(wire, monkeypatch):
+    admitted = request(timeout=0.01)
+    options = {"single_attempt": True, "single_attempt_version": 2}
+    saved = admitted.model_dump(), copy.deepcopy(options)
+    scopes = []
+    original_asyncio = bounded.asyncio
+    original_send = wire.send
+
+    def timeout(seconds):
+        assert seconds == admitted.timeout == 0.01
+        scope = asyncio.timeout(None)
+        scopes.append(scope)
+        return scope
+
+    async def expire_after_count_entry(req):
+        response = await original_send(req)
+        assert [path for path, _ in wire.calls] == ["/v1/responses/input_tokens"]
+        # Start real expiry only after the actual SDK transport records count.
+        scopes[0].reschedule(asyncio.get_running_loop().time() - 1)
+        await asyncio.Event().wait()
+        return response
+
+    with monkeypatch.context() as patch:
+        patch.setattr(wire, "send", expire_after_count_entry)
+        patch.setattr(
+            bounded, "asyncio",
+            SimpleNamespace(
+                timeout=timeout,
+                CancelledError=asyncio.CancelledError,
+                wait_for=asyncio.wait_for,
+            ),
         )
+        with pytest.raises(bounded.SingleAttemptError, match="timeout") as error:
+            await OpenAIProvider(api_key="offline-dummy").complete(
+                admitted, request_options=options,
+            )
+    assert bounded.asyncio is original_asyncio
+    assert error.value.reason == "timeout" and error.value.retryable is False
+    assert len(scopes) == 1 and scopes[0].expired()
     assert len(wire.calls) == wire.closed == 1
+    assert [path for path, _ in wire.calls] == ["/v1/responses/input_tokens"]
+    assert len(wire.clients) == 1 and wire.clients[0].is_closed()
+    assert wire.clients[0].timeout == 0.01
+    assert wire.timeouts == [dict.fromkeys(("connect", "read", "write", "pool"), 0.01)]
+    assert (admitted.model_dump(), options) == saved
+
+
+@pytest.mark.asyncio
+async def test_v2_expiry_before_count_wire_closes_without_replay(wire, monkeypatch):
+    admitted = request(timeout=0.01)
+    options = {"single_attempt": True, "single_attempt_version": 2}
+    saved = admitted.model_dump(), copy.deepcopy(options)
+    scopes = []
+    original_asyncio = bounded.asyncio
+    original_factory = wire.factory
+
+    def timeout(seconds):
+        assert seconds == admitted.timeout == 0.01
+        scope = asyncio.timeout(0)
+        scopes.append(scope)
+        return scope
+
+    def factory(**kwargs):
+        assert kwargs["timeout"] == admitted.timeout == 0.01
+        client = original_factory(**kwargs)
+        original_count = client.responses.input_tokens.count
+
+        async def count(**params):
+            # A checkpoint, not an elapsed wait: expire before SDK HTTP entry.
+            await asyncio.sleep(0)
+            return await original_count(**params)
+
+        client.responses.input_tokens.count = count
+        return client
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "AsyncOpenAI", factory)
+        patch.setattr(
+            bounded, "asyncio",
+            SimpleNamespace(
+                timeout=timeout,
+                CancelledError=asyncio.CancelledError,
+                wait_for=asyncio.wait_for,
+            ),
+        )
+        with pytest.raises(bounded.SingleAttemptError, match="timeout") as error:
+            await OpenAIProvider(api_key="offline-dummy").complete(
+                admitted, request_options=options,
+            )
+    assert bounded.asyncio is original_asyncio
+    assert error.value.reason == "timeout" and error.value.retryable is False
+    assert len(scopes) == 1 and scopes[0].expired()
+    assert wire.calls == [] and wire.closed == 1
+    assert wire.timeouts == []
+    assert len(wire.clients) == 1 and wire.clients[0].is_closed()
+    assert wire.clients[0].timeout == 0.01
+    assert (admitted.model_dump(), options) == saved
 
 
 @pytest.mark.parametrize("failure", ["incomplete", "over-output", "close-failed"])
