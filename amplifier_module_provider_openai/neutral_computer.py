@@ -552,13 +552,24 @@ def replay_calls(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             if binding != {**declaration, "model": binding["model"]} or not isinstance(binding["model"], str):
                 refuse("persisted binding disagrees with its function schema")
             expected = provenance(identity, record.get("vendor_actions"), binding)
-            arguments = block.get("input", block.get("arguments"))
-            if isinstance(arguments, str):
-                try:
-                    arguments = json.loads(arguments)
-                except ValueError:
-                    refuse("malformed replay arguments")
-            if record != expected or record["alias"] != block.get("name") or arguments != record["canonical"]:
+            # The loop retains both legacy tool/arguments and structured
+            # name/input copies. Validate every supplied field, not just the
+            # preferred spelling: an equivalent duplicate is not a conflict.
+            aliases = [block[key] for key in ("name", "tool") if key in block]
+            arguments = []
+            for key in ("input", "arguments"):
+                if key not in block:
+                    continue
+                value = block[key]
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except ValueError:
+                        refuse("malformed replay arguments")
+                arguments.append(value)
+            if (record != expected or not aliases or not arguments
+                    or any(alias != record["alias"] for alias in aliases)
+                    or any(value != record["canonical"] for value in arguments)):
                 refuse("computer replay provenance does not match the canonical call")
             if identity in found and found[identity] != record:
                 refuse("conflicting replay call identity")

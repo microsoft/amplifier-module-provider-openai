@@ -10,7 +10,7 @@ import httpx
 import openai
 import pytest
 from amplifier_core.llm_errors import InvalidRequestError
-from amplifier_core.message_models import ChatRequest, Message, ToolSpec
+from amplifier_core.message_models import ChatRequest, ChatResponse, Message, ToolSpec
 
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai.neutral_computer import (
@@ -320,9 +320,38 @@ def test_provenance_tampering_and_failed_history_new_user_projection():
         replay_calls([bad])
 
 
+def stored_response(response, storage="loop"):
+    """Public response fields in the normal loop's two persisted representations."""
+    response = ChatResponse.model_validate_json(response.model_dump_json())
+    content = [item.model_dump() for item in response.content]
+    calls = [
+        {"id": tc.id, "tool": tc.name, "arguments": tc.arguments}
+        for tc in response.tool_calls
+    ]
+    if storage == "structured":
+        calls = []
+    elif storage in {"legacy", "name_arguments"}:
+        content = []
+        if storage == "name_arguments":
+            calls = [
+                {"id": tc.id, "name": tc.name, "arguments": json.dumps(tc.arguments)}
+                for tc in response.tool_calls
+            ]
+    elif storage == "both_fields":
+        for call in calls:
+            call["name"] = call["tool"]
+            call["input"] = call["arguments"]
+            call["arguments"] = json.dumps(call["arguments"])
+    saved = Message(
+        role="assistant", content=content, tool_calls=calls, metadata=response.metadata,
+    )
+    return Message.model_validate_json(saved.model_dump_json())
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_actual_sdk_count_create_stream_two_turns_with_no_execution(streaming):
+@pytest.mark.parametrize("storage", ["structured", "legacy", "name_arguments", "loop", "both_fields"])
+async def test_actual_sdk_count_create_stream_two_turns_with_no_execution(streaming, storage):
     wires = []
     async def handle(req):
         body = json.loads(req.content)
@@ -340,16 +369,26 @@ async def test_actual_sdk_count_create_stream_two_turns_with_no_execution(stream
                             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)))
     driver = OpenAIProvider(client=sdk, config={"use_streaming": streaming, "max_retries": 0})
     try:
-        first = request()
+        tool = spec("my_desktop", operations=["screenshot", "left_click", "key"])
+        first = request(tool)
+        first_before = first.model_dump()
         budget = await driver.request_budget(first, context_estimate=1)
         assert budget["measurement"]["kind"] == "provider_count"
         response = await driver.complete(first)
         assert len(response.tool_calls) == 1
-        assert response.tool_calls[0].name == "desk"
-        second = request(messages=[Message(role="assistant", content=response.content, metadata=response.metadata),
-                                   Message(role="tool", tool_call_id="call_fixture", content=[image()])])
+        assert response.tool_calls[0].name == "my_desktop"
+        saved = stored_response(response, storage)
+        second = request(tool, messages=[
+            saved, Message(role="tool", tool_call_id="call_fixture", content=[image()]),
+        ])
+        second_before = second.model_dump()
+        replay = replay_calls([saved.model_dump()])
+        assert list(replay) == ["call_fixture"]
+        assert replay["call_fixture"] == response.metadata[CALLS]["call_fixture"]
         await driver.request_budget(second, context_estimate=1)
         await driver.complete(second)
+        assert first.model_dump() == first_before
+        assert second.model_dump() == second_before
         assert len(wires) == 6  # two budget counts, two dispatch counts, two generations
         for _, body in wires:
             assert body["tools"] == [{"type": "computer"}]
@@ -358,9 +397,109 @@ async def test_actual_sdk_count_create_stream_two_turns_with_no_execution(stream
         counts = [body for path, body in wires if path.endswith("input_tokens")]
         creates = [body for path, body in wires if path.endswith("responses")]
         assert counts[-1]["input"] == creates[-1]["input"]
-        assert sum(i.get("type") == "computer_call_output" for i in creates[-1]["input"]) == 1
+        for body in [counts[-2], counts[-1], creates[-1]]:
+            calls = [i for i in body["input"] if i.get("type") == "computer_call"]
+            outputs = [i for i in body["input"] if i.get("type") == "computer_call_output"]
+            assert len(calls) == len(outputs) == 1
+            assert calls[0]["call_id"] == outputs[0]["call_id"] == "call_fixture"
+            assert calls[0]["actions"] == block()["actions"]
+            assert outputs[0]["output"]["image_url"] == neutral_screenshot([image()])[0]
     finally:
         await driver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", [
+    "name_tool", "tool_name", "input_arguments", "arguments_input",
+    "malformed_json", "duplicate_alias", "call_identity",
+    "duplicate_arguments", "duplicate_provenance", "canonical", "vendor_actions",
+    "image_binding", "cross_turn",
+])
+async def test_sdk_loop_replay_consistency_refuses_before_http_without_mutation(corruption):
+    wires = []
+
+    async def handle(req):
+        wires.append(req.url.path)
+        if req.url.path.endswith("input_tokens"):
+            return httpx.Response(200, json={"input_tokens": 1})
+        return httpx.Response(200, json=envelope([block()]))
+
+    sdk = openai.AsyncOpenAI(
+        api_key="offline", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
+    driver = OpenAIProvider(client=sdk, config={"use_streaming": False, "max_retries": 0})
+    try:
+        response = await driver.complete(request())
+        saved = stored_response(response).model_dump()
+        legacy = saved["tool_calls"][0]
+        structured = saved["content"][0]
+        if corruption == "name_tool":
+            legacy["name"] = legacy["tool"]
+            legacy["tool"] = "wrong"
+        elif corruption == "tool_name":
+            legacy["name"] = "wrong"
+        elif corruption == "input_arguments":
+            structured["arguments"] = json.dumps({**structured["input"], "capture_after": False})
+        elif corruption == "arguments_input":
+            structured["arguments"] = json.dumps(structured["input"])
+            structured["input"]["capture_after"] = False
+        elif corruption == "malformed_json":
+            legacy["arguments"] = "{"
+        elif corruption == "duplicate_alias":
+            structured["name"] = "wrong"
+        elif corruption == "call_identity":
+            structured["id"] = "tampered"
+        elif corruption == "duplicate_arguments":
+            structured["input"]["capture_after"] = False
+        elif corruption == "duplicate_provenance":
+            structured["metadata"][KEY]["alias"] = "wrong"
+        elif corruption == "canonical":
+            for record in (saved["metadata"][CALLS]["call_fixture"], structured["metadata"][KEY]):
+                record["canonical"]["capture_after"] = False
+        elif corruption == "vendor_actions":
+            for record in (saved["metadata"][CALLS]["call_fixture"], structured["metadata"][KEY]):
+                record["vendor_actions"] = [{"type": "move", "x": 1, "y": 2}]
+        elif corruption == "image_binding":
+            for record in (saved["metadata"][CALLS]["call_fixture"], structured["metadata"][KEY]):
+                record["binding"]["image_space"]["width"] = 1
+        saved = Message.model_validate(saved)
+        result = Message(role="tool", tool_call_id="call_fixture", content=[image()])
+        messages = [saved, result]
+        if corruption == "cross_turn":
+            messages.extend([saved.model_copy(deep=True), result.model_copy(deep=True)])
+        req = request(messages=messages)
+        before = req.model_dump()
+        dispatched = list(wires)
+        # Both the public budgeting and completion boundaries must refuse replay.
+        with pytest.raises(InvalidRequestError) as caught:
+            await driver.request_budget(req, context_estimate=1)
+        assert caught.value.retryable is False
+        with pytest.raises(InvalidRequestError):
+            await driver.complete(req)
+        assert wires == dispatched
+        assert req.model_dump() == before
+    finally:
+        await driver.close()
+
+
+@pytest.mark.parametrize("alias", ["computer", "screenshot", "unknown"])
+def test_loop_storage_without_provenance_stays_ordinary(alias):
+    arguments = {"actions": [{"type": "screenshot"}]}
+    saved = Message(
+        role="assistant",
+        content=[{"type": "tool_call", "id": "ordinary", "name": alias, "input": arguments}],
+        tool_calls=[{"id": "ordinary", "tool": alias, "arguments": arguments}],
+    )
+    before = saved.model_dump()
+    assert replay_calls([before]) == {}
+    tool = ToolSpec(name=alias, description="Ordinary", parameters={"type": "object"})
+    req = request(tool, messages=[
+        saved, Message(role="tool", tool_call_id="ordinary", content="ordinary text"),
+    ])
+    wire = provider()._budget_params(req)
+    assert [item["type"] for item in wire["input"]] == ["function_call", "function_call_output"]
+    assert saved.model_dump() == before
 
 
 @pytest.mark.asyncio
