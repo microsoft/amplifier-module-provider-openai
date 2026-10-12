@@ -15,6 +15,8 @@ from amplifier_core.message_models import ChatRequest, ChatResponse, Message, To
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai.neutral_computer import (
     CALLS,
+    IMAGE_DROPPED,
+    IMAGES,
     KEY,
     neutral_screenshot,
     replay_calls,
@@ -26,7 +28,7 @@ from amplifier_module_provider_openai.neutral_computer import (
 PNG = Path(__file__).parent / "fixtures/computer_use/valid-red-pixel.png"
 
 
-def image():
+def image(tint=0):
     import base64
     import struct
     import zlib
@@ -36,7 +38,7 @@ def image():
 
     # A backend fake's full screenshot, matching the real declared pixel space.
     png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1280, 720, 8, 2, 0, 0, 0))
-    png += chunk(b"IDAT", zlib.compress((b"\x00" + b"\x00" * (1280 * 3)) * 720)) + chunk(b"IEND", b"")
+    png += chunk(b"IDAT", zlib.compress((b"\x00" + bytes([tint]) * (1280 * 3)) * 720)) + chunk(b"IEND", b"")
     return {"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                          "data": base64.b64encode(png).decode()}}
 
@@ -326,7 +328,7 @@ def stored_response(response, storage="loop"):
     content = [item.model_dump() for item in response.content]
     calls = [
         {"id": tc.id, "tool": tc.name, "arguments": tc.arguments}
-        for tc in response.tool_calls
+        for tc in (response.tool_calls or [])
     ]
     if storage == "structured":
         calls = []
@@ -335,7 +337,7 @@ def stored_response(response, storage="loop"):
         if storage == "name_arguments":
             calls = [
                 {"id": tc.id, "name": tc.name, "arguments": json.dumps(tc.arguments)}
-                for tc in response.tool_calls
+                for tc in (response.tool_calls or [])
             ]
     elif storage == "both_fields":
         for call in calls:
@@ -414,6 +416,10 @@ async def test_actual_sdk_count_create_stream_two_turns_with_no_execution(stream
     "malformed_json", "duplicate_alias", "call_identity",
     "duplicate_arguments", "duplicate_provenance", "canonical", "vendor_actions",
     "image_binding", "cross_turn",
+    "bool_capture", "bool_version", "null_message", "null_record", "null_block",
+    "second_identity", "orphan", "same_storage_duplicate", "nan", "non_json",
+    "block_only_alias", "block_only_arguments",
+    "misplaced_message", "misplaced_block", "duplicate_json_field",
 ])
 async def test_sdk_loop_replay_consistency_refuses_before_http_without_mutation(corruption):
     wires = []
@@ -463,6 +469,38 @@ async def test_sdk_loop_replay_consistency_refuses_before_http_without_mutation(
         elif corruption == "image_binding":
             for record in (saved["metadata"][CALLS]["call_fixture"], structured["metadata"][KEY]):
                 record["binding"]["image_space"]["width"] = 1
+        elif corruption == "bool_capture":
+            legacy["arguments"] = {**legacy["arguments"], "capture_after": 1}
+        elif corruption == "bool_version":
+            legacy["arguments"] = {**legacy["arguments"], "version": True}
+        elif corruption == "null_message":
+            saved["metadata"][CALLS] = None
+        elif corruption == "null_record":
+            saved["metadata"][CALLS]["call_fixture"] = None
+        elif corruption == "null_block":
+            structured["metadata"][KEY] = None
+        elif corruption == "second_identity":
+            legacy["tool_call_id"] = "wrong"
+        elif corruption == "orphan":
+            saved["metadata"][CALLS]["orphan"] = copy.deepcopy(saved["metadata"][CALLS]["call_fixture"])
+        elif corruption == "same_storage_duplicate":
+            saved["tool_calls"].append(copy.deepcopy(legacy))
+        elif corruption == "nan":
+            legacy["arguments"] = {**legacy["arguments"], "version": float("nan")}
+        elif corruption == "non_json":
+            legacy["arguments"] = {**legacy["arguments"], "actions": ("not", "json")}
+        elif corruption in {"block_only_alias", "block_only_arguments"}:
+            saved["metadata"].pop(CALLS)
+            if corruption == "block_only_alias":
+                legacy["tool"] = "wrong"
+            else:
+                legacy["arguments"] = {**legacy["arguments"], "capture_after": False}
+        elif corruption == "misplaced_message":
+            saved["metadata"][KEY] = copy.deepcopy(structured["metadata"][KEY])
+        elif corruption == "misplaced_block":
+            structured["metadata"][CALLS] = {}
+        elif corruption == "duplicate_json_field":
+            legacy["arguments"] = json.dumps(legacy["arguments"]).replace('"version": 1', '"version": true, "version": 1')
         saved = Message.model_validate(saved)
         result = Message(role="tool", tool_call_id="call_fixture", content=[image()])
         messages = [saved, result]
@@ -840,6 +878,7 @@ async def test_native_adapter_full_and_delta_views_keep_neutral_alias(monkeypatc
         ])
         final = await driver.complete(second, model="gpt-6-astra")
         assert final.tool_calls[0].name == "desk"
+        assert list(final.metadata[IMAGES]) == ["native_1"]
         assert len(calls) == 2
         assert calls[1]["tools"] == [{"type": "computer"}]
         assert sum(i.get("type") == "computer_call_output" for i in calls[1]["input"]) == 1
@@ -885,3 +924,290 @@ async def test_native_neutral_alias_never_starts_an_async_job(monkeypatch):
         assert "async" not in sent[0]["tools"][0]
     finally:
         await driver.close()
+
+
+def terminal_output():
+    return [{"type": "message", "id": "m_terminal", "role": "assistant", "status": "completed",
+             "content": [{"type": "output_text", "text": "Observed.", "annotations": []}]}]
+
+
+def sdk_driver(output_factory, *, streaming=False):
+    """Real SDK transport with an inspectable sequence, never a private replay seed."""
+    wires = []
+
+    async def handle(req):
+        body = json.loads(req.content)
+        wires.append((req.url.path, body))
+        if req.url.path.endswith("input_tokens"):
+            return httpx.Response(200, json={"input_tokens": 100})
+        payload = envelope(output_factory(body))
+        if body.get("stream"):
+            sse = "".join("data: " + json.dumps({"type": kind, "sequence_number": seq, "response": payload}) + "\n\n"
+                          for seq, kind in enumerate(["response.created", "response.completed"]))
+            return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json=payload)
+
+    sdk = openai.AsyncOpenAI(api_key="offline", max_retries=0,
+                            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+    return OpenAIProvider(client=sdk, config={"use_streaming": streaming, "max_retries": 0}), wires
+
+
+def recency_view(history):
+    """Source evidence: mirror only the supported recency3 transformation.
+
+    No actual Session.execute acceptance is claimed by this provider-local test.
+    """
+    view = [Message.model_validate_json(m.model_dump_json()) for m in history]
+    results = [m for m in view if m.role == "tool"]
+    for result in results[:-3]:
+        original = result.model_dump()["content"]
+        if isinstance(original, list) and any(b.get("type") == "image" for b in original):
+            references = [b["text"] for b in original if b.get("type") == "text"]
+            result.content = [{"type": "text", "text": references[0] + IMAGE_DROPPED}]
+    return view
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restart(streaming):
+    import base64
+    import hashlib
+
+    captures = 0
+    terminal_at = 4
+    expected = {}
+    history = [Message(role="user", content="Observe four synthetic frames")]
+
+    def outputs(body):
+        nonlocal captures
+        if captures == terminal_at:
+            return terminal_output()
+        captures += 1
+        return [block(call_id=f"capture_{captures}")]
+
+    driver, wires = sdk_driver(outputs, streaming=streaming)
+    all_wires = []
+    try:
+        for target in (4, 12):
+            terminal_at = target
+            if target == 12:
+                await driver.close()
+                all_wires.extend(wires)
+                driver, wires = sdk_driver(outputs, streaming=streaming)
+                history = [Message.model_validate_json(m.model_dump_json()) for m in history]
+                history.append(Message(role="user", content="Observe eight more synthetic frames"))
+            while True:
+                req = request(messages=recency_view(history))
+                before = req.model_dump_json()
+                state = (set(driver._native_call_ids), dict(driver._native_call_types),
+                         set(driver._repaired_tool_ids))
+                await driver.request_budget(req, context_estimate=1)
+                await driver.request_budget(req, context_estimate=1)
+                assert req.model_dump_json() == before
+                assert state == (driver._native_call_ids, driver._native_call_types, driver._repaired_tool_ids)
+                assert not hasattr(driver, "_staged_computer_images")
+                reply = await driver.complete(req)
+                assert req.model_dump_json() == before
+                new = reply.metadata.get(IMAGES, {})
+                assert len(new) == (1 if expected and len(expected) > sum(
+                    len((m.metadata or {}).get(IMAGES, {})) for m in history) else 0)
+                history.append(stored_response(reply))
+                if not reply.tool_calls:
+                    assert captures == target
+                    assert new  # terminal replies carry the last newly observed frame
+                    break
+                assert len(reply.tool_calls) == 1
+                call = reply.tool_calls[0]
+                assert call.id == f"capture_{captures}"
+                assert call.arguments == {"version": 1, "actions": [{"action": "screenshot"}], "capture_after": True}
+                png = image(captures)
+                expected[call.id] = hashlib.sha256(base64.b64decode(png["source"]["data"])).hexdigest()
+                history.append(Message(role="tool", tool_call_id=call.id,
+                    content=[{"type": "text", "text": f"owned-frame-{captures}"}, png]))
+        all_wires.extend(wires)
+        assert captures == len(expected) == 12
+        assert sum(len((m.metadata or {}).get(IMAGES, {})) for m in history) == 12
+        assert len(json.dumps([m.model_dump() for m in history]).encode()) < 64 * 1024 * 1024
+        groups = [all_wires[i:i + 4] for i in range(0, len(all_wires), 4)]
+        assert len(groups) == 14  # 12 requested captures, two terminal generations
+        for group in groups:
+            assert len(group) == 4
+            assert all(body["input"] == group[-1][1]["input"] for _, body in group)
+            for item in group[-1][1]["input"]:
+                if item.get("type") == "computer_call_output":
+                    raw = base64.b64decode(item["output"]["image_url"].partition(",")[2])
+                    assert hashlib.sha256(raw).hexdigest() == expected[item["call_id"]]
+            assert IMAGES not in json.dumps(group[-1][1])
+    finally:
+        await driver.close()
+
+
+async def observed_history(driver):
+    first = await driver.complete(request())
+    history = [stored_response(first), Message(role="tool", tool_call_id="call_fixture",
+        content=[{"type": "text", "text": "owned reference"}, image(1)])]
+    observed = await driver.complete(request(messages=history))
+    assert list(observed.metadata[IMAGES]) == ["call_fixture"]
+    history.append(stored_response(observed))
+    return history
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", [
+    "digest", "pixels", "call_record", "reference", "null", "version", "format", "duplicate",
+    "missing_carrier", "missing_result", "missing_call", "present_conflict", "present_reference",
+    "arbitrary_omission", "failed_result", "unavailable_file", "duplicate_result",
+    "url_wrong_type",
+])
+async def test_genuine_observation_tampering_refuses_before_count_or_generation(corruption):
+    driver, wires = sdk_driver(lambda body: terminal_output() if any(
+        i.get("type") == "computer_call" for i in body["input"]) else [block()])
+    try:
+        history = await observed_history(driver)
+        carrier = history[-1].metadata[IMAGES]
+        record = carrier["call_fixture"]
+        if corruption == "digest":
+            record["sha256"] = "0" * 64
+        elif corruption == "pixels":
+            record["image_url"] = neutral_screenshot([image(2)])[0]
+        elif corruption == "call_record":
+            record["call_record"]["alias"] = "wrong"
+        elif corruption == "reference":
+            record["references"] = ["wrong"]
+        elif corruption == "null":
+            history[-1].metadata[IMAGES] = None
+        elif corruption == "version":
+            record["version"] = True
+        elif corruption == "format":
+            record["unknown"] = "unsupported"
+        elif corruption == "duplicate":
+            history.append(history[-1].model_copy(deep=True))
+        elif corruption == "missing_carrier":
+            history[-1].metadata.pop(IMAGES)
+        elif corruption == "missing_result":
+            history.pop(1)
+        elif corruption == "missing_call":
+            history.pop(0)
+        elif corruption == "present_conflict":
+            history[1].content = [{"type": "text", "text": "owned reference"}, image(2)]
+        elif corruption == "present_reference":
+            history[1].content = [{"type": "text", "text": "wrong"}, image(1)]
+        elif corruption == "arbitrary_omission":
+            history[1].content = [{"type": "text", "text": "arbitrary unavailable image"}]
+        elif corruption == "failed_result":
+            history[1].content = '{"success":false,"error":"halt"}'
+        elif corruption == "unavailable_file":
+            history[1].content = "/nonexistent/capture.png"
+        elif corruption == "duplicate_result":
+            history.append(history[1].model_copy(deep=True))
+        elif corruption == "url_wrong_type":
+            record["image_url"] = [image(1)]
+        if corruption in {"missing_carrier", "digest", "pixels", "call_record", "reference", "null", "version", "format", "duplicate"}:
+            history[1].content = [{"type": "text", "text": "owned reference" + IMAGE_DROPPED}]
+        req = request(messages=history)
+        before = req.model_dump_json()
+        sent = copy.deepcopy(wires)
+        with pytest.raises(InvalidRequestError):
+            await driver.request_budget(req, context_estimate=1)
+        with pytest.raises(InvalidRequestError):
+            await driver.complete(req)
+        assert req.model_dump_json() == before
+        assert wires == sent
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_observations_are_request_local_for_disjoint_histories_reusing_ids():
+    driver, wires = sdk_driver(lambda body: terminal_output() if any(
+        i.get("type") == "computer_call" for i in body["input"]) else [block()])
+    try:
+        alpha = await driver.complete(request())
+        beta = await driver.complete(request())
+        histories = [
+            [stored_response(reply), Message(role="tool", tool_call_id="call_fixture",
+                content=[{"type": "text", "text": "owned reference"}, image(tint)])]
+            for reply, tint in ((alpha, 1), (beta, 2))
+        ]
+        replies = await asyncio.gather(*(driver.complete(request(messages=h)) for h in histories))
+        assert replies[0].metadata[IMAGES]["call_fixture"]["sha256"] != replies[1].metadata[IMAGES]["call_fixture"]["sha256"]
+        for history, reply in zip(histories, replies):
+            history.append(stored_response(reply))
+            history[1].content = [{"type": "text", "text": "owned reference" + IMAGE_DROPPED}]
+            await driver.complete(request(messages=history))
+        creates = [body for path, body in wires if not path.endswith("input_tokens")]
+        assert creates[-2]["input"] != creates[-1]["input"]
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_observation_aggregate_boundary_counts_persisted_plus_new(monkeypatch):
+    import amplifier_module_provider_openai.neutral_computer as neutral
+    assert neutral.MAX_OBSERVATION_BYTES == 64 * 1024 * 1024
+    driver, wires = sdk_driver(lambda body: terminal_output() if any(
+        i.get("type") == "computer_call" for i in body["input"]) else [block()])
+    try:
+        history = await observed_history(driver)
+        records = history[-1].metadata[IMAGES]
+        size = len(json.dumps(records, ensure_ascii=True, allow_nan=False).encode())
+        monkeypatch.setattr(neutral, "MAX_OBSERVATION_BYTES", size)
+        await driver.request_budget(request(messages=history), context_estimate=1)
+        new_driver, new_wires = sdk_driver(lambda body: [block(call_id="call_new")])
+        try:
+            genuine = await new_driver.complete(request())
+        finally:
+            await new_driver.close()
+        with_new = [*history, stored_response(genuine),
+                    Message(role="tool", tool_call_id="call_new",
+                            content=[{"type": "text", "text": "new reference"}, image(2)])]
+        sent = copy.deepcopy(wires)
+        with pytest.raises(InvalidRequestError, match="64MiB"):
+            await driver.request_budget(request(messages=with_new), context_estimate=1)
+        assert wires == sent
+        assert len(new_wires) == 2
+        monkeypatch.setattr(neutral, "MAX_OBSERVATION_BYTES", size - 1)
+        sent = copy.deepcopy(wires)
+        req = request(messages=history)
+        before = req.model_dump_json()
+        with pytest.raises(InvalidRequestError, match="64MiB") as caught:
+            await driver.request_budget(req, context_estimate=1)
+        assert caught.value.code == "computer_images_overflow"
+        with pytest.raises(InvalidRequestError):
+            await driver.complete(req)
+        assert before == req.model_dump_json()
+        assert wires == sent
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_64mib_aggregate_overflow_refuses_new_observation_before_http():
+    driver, wires = sdk_driver(lambda body: [block()])
+    try:
+        first = await driver.complete(request())
+        req = request(messages=[stored_response(first),
+            Message(role="tool", tool_call_id="call_fixture", content=[
+                {"type": "text", "text": "x" * (64 * 1024 * 1024)}, image(1)])])
+        sent = copy.deepcopy(wires)
+        with pytest.raises(InvalidRequestError) as caught:
+            await driver.request_budget(req, context_estimate=1)
+        assert caught.value.code == "computer_images_overflow"
+        with pytest.raises(InvalidRequestError):
+            await driver.complete(req)
+        assert len(req.messages[1].content[0].text) == 64 * 1024 * 1024
+        assert wires == sent
+        assert not hasattr(driver, "_staged_computer_images")
+    finally:
+        await driver.close()
+
+
+def test_ordinary_legacy_call_is_not_deduplicated_against_a_text_id():
+    driver = provider()
+    messages = [{"role": "assistant", "content": [
+        {"type": "text", "text": "ordinary evidence", "id": "ordinary"}],
+        "tool_calls": [{"id": "ordinary", "tool": "lookup", "arguments": {"value": 1}}]},
+        {"role": "tool", "tool_call_id": "ordinary", "content": "found"}]
+    wire = driver._convert_messages(messages)
+    assert sum(i.get("type") == "function_call" for i in wire) == 1
+    assert sum(i.get("type") == "function_call_output" for i in wire) == 1

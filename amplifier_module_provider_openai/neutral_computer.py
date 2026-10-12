@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
+import math
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -21,6 +23,9 @@ from ._computer_result import screenshot_data_url, validate_image
 
 KEY = "openai:computer_use"
 CALLS = "openai:computer_calls"
+IMAGES = "openai:computer_images"
+MAX_OBSERVATION_BYTES = 64 * 1024 * 1024
+IMAGE_DROPPED = " [image dropped: superseded by a newer screenshot]"
 CANONICAL = frozenset({
     "screenshot", "zoom", "cursor_position", "mouse_move", "left_click",
     "right_click", "middle_click", "double_click", "triple_click",
@@ -43,7 +48,7 @@ KEYS = frozenset({"enter", "return", "tab", "space", "backspace",
 
 def refuse(reason: str, code: str = "computer_use_invalid") -> None:
     error = InvalidRequestError(
-        f"Neutral computer-use request refused: {reason}. No computer action was executed.",
+        f"Neutral computer-use request refused: {reason}. This provider request did not execute a computer action.",
         provider="openai", retryable=False,
     )
     error.code = code
@@ -513,31 +518,143 @@ def response_calls(output: list[Any], context: dict[str, Any], model: Any,
     return calls
 
 
+def validate_json(value: Any) -> None:
+    try:
+        _validate_json(value)
+    except RecursionError:
+        refuse("malformed recursive replay value")
+
+
+def _validate_json(value: Any) -> None:
+    """Reject non-JSON values rather than coerce them into agreement."""
+    if value is None or type(value) in (str, bool, int):
+        return
+    if type(value) is float and math.isfinite(value):
+        return
+    if type(value) is list:
+        for item in value:
+            _validate_json(item)
+        return
+    if type(value) is dict and all(type(key) is str for key in value):
+        for item in value.values():
+            _validate_json(item)
+        return
+    refuse("malformed non-JSON replay value")
+
+
+def json_agrees(left: Any, right: Any) -> bool:
+    """JSON numbers may agree; booleans never agree with numbers."""
+    validate_json(left)
+    validate_json(right)
+    if type(left) in (int, float) and type(right) in (int, float):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(json_agrees(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(json_agrees(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _metadata(value: dict[str, Any]) -> dict[str, Any]:
+    metadata = value.get("metadata")
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        refuse("malformed replay metadata")
+    return metadata
+
+
+def _stored_blocks(message):
+    content = message.get("content")
+    for source, blocks in (
+        ("legacy", message.get("tool_calls") or []),
+        ("structured", content if isinstance(content, list) else []),
+    ):
+        for block in blocks:
+            if hasattr(block, "model_dump"):
+                block = block.model_dump()
+            if isinstance(block, dict):
+                yield source, block
+
+
+def _replay_json(text):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                refuse("duplicate JSON field in replay arguments")
+            result[key] = value
+        return result
+    try:
+        return json.loads(text, object_pairs_hook=unique_object)
+    except (ValueError, RecursionError):
+        refuse("malformed replay arguments")
+
+
 def replay_calls(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Validate persisted provenance; never infer neutral native calls by name."""
     found = {}
     owners = {}
     for index, message in enumerate(messages):
-        if message.get("role") != "assistant":
-            continue
-        saved = (message.get("metadata") or {}).get(CALLS, {})
+        metadata = _metadata(message)
+        if KEY in metadata:
+            refuse("block provenance is misplaced on a message")
+        saved = metadata.get(CALLS, {})
         if not isinstance(saved, dict):
             refuse("malformed replay provenance")
-        content = message.get("content")
-        blocks = content if isinstance(content, list) else []
-        for block in [*(message.get("tool_calls") or []), *blocks]:
-            if hasattr(block, "model_dump"):
-                block = block.model_dump()
-            if not isinstance(block, dict):
+        validate_json(saved)
+        if CALLS in metadata and message.get("role") != "assistant":
+            refuse("orphaned native provenance")
+        available = dict(saved)
+        # Provenance on either supported storage representation establishes an
+        # identity, not a preferred copy. All same-ID copies must then agree.
+        for _, block in _stored_blocks(message):
+            local_metadata = _metadata(block)
+            if CALLS in local_metadata or IMAGES in local_metadata:
+                refuse("message provenance is misplaced on a block")
+            if KEY not in local_metadata:
                 continue
             identity = block.get("id") or block.get("tool_call_id")
-            local = (block.get("metadata") or {}).get(KEY)
-            persisted = saved.get(identity)
-            if local is not None and persisted is not None and local != persisted:
+            local = local_metadata[KEY]
+            if not isinstance(identity, str) or not identity or not isinstance(local, dict) or not local:
+                refuse("malformed block replay provenance")
+            if identity in available and not json_agrees(available[identity], local):
                 refuse("conflicting block and message replay provenance")
-            record = local if local is not None else persisted
-            if record is None:
+            available[identity] = local
+        consumed = set()
+        seen = set()
+        for source, block in _stored_blocks(message):
+            identity = block.get("id") or block.get("tool_call_id")
+            local_metadata = _metadata(block)
+            local_present = KEY in local_metadata
+            persisted_present = identity in saved if isinstance(identity, str) else False
+            local = local_metadata.get(KEY)
+            persisted = saved.get(identity) if isinstance(identity, str) else None
+            if not local_present and not persisted_present and (
+                not isinstance(identity, str) or identity not in available
+            ):
                 continue
+            if message.get("role") != "assistant" or (
+                source == "structured" and block.get("type") != "tool_call"
+            ):
+                refuse("orphaned native block provenance")
+            identities = [block[key] for key in ("id", "tool_call_id", "call_id") if key in block]
+            if not isinstance(identity, str) or not identity or any(v != identity for v in identities):
+                refuse("conflicting or malformed replay identity")
+            if (source, identity) in seen:
+                refuse("duplicate computer call in one storage representation")
+            seen.add((source, identity))
+            consumed.add(identity)
+            if local_present and (not isinstance(local, dict) or not local):
+                refuse("malformed block replay provenance")
+            if persisted_present and (not isinstance(persisted, dict) or not persisted):
+                refuse("malformed saved replay provenance")
+            if local_present and persisted_present and not json_agrees(local, persisted):
+                refuse("conflicting block and message replay provenance")
+            record = local if local_present else persisted if persisted_present else available[identity]
+            validate_json(record)
             if (not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != 1
                     or record.get("call_id") != identity or not isinstance(record.get("binding"), dict)):
                 refuse("malformed computer replay binding")
@@ -549,7 +666,11 @@ def replay_calls(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                 "version": binding["version"], "operations": binding["operations"],
                 "image_space": binding["image_space"],
             }})
-            if binding != {**declaration, "model": binding["model"]} or not isinstance(binding["model"], str):
+            if (not json_agrees(binding, {**declaration, "model": binding["model"]})
+                    or not isinstance(binding["model"], str) or not binding["model"]
+                    or binding["image_space"] is None
+                    or not set(binding["operations"]) <= SUPPORTED
+                    or "screenshot" not in binding["operations"]):
                 refuse("persisted binding disagrees with its function schema")
             expected = provenance(identity, record.get("vendor_actions"), binding)
             # The loop retains both legacy tool/arguments and structured
@@ -562,22 +683,141 @@ def replay_calls(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                     continue
                 value = block[key]
                 if isinstance(value, str):
-                    try:
-                        value = json.loads(value)
-                    except ValueError:
-                        refuse("malformed replay arguments")
+                    value = _replay_json(value)
                 arguments.append(value)
-            if (record != expected or not aliases or not arguments
+            if (not json_agrees(record, expected) or not aliases or not arguments
                     or any(alias != record["alias"] for alias in aliases)
-                    or any(value != record["canonical"] for value in arguments)):
+                    or any(not json_agrees(value, record["canonical"]) for value in arguments)):
                 refuse("computer replay provenance does not match the canonical call")
-            if identity in found and found[identity] != record:
+            if identity in found and not json_agrees(found[identity], record):
                 refuse("conflicting replay call identity")
             if identity in owners and owners[identity] != index:
                 refuse("duplicate computer call across historical turns")
             owners[identity] = index
             found[identity] = copy.deepcopy(record)
+        if saved.keys() - consumed:
+            refuse("orphaned native provenance record")
+    # A second ordinary/otherwise unmarked copy cannot steal a native identity.
+    for index, message in enumerate(messages):
+        for _, block in _stored_blocks(message):
+            identity = block.get("id") or block.get("tool_call_id")
+            if isinstance(identity, str) and identity in found and owners[identity] != index:
+                refuse("duplicate computer call across historical turns")
     return found
+
+
+def _png_digest(url: str) -> str:
+    return hashlib.sha256(base64.b64decode(url.partition(",")[2], validate=True)).hexdigest()
+
+
+def _omitted_references(content: Any) -> list[str] | None:
+    """Only the generic recency hook's exact transformation is recognized."""
+    if not isinstance(content, list) or not content:
+        return None
+    if any(not isinstance(b, dict) or b.get("type") not in {"text", "input_text"}
+           or not isinstance(b.get("text"), str) for b in content):
+        return None
+    texts = [b["text"] for b in content]
+    if not texts[-1].endswith(IMAGE_DROPPED):
+        return None
+    return [*texts[:-1], texts[-1][:-len(IMAGE_DROPPED)]]
+
+
+def plan_observations(messages, replay):
+    """Validate public history, hydrate a derived copy, stage only new results.
+
+    No files, provider cache, caller mutation, or persistence on the count path.
+    Carrier removal cannot authorize image recovery.
+    """
+    persisted = {}
+    carrier_indices = {}
+    for index, message in enumerate(messages):
+        metadata = _metadata(message)
+        if IMAGES not in metadata:
+            continue
+        records = metadata[IMAGES]
+        validate_json(records)
+        if message.get("role") != "assistant" or not isinstance(records, dict) or not records:
+            refuse("malformed observed-image metadata")
+        for identity, record in records.items():
+            if identity in persisted:
+                refuse("duplicate observed-image ownership")
+            if identity not in replay or not isinstance(record, dict):
+                refuse("orphaned observed-image record")
+            expected_fields = {"version", "call_id", "call_record", "image_url", "sha256", "references"}
+            if (set(record) != expected_fields or type(record.get("version")) is not int
+                    or record["version"] != 1 or record.get("call_id") != identity
+                    or not json_agrees(record.get("call_record"), replay[identity])
+                    or not isinstance(record.get("image_url"), str)
+                    or not isinstance(record.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None
+                    or not isinstance(record.get("references"), list)
+                    or any(not isinstance(v, str) for v in record["references"])):
+                refuse("invalid observed-image binding or format")
+            url, refs = neutral_screenshot(
+                record.get("image_url"), image_space=replay[identity]["binding"]["image_space"]
+            )
+            if refs or record.get("sha256") != _png_digest(url):
+                refuse("observed-image PNG digest mismatch")
+            neutral_screenshot([
+                *({"type": "text", "text": text} for text in record["references"]),
+                {"type": "input_image", "image_url": url},
+            ], image_space=replay[identity]["binding"]["image_space"])
+            persisted[identity] = copy.deepcopy(record)
+            carrier_indices[identity] = index
+    projected = copy.deepcopy(messages)
+    staged = {}
+    for identity, call in replay.items():
+        results = [(i, m) for i, m in enumerate(messages)
+                   if m.get("role") == "tool" and m.get("tool_call_id") == identity]
+        if len(results) != 1:
+            refuse("missing or duplicate native tool result")
+        index, result = results[0]
+        call_index = next(i for i, m in enumerate(messages) if any(
+            (b.get("id") or b.get("tool_call_id")) == identity for _, b in _stored_blocks(m)
+        ))
+        if index <= call_index:
+            refuse("native result precedes its original call")
+        record = persisted.get(identity)
+        omitted = _omitted_references(result.get("content"))
+        if record is not None:
+            if carrier_indices[identity] <= index:
+                refuse("observed-image carrier precedes its result")
+            if omitted is not None:
+                if not json_agrees(omitted, record["references"]):
+                    refuse("omitted image references disagree with observation")
+                projected[index]["content"] = [
+                    *({"type": "text", "text": text} for text in record["references"]),
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png",
+                        "data": record["image_url"].partition(",")[2],
+                    }},
+                ]
+            else:
+                url, refs = neutral_screenshot(
+                    result.get("content"), image_space=call["binding"]["image_space"]
+                )
+                if url != record["image_url"] or not json_agrees(refs, record["references"]):
+                    refuse("present image or references conflict with observation")
+        elif omitted is not None:
+            refuse("recency-omitted native pixels have no observation carrier", "computer_result_not_image")
+        else:
+            try:
+                url, refs = neutral_screenshot(
+                    result.get("content"), image_space=call["binding"]["image_space"]
+                )
+            except InvalidRequestError:
+                # Preserve the existing failed-result discussion projection. It
+                # does not gain an image observation, even after a new user turn.
+                continue
+            staged[identity] = {
+                "version": 1, "call_id": identity, "call_record": copy.deepcopy(call),
+                "image_url": url, "sha256": _png_digest(url), "references": refs,
+            }
+    size = len(json.dumps({**persisted, **staged}, ensure_ascii=True, allow_nan=False).encode())
+    if size > MAX_OBSERVATION_BYTES:
+        refuse("observed-image replay exceeds the aggregate 64MiB limit", "computer_images_overflow")
+    return projected, staged
 
 
 def neutral_screenshot(content: Any, *, image_space=None) -> tuple[str, list[Any]]:

@@ -687,6 +687,26 @@ execution, including after historical failure projection. Count, complete,
 stream, text-only continuation, and the optional native adapter use the same
 binding/projection. Incomplete tool batches are not internally replayed.
 
+Successful native observations are retained once in returned
+`openai:computer_images` metadata, including on terminal assistant replies. Each
+record binds the original call/actions, full validated PNG, its SHA-256 digest,
+and accompanying reference text. Counts may read these records but never publish
+them. Later requests reconstruct only a derived wire result for a surviving
+original call and unique result whose pixels/references agree. Only the generic
+recency hook's exact superseded-screenshot text transformation permits recovery
+of omitted pixels; arbitrary text, files, errors, missing calls/results, conflicting
+records, or lost carriers fail closed. No paths are reopened, actions replayed,
+or compacted calls resurrected.
+
+The aggregate serialized persisted-plus-new observation records are limited to
+64MiB before dispatch, with unchanged per-image limits and explicit overflow
+refusal (no silent eviction). Screenshot bytes now live longer in serialized
+context/transcripts: this is an intentional provider-replay privacy trade-off,
+not a generic tool-retention increase or new external vendor storage.
+Provider restart can replay public history; removal of required records/pixels
+cannot. Digests prove consistency, not cryptographic trust or resistance to
+wholesale internally consistent forged transcripts.
+
 Neutral native results require one full final PNG with validated pixel rows.
 Other formats retain ordinary/legacy image handling, but are explicitly refused
 as neutral native final observations until their pixel integrity can be checked.

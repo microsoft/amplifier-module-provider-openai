@@ -33,6 +33,23 @@ class FakeCoordinator:
         self.hooks = FakeHooks()
 
 
+def complete_and_inspect_request_copy(provider, original):
+    """Keep the prior repair assertions, but inspect the transmitted projection.
+
+    The approved purity contract forbids inserting repairs into caller history.
+    Count and generation must still transmit the same ordinary repair ordering.
+    """
+    before = original.model_dump_json()
+    budget_wire = provider._budget_params(original)
+    planned, _ = provider._plan_tool_repairs(original)
+    asyncio.run(provider.complete(original))
+    assert original.model_dump_json() == before
+    sent = provider.client.responses.create.await_args_list[-1].kwargs
+    assert sent["input"] == budget_wire["input"]
+    assert provider._budget_params(original)["input"] == sent["input"]
+    return planned
+
+
 def test_extended_thinking_forces_high_effort_without_budget_arithmetic():
     """extended_thinking still forces high reasoning effort, but no longer
     adjusts max_output_tokens -- the budget/buffer arithmetic was removed.
@@ -72,7 +89,7 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     ]
     request = ChatRequest(messages=messages)
 
-    asyncio.run(provider.complete(request))
+    request = complete_and_inspect_request_copy(provider, request)
 
     # Should succeed (not raise validation error)
     provider.client.responses.create.assert_awaited_once()
@@ -138,7 +155,7 @@ def test_repaired_tool_ids_are_not_detected_again():
     request = ChatRequest(messages=messages)
 
     # First call - should detect and repair
-    asyncio.run(provider.complete(request))
+    request = complete_and_inspect_request_copy(provider, request)
 
     # Verify repair happened
     assert "call_abc123" in provider._repaired_tool_ids  # pyright: ignore[reportAttributeAccessIssue]
@@ -205,7 +222,7 @@ def test_multiple_missing_tool_results_all_tracked():
     ]
     request = ChatRequest(messages=messages)
 
-    asyncio.run(provider.complete(request))
+    request = complete_and_inspect_request_copy(provider, request)
 
     # All 3 should be tracked
     assert provider._repaired_tool_ids == {"call_1", "call_2", "call_3"}  # pyright: ignore[reportAttributeAccessIssue]
@@ -257,7 +274,7 @@ def test_fm3_synthetic_assistant_response_inserted_before_user_message():
     ]
     request = ChatRequest(messages=messages)
 
-    asyncio.run(provider.complete(request))
+    request = complete_and_inspect_request_copy(provider, request)
 
     # [assistant, synthetic_tool_result, synthetic_assistant_close, user]
     assert len(request.messages) == 4
@@ -322,7 +339,7 @@ def test_fm3_does_not_insert_synthetic_before_source_attributed_reminder():
     ]
     request = ChatRequest(messages=messages)
 
-    asyncio.run(provider.complete(request))
+    request = complete_and_inspect_request_copy(provider, request)
 
     # No FM3 synthetic assistant close: [assistant, synthetic_tool_result, reminder]
     assert len(request.messages) == 3, (
@@ -378,7 +395,7 @@ def test_fm3_does_not_insert_synthetic_before_reminder_envelope():
     ]
     request = ChatRequest(messages=messages)
 
-    asyncio.run(provider.complete(request))
+    request = complete_and_inspect_request_copy(provider, request)
 
     assert len(request.messages) == 3, (
         f"Expected no synthetic assistant before a reminder envelope; got "
@@ -413,7 +430,7 @@ def test_fm3_still_inserts_synthetic_before_genuine_user_message():
     ]
     request = ChatRequest(messages=messages)
 
-    asyncio.run(provider.complete(request))
+    request = complete_and_inspect_request_copy(provider, request)
 
     # [assistant, synthetic_tool_result, synthetic_assistant_close, user]
     assert len(request.messages) == 4
