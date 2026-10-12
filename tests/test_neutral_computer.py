@@ -241,13 +241,31 @@ def test_disabled_undeclared_familyless_and_wrong_model_refused():
         response_calls([block()], ctx, "gpt-6.1-sol", "incomplete")
 
 
-def test_sdk_object_response_core_serialization_alias_and_replay():
+@pytest.mark.asyncio
+async def test_sdk_object_response_core_serialization_alias_and_replay():
+    from openai import AsyncOpenAI
     from openai.types.responses import Response
     driver = provider()
     wire, state, _ = driver._assemble_initial_responses_params(request())
     assert wire["tools"] == [{"type": "computer"}]
     vendor = block([{"type": "move", "x": 426, "y": 87}, {"type": "keypress", "keys": ["CTRL", "s"]}], pending_safety_checks=[])
-    response = driver._convert_to_chat_response(Response.model_validate(envelope([vendor])), computer_context=state["neutral_computer_context"])
+    # Obtain the SDK's actual parsed response, not a stricter Pydantic fixture.
+    # SDK 2.9 permits new wire fields through its normal forward-compatible parser.
+    async def handle(http_request):
+        assert json.loads(http_request.content)["tools"] == [{"type": "computer"}]
+        return httpx.Response(200, json=envelope([vendor]))
+    client = AsyncOpenAI(
+        api_key="fixture",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        parsed = await client.responses.create(
+            model="gpt-6.1-sol", input=[], tools=[{"type": "computer"}],
+        )
+        assert isinstance(parsed, Response)
+        response = driver._convert_to_chat_response(parsed, computer_context=state["neutral_computer_context"])
+    finally:
+        await client.close()
     assert response.tool_calls[0].name == "desk"
     assert response.tool_calls[0].arguments["capture_after"] is True
     assert response.tool_calls[0].arguments["actions"][0]["coordinate"] == [426, 87]
