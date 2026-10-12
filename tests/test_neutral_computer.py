@@ -1108,9 +1108,12 @@ def recency_view(history, omission="list"):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("omission", ["list", "string"])
-async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restart(streaming, omission):
+@pytest.mark.parametrize("adapter", [False, True])
+async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restart(streaming, omission, adapter):
     import base64
     import hashlib
+
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
 
     captures = 0
     terminal_at = 4
@@ -1125,7 +1128,10 @@ async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restar
         return [block(call_id=f"capture_{captures}")]
 
     driver, wires = sdk_driver(outputs, streaming=streaming)
+    if adapter:
+        driver = NativeResponsesProvider.wrap(driver, owner_getter=lambda: None)
     all_wires = []
+    planned_inputs = []
     try:
         for target in (4, 12):
             terminal_at = target
@@ -1133,6 +1139,8 @@ async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restar
                 await driver.close()
                 all_wires.extend(wires)
                 driver, wires = sdk_driver(outputs, streaming=streaming)
+                if adapter:
+                    driver = NativeResponsesProvider.wrap(driver, owner_getter=lambda: None)
                 history = [Message.model_validate_json(m.model_dump_json()) for m in history]
                 history.append(Message(role="user", content="Observe eight more synthetic frames"))
             while True:
@@ -1151,6 +1159,7 @@ async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restar
                 assert req.model_dump_json() == before
                 assert state == (driver._native_call_ids, driver._native_call_types, driver._repaired_tool_ids)
                 assert not hasattr(driver, "_staged_computer_images")
+                planned_inputs.append(driver._budget_params(req)["input"])
                 reply = await driver.complete(req)
                 assert req.model_dump_json() == before
                 assert [m.model_dump_json() for m in history] == retained_before
@@ -1177,11 +1186,16 @@ async def test_source_four_then_eight_owned_captures_public_roundtrip_and_restar
         assert captures == len(expected) == 12
         assert sum(len((m.metadata or {}).get(IMAGES, {})) for m in history) == 12
         assert len(json.dumps([m.model_dump() for m in history]).encode()) < 64 * 1024 * 1024
-        groups = [all_wires[i:i + 4] for i in range(0, len(all_wires), 4)]
+        # The exact optional adapter retains its existing conservative count
+        # capability (subclasses do not advertise the base counter). Its public
+        # budgets still validate/plan, without count HTTP or staged state.
+        width = 1 if adapter else 4
+        groups = [all_wires[i:i + width] for i in range(0, len(all_wires), width)]
         assert len(groups) == 14  # 12 requested captures, two terminal generations
-        for group in groups:
-            assert len(group) == 4
+        for group, planned in zip(groups, planned_inputs, strict=True):
+            assert len(group) == width
             assert all(body["input"] == group[-1][1]["input"] for _, body in group)
+            assert group[-1][1]["input"] == planned
             for item in group[-1][1]["input"]:
                 if item.get("type") == "computer_call_output":
                     raw = base64.b64decode(item["output"]["image_url"].partition(",")[2])
@@ -1244,9 +1258,14 @@ async def test_native_secondary_identity_cannot_hide_behind_unknown_primary(seco
     "url_wrong_type", "forged_reference", "unavailable_suffix", "failed_suffix",
     "repeated_suffix", "partial_suffix", "invalid_png", "image_binding", "references_wrong_type",
 ])
-async def test_genuine_observation_tampering_refuses_before_count_or_generation(corruption, omission):
+@pytest.mark.parametrize("adapter", [False, True])
+async def test_genuine_observation_tampering_refuses_before_count_or_generation(corruption, omission, adapter):
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
+
     driver, wires = sdk_driver(lambda body: terminal_output() if any(
         i.get("type") == "computer_call" for i in body["input"]) else [block()])
+    if adapter:
+        driver = NativeResponsesProvider.wrap(driver, owner_getter=lambda: None)
     try:
         history = await observed_history(driver)
         carrier = history[-1].metadata[IMAGES]
@@ -1323,8 +1342,13 @@ async def test_genuine_observation_tampering_refuses_before_count_or_generation(
 
 
 @pytest.mark.asyncio
-async def test_ordinary_string_omission_never_hydrates_a_native_image():
+@pytest.mark.parametrize("adapter", [False, True])
+async def test_ordinary_string_omission_never_hydrates_a_native_image(adapter):
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
+
     driver, wires = sdk_driver(lambda body: terminal_output())
+    if adapter:
+        driver = NativeResponsesProvider.wrap(driver, owner_getter=lambda: None)
     try:
         req = request(ToolSpec(name="desk", description="Ordinary", parameters={"type": "object"}), messages=[
             Message(role="assistant", content="", tool_calls=[{"id": "ordinary", "tool": "desk", "arguments": {}}]),
@@ -1407,8 +1431,13 @@ async def test_observation_aggregate_boundary_counts_persisted_plus_new(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_actual_64mib_aggregate_overflow_refuses_new_observation_before_http():
+@pytest.mark.parametrize("adapter", [False, True])
+async def test_actual_64mib_aggregate_overflow_refuses_new_observation_before_http(adapter):
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
+
     driver, wires = sdk_driver(lambda body: [block()])
+    if adapter:
+        driver = NativeResponsesProvider.wrap(driver, owner_getter=lambda: None)
     try:
         first = await driver.complete(request())
         req = request(messages=[stored_response(first),
@@ -1436,3 +1465,534 @@ def test_ordinary_legacy_call_is_not_deduplicated_against_a_text_id():
     wire = driver._convert_messages(messages)
     assert sum(i.get("type") == "function_call" for i in wire) == 1
     assert sum(i.get("type") == "function_call_output" for i in wire) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omission", ["list", "string"])
+async def test_owned_native_observations_validate_full_history_before_delta(omission):
+    """Public native parsing/planning, not monkeypatched conversion or replay maps."""
+    import base64
+    import hashlib
+    from unittest.mock import AsyncMock
+
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
+
+    class CountedNativeFixture(NativeResponsesProvider):
+        # Explicit test-only opt-in: known official-route SDK MockTransport.
+        # Production adapter/subclass count capability is not changed.
+        def _uses_standard_openai_endpoint(self):
+            return str(self.client.base_url) == "https://api.openai.com/v1/"
+
+    history = [Message(role="user", content="Observe four synthetic frames")]
+    captures, terminal_at = 0, 4
+    expected, published, sent = {}, {}, []
+
+    async def get_messages():
+        return [m.model_dump() for m in history]
+
+    owner = SimpleNamespace(context=SimpleNamespace(get_messages=get_messages),
+        runtime=SimpleNamespace(emit=AsyncMock()), native_job=lambda identity: None,
+        config={}, start_native_job=AsyncMock())
+    original, counts = sdk_driver(lambda body: terminal_output())
+    driver = CountedNativeFixture.wrap(original, owner_getter=lambda: owner)
+    events = asyncio.Queue()
+    closed = []
+
+    async def send(value):
+        nonlocal captures
+        body = json.loads(value)
+        sent.append(body)
+        identity = f"response_{len(sent)}"
+        if captures == terminal_at:
+            output = terminal_output()
+        else:
+            captures += 1
+            output = [block(call_id=f"capture_{captures}")]
+        payload = envelope(output, model="gpt-6-astra")
+        payload["id"] = identity
+        events.put_nowait({"type": "response.created", "response": {"id": identity}})
+        events.put_nowait({"type": "response.completed", "response": payload})
+
+    async def recv():
+        return json.dumps(await events.get())
+
+    async def close():
+        closed.append(True)
+
+    driver.socket = SimpleNamespace(send=send, recv=recv, close=close)
+    try:
+        for target in (4, 12):
+            terminal_at = target
+            if target == 12:
+                history = [Message.model_validate_json(m.model_dump_json()) for m in history]
+                history.append(Message(role="user", content="Observe eight more synthetic frames"))
+            while True:
+                req = request(messages=recency_view(history, omission))
+                before = req.model_dump_json()
+                state = (driver.epoch, driver.previous_response_id, copy.deepcopy(driver.seen),
+                    copy.deepcopy(driver.last_context), set(driver._native_call_ids),
+                    dict(driver._native_call_types))
+                planned = driver._budget_params(req, model="gpt-6-astra")["input"]
+                await driver.request_budget(req, context_estimate=1, model="gpt-6-astra")
+                assert state == (driver.epoch, driver.previous_response_id, driver.seen,
+                    driver.last_context, driver._native_call_ids, driver._native_call_types)
+                assert not hasattr(driver, "_staged_computer_images")
+                reply = await driver.complete(req, model="gpt-6-astra")
+                assert req.model_dump_json() == before
+                # Native dispatch selects a delta after the unchanged full-plan
+                # count. That full measurement is conservative, not a claim
+                # that the counter remeasured the smaller socket delta.
+                assert counts[-1][1]["input"] == planned
+                assert counts[-2][1]["input"] == planned
+                new = (reply.metadata or {}).get(IMAGES, {})
+                assert new.keys().isdisjoint(published)
+                assert len(new) == (1 if len(expected) > len(published) else 0)
+                published.update(new)
+                for item in sent[-1]["input"]:
+                    if item.get("type") == "computer_call_output":
+                        raw = base64.b64decode(item["output"]["image_url"].partition(",")[2])
+                        assert hashlib.sha256(raw).hexdigest() == expected[item["call_id"]]
+                if len(sent) > 1:
+                    assert sent[-1]["previous_response_id"] == f"response_{len(sent) - 1}"
+                    assert not any(i.get("type") == "computer_call" for i in sent[-1]["input"])
+                    assert sum(i.get("type") == "computer_call_output" for i in sent[-1]["input"]) == len(new)
+                history.append(stored_response(reply))
+                if not reply.tool_calls:
+                    assert captures == target and new
+                    break
+                call = reply.tool_calls[0]
+                assert call.id == f"capture_{captures}" and call.name == "desk"
+                png = image(captures)
+                expected[call.id] = hashlib.sha256(base64.b64decode(png["source"]["data"])).hexdigest()
+                history.append(Message(role="tool", tool_call_id=call.id,
+                    content=[{"type": "text", "text": f"owned reference {captures}"}, png]))
+        assert len(expected) == len(set(expected.values())) == len(published) == 12
+        assert len(sent) == 14
+        # Persisted terminal carrier + new user: no new observations to publish.
+        req = request(messages=recency_view(history, omission) + [Message(role="user", content="Discuss these frames")])
+        before = req.model_dump_json()
+        reply = await driver.complete(req, model="gpt-6-astra")
+        assert IMAGES not in (reply.metadata or {})
+        assert req.model_dump_json() == before
+        assert not any(i.get("type") in {"computer_call", "computer_call_output"} for i in sent[-1]["input"])
+        # Corrupt an old, already-delivered pair that delta selection would omit.
+        # Complete-history validation must reject it before any count or send.
+        for corruption in ("digest", "reference", "missing_carrier", "orphan"):
+            bad = ChatRequest.model_validate_json(req.model_dump_json())
+            carrier = next(m for m in bad.messages if "capture_1" in (m.metadata or {}).get(IMAGES, {}))
+            if corruption == "digest":
+                carrier.metadata[IMAGES]["capture_1"]["sha256"] = "0" * 64
+            elif corruption == "reference":
+                result = next(m for m in bad.messages if m.tool_call_id == "capture_1")
+                result.content = "wrong reference" + IMAGE_DROPPED
+            elif corruption == "missing_carrier":
+                carrier.metadata.pop(IMAGES)
+            else:
+                bad.messages = [m for m in bad.messages if "capture_1" not in (m.metadata or {}).get(CALLS, {})]
+            frozen = bad.model_dump_json()
+            dispatched = (len(counts), len(sent))
+            with pytest.raises(InvalidRequestError):
+                await driver.request_budget(bad, context_estimate=1, model="gpt-6-astra")
+            with pytest.raises(InvalidRequestError):
+                await driver.complete(bad, model="gpt-6-astra")
+            assert (len(counts), len(sent)) == dispatched
+            assert bad.model_dump_json() == frozen
+        owner.start_native_job.assert_not_awaited()
+    finally:
+        await driver.close_live()
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [
+    '{"success":false,"error":"safety halt"}',
+    "/unavailable/capture.png",
+    [{"type": "text", "text": "missing pixels"}],
+])
+async def test_native_adapter_later_failure_discussion_never_becomes_pixels(result):
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
+
+    generations = 0
+
+    def outputs(body):
+        nonlocal generations
+        generations += 1
+        return [block()] if generations == 1 else terminal_output()
+
+    driver, wires = sdk_driver(outputs)
+    driver = NativeResponsesProvider.wrap(driver, owner_getter=lambda: None)
+    try:
+        first = await driver.complete(request())
+        history = [stored_response(first), Message(role="tool", tool_call_id="call_fixture", content=result)]
+        req = request(messages=history)
+        before, sent_before = req.model_dump_json(), len(wires)
+        with pytest.raises(InvalidRequestError):
+            await driver.request_budget(req, context_estimate=1)
+        with pytest.raises(InvalidRequestError):
+            await driver.complete(req)
+        assert len(wires) == sent_before and req.model_dump_json() == before
+        req.messages.append(Message(role="user", content="Discuss the failure; do not retry"))
+        before = req.model_dump_json()
+        await driver.request_budget(req, context_estimate=1)
+        reply = await driver.complete(req)
+        assert req.model_dump_json() == before and IMAGES not in (reply.metadata or {})
+        for _, body in wires[sent_before:]:
+            assert not any(i.get("type") in {"computer_call", "computer_call_output"} for i in body["input"])
+            assert "Historical computer-tool failure" in json.dumps(body["input"])
+    finally:
+        await driver.close()
+
+
+def legacy_lineage_state(driver):
+    """Live state, excluding the one explicitly permitted observation."""
+    names = (
+        "previous_response_id", "epoch", "seen", "pending_parent",
+        "pending_steer", "inflight", "async_calls", "delivered_results",
+        "native_calls", "request_uncertain", "_computer_function_lineage",
+        "_native_call_ids", "_native_call_types", "_repaired_tool_ids",
+        "_checkpoint", "_checkpoint_status", "_pending_additional_tools_item",
+        "_tool_search_roster", "_tool_search_extra", "_neutral_computer_context",
+    )
+    return copy.deepcopy({name: getattr(driver, name, None) for name in names})
+
+
+def legacy_lineage_fixture():
+    from unittest.mock import AsyncMock
+
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
+
+    history = [
+        Message(role="user", content="Inspect"),
+        Message(role="assistant", content=[{
+            "type": "tool_call", "id": "failed-computer", "name": "computer",
+            "input": {"actions": [{"type": "screenshot"}]},
+        }]),
+        Message(role="tool", tool_call_id="failed-computer",
+                content=json.dumps({"success": False, "error": {"code": "safety_halt"}})),
+    ]
+    sent = []
+
+    async def get_messages():
+        return [m.model_dump() for m in history]
+
+    owner = SimpleNamespace(context=SimpleNamespace(get_messages=get_messages),
+        runtime=SimpleNamespace(emit=AsyncMock()), native_job=lambda identity: None,
+        config={}, start_native_job=AsyncMock())
+    original, counts = sdk_driver(lambda body: terminal_output())
+
+    class CountedLegacyFixture(NativeResponsesProvider):
+        # Only the known official-route MockTransport opts in, not production.
+        def _uses_standard_openai_endpoint(self):
+            return str(self.client.base_url) == "https://api.openai.com/v1/"
+
+    driver = CountedLegacyFixture.wrap(original, owner_getter=lambda: owner)
+    events = asyncio.Queue()
+
+    async def send(value):
+        body = json.loads(value)
+        sent.append(body)
+        identity = f"legacy_response_{len(sent)}"
+        payload = envelope(terminal_output(), model="gpt-6-astra")
+        payload["id"] = identity
+        events.put_nowait({"type": "response.created", "response": {"id": identity}})
+        events.put_nowait({"type": "response.completed", "response": payload})
+
+    async def recv():
+        return json.dumps(await events.get())
+
+    driver.socket = SimpleNamespace(send=send, recv=recv, close=AsyncMock())
+    driver.previous_response_id = "prior"
+    tool = ToolSpec(name="computer", description="Legacy computer",
+                    type="computer", parameters={"type": "object"})
+    req = ChatRequest(model="gpt-6-astra", tools=[tool], messages=history)
+    return driver, owner, req, counts, sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("public_complete", [False, True])
+async def test_legacy_lineage_failure_observation_is_complete_only_and_recovers_once(public_complete):
+    from amplifier_module_provider_openai.native import NATIVE_REQUEST
+
+    driver, owner, req, counts, sent = legacy_lineage_fixture()
+    original = req.model_dump_json()
+    state = legacy_lineage_state(driver)
+    epoch = driver.epoch
+
+    async def convert(packet):
+        if public_complete:
+            reply = await driver.complete(packet, model="gpt-6-astra")
+            assert IMAGES not in (reply.metadata or {})
+            return sent[-1]["input"]
+        driver.owner = owner
+        token = NATIVE_REQUEST.set(driver)
+        try:
+            return driver._convert_messages([m.model_dump() for m in packet.messages])
+        finally:
+            NATIVE_REQUEST.reset(token)
+            driver.owner = None
+
+    try:
+        # Both budget entry points refuse, without observing the failed turn.
+        with pytest.raises(InvalidRequestError):
+            driver._budget_params(req, model="gpt-6-astra")
+        with pytest.raises(InvalidRequestError):
+            await driver.request_budget(req, context_estimate=1, model="gpt-6-astra")
+        assert legacy_lineage_state(driver) == state and not driver.last_context
+        assert not hasattr(driver, "_staged_computer_images")
+        with pytest.raises(InvalidRequestError) as caught:
+            await convert(req)
+        assert caught.value.code == "computer_result_not_image"
+        assert caught.value.result_kind == "error" and caught.value.retryable is False
+        assert legacy_lineage_state(driver) == state
+        observed = copy.deepcopy(driver.last_context)
+        assert observed and "failed-computer" in json.dumps(list(observed))
+        assert not hasattr(driver, "_staged_computer_images")
+        assert req.model_dump_json() == original and counts == sent == []
+
+        # A reminder cannot recover, and a failed count cannot update observation.
+        reminder = req.model_copy(deep=True)
+        reminder.messages.append(Message(role="user", content="Explain",
+                                          metadata={"ephemeral": True}))
+        with pytest.raises(InvalidRequestError):
+            await driver.request_budget(reminder, context_estimate=1, model="gpt-6-astra")
+        with pytest.raises(InvalidRequestError):
+            await convert(reminder)
+        assert driver.last_context == observed and legacy_lineage_state(driver) == state
+        assert counts == sent == []
+        owner.runtime.emit.assert_not_awaited()
+
+        later = req.model_copy(deep=True)
+        later.messages.append(Message(role="user", content="Keep the stop. Explain without tools."))
+        frozen = later.model_dump_json()
+        await driver.request_budget(later, context_estimate=1, model="gpt-6-astra")
+        assert driver.last_context == observed and legacy_lineage_state(driver) == state
+        assert not hasattr(driver, "_staged_computer_images")
+        wire = await convert(later)
+        assert driver.epoch != epoch
+        assert driver.previous_response_id == ("legacy_response_1" if public_complete else None)
+        if public_complete:
+            assert sent[-1].get("previous_response_id") is None
+        assert "safety_halt" in json.dumps(wire)
+        assert not any(i.get("type") in {"computer_call", "computer_call_output"} for i in wire)
+        new_epoch, new_context = driver.epoch, copy.deepcopy(driver.last_context)
+        if not public_complete:
+            driver.previous_response_id = "new-lineage"
+        lineage = driver.previous_response_id
+        await driver.request_budget(later, context_estimate=1, model="gpt-6-astra")
+        assert driver.previous_response_id == lineage and driver.epoch == new_epoch
+        again = await convert(later)
+        assert driver.epoch == new_epoch and driver.last_context == new_context
+        assert not any(i.get("type") in {"computer_call", "computer_call_output"} for i in again)
+        if public_complete:
+            assert sent[-1]["previous_response_id"] == lineage
+        else:
+            assert driver.previous_response_id == lineage
+        assert later.model_dump_json() == frozen and req.model_dump_json() == original
+        assert all(path.endswith("input_tokens") for path, _ in counts)
+        assert all(not any(i.get("type") in {"computer_call", "computer_call_output"}
+                           for i in body["input"]) for _, body in counts)
+        owner.start_native_job.assert_not_awaited()
+        if public_complete:
+            assert [call.args[0] for call in owner.runtime.emit.await_args_list] == [
+                "native.submitting", "native.request", "native.response.created", "native.completed",
+            ] * 2
+        else:
+            owner.runtime.emit.assert_not_awaited()
+    finally:
+        await driver.close_live()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("public_complete", [False, True])
+async def test_legacy_lineage_pending_steering_refuses_recovery_without_state_commit(public_complete):
+    from amplifier_core.llm_errors import LLMError
+
+    from amplifier_module_provider_openai.native import NATIVE_REQUEST
+
+    driver, owner, req, counts, sent = legacy_lineage_fixture()
+    req.messages[1:1] = [
+        Message(role="assistant", content=[{
+            "type": "tool_call", "id": "success-computer", "name": "computer",
+            "input": {"actions": [{"type": "screenshot"}]},
+        }]),
+        Message(role="tool", tool_call_id="success-computer", content=[image(2)]),
+    ]
+
+    async def convert():
+        if public_complete:
+            return await driver.complete(req, model="gpt-6-astra")
+        driver.owner = owner
+        token = NATIVE_REQUEST.set(driver)
+        try:
+            return driver._convert_messages([m.model_dump() for m in req.messages])
+        finally:
+            NATIVE_REQUEST.reset(token)
+            driver.owner = None
+
+    try:
+        with pytest.raises(InvalidRequestError):
+            await convert()
+        driver.pending_parent = True
+        req.messages.append(Message(role="user", content="Keep the stop. Explain without tools."))
+        frozen = req.model_dump_json()
+        state, observed = legacy_lineage_state(driver), copy.deepcopy(driver.last_context)
+        with pytest.raises(LLMError, match="Pending steering") as caught:
+            await convert()
+        assert caught.value.retryable is False
+        assert legacy_lineage_state(driver) == state and driver.last_context == observed
+        assert not hasattr(driver, "_staged_computer_images")
+        assert req.model_dump_json() == frozen and counts == sent == []
+        owner.runtime.emit.assert_not_awaited()
+    finally:
+        driver.pending_parent = False
+        driver.owner = None
+        await driver.close_live()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ["png", "orphan", "carrier", "unknown_record"])
+async def test_legacy_lineage_invalid_history_cannot_commit_observation(corruption):
+    from amplifier_module_provider_openai.native import NATIVE_REQUEST
+
+    driver, owner, req, counts, sent = legacy_lineage_fixture()
+    if corruption == "png":
+        req.messages[-1].content = [{"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "bm90IFBORw==",
+        }}]
+    elif corruption == "orphan":
+        req.messages.append(Message(role="assistant", content="", metadata={CALLS: {"orphan": {}}}))
+    elif corruption == "carrier":
+        req.messages.append(Message(role="assistant", content="", metadata={IMAGES: {"orphan": {}}}))
+    else:
+        req.messages[1].metadata = {CALLS: {"failed-computer": {"unknown": True}}}
+    frozen = req.model_dump_json()
+    state = legacy_lineage_state(driver)
+    driver.owner = owner
+    token = NATIVE_REQUEST.set(driver)
+    try:
+        with pytest.raises(InvalidRequestError):
+            driver._convert_messages([m.model_dump() for m in req.messages])
+        assert not driver.last_context and legacy_lineage_state(driver) == state
+        assert not hasattr(driver, "_staged_computer_images")
+        assert req.model_dump_json() == frozen and counts == sent == []
+    finally:
+        NATIVE_REQUEST.reset(token)
+        driver.owner = None
+        await driver.close_live()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", [
+    "missing_origin", "duplicate_origin", "duplicate_result", "result_before_call",
+    "secondary_id", "conflicting_arguments", "missing_primary", "structured_missing_primary",
+    "boolean_numeric_arguments", "structured_missing_name", "structured_missing_input",
+])
+async def test_legacy_lineage_retained_type_is_not_authority_for_invalid_pairing(corruption):
+    from amplifier_module_provider_openai.native import NATIVE_REQUEST
+
+    driver, owner, req, counts, sent = legacy_lineage_fixture()
+    driver.owner = owner
+    token = NATIVE_REQUEST.set(driver)
+    try:
+        # Establish a legacy type through genuine conversion, not a seeded map.
+        valid = [m.model_dump() for m in req.messages]
+        valid[-1]["content"] = [image(1)]
+        driver._convert_messages(valid)
+        state, observed = legacy_lineage_state(driver), copy.deepcopy(driver.last_context)
+        messages = [m.model_dump() for m in req.messages]
+        if corruption == "missing_origin":
+            messages.pop(1)
+        elif corruption == "duplicate_origin":
+            messages[1]["content"].append(copy.deepcopy(messages[1]["content"][0]))
+        elif corruption == "duplicate_result":
+            messages.append(copy.deepcopy(messages[-1]))
+        elif corruption == "result_before_call":
+            messages[1], messages[2] = messages[2], messages[1]
+        elif corruption == "secondary_id":
+            messages[1]["content"][0]["call_id"] = "conflicting"
+        elif corruption == "conflicting_arguments":
+            messages[1]["content"][0]["arguments"] = {"actions": [{"type": "click", "x": 1, "y": 1}]}
+        elif corruption == "missing_primary":
+            messages[1]["content"] = []
+            messages[1]["tool_calls"] = [{
+                "call_id": "failed-computer", "tool": "computer",
+                "arguments": {"actions": [{"type": "screenshot"}]},
+            }]
+        elif corruption == "structured_missing_primary":
+            messages[1]["content"][0].pop("id")
+            messages[1]["content"][0]["tool_call_id"] = "failed-computer"
+        elif corruption == "structured_missing_name":
+            call = messages[1]["content"][0]
+            call["tool"] = call.pop("name")
+        elif corruption == "structured_missing_input":
+            call = messages[1]["content"][0]
+            call["arguments"] = call.pop("input")
+        else:
+            call = messages[1]["content"][0]
+            call["input"] = {"actions": [{"type": "screenshot", "x": 1}]}
+            call["arguments"] = {"actions": [{"type": "screenshot", "x": True}]}
+        frozen = copy.deepcopy(messages)
+        with pytest.raises(InvalidRequestError):
+            driver._convert_messages(messages)
+        assert driver.last_context == observed and legacy_lineage_state(driver) == state
+        assert messages == frozen and counts == sent == []
+        assert driver._staged_computer_images == {}  # prior successful conversion only
+    finally:
+        NATIVE_REQUEST.reset(token)
+        driver.owner = None
+        await driver.close_live()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("public_complete", [False, True])
+@pytest.mark.parametrize("invalid_first", [False, True])
+@pytest.mark.parametrize("neutral", [False, True])
+async def test_legacy_lineage_error_cannot_mask_another_invalid_png(public_complete, invalid_first, neutral):
+    from amplifier_module_provider_openai.native import NATIVE_REQUEST
+
+    driver, owner, req, counts, sent = legacy_lineage_fixture()
+    messages = [m.model_dump() for m in req.messages]
+    if neutral:
+        producer, _ = sdk_driver(lambda body: [block(call_id="bad-png")])
+        try:
+            genuine = await producer.complete(request())
+            messages.insert(2, stored_response(genuine).model_dump())
+        finally:
+            await producer.close()
+    else:
+        messages[1]["content"].append({
+            "type": "tool_call", "id": "bad-png", "name": "computer",
+            "input": {"actions": [{"type": "screenshot"}]},
+        })
+    bad_result = {"role": "tool", "tool_call_id": "bad-png", "content": [{
+        "type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "bm90IFBORw==",
+        },
+    }]}
+    if invalid_first:
+        failed = messages.pop(next(i for i, m in enumerate(messages) if m.get("tool_call_id") == "failed-computer"))
+        messages.extend([bad_result, failed])
+    else:
+        messages.append(bad_result)
+    req = req.model_copy(update={"messages": [Message.model_validate(m) for m in messages]})
+    frozen = req.model_dump_json()
+    state = legacy_lineage_state(driver)
+    try:
+        if public_complete:
+            with pytest.raises(InvalidRequestError):
+                await driver.complete(req, model="gpt-6-astra")
+        else:
+            driver.owner = owner
+            token = NATIVE_REQUEST.set(driver)
+            try:
+                with pytest.raises(InvalidRequestError):
+                    driver._convert_messages([m.model_dump() for m in req.messages])
+            finally:
+                NATIVE_REQUEST.reset(token)
+                driver.owner = None
+        assert legacy_lineage_state(driver) == state and not driver.last_context
+        assert not hasattr(driver, "_staged_computer_images")
+        assert req.model_dump_json() == frozen and counts == sent == []
+        owner.runtime.emit.assert_not_awaited()
+    finally:
+        await driver.close_live()

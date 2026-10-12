@@ -17,7 +17,7 @@ from collections import Counter
 from urllib.parse import urlparse
 
 import websockets
-from amplifier_core.llm_errors import LLMError
+from amplifier_core.llm_errors import InvalidRequestError, LLMError
 from amplifier_core.message_models import ToolCall
 from openai import NOT_GIVEN, Timeout
 from websockets.protocol import State
@@ -102,6 +102,115 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
     def _validate_native_items(self, items):
         return items
 
+    def _retain_legacy_failed_context(self, messages, error):
+        # Observation is not conversion success or permission to replay. Counts
+        # and isolated assembly planners must never advance the live lineage.
+        if (
+            NATIVE_REQUEST.get() is not self
+            or NATIVE_BUDGET.get() is not None
+            or getattr(error, "code", None) != "computer_result_not_image"
+            or getattr(error, "result_kind", None) != "error"
+        ):
+            return
+        from .neutral_computer import (
+            _replay_json,
+            _stored_blocks,
+            json_agrees,
+            neutral_screenshot,
+            plan_observations,
+            replay_calls,
+        )
+
+        replay = replay_calls(messages)
+        messages, _ = plan_observations(messages, replay)
+        identity = getattr(error, "tool_call_id", None)
+        if not isinstance(identity, str) or not identity or identity in replay:
+            return  # Neutral provenance/observations never gain this exception.
+        # A retained type map is not evidence of an original legacy call.
+        # Require one originating turn and one later result, with all supported
+        # copies agreeing, before replacing the rewrite-detection baseline.
+        originals = [
+            (index, source, call)
+            for index, message in enumerate(messages) if message.get("role") == "assistant"
+            for source, call in _stored_blocks(message)
+            if identity in [call.get(k) for k in ("id", "tool_call_id", "call_id")]
+        ]
+        results = [
+            index for index, message in enumerate(messages)
+            if message.get("role") == "tool" and message.get("tool_call_id") == identity
+        ]
+        if (
+            not originals or len({i for i, _, _ in originals}) != 1
+            or len({(i, source) for i, source, _ in originals}) != len(originals)
+            or len(results) != 1 or results[0] <= originals[0][0]
+        ):
+            return
+        arguments = []
+        for _, source, call in originals:
+            primary = call.get("id") if source == "structured" else call.get("id") or call.get("tool_call_id")
+            if (
+                primary != identity
+                or source == "structured" and call.get("type") != "tool_call"
+                or source == "structured" and ("name" not in call or "input" not in call)
+                or any(call[k] != identity for k in ("id", "tool_call_id", "call_id") if k in call)
+                or not any(k in call for k in ("name", "tool"))
+                or any(call[k] != "computer" for k in ("name", "tool") if k in call)
+                or not any(k in call for k in ("input", "arguments"))
+            ):
+                return
+            for name in ("input", "arguments"):
+                if name not in call:
+                    continue
+                try:
+                    value = _replay_json(call[name]) if isinstance(call[name], str) else call[name]
+                except InvalidRequestError:
+                    return
+                if not isinstance(value, dict) or value.get("version") or not isinstance(value.get("actions"), list):
+                    return
+                arguments.append(value)
+        try:
+            agrees = all(json_agrees(value, arguments[0]) for value in arguments)
+        except InvalidRequestError:
+            return
+        if not agrees:
+            return
+        # The first refusal must not conceal a later invalid image. Validate
+        # the remainder privately, removing only this already-established
+        # failed pair: no pixels, new user turn, or successful result is invented.
+        remainder = []
+        for original in messages:
+            if original.get("role") == "tool" and original.get("tool_call_id") == identity:
+                continue
+            message = copy.deepcopy(original)
+            if message.get("role") == "assistant":
+                for field in ("content", "tool_calls"):
+                    if isinstance(message.get(field), list):
+                        message[field] = [
+                            block for block in message[field]
+                            if not isinstance(block, dict)
+                            or (block.get("id") or block.get("tool_call_id")) != identity
+                        ]
+            remainder.append(message)
+        validator = copy.copy(self)
+        validator._native_call_ids = set(self._native_call_ids) - {identity}
+        validator._native_call_types = {
+            k: v for k, v in self._native_call_types.items() if k != identity
+        }
+        try:
+            for call_id, record in replay.items():
+                result = next(m for m in messages if m.get("role") == "tool" and m.get("tool_call_id") == call_id)
+                neutral_screenshot(
+                    result.get("content"), image_space=record["binding"]["image_space"],
+                )
+            super(NativeResponsesProvider, validator)._convert_messages(remainder)
+        except InvalidRequestError:
+            return
+        self.last_context = Counter(
+            key(m) for m in messages
+            if m.get("role") != "tool"
+            and not (m.get("metadata") or {}).get("ephemeral")
+        )
+
     @staticmethod
     def _steer_identity(event):
         identity = (event.get("steer") or {}).get("id")
@@ -167,6 +276,22 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             request, **kwargs
         )
         if NATIVE_REQUEST.get() is self:
+            # Refuse a validated rewrite while state is still request-local,
+            # before shared COMPLETE commits fresh call maps or repair receipts.
+            if self.pending_parent:
+                projected = self._prepare_native_messages(
+                    self._request_messages,
+                    ordinary_names=frozenset(state["neutral_computer_context"].get("ordinary_names", [])),
+                )
+                persistent = Counter(
+                    key(m) for m in projected if m.get("role") != "tool"
+                    and not (m.get("metadata") or {}).get("ephemeral")
+                )
+                if self.last_context - persistent:
+                    raise LLMError(
+                        "Pending steering cannot move to a rewritten context or new connection; explicit recovery is required",
+                        provider=self.name, retryable=False,
+                    )
             # Retain the canonical wire view only in private planning state. The
             # public hook/budget payload is the actual full compact window.
             state = {**state, "native_full_params": copy.deepcopy(params)}
@@ -243,11 +368,17 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 "converge_native_async_calls": calls,
             }
             return response
+        except InvalidRequestError as exc:
+            # Initial full assembly failed in an isolated planner, before the
+            # live converter could observe this legitimate legacy failed turn.
+            self._retain_legacy_failed_context(self._request_messages, exc)
+            raise
         finally:
             NATIVE_REQUEST.reset(token)
             self.owner = None
             self.response_id = None
             self._native_computer_context = {}
+            self.__dict__.pop("_staged_computer_images", None)
             self.full_messages = []
 
     def _find_missing_tool_results(self, messages):
@@ -265,13 +396,36 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         return missing
 
     def _convert_messages(self, messages, **kwargs):
-        messages = self._prepare_native_messages(
-            messages, ordinary_names=kwargs.get("ordinary_computer_names", frozenset())
-        )
         if NATIVE_REQUEST.get() is not self:
+            # The shared serializer validates and hydrates complete observation
+            # history before classifying genuine failed computer results.
             return self._validate_native_items(
                 super()._convert_messages(messages, **kwargs)
             )
+        from .neutral_computer import (
+            CALLS,
+            IMAGES,
+            KEY,
+            neutral_screenshot,
+            plan_observations,
+            replay_calls,
+        )
+
+        replay = replay_calls(messages)
+        messages, newly_observed = plan_observations(messages, replay)
+        # Establish all call/namespace maps from the complete hydrated history.
+        # A carrier-bearing delta is not a complete transcript to validate.
+        serializer = copy.copy(self)
+        serializer._native_call_ids = set(self._native_call_ids)
+        serializer._native_call_types = dict(self._native_call_types)
+        try:
+            super(NativeResponsesProvider, serializer)._convert_messages(messages, **kwargs)
+        except InvalidRequestError as exc:
+            self._retain_legacy_failed_context(messages, exc)
+            raise
+        messages = serializer._prepare_native_messages(
+            messages, ordinary_names=kwargs.get("ordinary_computer_names", frozenset())
+        )
         for message in messages:
             for call in (message.get("metadata") or {}).get(
                 "converge_native_async_calls", []
@@ -300,6 +454,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             self.seen.clear()
             self.epoch = str(uuid.uuid4())
         self.last_context = persistent
+        self._native_call_ids = serializer._native_call_ids
+        self._native_call_types = serializer._native_call_types
         selected, occurrences = [], Counter()
         for message in messages:
             metadata = message.get("metadata") or {}
@@ -312,6 +468,16 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             if message.get("role") == "tool" and call_id in self.async_calls:
                 continue  # Reconcile from the original job/full history below.
             identity = key(message)
+            if message.get("role") == "tool" and call_id in replay:
+                # Present Core blocks carry optional fields that the recency
+                # hydration copy need not carry. Compare the validated PNG and
+                # reference semantics, so omission does not resend an old result.
+                identity = key({
+                    **message, "content": neutral_screenshot(
+                        message.get("content"),
+                        image_space=replay[call_id]["binding"]["image_space"],
+                    ),
+                })
             occurrences[identity] += 1
             if (
                 not self.previous_response_id
@@ -320,10 +486,27 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             ):
                 selected.append(message)
         self.seen |= occurrences
-        # Run the full serializer once to retain native call/namespace maps even
-        # when their assistant messages are already in the server's lineage.
-        super()._convert_messages(messages, **kwargs)
-        items = super()._convert_messages(selected, **kwargs)
+        # Full-history provenance was checked before selection. Serialize only a
+        # private wire projection of the hydrated delta, not its complete-history
+        # annotations. Keep calls, pixels, references and unrelated metadata;
+        # final neutral compilation still uses the original full replay binding.
+        delta = copy.deepcopy(selected)
+        for message in delta:
+            metadata = message.get("metadata") or {}
+            metadata.pop(IMAGES, None)
+            metadata.pop(CALLS, None)
+            for block in [
+                *(message.get("tool_calls") or []),
+                *(message.get("content") if isinstance(message.get("content"), list) else []),
+            ]:
+                if isinstance(block, dict):
+                    (block.get("metadata") or {}).pop(KEY, None)
+        try:
+            items = super()._convert_messages(delta, **kwargs)
+        finally:
+            # A result-only delta cannot rediscover its original call. Response
+            # assembly owns publication of the complete plan's new records once.
+            self._staged_computer_images = newly_observed
         outstanding = {
             identity
             for identity in self.async_calls
@@ -512,9 +695,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 name for name in context.get("ordinary_names", []) if name == "computer"
             )
             ordinary = super()._convert_messages(
-                self._prepare_native_messages(
-                    self._request_messages, ordinary_names=ordinary_names
-                ),
+                self._request_messages,
                 ordinary_computer_names=ordinary_names,
             )
             from .computer_images import prepare_computer_images
