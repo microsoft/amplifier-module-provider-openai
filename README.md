@@ -2,6 +2,10 @@
 
 GPT model integration for Amplifier via OpenAI's Responses API.
 
+The [draft image-operation contract](contracts/image-generation.v1.md) describes
+an optional provider-owned image boundary. It is proposed direction, not a claim
+that the Responses image operation or new capability methods are implemented.
+
 ## Prerequisites
 
 Offline provider contracts run without real credentials: their scoped fixtures
