@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import base64
-from copy import deepcopy
 import hashlib
-from io import BytesIO
 import json
 import re
 import uuid
+from copy import deepcopy
+from io import BytesIO
+
+import httpx
 
 PROTOCOL = "amplifier.image-operation.v1"
 MAX_BYTES = 8 * 1024 * 1024
@@ -17,6 +19,19 @@ CONTROLLERS = {"gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-5", "gpt-5-mini",
                "gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.5", "gpt-5.6-sol",
                "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol",
                "gpt-6-luna", "gpt-6.1-sol"}
+
+class _BoundHTTP(httpx.AsyncClient):
+    """Borrow the selected HTTP client without changing or closing it."""
+    def __init__(self, original):
+        super().__init__(follow_redirects=False)
+        self.original = original
+
+    def build_request(self, *args, **kwargs):
+        return self.original.build_request(*args, **kwargs)
+
+    async def send(self, request, **kwargs):
+        kwargs["follow_redirects"] = False
+        return await self.original.send(request, **kwargs)
 
 
 def unavailable(reason):
@@ -112,7 +127,9 @@ def binding(provider):
             # SDK omission sentinels are not transmitted and don't retain
             # equality under deepcopy. Snapshot effective scalar headers only.
             {k: v for k, v in client.default_headers.items() if isinstance(v, str)},
-            getattr(client, "_client", None), provider.timeout,
+            getattr(client, "_client", None),
+            dict(client._client.headers), client._client.auth,
+            provider.timeout,
             deepcopy(provider.config.get("image_generation")))
 
 
@@ -156,7 +173,7 @@ async def prepare(provider, request):
 
 
 def _dump(value):
-    return value.model_dump(mode="json") if callable(getattr(value, "model_dump", None)) else value
+    return value.model_dump(mode="json", warnings="error") if callable(getattr(value, "model_dump", None)) else value
 
 
 async def generate(provider, request, *, plan):
@@ -171,7 +188,7 @@ async def generate(provider, request, *, plan):
     plan = deepcopy(saved[0])
     try:
         return await _dispatch(provider, request, plan)
-    except Exception:
+    except Exception:  # noqa: BLE001 - safe unknown-outcome boundary, never retry
         # SDK errors may echo request bodies. Cancellation still propagates;
         # every other post-admission failure is safe, non-replayable evidence.
         return {"protocol": PROTOCOL, "status": "unknown", "outputs": [],
@@ -179,7 +196,12 @@ async def generate(provider, request, *, plan):
 
 
 async def _dispatch(provider, request, plan):
-    client = provider.client.with_options(max_retries=0, timeout=provider.timeout)
+    async with _BoundHTTP(provider.client._client) as transport:
+        client = provider.client.with_options(max_retries=0, timeout=provider.timeout, http_client=transport)
+        return await _dispatch_with_client(client, request, plan)
+
+
+async def _dispatch_with_client(client, request, plan):
     options = {k: plan["output"][k] for k in ("size", "quality", "background")}
     if plan["transport"] == "responses":
         content = [{"type": "input_text", "text": request["prompt"]}]
@@ -191,25 +213,6 @@ async def _dispatch(provider, request, plan):
             tool_choice={"type": "image_generation"}, max_tool_calls=1,
             parallel_tool_calls=False, store=False, stream=False,
         )
-        if response.status != "completed":
-            return {"protocol": PROTOCOL, "status": "unknown", "outputs": [], "reason_code": "incomplete_response"}
-        outputs, calls = [], []
-        for item in response.output or []:
-            if item.type == "image_generation_call":
-                if getattr(item, "status", None) != "completed" or not isinstance(item.result, str) or len(item.result) > 12 * 1024 * 1024:
-                    raise ValueError("Incomplete or oversized image output.")
-                outputs.append({"kind": "image", "mime_type": "image/png", "data": raster(base64.b64decode(item.result, validate=True), size=options["size"])})
-                calls.append(item)
-            elif item.type == "message":
-                for part in item.content:
-                    if part.type == "output_text":
-                        outputs.append({"kind": "text", "text": part.text})
-        observed = getattr(response, "model", None)
-        upstream = {"request_id": getattr(response, "_request_id", None), "response_id": response.id,
-                    "image_call_id": calls[0].id if len(calls) == 1 else None}
-        models = [{"purpose": "controller", "requested": plan["controller"], "resolved": observed},
-                  {"purpose": "image", "requested": plan["model"], "resolved": getattr(calls[0], "model", None) if len(calls) == 1 else None}]
-        usage = _dump(response.usage)
     else:
         params = {"model": plan["model"], "prompt": request["prompt"], "n": 1, "output_format": "png", **options}
         if request["operation"] == "edit":
@@ -217,20 +220,89 @@ async def _dispatch(provider, request, plan):
             response = await client.images.edit(**params)
         else:
             response = await client.images.generate(**params)
-        outputs = []
-        for item in response.data or []:
-            if not isinstance(item.b64_json, str) or len(item.b64_json) > 12 * 1024 * 1024:
-                raise ValueError("Missing or oversized base64 image output.")
-            outputs.append({"kind": "image", "mime_type": "image/png", "data": raster(base64.b64decode(item.b64_json, validate=True), size=options["size"])})
-        models = [{"purpose": "image", "requested": plan["model"], "resolved": None}]
-        upstream = {"request_id": getattr(response, "_request_id", None)}
+    return _parse_response(response, plan)
+
+
+def _parse_response(response, plan):
+    """Retain bounded, independently validated evidence even on parse failure."""
+    responses = plan["transport"] == "responses"
+    reason = "incomplete_response" if responses and getattr(response, "status", None) != "completed" else None
+    outputs, calls = [], []
+
+    def invalid():
+        nonlocal reason
+        reason = reason or "generation_outcome_unknown"
+
+    def identifier(value):
+        if value is None or isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,512}", value):
+            return value
+        invalid()
+        return None
+
+    def append(output):
+        if len(outputs) >= 16:
+            raise ValueError("Oversized image operation output.")
+        if output["kind"] == "text":
+            text = output["text"]
+            if not isinstance(text, str) or len(text) + sum(len(o.get("text", "")) for o in outputs) > 32000:
+                raise ValueError("Invalid or oversized image operation text.")
+        outputs.append(output)
+
+    upstream = {"request_id": identifier(getattr(response, "_request_id", None))}
+    models = [{"purpose": "image", "requested": plan["model"], "resolved": None}]
+    if responses:
+        upstream.update(response_id=identifier(getattr(response, "id", None)), image_call_id=None)
+        models.insert(0, {"purpose": "controller", "requested": plan["controller"],
+                          "resolved": identifier(getattr(response, "model", None))})
+    items = getattr(response, "output" if responses else "data", None)
+    if not isinstance(items, list):
+        invalid()
+        items = []
+    for item in items:
+        try:
+            kind = item.type if responses else "image_generation_call"
+            if kind == "image_generation_call":
+                if responses:
+                    calls.append(item)
+                    if getattr(item, "status", None) != "completed":
+                        raise ValueError("Incomplete image output.")
+                encoded = item.result if responses else item.b64_json
+                if not isinstance(encoded, str) or len(encoded) > 12 * 1024 * 1024:
+                    raise ValueError("Missing or oversized base64 image output.")
+                append({"kind": "image", "mime_type": "image/png",
+                        "data": raster(base64.b64decode(encoded, validate=True), size=plan["output"]["size"])})
+            elif kind == "message":
+                if getattr(item, "status", None) != "completed" or not isinstance(item.content, list):
+                    raise ValueError("Incomplete or malformed message output.")
+                for part in item.content:
+                    if part.type != "output_text":
+                        raise ValueError("Unexpected image operation text.")
+                    append({"kind": "text", "text": part.text})
+            elif kind != "reasoning":
+                raise ValueError("Unexpected image operation output.")
+        except Exception:  # noqa: BLE001 - keep earlier validated outputs, never exception text
+            invalid()
+    if responses and len(calls) == 1:
+        upstream["image_call_id"] = identifier(getattr(calls[0], "id", None))
+        models[1]["resolved"] = identifier(getattr(calls[0], "model", None))
+    try:
         usage = _dump(getattr(response, "usage", None))
-    if len(outputs) > 16 or sum(len(o.get("text", "")) for o in outputs) > 32000:
-        raise ValueError("Oversized image operation output.")
+        if usage is not None and (
+            not isinstance(usage, dict) or len(json.dumps(usage, allow_nan=False)) > 32000
+            or any(usage.get(k) is not None and (type(usage[k]) is not int or usage[k] < 0)
+                   for k in ("input_tokens", "output_tokens", "total_tokens"))
+        ):
+            raise ValueError("Malformed image operation usage.")
+    except Exception:  # noqa: BLE001 - metadata failure must not discard paid images
+        invalid()
+        usage = None
     count = sum(o["kind"] == "image" for o in outputs)
     normalized = {k: usage[k] for k in ("input_tokens", "output_tokens", "total_tokens")
                   if isinstance(usage, dict) and type(usage.get(k)) is int and usage[k] >= 0}
-    return {"protocol": PROTOCOL, "status": "completed" if count == 1 else "failed",
-            "outputs": outputs, "models": models, "upstream": upstream,
-            "usage": {"normalized": normalized or None, "provider": usage},
-            "effective_options": plan["output"], "warnings": [], "continuation": None}
+    result = {"protocol": PROTOCOL, "status": "unknown" if reason else "completed" if count == 1 else "failed",
+              "outputs": outputs, "models": models, "upstream": upstream,
+              "usage": {"normalized": normalized or None, "provider": usage},
+              "effective_options": plan["output"], "warnings": [], "continuation": None}
+    if reason:
+        result.update(reason_code=reason, dispatch_state="unknown")
+    return result

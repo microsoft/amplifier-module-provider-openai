@@ -1,18 +1,17 @@
 """Real SDK serialization and one-send image effects over an offline transport."""
 import asyncio
 import base64
-from copy import deepcopy
 import hashlib
-from io import BytesIO
 import json
+from copy import deepcopy
+from io import BytesIO
 
 import httpx
-from openai import AsyncOpenAI
-from PIL import Image
 import pytest
-
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai.image_operation import PROTOCOL
+from openai import AsyncOpenAI
+from PIL import Image
 
 
 def png():
@@ -40,6 +39,29 @@ def response():
                  "content": [{"type": "output_text", "text": "Accompanying text", "annotations": []}]},
             ], "usage": None, "parallel_tool_calls": False, "tool_choice": {"type": "image_generation"},
             "tools": [], "temperature": 1, "top_p": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["server", "disconnect", "redirect"])
+async def test_legacy_images_also_sends_once(failure):
+    from amplifier_module_provider_openai.images import OpenAIImageBackend
+    sent = []
+    def respond(req):
+        sent.append(req)
+        if failure == "disconnect":
+            raise httpx.RemoteProtocolError("fixture disconnect after possible send")
+        if failure == "redirect":
+            return httpx.Response(307, headers={"location": "https://other.example.invalid/generate"})
+        return httpx.Response(500, json={"error": {"message": "fixture", "type": "server_error"}})
+    async with AsyncOpenAI(api_key="fixture-blue", http_client=httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), follow_redirects=True)) as client:
+        provider = OpenAIProvider(api_key="fixture-blue", client=client)
+        backend = OpenAIImageBackend(provider, {"model": "gpt-image-2.5-flare"})
+        with pytest.raises(Exception):
+            await asyncio.wait_for(backend.generate(action="generate", prompt="fixture",
+                images=[], size="auto", quality="auto", background="auto"), 3)
+        assert len(sent) == 1 and sent[0].url.path == "/v1/images/generations"
+        assert client._client.follow_redirects is True and not client._client.is_closed
 
 
 @pytest.mark.asyncio
@@ -151,3 +173,95 @@ async def test_cancelled_send_stays_consumed():
         task.cancel()
         with pytest.raises(asyncio.CancelledError): await task
         with pytest.raises(ValueError): await provider.generate_image(item, plan=plan)
+
+
+@pytest.mark.asyncio
+async def test_redirect_does_not_repeat_generation_or_change_bound_endpoint():
+    sent = []
+    def respond(req):
+        sent.append(req)
+        return httpx.Response(307, headers={"location": "https://other.example.invalid/v1/responses"})
+    async with AsyncOpenAI(api_key="fixture-blue", http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), follow_redirects=True)) as client:
+        provider = OpenAIProvider(api_key="fixture-blue", client=client)
+        item = request()
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        result = await provider.generate_image(item, plan=plan)
+        assert result["status"] == "unknown" and len(sent) == 1
+        assert client._client.follow_redirects is True and not client._client.is_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["oversized_text", "text", "output_count", "usage", "model"])
+async def test_parse_failure_retains_paid_image_and_safe_provenance_once(malformed, recwarn):
+    payload = response()
+    payload["output"][0]["model"] = "gpt-image-2.5-flare"
+    if malformed == "oversized_text":
+        payload["output"][1]["content"][0]["text"] = "x" * 32001
+    elif malformed == "text":
+        payload["output"][1]["content"][0]["text"] = {"secret": "fixture-secret"}
+    elif malformed == "output_count":
+        payload["output"][1]["content"] *= 16
+    elif malformed == "usage":
+        payload["usage"] = {"input_tokens": "fixture-secret"}
+    else:
+        payload["model"] = {"secret": "fixture-secret"}
+    sent = []
+    def respond(req):
+        sent.append(req)
+        return httpx.Response(200, json=payload, headers={"x-request-id": "req-fixture"})
+    async with AsyncOpenAI(api_key="fixture-blue", max_retries=5,
+                          http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))) as client:
+        provider = OpenAIProvider(api_key="fixture-blue", client=client)
+        item = request()
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        result = await provider.generate_image(item, plan=plan)
+        assert result["status"] == "unknown"
+        assert result["reason_code"] == "generation_outcome_unknown"
+        assert result["outputs"][0] == {"kind": "image", "mime_type": "image/png", "data": png()}
+        assert sum(o["kind"] == "image" for o in result["outputs"]) == 1
+        assert len(result["outputs"]) <= 16
+        assert sum(len(o.get("text", "")) for o in result["outputs"]) <= 32000
+        assert result["upstream"] == {
+            "request_id": "req-fixture", "response_id": "resp-fixture", "image_call_id": "ig-fixture"}
+        assert result["models"] == [
+            {"purpose": "controller", "requested": "gpt-6.1-sol",
+             "resolved": None if malformed == "model" else "gpt-6.1-sol"},
+            {"purpose": "image", "requested": "gpt-image-2.5-flare", "resolved": "gpt-image-2.5-flare"}]
+        assert "fixture-secret" not in repr(result)
+        assert all("fixture-secret" not in str(warning.message) for warning in recwarn)
+        assert result["continuation"] is None
+        with pytest.raises(ValueError, match="consumed"):
+            await provider.generate_image(item, plan=plan)
+        assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_incomplete_response_retains_completed_image_without_continuation():
+    payload = response()
+    payload["status"] = "incomplete"
+    payload["incomplete_details"] = {"reason": "max_output_tokens"}
+    payload["output"][0]["model"] = "gpt-image-2.5-flare"
+    payload["usage"] = {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}
+    sent = []
+    def respond(req):
+        sent.append(req)
+        return httpx.Response(200, json=payload, headers={"x-request-id": "req-fixture"})
+    async with AsyncOpenAI(api_key="fixture-blue", max_retries=5,
+                          http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))) as client:
+        provider = OpenAIProvider(api_key="fixture-blue", client=client)
+        item = request()
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        result = await provider.generate_image(item, plan=plan)
+        assert result["status"] == "unknown" and result["reason_code"] == "incomplete_response"
+        assert result["outputs"] == [
+            {"kind": "image", "mime_type": "image/png", "data": png()},
+            {"kind": "text", "text": "Accompanying text"}]
+        assert result["upstream"] == {
+            "request_id": "req-fixture", "response_id": "resp-fixture", "image_call_id": "ig-fixture"}
+        assert [model["resolved"] for model in result["models"]] == ["gpt-6.1-sol", "gpt-image-2.5-flare"]
+        assert result["usage"]["normalized"] == payload["usage"]
+        assert result["continuation"] is None
+        with pytest.raises(ValueError, match="consumed"):
+            await provider.generate_image(item, plan=plan)
+        assert len(sent) == 1
