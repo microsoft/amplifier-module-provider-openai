@@ -6,6 +6,56 @@ The [draft image-operation contract](contracts/image-generation.v1.md) describes
 an optional provider-owned image boundary. It is proposed direction, not a claim
 that the Responses image operation or new capability methods are implemented.
 
+## Optional image-operation surface — source candidate
+
+The current source now contains the experimental implementation in
+[`image_operation.py`](amplifier_module_provider_openai/image_operation.py).
+This updates the implementation status of the draft introduction above, not
+its approval status: the contract remains unfrozen, combined offline
+qualification is pending, and nothing here claims a shipped deployment or live
+account entitlement.
+
+The ordinary provider exposes three optional structural methods, without
+extending the required Core Provider protocol:
+
+```python
+get_image_generation_capabilities() -> dict
+async prepare_image_generation(request: dict) -> dict
+async generate_image(request: dict, *, plan: dict) -> dict
+```
+
+Callers must require all three methods and negotiate
+`protocol: amplifier.image-operation.v1`. Capabilities inspection is local;
+preparation validates a supported model/transport and binds a single-use plan
+to this provider's connection without a catalogue or generation request.
+Generation validates the unchanged request and binding, then consumes the plan
+before dispatch. The caller owns admission, durable identity, files and recovery.
+
+Operation requests carry `selection.model` separately from
+`selection.config.image_generation: {model, transport}`. The former is the
+controller for the default `responses` transport; the latter names the hosted
+image model. `responses` uses a forced image tool, `max_tool_calls: 1`,
+`parallel_tool_calls: false`, `store: false` and non-streaming output.
+Explicit `transport: images` uses the Images API without invoking a controller.
+There is no implicit transport fallback.
+
+The nested operation override accepts only `model` and `transport`, not
+`enabled`, credentials, endpoints, timeout or reasoning effort. Existing
+provider-level `image_generation.enabled: false` remains a denial; an absent
+setting does not require a separate image setup step for this optional surface.
+The [Image backend](#image-backend) instructions below describe the retained
+explicit `image.backends` registration, not a prerequisite for these methods.
+
+Execution uses the bound SDK client with `max_retries=0` and the provider timeout,
+independent of ordinary completion's retry/continuation behavior. Results retain
+ordered bounded image/text outputs, requested versus observed controller/image
+models, upstream IDs and reported/normalized usage. Unknown facts remain null.
+There is no automatic continuation or cross-account fallback, and a spent plan
+cannot be replayed after cancellation or uncertainty. This is not an upstream
+exactly-once guarantee. The standard endpoint and configured connection are
+checked locally; preparation separately validates model/transport support.
+Capability advertisement, catalogue visibility and preparation do not prove access.
+
 ## Prerequisites
 
 Offline provider contracts run without real credentials: their scoped fixtures

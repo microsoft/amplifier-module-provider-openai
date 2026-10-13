@@ -49,10 +49,10 @@ jobs:
         run: |
           uv build --wheel
           uv venv "$RUNNER_TEMP/provider-runtime"
-          uv pip install --python "$RUNNER_TEMP/provider-runtime/bin/python" dist/*.whl amplifier-core 'openai==2.9.0'
+          uv pip install --python "$RUNNER_TEMP/provider-runtime/bin/python" dist/*.whl amplifier-core 'openai==3.29.0'
           "$RUNNER_TEMP/provider-runtime/bin/python" -I tests/runtime_install_smoke.py
 
       - name: Verify minimum SDK compaction with Core 2.0.1
         run: |
-          uv pip install 'openai==2.9.0' 'amplifier-core==2.0.1'
-          uv run --no-sync pytest -q tests/test_wait_policy.py tests/test_native_compaction.py
+          uv pip install 'openai==3.29.0' 'amplifier-core==2.0.1'
+          uv run --no-sync pytest -q tests/test_wait_policy.py tests/test_native_compaction.py tests/test_image_operation.py
