@@ -8,10 +8,11 @@ from io import BytesIO
 
 import httpx
 import pytest
+from openai import APIError, AsyncOpenAI
+from PIL import Image
+
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai.image_operation import PROTOCOL
-from openai import AsyncOpenAI
-from PIL import Image
 
 
 def png():
@@ -57,7 +58,7 @@ async def test_legacy_images_also_sends_once(failure):
         transport=httpx.MockTransport(respond), follow_redirects=True)) as client:
         provider = OpenAIProvider(api_key="fixture-blue", client=client)
         backend = OpenAIImageBackend(provider, {"model": "gpt-image-2.5-flare"})
-        with pytest.raises(Exception):
+        with pytest.raises(APIError):
             await asyncio.wait_for(backend.generate(action="generate", prompt="fixture",
                 images=[], size="auto", quality="auto", background="auto"), 3)
         assert len(sent) == 1 and sent[0].url.path == "/v1/images/generations"
