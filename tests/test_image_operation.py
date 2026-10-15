@@ -238,6 +238,40 @@ async def test_parse_failure_retains_paid_image_and_safe_provenance_once(malform
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["responses", "images"])
+@pytest.mark.parametrize("matching", [False, True])
+async def test_requested_geometry_failure_keeps_safe_image_evidence_once(transport, matching):
+    output = BytesIO()
+    Image.new("RGB", (1024, 1024) if matching else (8, 8), "blue").save(output, format="PNG")
+    data = output.getvalue()
+    encoded = base64.b64encode(data).decode()
+    payload = response() if transport == "responses" else {"created": 0, "data": [{"b64_json": encoded}]}
+    if transport == "responses":
+        payload["output"][0]["result"] = encoded
+    sent = []
+
+    def respond(req):
+        sent.append(req)
+        return httpx.Response(200, json=payload)
+
+    async with AsyncOpenAI(api_key="fixture-blue",
+                          http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))) as client:
+        provider = OpenAIProvider(api_key="fixture-blue", client=client)
+        item = request(transport=transport)
+        item["output"]["size"] = "1024x1024"
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        result = await provider.generate_image(item, plan=plan)
+        assert result["status"] == ("completed" if matching else "unknown")
+        images = [part for part in result["outputs"] if part["kind"] == "image"]
+        assert images == [{"kind": "image", "mime_type": "image/png", "data": data}]
+        if not matching:
+            assert result["reason_code"] == "generation_outcome_unknown"
+        with pytest.raises(ValueError, match="consumed"):
+            await provider.generate_image(item, plan=plan)
+        assert len(sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_incomplete_response_retains_completed_image_without_continuation():
     payload = response()
     payload["status"] = "incomplete"
