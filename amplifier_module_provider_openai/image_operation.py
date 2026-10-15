@@ -98,7 +98,7 @@ def validate(request):
     return hashlib.sha256(json.dumps(compact, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def raster(data, mime_type="image/png", size="auto"):
+def raster(data, mime_type="image/png"):
     from PIL import Image
     if not isinstance(data, bytes) or not 0 < len(data) <= MAX_BYTES:
         raise ValueError("Invalid image output size.")
@@ -108,8 +108,6 @@ def raster(data, mime_type="image/png", size="auto"):
             raise ValueError("Image bytes do not match the declared format.")
         if not 0 < image.width <= 4096 or not 0 < image.height <= 4096:
             raise ValueError("Image dimensions exceed the artifact limit.")
-        if size != "auto" and size != f"{image.width}x{image.height}":
-            raise ValueError("Image does not meet the required dimensions.")
         if mime_type == "image/png" and image.mode not in {"RGB", "RGBA"}:
             raise ValueError("An RGB/RGBA PNG is required.")
         image.verify()
@@ -269,8 +267,15 @@ def _parse_response(response, plan):
                 encoded = item.result if responses else item.b64_json
                 if not isinstance(encoded, str) or len(encoded) > 12 * 1024 * 1024:
                     raise ValueError("Missing or oversized base64 image output.")
-                append({"kind": "image", "mime_type": "image/png",
-                        "data": raster(base64.b64decode(encoded, validate=True), size=plan["output"]["size"])})
+                data = raster(base64.b64decode(encoded, validate=True))
+                # Safe bytes remain evidence even when they miss a requested
+                # control. Never resize them or report the mismatch as success.
+                append({"kind": "image", "mime_type": "image/png", "data": data})
+                if plan["output"]["size"] != "auto":
+                    from PIL import Image
+                    with Image.open(BytesIO(data)) as image:
+                        if plan["output"]["size"] != f"{image.width}x{image.height}":
+                            invalid()
             elif kind == "message":
                 if getattr(item, "status", None) != "completed" or not isinstance(item.content, list):
                     raise ValueError("Incomplete or malformed message output.")

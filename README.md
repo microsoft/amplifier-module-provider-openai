@@ -3,17 +3,16 @@
 GPT model integration for Amplifier via OpenAI's Responses API.
 
 The [draft image-operation contract](contracts/image-generation.v1.md) describes
-an optional provider-owned image boundary. It is proposed direction, not a claim
-that the Responses image operation or new capability methods are implemented.
+an optional provider-owned image boundary. Its promises remain proposed,
+not certification of live API acceptance or every consuming host.
 
 ## Optional image-operation surface — source candidate
 
 The current source now contains the experimental implementation in
 [`image_operation.py`](amplifier_module_provider_openai/image_operation.py).
-This updates the implementation status of the draft introduction above, not
-its approval status: the contract remains unfrozen, combined offline
-qualification is pending, and nothing here claims a shipped deployment or live
-account entitlement.
+The contract remains unfrozen. Offline SDK transport tests cover preparation,
+single-send execution and bounded evidence recovery; host adoption and live
+account entitlement are separate qualification boundaries.
 
 The ordinary provider exposes three optional structural methods, without
 extending the required Core Provider protocol:
@@ -50,6 +49,9 @@ Execution uses the bound SDK client with `max_retries=0` and the provider timeou
 independent of ordinary completion's retry/continuation behavior. Results retain
 ordered bounded image/text outputs, requested versus observed controller/image
 models, upstream IDs and reported/normalized usage. Unknown facts remain null.
+Safely decoded images that miss required dimensions remain non-success evidence,
+not silently resized artifacts. Malformed accompanying output cannot turn that
+result into success or authorize regeneration.
 There is no automatic continuation or cross-account fallback, and a spent plan
 cannot be replayed after cancellation or uncertainty. This is not an upstream
 exactly-once guarantee. The standard endpoint and configured connection are
@@ -59,7 +61,7 @@ Capability advertisement, catalogue visibility and preparation do not prove acce
 ## Prerequisites
 
 Offline provider contracts run without real credentials: their scoped fixtures
-mount with a nonfunctional key and mock only SDK model listing. Run
+mount with a nonfunctional key and replace model listing and inference transport. Run
 `uv run pytest -q -m "not live"` for all offline checks; separately marked
 inference tests require explicitly supplied live credentials.
 
