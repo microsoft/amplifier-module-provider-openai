@@ -2656,6 +2656,24 @@ class OpenAIProvider:
 
         return image_generation_info()
 
+    def get_image_generation_capabilities(self) -> dict:
+        """Describe the optional instance-bound image operation without I/O."""
+        from .image_operation import capabilities
+
+        return capabilities(self)
+
+    async def prepare_image_generation(self, request: dict) -> dict:
+        """Prepare an image operation without generation or chat mutation."""
+        from .image_operation import prepare
+
+        return await prepare(self, request)
+
+    async def generate_image(self, request: dict, *, plan: dict) -> dict:
+        """Execute a prepared native image operation, never chat completion."""
+        from .image_operation import generate
+
+        return await generate(self, request, plan=plan)
+
     async def list_image_models(self) -> list[dict]:
         """Discover compatible image models without generating an image."""
         from .images import list_image_models

@@ -96,6 +96,19 @@ class OpenAIImageBackend:
         }
 
     async def generate(self, *, action, prompt, images, size, quality, background):
+        from .image_operation import _BoundHTTP
+        client = self.provider.client
+        from openai import AsyncOpenAI
+        if isinstance(client, AsyncOpenAI):
+            async with _BoundHTTP(client._client) as transport:
+                return await self._generate(action=action, prompt=prompt, images=images,
+                    size=size, quality=quality, background=background,
+                    client=client.with_options(http_client=transport))
+        # Alternate explicitly registered clients retain their own contract.
+        return await self._generate(action=action, prompt=prompt, images=images,
+            size=size, quality=quality, background=background, client=client)
+
+    async def _generate(self, *, action, prompt, images, size, quality, background, client):
         if not self.describe()["configured"]:
             raise ValueError("Configure image_generation.model explicitly.")
         if action not in {"generate", "edit"} or (action == "edit") != bool(images):
@@ -105,7 +118,7 @@ class OpenAIImageBackend:
         model = self.model
         if model == "auto":
             model = latest_image_model(await list_image_models(self.provider))
-        client = self.provider.client.with_options(timeout=self.timeout, max_retries=0)
+        client = client.with_options(timeout=self.timeout, max_retries=0)
         params = {
             "model": model,
             "prompt": prompt,
