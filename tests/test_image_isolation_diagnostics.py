@@ -10,6 +10,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 SOURCE = Path(__file__).with_name("image_outcome_baseline.py")
 SPEC = importlib.util.spec_from_file_location("image_isolation_fixture", SOURCE)
@@ -40,6 +41,19 @@ def observations(raw):
                              "parentRead": {"complete": True, "error": None, "identityBound": True,
                                             "limit": 1024, "bytesObserved": 134}}
     return evidence
+
+
+def case_fixture():
+    """Synthetic one-to-one evidence for the immutable product test identities."""
+    nodes = list(helper.EXPECTED_NODE_IDS)
+    reports = [{"nodeid": node, "when": phase, "outcome": "passed"}
+               for node in nodes for phase in ("setup", "call", "teardown")]
+    tree = ET.Element("testsuites")
+    suite = ET.SubElement(tree, "testsuite", tests="32", failures="0", errors="0", skipped="0")
+    for node in nodes:
+        ET.SubElement(suite, "testcase", classname="tests.test_image_operation",
+                      name=node.split("::", 1)[1])
+    return nodes, reports, tree
 
 
 class DiagnosticControls(unittest.TestCase):
@@ -350,6 +364,166 @@ class DiagnosticControls(unittest.TestCase):
             self.assertFalse(result["productImports"])
             self.assertFalse(result["testsExecuted"])
             self.assertIsNone(result["networkAttempts"])
+
+    def test_fixed_case_identities_match_unchanged_literal_parametrization(self):
+        # Independently expand this fixed source's literal decorators, without
+        # importing pytest, collecting tests, or running any provider fixture.
+        expected = []
+        for node in ast.parse(helper.TEST.read_text()).body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not node.name.startswith("test_"):
+                continue
+            ids = [""]
+            for decorator in reversed(node.decorator_list):
+                if isinstance(decorator, ast.Call) and ast.unparse(decorator.func) == "pytest.mark.parametrize":
+                    self.assertEqual(len(decorator.args), 2)
+                    self.assertFalse(decorator.keywords)
+                    values = ast.literal_eval(decorator.args[1])
+                    self.assertTrue(all(isinstance(value, (bool, str)) for value in values))
+                    ids = [prefix + ("-" if prefix else "") + str(value) for prefix in ids for value in values]
+            expected.extend("tests/test_image_operation.py::" + node.name + ("[" + value + "]" if value else "")
+                            for value in ids)
+        self.assertEqual(len(expected), 32)
+        self.assertEqual(len(set(expected)), 32)
+        self.assertEqual(tuple(expected), helper.EXPECTED_NODE_IDS)
+
+    def test_exact_evidence_accepts_all_32_unique_cases_in_any_report_order(self):
+        nodes, reports, tree = case_fixture()
+        result = helper.exact_case_evidence(list(reversed(nodes)), list(reversed(reports)), tree)
+        self.assertTrue(result["allRequiredExecuted"])
+        self.assertEqual(result["expectedCount"], 32)
+        for phase in ("collection", "calls", "junit"):
+            self.assertEqual(result[phase]["count"], 32)
+            self.assertEqual(result[phase]["unique"], 32)
+            self.assertTrue(result[phase]["exact"])
+        self.assertTrue(result["junit"]["countsMatch"])
+        self.assertEqual(result["counts"], {"tests": 32, "failures": 0, "errors": 0, "skipped": 0})
+
+    def test_missing_parameter_variant_cannot_pass_a_complete_function_set(self):
+        nodes, reports, tree = case_fixture()
+        missing = nodes.pop(0)  # Other variants of this same function remain.
+        reports = [report for report in reports if report["nodeid"] != missing]
+        suite = tree.find("testsuite")
+        suite.remove(suite[0])
+        suite.set("tests", "31")
+        result = helper.exact_case_evidence(nodes, reports, tree)
+        self.assertFalse(result["allRequiredExecuted"])
+        for phase in ("collection", "calls", "junit"):
+            self.assertEqual(result[phase]["count"], 31)
+            self.assertEqual(result[phase]["missing"], [missing])
+        self.assertEqual(result["counts"]["tests"], 31)
+
+    def test_collected_duplicate_or_unexpected_variant_cannot_replace_expected_case(self):
+        for replacement in (helper.EXPECTED_NODE_IDS[1], "tests/test_image_operation.py::test_legacy_images_also_sends_once[unexpected]"):
+            with self.subTest(replacement=replacement):
+                nodes, reports, tree = case_fixture()
+                missing = nodes[0]
+                nodes[0] = replacement
+                result = helper.exact_case_evidence(nodes, reports, tree)
+                self.assertFalse(result["allRequiredExecuted"])
+                self.assertEqual(result["collection"]["count"], 32)
+                self.assertEqual(result["collection"]["missing"], [missing])
+                self.assertTrue(result["collection"]["duplicate"] or result["collection"]["unexpected"])
+
+    def test_call_reports_require_exactly_one_call_per_expected_identity(self):
+        for change in ("missing", "duplicate", "unexpected", "unexpected_setup"):
+            with self.subTest(change=change):
+                nodes, reports, tree = case_fixture()
+                call = next(report for report in reports if report["when"] == "call")
+                if change == "missing":
+                    reports.remove(call)
+                elif change == "duplicate":
+                    reports.append(dict(call))
+                else:
+                    reports.append({**call, "nodeid": "tests/test_image_operation.py::unexpected",
+                                    "when": "call" if change == "unexpected" else "setup"})
+                result = helper.exact_case_evidence(nodes, reports, tree)
+                self.assertFalse(result["allRequiredExecuted"])
+                if change == "missing":
+                    self.assertEqual(result["calls"]["missing"], [call["nodeid"]])
+                elif change == "duplicate":
+                    self.assertEqual(result["calls"]["duplicate"], [call["nodeid"]])
+                else:
+                    self.assertEqual(len(result["unexpectedReports"]), 1)
+
+    def test_junit_identities_must_match_every_expected_parameter_once(self):
+        for change in ("missing", "duplicate", "unexpected", "wrong_class", "missing_name"):
+            with self.subTest(change=change):
+                nodes, reports, tree = case_fixture()
+                suite = tree.find("testsuite")
+                if change == "missing":
+                    suite.remove(suite[0])
+                    suite.set("tests", "31")
+                elif change == "duplicate":
+                    suite[0].set("name", suite[1].get("name"))
+                elif change == "unexpected":
+                    suite[0].set("name", "test_legacy_images_also_sends_once[unexpected]")
+                elif change == "wrong_class":
+                    suite[0].set("classname", "other.test_image_operation")
+                else:
+                    del suite[0].attrib["name"]
+                result = helper.exact_case_evidence(nodes, reports, tree)
+                self.assertFalse(result["allRequiredExecuted"])
+                self.assertTrue(result["junit"]["missing"])
+                if change in {"wrong_class", "missing_name"}:
+                    self.assertEqual(len(result["junit"]["unmapped"]), 1)
+
+    def test_junit_declared_counts_must_equal_actual_case_and_outcome_counts(self):
+        for key in ("tests", "failures", "errors", "skipped"):
+            for value in ("", "invalid", "1", None):
+                with self.subTest(key=key, value=value):
+                    nodes, reports, tree = case_fixture()
+                    suite = tree.find("testsuite")
+                    if value is None:
+                        del suite.attrib[key]
+                    else:
+                        suite.set(key, value)
+                    result = helper.exact_case_evidence(nodes, reports, tree)
+                    self.assertFalse(result["allRequiredExecuted"])
+                    self.assertFalse(result["junit"]["countsMatch"])
+                    self.assertEqual(result["counts"]["tests"], 32)  # Preserve observed, not declared totals.
+
+    def test_product_failure_keeps_complete_evidence_and_nonzero_failure_count(self):
+        nodes, reports, tree = case_fixture()
+        next(report for report in reports if report["when"] == "call")["outcome"] = "failed"
+        suite = tree.find("testsuite")
+        suite.set("failures", "1")
+        ET.SubElement(suite[0], "failure", message="synthetic expected product red").text = "retained assertion"
+        result = helper.exact_case_evidence(nodes, reports, tree)
+        self.assertTrue(result["allRequiredExecuted"])  # Executed is not passed.
+        self.assertEqual(result["counts"], {"tests": 32, "failures": 1, "errors": 0, "skipped": 0})
+        self.assertEqual(len(result["junit"]["identities"]), 32)
+        self.assertIn("retained assertion", ET.tostring(tree, encoding="unicode"))
+        main = SOURCE.read_text().split("def main():", 1)[1]
+        self.assertIn('not any(counts[key] for key in ("failures", "errors", "skipped"))', main)
+        self.assertIn('exit_code = 0 if result["status"] == "PASS" else (code or 1)', main)
+
+    def test_junit_incomplete_empty_or_multiple_suites_never_qualify(self):
+        for change in ("empty", "multiple", "nested"):
+            with self.subTest(change=change):
+                nodes, reports, tree = case_fixture()
+                if change == "empty":
+                    tree = ET.Element("testsuites")
+                elif change == "multiple":
+                    ET.SubElement(tree, "testsuite", tests="0", failures="0", errors="0", skipped="0")
+                else:
+                    suite = tree.find("testsuite")
+                    row = suite[0]
+                    suite.remove(row)
+                    ET.SubElement(suite, "unexpected-wrapper").append(row)
+                result = helper.exact_case_evidence(nodes, reports, tree)
+                self.assertFalse(result["allRequiredExecuted"])
+                self.assertFalse(result["junit"]["countsMatch"])
+
+    def test_junit_skips_and_errors_remain_visible_without_becoming_passes(self):
+        for tag, key in (("skipped", "skipped"), ("error", "errors")):
+            with self.subTest(tag=tag):
+                nodes, reports, tree = case_fixture()
+                suite = tree.find("testsuite")
+                suite.set(key, "1")
+                ET.SubElement(suite[0], tag, message="synthetic non-pass")
+                result = helper.exact_case_evidence(nodes, reports, tree)
+                self.assertEqual(result["counts"][key], 1)
+                self.assertEqual(result["counts"]["tests"], 32)
 
 
 if __name__ == "__main__":

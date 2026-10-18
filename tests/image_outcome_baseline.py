@@ -7,7 +7,7 @@ The original line-count predicate remains diagnostic, never admission authority.
 """
 from __future__ import annotations
 
-import ast
+from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import importlib
@@ -30,6 +30,43 @@ ROOT = Path(__file__).resolve().parents[1]
 PRODUCT = "amplifier_module_provider_openai"
 TEST = ROOT / "tests/test_image_operation.py"
 ROUTE_HEADER = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT".split()
+# Fixed identities for TEST_BLOB, including pytest's literal parameter IDs.
+# Do not derive the expected set from collection: a deselected variant is missing
+# evidence, even when every function name still appears in the remaining cases.
+EXPECTED_NODE_IDS = tuple("tests/test_image_operation.py::" + name for name in (
+    "test_legacy_images_also_sends_once[server]",
+    "test_legacy_images_also_sends_once[disconnect]",
+    "test_legacy_images_also_sends_once[redirect]",
+    "test_responses_uses_distinct_models_bound_account_and_final_image[False]",
+    "test_responses_uses_distinct_models_bound_account_and_final_image[True]",
+    "test_sdk_500_is_one_request_and_cannot_reuse_plan",
+    "test_changed_request_plan_or_binding_never_sends[prompt]",
+    "test_changed_request_plan_or_binding_never_sends[model]",
+    "test_changed_request_plan_or_binding_never_sends[plan]",
+    "test_changed_request_plan_or_binding_never_sends[account]",
+    "test_changed_request_plan_or_binding_never_sends[endpoint]",
+    "test_changed_request_plan_or_binding_never_sends[project]",
+    "test_changed_request_plan_or_binding_never_sends[organization]",
+    "test_changed_request_plan_or_binding_never_sends[headers]",
+    "test_missing_native_capability_controls_and_endpoint_refuse_without_call",
+    "test_cancelled_send_stays_consumed",
+    "test_redirect_does_not_repeat_generation_or_change_bound_endpoint",
+    "test_parse_failure_retains_paid_image_and_safe_provenance_once[oversized_text]",
+    "test_parse_failure_retains_paid_image_and_safe_provenance_once[text]",
+    "test_parse_failure_retains_paid_image_and_safe_provenance_once[output_count]",
+    "test_parse_failure_retains_paid_image_and_safe_provenance_once[usage]",
+    "test_parse_failure_retains_paid_image_and_safe_provenance_once[model]",
+    "test_requested_geometry_failure_keeps_safe_image_evidence_once[False-responses]",
+    "test_requested_geometry_failure_keeps_safe_image_evidence_once[False-images]",
+    "test_requested_geometry_failure_keeps_safe_image_evidence_once[True-responses]",
+    "test_requested_geometry_failure_keeps_safe_image_evidence_once[True-images]",
+    "test_incomplete_response_retains_completed_image_without_continuation",
+    "test_image_disconnect_retains_uncertain_dispatch_without_replay[responses]",
+    "test_image_disconnect_retains_uncertain_dispatch_without_replay[images]",
+    "test_nonterminal_image_response_remains_unknown_but_received[queued]",
+    "test_nonterminal_image_response_remains_unknown_but_received[in_progress]",
+    "test_nonterminal_image_response_remains_unknown_but_received[unrecognized-state]",
+))
 
 
 def require(condition, code):
@@ -285,6 +322,50 @@ def enforce_isolation(evidence, inputs, output):
     _enforce_guards(evidence, corrected_guard_observations(evidence, inputs), output)
 
 
+def exact_case_evidence(collected, reports, tree):
+    """Reconcile this fixed 32-case file; never turn an incomplete subset green."""
+    expected = Counter(EXPECTED_NODE_IDS)
+
+    def compare(observed):
+        counts = Counter(observed)
+        return {"count": len(observed), "unique": len(counts),
+                "missing": sorted((expected - counts).elements()),
+                "duplicate": sorted(node for node, count in counts.items() if count > 1),
+                "unexpected": sorted(node for node in counts if node not in expected),
+                "exact": len(observed) == 32 and counts == expected}
+
+    calls = [report["nodeid"] for report in reports if report["when"] == "call"]
+    cases = list(tree.iter("testcase"))
+    identities = [{"classname": case.get("classname"), "name": case.get("name")} for case in cases]
+    mapped = ["tests/test_image_operation.py::" + case["name"]
+              for case in identities if case["classname"] == "tests.test_image_operation"
+              and isinstance(case["name"], str)]
+    junit = compare(mapped)
+    junit.update(caseCount=len(cases), identities=identities, mappedNodeIds=mapped,
+                 unmapped=[case for case in identities if case["classname"] != "tests.test_image_operation"
+                           or not isinstance(case["name"], str)])
+    counts = {key: len(list(tree.iter(tag))) for key, tag in (
+        ("tests", "testcase"), ("failures", "failure"), ("errors", "error"), ("skipped", "skipped"))}
+    suites = list(tree.iter("testsuite"))
+    attributes = [{key: suite.get(key) for key in counts} for suite in suites]
+    # The unchanged pytest invocation writes one suite with direct case children.
+    # Reconcile all four declared counters against the actual XML, not just tests.
+    counters_match = (len(suites) == 1 and len(suites[0].findall("testcase")) == len(cases)
+                      and all(attributes[0][key] is not None and re.fullmatch(r"[0-9]+", attributes[0][key])
+                              and int(attributes[0][key]) == value for key, value in counts.items()))
+    junit.update(declaredCounters=attributes, countsMatch=counters_match)
+    collection, call_evidence = compare(collected), compare(calls)
+    unexpected_reports = [report for report in reports if report["nodeid"] not in expected]
+    complete = (len(EXPECTED_NODE_IDS) == len(expected) == 32
+                and all(count == 1 for count in expected.values())
+                and collection["exact"] and call_evidence["exact"] and not unexpected_reports
+                and junit["exact"] and len(cases) == 32 and not junit["unmapped"] and counters_match)
+    return {"expectedNodeIds": list(EXPECTED_NODE_IDS), "expectedCount": 32,
+            "collection": collection, "calls": call_evidence, "junit": junit,
+            "unexpectedReports": unexpected_reports, "counts": counts,
+            "allRequiredExecuted": complete}
+
+
 def main():
     # These checks precede every write. The workflow creates the offline namespace.
     require(os.environ.get("GITHUB_ACTIONS") == "true", "host_execution_refused")
@@ -372,9 +453,6 @@ def main():
                     paths[name] = str(Path(path).resolve().relative_to(work / "runtime"))
             return paths
         result["originsBefore"] = origins()
-        definitions = {node.name for node in ast.parse(TEST.read_text()).body
-                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")}
-
         class Evidence:
             def pytest_collection_finish(self, session):
                 collected.extend(item.nodeid for item in session.items)
@@ -395,12 +473,11 @@ def main():
         require(len(xml.encode()) <= 2 * 1024 * 1024, "junit_too_large")
         (output / "junit.xml").write_text(clean_text(xml, work))
         tree = ET.fromstring(xml)
-        counts = {key: len(list(tree.iter(tag))) for key, tag in (
-            ("tests", "testcase"), ("failures", "failure"), ("errors", "error"), ("skipped", "skipped"))}
+        case_evidence = exact_case_evidence(collected, reports, tree)
+        result["caseEvidence"] = case_evidence
+        counts = case_evidence["counts"]
         result["counts"] = counts
-        functions = {node.rsplit("::", 1)[-1].split("[", 1)[0] for node in collected}
-        called = {row["nodeid"] for row in reports if row["when"] == "call"}
-        result["allRequiredExecuted"] = functions == definitions and called == set(collected) and bool(collected)
+        result["allRequiredExecuted"] = case_evidence["allRequiredExecuted"]
         result["status"] = "PASS" if (code == 0 and result["allRequiredExecuted"] and not network_events
             and not any(counts[key] for key in ("failures", "errors", "skipped"))) else "FAIL"
         exit_code = 0 if result["status"] == "PASS" else (code or 1)
