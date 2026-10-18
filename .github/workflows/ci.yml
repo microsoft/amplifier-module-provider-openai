@@ -2,11 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, test/image-outcome-run-ad2410]
   pull_request:
 
 jobs:
   test:
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/test/image-outcome-run-ad2410') }}
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     # A hang must fail LOUDLY and fast, not sit burning runner time until the
@@ -56,3 +57,102 @@ jobs:
         run: |
           uv pip install 'openai==3.29.0' 'amplifier-core==2.0.1'
           uv run --no-sync pytest -q tests/test_wait_policy.py tests/test_native_compaction.py tests/test_image_operation.py
+
+  image-outcome-baseline:
+    # Publishing test/image-outcome-baseline-ad2410 does not execute CI.
+    # Only a separately admitted push of that exact commit to this run branch
+    # executes this one fixed job; it does not open a PR or publish a package.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/test/image-outcome-run-ad2410'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: image-outcome-baseline
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: '3.13'
+      - name: Prepare exact installed baseline
+        env:
+          UV_NO_BUILD_PACKAGE: amplifier-core
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
+        run: |
+          set -eu
+          work="$RUNNER_TEMP/openai-image-outcome"
+          mkdir -p "$work/evidence" "$work/wheels"
+          printf '{"status":"PREPARING","source":"%s","testBaseline":"32db886dd681a03f9fd7c1fdd2a4093a60d054c5"}\n' "$GITHUB_SHA" > "$work/evidence/preparation.json"
+          exec > >(tee "$work/preparation.log") 2>&1
+          uv export --locked --all-extras --no-emit-project --no-hashes > "$work/locked-requirements.txt"
+          uv build --wheel --out-dir "$work/wheels"
+          uv venv --python 3.13 "$work/runtime"
+          # Deliberate Core override: the retained provider lock has Core1.6.1.
+          # Use the current native runtime floor without building Core.
+          printf 'amplifier-core==2.0.2\nopenai==3.29.0\n' > "$work/overrides.txt"
+          uv pip install --python "$work/runtime/bin/python" \
+            --requirements "$work/locked-requirements.txt" --overrides "$work/overrides.txt" \
+            "$work"/wheels/*.whl \
+            'amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@8d26eceb9b7cafe6e93346f8f4294596bd45dcd1'
+          uv pip check --python "$work/runtime/bin/python"
+          printf '{"status":"READY","source":"%s","foundation":"8d26eceb9b7cafe6e93346f8f4294596bd45dcd1","sdk":"3.29.0","core":"2.0.2"}\n' "$GITHUB_SHA" > "$work/evidence/preparation.json"
+      - name: Execute unchanged image regressions without network access
+        run: |
+          set -eu
+          work="$RUNNER_TEMP/openai-image-outcome"
+          set +e
+          sudo --preserve-env=GITHUB_ACTIONS,GITHUB_REPOSITORY,GITHUB_REF,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,RUNNER_TEMP,HOME,PATH \
+            unshare --net -- bash -c '
+              set -eu
+              # No interface or route is enabled; MockTransport needs no socket.
+              exec setpriv --reuid="$1" --regid="$2" --init-groups \
+                --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+                env IMAGE_BASELINE_OFFLINE=1 timeout --kill-after=10s 180s \
+                "$3" -I "$4"
+            ' baseline "$(id -u)" "$(id -g)" "$work/runtime/bin/python" "$PWD/tests/image_outcome_baseline.py"
+          code=$?
+          printf '{"exitCode":%s,"note":"Nonzero, timeout or missing test result is not a pass"}\n' "$code" > "$work/evidence/process.json"
+          exit "$code"
+      - name: Retain bounded setup diagnostics without runner identities
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          work = Path(os.environ['RUNNER_TEMP']) / 'openai-image-outcome'
+          out = work / 'evidence'
+          out.mkdir(parents=True, exist_ok=True)
+          receipt = out / 'preparation.json'
+          data = json.loads(receipt.read_text()) if receipt.exists() else {'status': 'BLOCKED'}
+          if data.get('status') != 'READY':
+              data['status'] = 'BLOCKED'
+          data.update(runId=os.environ['GITHUB_RUN_ID'], runAttempt=os.environ['GITHUB_RUN_ATTEMPT'])
+          receipt.write_text(json.dumps(data, indent=2) + '\n')
+          log = work / 'preparation.log'
+          if log.exists():
+              with log.open('rb') as stream:
+                  size = log.stat().st_size
+                  stream.seek(max(0, size - 128000))
+                  text = stream.read().decode('utf-8', 'replace')
+              for value in (os.environ['GITHUB_WORKSPACE'], os.environ['RUNNER_TEMP'], str(Path.home())):
+                  text = text.replace(value, '[RUNNER]')
+              text = re.sub(r'/home/[^/\s]+', '[HOME]', text)
+              (out / 'preparation.log').write_text(('[earlier output truncated]\n' if size > 128000 else '') + text)
+          PY
+      - name: Preserve baseline results including red or partial checks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-outcome-baseline-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/openai-image-outcome/evidence/*.json
+            ${{ runner.temp }}/openai-image-outcome/evidence/*.xml
+            ${{ runner.temp }}/openai-image-outcome/evidence/*.log
+          if-no-files-found: error
