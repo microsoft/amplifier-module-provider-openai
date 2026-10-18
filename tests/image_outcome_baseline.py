@@ -1,24 +1,20 @@
-"""Fixed installed-wheel baseline for the retained image-outcome regressions.
+"""Diagnostic-only successor to the blocked installed-wheel image baseline.
 
 Run only in the repository's admitted hosted execution branch. Product/test bytes
-remain those of BASELINE; CI plumbing may differ. A failing regression is a failure,
-not an expected-green result. No live provider service is permitted.
+remain those of BASELINE. The four original isolation predicates are unchanged;
+format classifications are observations, never permission to proceed. Even when
+the guards and wheel attestation pass, this increment never imports a provider.
 """
 from __future__ import annotations
 
-import ast
-from contextlib import redirect_stderr, redirect_stdout
 import hashlib
-import importlib
 import importlib.metadata as metadata
-import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 import zipfile
 
 BASELINE = "32db886dd681a03f9fd7c1fdd2a4093a60d054c5"
@@ -51,11 +47,163 @@ def clean_text(text, work):
     return re.sub(r"/home/[^/\s]+", "[HOME]", text)
 
 
+def route_structure(text):
+    """Describe format, not route addresses; never use this to grant admission."""
+    lines = text.splitlines()  # Deliberately no strip/filter: preserve the refusal.
+    header = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT".split()
+    recognized = bool(lines) and lines[0].split() == header
+    rows = []
+    for index, line in enumerate(lines[1:] if recognized else lines, start=1 if recognized else 0):
+        fields = line.split()
+        valid = (len(fields) == 11 and re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", fields[0])
+                 and all(re.fullmatch(r"[0-9A-Fa-f]{8}", fields[i]) for i in (1, 2, 7))
+                 and re.fullmatch(r"[0-9A-Fa-f]{1,8}", fields[3])
+                 and all(re.fullmatch(r"[0-9]+", fields[i]) for i in (4, 5, 6, 8, 9, 10)))
+        rows.append({"index": index, "fields": len(fields),
+                     "kind": "blank" if not fields else "route" if valid else "malformed"})
+    route_count = sum(row["kind"] == "route" for row in rows)
+    malformed = sum(row["kind"] == "malformed" for row in rows)
+    classification = ("empty" if not text else "blank_only" if not text.strip() else
+                      "malformed_header" if not recognized else "malformed_rows" if malformed else
+                      "route_rows" if route_count else "header_only")
+    return {"classification": classification, "header": "recognized" if recognized else "unrecognized_or_absent",
+            "splitlinesCount": len(lines), "blankLines": sum(not line.strip() for line in lines),
+            "terminalNewlines": len(text) - len(text.rstrip("\n")),
+            "carriageReturns": text.count("\r"), "structuredRouteRows": route_count,
+            "malformedRows": malformed, "rows": rows[:32], "rowsCapped": len(rows) > 32,
+            "originalLineCountPredicate": len(lines) == 1, "admissionAuthority": False}
+
+
+def bounded_text(path, limit):
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+        complete = len(data) <= limit
+        try:
+            text = data[:limit].decode("utf-8")
+        except UnicodeDecodeError:
+            return None, {"complete": False, "error": "invalid_utf8", "bytesObserved": len(data)}
+        return text if complete else None, {
+            "complete": complete, "bytesObserved": len(data), "limit": limit,
+            "error": None if complete else "truncated"}
+    except OSError as error:
+        return None, {"complete": False, "error": type(error).__name__, "errno": error.errno}
+
+
+def namespace_identity():
+    try:
+        value = os.readlink("/proc/self/ns/net")
+        return value if re.fullmatch(r"net:\[[0-9]{1,20}\]", value) else None
+    except OSError:
+        return None
+
+
+def isolation_observations(work):
+    """Bounded current-process probes only; optional probe failures stay explicit."""
+    evidence = {"schema": "image-isolation-observation.v1", "guards": [],
+                "safetyQualified": False, "productExecutionAuthorized": False}
+    inputs = {}
+    for key, path, limit in (("status", "/proc/self/status", 32768),
+                             ("interfaces", "/proc/net/dev", 16384),
+                             ("routes", "/proc/net/route", 16384)):
+        inputs[key], evidence[key] = bounded_text(Path(path), limit)
+    fields = dict(line.split(":", 1) for line in (inputs["status"] or "").splitlines() if ":" in line)
+    observed_fields = {}
+    for key in ("NoNewPrivs", "CapEff", "CapPrm", "CapBnd", "CapAmb", "CapInh"):
+        value = fields.get(key, "").strip()
+        pattern = r"[01]" if key == "NoNewPrivs" else r"[0-9a-fA-F]{1,32}"
+        observed_fields[key] = value if re.fullmatch(pattern, value) else None
+    evidence["status"]["fields"] = observed_fields
+    names = {line.split(":", 1)[0].strip() for line in (inputs["interfaces"] or "").splitlines()[2:]}
+    evidence["interfaces"]["names"] = sorted(name if re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", name)
+                                              else "[invalid-interface]" for name in names)[:32]
+    evidence["interfaces"]["count"] = len(names)
+    flags = []
+    for name in sorted(names)[:32]:
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", name):
+            continue
+        try:
+            # This queries flags without bind/connect/send. No address is read.
+            import fcntl
+            import socket
+            import struct
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                data = fcntl.ioctl(probe.fileno(), 0x8913, struct.pack("256s", name.encode()))
+            value = struct.unpack_from("H", data, 16)[0]
+            flags.append({"interface": name, "flags": value, "up": bool(value & 1),
+                          "loopback": bool(value & 8), "status": "observed"})
+        except Exception as error:
+            # A diagnostic ioctl/import/decoding failure is not the isolation
+            # predicate. Preserve it without hiding a subsequent guard refusal.
+            flags.append({"interface": name, "status": "unavailable", "error": type(error).__name__})
+    evidence["interfaces"]["linkFlags"] = flags
+    if inputs["routes"] is not None:
+        evidence["routes"].update(route_structure(inputs["routes"]))
+    parent_text, parent_read = bounded_text(work / "evidence/parent-namespace.json", 1024)
+    parent = None
+    if parent_text is not None:
+        try:
+            saved = json.loads(parent_text)
+            value = saved.get("networkNamespace")
+            matching = all(saved.get(key) == os.environ.get(env) for key, env in (
+                ("source", "GITHUB_SHA"), ("runId", "GITHUB_RUN_ID"), ("attempt", "GITHUB_RUN_ATTEMPT")))
+            if matching and isinstance(value, str) and re.fullmatch(r"net:\[[0-9]{1,20}\]", value):
+                parent = value
+            else:
+                parent_read["error"] = "invalid_or_unbound_identity"
+        except (ValueError, AttributeError):
+            parent_read["error"] = "invalid_identity_record"
+    own = namespace_identity()
+    evidence["namespace"] = {"current": own, "retainedParent": parent, "parentRead": parent_read,
+                            "comparison": "unknown" if own is None or parent is None else
+                            "same" if own == parent else "different",
+                            "admissionAuthority": False}
+    return evidence, inputs
+
+
+def original_guard_observations(inputs):
+    """Same four admission predicates as a35e9; incomplete reads never qualify."""
+    status = dict(line.split(":", 1) for line in (inputs["status"] or "").splitlines() if ":" in line)
+    nnp = status.get("NoNewPrivs", "").strip()
+    caps = [status.get(key, "").strip() for key in ("CapEff", "CapPrm", "CapBnd", "CapAmb", "CapInh")]
+    try:
+        caps_zero = all(int(value, 16) == 0 for value in caps)
+    except ValueError:
+        caps_zero = False
+    names = {line.split(":", 1)[0].strip() for line in (inputs["interfaces"] or "").splitlines()[2:]}
+    lines = None if inputs["routes"] is None else len(inputs["routes"].splitlines())
+    return [
+        ("privilege_regain_not_blocked", "NoNewPrivs == 1", inputs["status"] is not None and nnp == "1"),
+        ("retained_capability", "five capability fields == 0", inputs["status"] is not None and caps_zero),
+        ("unexpected_network_interface", "interfaces == {lo}", inputs["interfaces"] is not None and names == {"lo"}),
+        ("unexpected_network_route", "raw splitlines count == 1", lines == 1),
+    ]
+
+
+def enforce_original_isolation(evidence, inputs, output):
+    for code, expected, passed in original_guard_observations(inputs):
+        evidence["guards"].append({"reasonCode": code, "expected": expected,
+                                   "observedPredicate": passed, "outcome": "pass" if passed else "refused"})
+        evidence["firstRefusal"] = None if passed else code
+        # Persist all bounded observations BEFORE the original require can raise.
+        try:
+            temporary = output / "isolation.json.tmp"
+            temporary.write_text(json.dumps(evidence, indent=2) + "\n")
+            temporary.replace(output / "isolation.json")
+        except OSError:
+            # Keep evaluating only the already-captured original predicates.
+            # Evidence failure cannot hide a later isolation refusal.
+            evidence["writeError"] = "isolation_evidence_write_failed"
+        require(passed, code)
+    require("writeError" not in evidence, "isolation_evidence_write_failed")
+
+
 def main():
     # These checks precede every write. The workflow creates the offline namespace.
     require(os.environ.get("GITHUB_ACTIONS") == "true", "host_execution_refused")
     require(os.environ.get("GITHUB_REPOSITORY") == "microsoft/amplifier-module-provider-openai", "wrong_repository")
-    require(os.environ.get("GITHUB_REF") == "refs/heads/test/image-outcome-run-ad2410", "wrong_execution_branch")
+    require(os.environ.get("GITHUB_REF") == "refs/heads/test/image-isolation-diagnostics-run-ad2410", "wrong_execution_branch")
+    require(sys.argv[1:] == ["--diagnostic-only"], "diagnostic_only_required")
     require(os.environ.get("IMAGE_BASELINE_OFFLINE") == "1", "offline_namespace_required")
     temp = Path(os.environ["RUNNER_TEMP"]).resolve()
     work = temp / "openai-image-outcome"
@@ -65,23 +213,13 @@ def main():
     result = {"status": "BLOCKED", "testBaseline": BASELINE, "foundation": FOUNDATION,
               "source": os.environ.get("GITHUB_SHA"), "runId": os.environ.get("GITHUB_RUN_ID"),
               "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"), "testsExecuted": False,
-              "limits": "Offline single-SDK provider baseline; not downstream, newest-SDK or live image acceptance."}
-    collected, reports, network_events = [], [], []
-    log = io.StringIO()
+              "productImports": False, "networkAttempts": None,
+              "limits": "Isolation diagnostics only; socket audit and product tests are never entered."}
     exit_code = 1
     try:
-        process_status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
-        require(process_status["NoNewPrivs"].strip() == "1", "privilege_regain_not_blocked")
-        require(all(int(process_status[key].strip(), 16) == 0
-                    for key in ("CapEff", "CapPrm", "CapBnd", "CapAmb", "CapInh")), "retained_capability")
-        # /proc/net is scoped to this process's network namespace. Do not infer
-        # it from the runner's pre-existing sysfs mount.
-        interfaces = {line.split(":", 1)[0].strip()
-                      for line in Path("/proc/net/dev").read_text().splitlines()[2:]}
-        require(interfaces == {"lo"}, "unexpected_network_interface")
-        require(len(Path("/proc/net/route").read_text().splitlines()) == 1, "unexpected_network_route")
-        result["isolation"] = {"interfaces": sorted(interfaces), "ipv4Routes": 0,
-                               "noNewPrivileges": True, "capabilities": "empty"}
+        observation, inputs = isolation_observations(work)
+        result["isolationDiagnostics"] = observation
+        enforce_original_isolation(observation, inputs, output)
         require(git("rev-parse", "HEAD") == result["source"], "checkout_identity_mismatch")
         require(git("rev-parse", "HEAD:" + PRODUCT) == PRODUCT_TREE, "product_changed_before_baseline")
         require(git("rev-parse", "HEAD:tests/test_image_operation.py") == TEST_BLOB, "regressions_changed")
@@ -117,72 +255,24 @@ def main():
         require(count > 0, "empty_provider_payload")
         result.update(wheelSha256=digest(wheel), installedPayloadFiles=count,
                       dependencyVersions=sorted((d.metadata["Name"], d.version) for d in metadata.distributions()))
-        # No ambient API keys, proxy, Python paths or credential configuration.
-        keep = {key: os.environ[key] for key in ("PATH", "LANG") if key in os.environ}
-        os.environ.clear()
-        os.environ.update(keep, HOME=str(work / "home"), TMPDIR=str(work / "tmp"),
-                          PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
-        for name in ("home", "tmp"):
-            (work / name).mkdir(exist_ok=True)
-
-        def audit(event, args):
-            if event in {"socket.connect", "socket.sendto", "socket.getaddrinfo"}:
-                network_events.append(event)
-                raise PermissionError("offline_image_baseline_network_refused")
-        sys.addaudithook(audit)
-        modules = ("amplifier_core", "amplifier_core.models", "amplifier_foundation.operation_routing", PRODUCT)
-        for name in modules:
-            importlib.import_module(name)
-
-        def origins():
-            paths = {}
-            for name, module in list(sys.modules.items()):
-                if name.startswith(("amplifier_core", "amplifier_foundation", PRODUCT)) and module is not None:
-                    path = getattr(module, "__file__", None)
-                    require(path and Path(path).resolve().is_relative_to(work / "runtime"), "source_import_detected")
-                    paths[name] = str(Path(path).resolve().relative_to(work / "runtime"))
-            return paths
-        result["originsBefore"] = origins()
-        definitions = {node.name for node in ast.parse(TEST.read_text()).body
-                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")}
-
-        class Evidence:
-            def pytest_collection_finish(self, session):
-                collected.extend(item.nodeid for item in session.items)
-            def pytest_runtest_logreport(self, report):
-                reports.append({"nodeid": report.nodeid, "when": report.when, "outcome": report.outcome})
-
-        import pytest
-        os.chdir(work)
-        with redirect_stdout(log), redirect_stderr(log):
-            code = int(pytest.main([str(TEST), "--rootdir=" + str(ROOT), "--import-mode=importlib",
-                "-o", "addopts=", "-o", "pythonpath=", "-o", "asyncio_mode=strict", "-o", "xfail_strict=true",
-                "-p", "pytest_asyncio.plugin", "--junitxml=" + str(work / "junit.xml"),
-                "--basetemp=" + str(work / "pytest-tmp"), "-q", "-ra", "--tb=short"], plugins=[Evidence()]))
-        result.update(pytestExit=code, testsExecuted=True, collectedNodeIds=collected, reports=reports,
-                      networkAttempts=len(network_events))
-        result["originsAfter"] = origins()
-        xml = (work / "junit.xml").read_text()
-        require(len(xml.encode()) <= 2 * 1024 * 1024, "junit_too_large")
-        (output / "junit.xml").write_text(clean_text(xml, work))
-        tree = ET.fromstring(xml)
-        counts = {key: len(list(tree.iter(tag))) for key, tag in (
-            ("tests", "testcase"), ("failures", "failure"), ("errors", "error"), ("skipped", "skipped"))}
-        result["counts"] = counts
-        functions = {node.rsplit("::", 1)[-1].split("[", 1)[0] for node in collected}
-        called = {row["nodeid"] for row in reports if row["when"] == "call"}
-        result["allRequiredExecuted"] = functions == definitions and called == set(collected) and bool(collected)
-        result["status"] = "PASS" if (code == 0 and result["allRequiredExecuted"] and not network_events
-            and not any(counts[key] for key in ("failures", "errors", "skipped"))) else "FAIL"
-        exit_code = 0 if result["status"] == "PASS" else (code or 1)
+        # This distinct diagnostic increment never calls providers, even when the
+        # original guards and native wheel/source attestation all pass.
+        result.update(status="DIAGNOSTIC_ONLY", reason="product_execution_not_admitted",
+                      diagnosticComplete=True)
+        exit_code = 0
     except Exception as error:
         result["reason"] = str(error) if type(error) is RuntimeError else type(error).__name__
-        result.update(collectedNodeIds=collected, reports=reports, networkAttempts=len(network_events))
     finally:
-        (output / "pytest.log").write_text(clean_text(log.getvalue()[-128000:], work))
-        (output / "result.json").write_text(clean_text(json.dumps(result, indent=2), work) + "\n")
+        try:
+            (output / "result.json").write_text(clean_text(json.dumps(result, indent=2), work) + "\n")
+        except OSError:
+            result["receiptWriteError"] = "result_evidence_write_failed"
+            if exit_code == 0:
+                result.update(status="BLOCKED", reason="result_evidence_write_failed")
+            exit_code = 1
         print(json.dumps({"status": result["status"], "testsExecuted": result["testsExecuted"],
-                          "counts": result.get("counts"), "reason": result.get("reason")}))
+                          "reason": result.get("reason"),
+                          "receiptWriteError": result.get("receiptWriteError")}))
     return exit_code
 
 
