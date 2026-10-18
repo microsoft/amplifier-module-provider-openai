@@ -24,7 +24,7 @@ import zipfile
 
 BASELINE = "32db886dd681a03f9fd7c1fdd2a4093a60d054c5"
 FOUNDATION = "8d26eceb9b7cafe6e93346f8f4294596bd45dcd1"
-PRODUCT_TREE = "f9cf9c89cd7fdf96964552a016fdf3c4fe74692d"
+PRODUCT_TREE = "bc160ea4272efef1a4870724769c369e3793be94"
 TEST_BLOB = "787e1308c9d17f5f9f4bae3a278ff2acc55507b6"
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCT = "amplifier_module_provider_openai"
