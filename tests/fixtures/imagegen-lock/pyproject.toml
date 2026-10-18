@@ -1,0 +1,39 @@
+# Private qualification input, not a product manifest or resolved graph.
+# A matching resolver-generated uv.lock is still REQUIRED before submission.
+[project]
+name = "imagegen-local-baseline-ad2410"
+version = "0.0.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "amplifier-core @ https://files.pythonhosted.org/packages/92/7f/80c9d27f76a3a1f0168ba4410e289d2eac21b01f5728e61be39df6ed9333/amplifier_core-2.0.2-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl#sha256=cba63bf80af198819ca648edbac4998735d2656fd19af0a569ef1849547a97ac",
+  "amplifier-foundation==1.0.0",
+  "amplifier-module-provider-openai==1.0.0",
+  "amplifier-module-provider-gemini==1.0.0",
+  "amplifier-module-tool-image==0.1.0",
+  "openai==3.29.0",
+  "google-genai==2.30.1",
+  "google-api-core>=2.0.0",
+  "httpx==0.28.1",
+  "Pillow==12.3.0",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "pytest-timeout==2.4.0",
+]
+
+[tool.uv]
+package = false
+no-build-package = ["amplifier-core"]
+# The private resolver must bind this to sources/amplifier-foundation below,
+# rather than the public @main dependency carried by the unchanged image tool.
+override-dependencies = ["amplifier-foundation==1.0.0"]
+
+[tool.uv.sources]
+amplifier-foundation = { path = "sources/amplifier-foundation", editable = false }
+amplifier-module-provider-openai = { path = "sources/amplifier-module-provider-openai", editable = false }
+amplifier-module-provider-gemini = { path = "sources/amplifier-module-provider-gemini", editable = false }
+amplifier-module-tool-image = { path = "sources/amplifier-bundle-imagegen", editable = false }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "--import-mode=importlib"
+testpaths = ["tests"]

@@ -2,11 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, test/imagegen-lock-run-ad2410]
   pull_request:
 
 jobs:
   test:
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/test/imagegen-lock-run-ad2410') }}
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     # A hang must fail LOUDLY and fast, not sit burning runner time until the
@@ -56,3 +57,53 @@ jobs:
         run: |
           uv pip install 'openai==3.29.0' 'amplifier-core==2.0.1'
           uv run --no-sync pytest -q tests/test_wait_policy.py tests/test_native_compaction.py tests/test_image_operation.py
+
+  imagegen-manifest-lock:
+    # A preparation-branch push never selects this job. Execution needs a
+    # separately admitted exact commit pushed to this one test-only run branch.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/test/imagegen-lock-run-ad2410'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: imagegen-manifest-lock
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Initialize a non-success preparation receipt
+        run: |
+          set -eu
+          out="$RUNNER_TEMP/imagegen-manifest-lock-evidence"
+          test ! -e "$out"
+          mkdir -m 700 "$out"
+          printf '{"status":"BLOCKED","phase":"toolchain_preparation","source":"%s","runId":"%s","attempt":"%s","startedAt":%s,"lockPublished":false}\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$(date +%s)" > "$out/lock-result.json"
+      - name: Install pinned resolver toolchain
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        timeout-minutes: 2
+        with:
+          version: '0.9.18'
+          python-version: '3.13'
+          enable-cache: false
+      - name: Select Python 3.13 explicitly
+        timeout-minutes: 1
+        run: uv python install --no-config 3.13
+      - name: Resolve and validate only the frozen manifests
+        timeout-minutes: 6
+        run: |
+          set -eu
+          python="$(uv python find --no-config --no-python-downloads 3.13)"
+          "$python" -I tests/imagegen_manifest_lock.py
+      - name: Retain validated lock or explicit failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: imagegen-manifest-lock-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/imagegen-manifest-lock-evidence/uv.lock
+            ${{ runner.temp }}/imagegen-manifest-lock-evidence/lock-result.json
+            ${{ runner.temp }}/imagegen-manifest-lock-evidence/lock.log
+          if-no-files-found: error

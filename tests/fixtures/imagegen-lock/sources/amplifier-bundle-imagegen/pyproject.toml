@@ -1,0 +1,61 @@
+[project]
+name = "amplifier-module-tool-image"
+version = "0.1.0"
+description = "Workspace-safe image generation and editing tool for Amplifier"
+readme = "README.md"
+license-files = ["UPSTREAM-NOTICES.md"]
+authors = [
+    {name = "Brian Krabach"}
+]
+requires-python = ">=3.11"
+dependencies = [
+    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
+    "openai>=3.16.1",
+    "google-genai>=2.23.0,<3",
+    "aiohttp>=3.9.0",
+    "httpx>=0.28.1,<1",
+    "pydantic>=2.0.0",
+    "Pillow>=11,<13",
+]
+
+[project.entry-points."amplifier.tool"]
+image-generation = "amplifier_module_tool_image:ImageGenerationTool"
+
+[project.entry-points."amplifier.modules"]
+tool-image = "amplifier_module_tool_image:mount"
+
+[project.optional-dependencies]
+tool = [
+    "amplifier-core",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pyright>=1.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_module_tool_image"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["amplifier_module_tool_image", "tests"]
+exclude = [".venv", "__pycache__", "*.egg-info"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
