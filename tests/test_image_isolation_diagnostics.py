@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import socket
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -18,11 +19,27 @@ HEADER = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWi
 ROW = "lo\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n"
 STATUS = "NoNewPrivs:\t1\n" + "".join(key + ":\t0000000000000000\n" for key in
     ("CapEff", "CapPrm", "CapBnd", "CapAmb", "CapInh"))
-DEV = "Inter-| Receive | Transmit\n face |bytes packets |bytes packets\n lo: 0 0 0\n"
+DEV = ("Inter-| Receive | Transmit\n"
+       " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
+       " lo: " + " ".join(["0"] * 16) + "\n")
 
 
 def inputs(route=HEADER):
     return {"status": STATUS, "interfaces": DEV, "routes": route}
+
+
+def observations(raw):
+    """Synthetic reproduction of complete reads and the observed down-loopback."""
+    evidence = {"guards": [], "safetyQualified": False, "productAcceptance": False}
+    for key, limit in (("status", 32768), ("interfaces", 16384), ("routes", 16384)):
+        evidence[key] = {"complete": True, "bytesObserved": len(raw[key].encode()),
+                         "limit": limit, "error": None}
+    evidence["interfaces"].update(names=["lo"], count=1, linkFlags=[
+        {"interface": "lo", "status": "observed", "flags": 8, "up": False, "loopback": True}])
+    evidence["namespace"] = {"current": "net:[200]", "retainedParent": "net:[100]", "comparison": "different",
+                             "parentRead": {"complete": True, "error": None, "identityBound": True,
+                                            "limit": 1024, "bytesObserved": 134}}
+    return evidence
 
 
 class DiagnosticControls(unittest.TestCase):
@@ -122,14 +139,14 @@ class DiagnosticControls(unittest.TestCase):
             output = work / "evidence"
             output.mkdir(parents=True)
             environment = {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "microsoft/amplifier-module-provider-openai",
-                           "GITHUB_REF": "refs/heads/test/image-isolation-diagnostics-run-ad2410",
+                           "GITHUB_REF": "refs/heads/test/image-empty-route-baseline-run-ad2410",
                            "IMAGE_BASELINE_OFFLINE": "1", "RUNNER_TEMP": directory}
             stream = io.StringIO()
             with patch.dict(helper.os.environ, environment, clear=True), \
-                 patch.object(helper.sys, "argv", ["fixture", "--diagnostic-only"]), \
+                 patch.object(helper.sys, "argv", ["fixture"]), \
                  patch.object(helper.sys, "flags", SimpleNamespace(isolated=1)), \
                  patch.object(helper.sys, "prefix", str(work / "runtime")), \
-                 patch.object(helper, "isolation_observations", return_value=({"guards": []}, inputs(HEADER + "\n"))), \
+                 patch.object(helper, "isolation_observations", return_value=(observations(inputs(HEADER + "\n")), inputs(HEADER + "\n"))), \
                  patch.object(helper, "git", side_effect=AssertionError("Must stop before source/provider stage")), \
                  patch.object(Path, "write_text", side_effect=OSError), redirect_stdout(stream):
                 self.assertEqual(helper.main(), 1)
@@ -148,14 +165,191 @@ class DiagnosticControls(unittest.TestCase):
             self.assertFalse(evidence["safetyQualified"])
             self.assertFalse(evidence["productExecutionAuthorized"])
 
-    def test_diagnostic_entry_point_cannot_import_or_execute_product_tests(self):
-        tree = ast.parse(SOURCE.read_text())
-        for node in ast.walk(tree):
+    def test_baseline_entry_point_guards_and_audits_before_product_imports(self):
+        source = SOURCE.read_text()
+        tree = ast.parse(source)
+        for node in tree.body:  # Importing the helper to run controls is stdlib-only.
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module or ""]
                 self.assertFalse(any(name.startswith(("amplifier_", "pytest", "openai")) for name in modules))
-        self.assertNotIn("pytest.main(", SOURCE.read_text())
-        self.assertNotIn("importlib.import_module(", SOURCE.read_text())
+        main = source[source.index("def main():"):]
+        self.assertLess(main.index("enforce_isolation("), main.index("installed_payload_mismatch"))
+        self.assertLess(main.index("installed_payload_mismatch"), main.index("sys.addaudithook(audit)"))
+        self.assertLess(main.index("sys.addaudithook(audit)"), main.index("importlib.import_module(name)"))
+        self.assertLess(main.index("importlib.import_module(name)"), main.index("pytest.main("))
+        self.assertEqual(helper.BASELINE, "32db886dd681a03f9fd7c1fdd2a4093a60d054c5")
+        self.assertEqual(helper.TEST_BLOB, "787e1308c9d17f5f9f4bae3a278ff2acc55507b6")
+        self.assertEqual(helper.TEST.name, "test_image_operation.py")
+        self.assertNotIn("DIAGNOSTIC_ONLY", main)
+
+    def test_corrected_guard_accepts_complete_observed_zero_byte_input(self):
+        raw = inputs("")
+        evidence = observations(raw)
+        self.assertFalse(helper.original_guard_observations(raw)[-1][2])
+        with tempfile.TemporaryDirectory() as directory:
+            helper.enforce_isolation(evidence, raw, Path(directory))
+            retained = json.loads((Path(directory) / "isolation.json").read_text())
+        self.assertTrue(all(row["observedPredicate"] for row in retained["guards"]))
+        self.assertEqual(retained["routes"]["bytesObserved"], 0)
+        self.assertFalse(retained["originalPredicates"][-1]["observedPredicate"])
+        self.assertFalse(retained["originalPredicates"][-1]["admissionAuthority"])
+        self.assertFalse(retained["productAcceptance"])
+
+    def test_corrected_guard_accepts_only_strict_header_only_forms(self):
+        for text in (HEADER, HEADER.rstrip("\n"), HEADER.replace("\n", "\r\n"),
+                     " ".join(helper.ROUTE_HEADER) + "\n"):
+            with self.subTest(text=text):
+                raw = inputs(text)
+                self.assertTrue(all(row[2] for row in helper.corrected_guard_observations(observations(raw), raw)))
+
+    def test_corrected_guard_rejects_blank_malformed_extra_and_actual_rows(self):
+        for text in ("\n", " ", "\t\r\n", "malformed\n", HEADER + "\n", HEADER + " \n",
+                     "\n" + HEADER, HEADER + ROW, ROW, HEADER + "bad row\n", HEADER + HEADER):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as directory:
+                raw = inputs(text)
+                with self.assertRaisesRegex(RuntimeError, "^unexpected_network_route$"):
+                    helper.enforce_isolation(observations(raw), raw, Path(directory))
+
+    def test_corrected_guard_refuses_any_incomplete_or_inconsistent_read(self):
+        for key in ("status", "interfaces", "routes"):
+            for change in ({"complete": False}, {"error": "PermissionError"}, {"bytesObserved": -1},
+                           {"bytesObserved": True}, {"limit": 100000}, {"bytesObserved": 16385}):
+                with self.subTest(key=key, change=change):
+                    raw = inputs("")
+                    evidence = observations(raw)
+                    evidence[key].update(change)
+                    self.assertFalse(helper.corrected_guard_observations(evidence, raw)[0][2])
+            raw = inputs("")
+            evidence = observations(raw)
+            raw[key] = None  # Never use the remaining complete-looking prefix/metadata.
+            self.assertFalse(helper.corrected_guard_observations(evidence, raw)[0][2])
+
+    def test_corrected_guard_requires_distinct_complete_bound_namespace(self):
+        for changes in ({"current": None}, {"retainedParent": None}, {"current": "net:[100]"},
+                        {"comparison": "unknown"}, {"comparison": "same"}, {"current": "malformed"},
+                        {"parentRead": {"complete": False}},
+                        {"parentRead": {"complete": True, "error": "invalid_or_unbound_identity", "identityBound": True, "limit": 1024, "bytesObserved": 134}},
+                        {"parentRead": {"complete": True, "error": None, "identityBound": True, "limit": 1024, "bytesObserved": 0}},
+                        {"parentRead": {"complete": True, "error": None, "identityBound": False, "limit": 1024, "bytesObserved": 134}}):
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
+                raw = inputs("")
+                evidence = observations(raw)
+                evidence["namespace"].update(changes)
+                with self.assertRaisesRegex(RuntimeError, "^network_namespace_not_separate$"):
+                    helper.enforce_isolation(evidence, raw, Path(directory))
+
+    def test_parent_namespace_binding_refuses_missing_or_mismatched_run_identity(self):
+        raw = inputs("")
+        source = "a" * 40
+        record = {"networkNamespace": "net:[100]", "source": source, "runId": "123", "attempt": "1"}
+        good_env = {"GITHUB_SHA": source, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
+        for environment, accepted in ((good_env, True), ({}, False),
+                                      ({**good_env, "GITHUB_RUN_ID": "124"}, False),
+                                      ({**good_env, "GITHUB_SHA": "bad"}, False)):
+            with self.subTest(environment=environment):
+                serialized = json.dumps(record)
+                reads = [(raw[key], observations(raw)[key]) for key in ("status", "interfaces", "routes")]
+                reads.append((serialized, {"complete": True, "error": None, "limit": 1024,
+                                           "bytesObserved": len(serialized)}))
+                with patch.dict(helper.os.environ, environment, clear=True), \
+                     patch.object(helper, "bounded_text", side_effect=reads), \
+                     patch.object(helper, "namespace_identity", return_value="net:[200]"), \
+                     patch.object(socket, "socket", side_effect=OSError("synthetic unavailable flags")):
+                    evidence, _ = helper.isolation_observations(Path("synthetic-work"))
+                self.assertEqual(evidence["namespace"]["parentRead"]["identityBound"], accepted)
+                self.assertEqual(evidence["namespace"]["retainedParent"], "net:[100]" if accepted else None)
+                self.assertEqual(evidence["namespace"]["comparison"], "different" if accepted else "unknown")
+                self.assertEqual(evidence["interfaces"]["linkFlags"][0]["status"], "unavailable")
+
+    def test_corrected_guard_refuses_nonloopback_or_unobserved_up_flags(self):
+        for changes in ({"status": "unavailable"}, {"flags": 9, "up": True}, {"flags": 0, "loopback": False},
+                        {"flags": -8}, {"flags": True}, {"flags": "8"}, {"up": True},
+                        {"loopback": False}, {"interface": "eth0"}):
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
+                raw = inputs("")
+                evidence = observations(raw)
+                evidence["interfaces"]["linkFlags"][0].update(changes)
+                with self.assertRaisesRegex(RuntimeError, "^loopback_not_down$"):
+                    helper.enforce_isolation(evidence, raw, Path(directory))
+        raw = {**inputs(""), "interfaces": DEV + " eth0: 0 0 0\n"}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "^unexpected_network_interface$"):
+                helper.enforce_isolation(observations(raw), raw, Path(directory))
+
+    def test_corrected_empty_route_never_bypasses_privilege_denials(self):
+        for key in ("NoNewPrivs", "CapEff", "CapPrm", "CapBnd", "CapAmb", "CapInh"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                raw = inputs("")
+                raw["status"] = (STATUS.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0") if key == "NoNewPrivs" else
+                                 STATUS.replace(key + ":\t0000000000000000", key + ":\t0000000000000001"))
+                reason = "privilege_regain_not_blocked" if key == "NoNewPrivs" else "retained_capability"
+                with self.assertRaisesRegex(RuntimeError, "^" + reason + "$"):
+                    helper.enforce_isolation(observations(raw), raw, Path(directory))
+
+    def test_corrected_guard_refuses_duplicate_and_malformed_status_fields(self):
+        for key in ("NoNewPrivs", "CapEff", "CapPrm", "CapBnd", "CapAmb", "CapInh"):
+            value = "1" if key == "NoNewPrivs" else "0000000000000000"
+            line = key + ":\t" + value + "\n"
+            variants = [
+                STATUS.replace(line, ""),  # Missing is not a zero capability.
+                STATUS + line,  # Even duplicate equal observations are ambiguous.
+                key + ":\t0000000000000001\n" + STATUS,
+                STATUS.replace(line, key + ":\t-0\n"),
+                STATUS.replace(line, key + ":\t+0\n"),
+                STATUS.replace(line, key + ":\t0x0000000000000000\n"),
+            ]
+            for text in variants:
+                with self.subTest(key=key, text=text), tempfile.TemporaryDirectory() as directory:
+                    raw = {**inputs(""), "status": text}
+                    reason = "privilege_regain_not_blocked" if key == "NoNewPrivs" else "retained_capability"
+                    with self.assertRaisesRegex(RuntimeError, "^" + reason + "$"):
+                        helper.enforce_isolation(observations(raw), raw, Path(directory))
+
+    def test_corrected_guard_refuses_hidden_duplicate_or_malformed_interface_rows(self):
+        lines = DEV.splitlines()
+        for text in ("\n".join(["eth0: 0", *lines[1:]]) + "\n",
+                     "\n".join([lines[0], "eth0: 0", lines[2]]) + "\n",
+                     DEV + lines[2] + "\n", DEV + "\n", DEV + " eth0: 0\n",
+                     DEV.replace("lo:", "eth0:"), DEV.replace("Receive", "Unknown"),
+                     "\n".join([*lines[:2], " lo: 0 0 0"]) + "\n",
+                     DEV.replace(" lo: 0", " lo: -0", 1)):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as directory:
+                raw = {**inputs(""), "interfaces": text}
+                with self.assertRaisesRegex(RuntimeError, "^unexpected_network_interface$"):
+                    helper.enforce_isolation(observations(raw), raw, Path(directory))
+
+    def test_corrected_guard_preserves_refusal_when_evidence_write_fails(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path, "write_text", side_effect=OSError):
+            raw = inputs(HEADER + ROW)
+            with self.assertRaisesRegex(RuntimeError, "^unexpected_network_route$"):
+                helper.enforce_isolation(observations(raw), raw, Path(directory))
+            raw = inputs("")
+            with self.assertRaisesRegex(RuntimeError, "^isolation_evidence_write_failed$"):
+                helper.enforce_isolation(observations(raw), raw, Path(directory))
+
+    def test_refused_main_never_reaches_source_or_provider_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory).resolve() / "openai-image-outcome"
+            output = work / "evidence"
+            output.mkdir(parents=True)
+            raw = inputs(HEADER + ROW)
+            environment = {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "microsoft/amplifier-module-provider-openai",
+                           "GITHUB_REF": "refs/heads/test/image-empty-route-baseline-run-ad2410",
+                           "IMAGE_BASELINE_OFFLINE": "1", "RUNNER_TEMP": directory}
+            with patch.dict(helper.os.environ, environment, clear=True), \
+                 patch.object(helper.sys, "argv", ["fixture"]), \
+                 patch.object(helper.sys, "flags", SimpleNamespace(isolated=1)), \
+                 patch.object(helper.sys, "prefix", str(work / "runtime")), \
+                 patch.object(helper, "isolation_observations", return_value=(observations(raw), raw)), \
+                 patch.object(helper, "git", side_effect=AssertionError("No source/provider stage")), \
+                 patch.object(helper.importlib, "import_module", side_effect=AssertionError("No product import")), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(helper.main(), 1)
+            result = json.loads((output / "result.json").read_text())
+            self.assertEqual(result["reason"], "unexpected_network_route")
+            self.assertFalse(result["productImports"])
+            self.assertFalse(result["testsExecuted"])
+            self.assertIsNone(result["networkAttempts"])
 
 
 if __name__ == "__main__":
