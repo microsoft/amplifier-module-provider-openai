@@ -2,6 +2,43 @@
 
 GPT model integration for Amplifier via OpenAI's Responses API.
 
+## Optional Decisions capability (development candidate)
+
+The provider can register a named `decision.backends` capability using the same
+configured client, authentication, base URL, organization and project as chat.
+It follows the provider-owned image capability pattern. Explicit setup is required:
+
+```yaml
+providers:
+  - module: provider-openai
+    config:
+      default_model: gpt-6-luna
+      decisions:
+        enabled: true
+        id: openai-ui
+        model: gpt-6-luna
+```
+
+The decision model is independent of the chat model and does not inherit chat
+reasoning options. Capability registration does not select it for a consumer;
+UI-use or routing must explicitly bind to `openai-ui`. No second API key is needed
+when the configured account/endpoint supports the Decisions API. Custom gateways
+and Azure endpoints are not assumed to expose OpenAI's Decisions route.
+
+`get_decision_info()` describes implementation support without account discovery
+or inference. The backend uses `client.decisions.create`, applies bounded requests,
+propagates cancellation, avoids automatic retries, and returns typed per-question
+outcomes, usage and request identity. Decision usage events are separate from chat;
+this spike does not fabricate a decision dollar price or add it to chat pricing.
+
+The shared `amplifier_decisions` contract is currently staged in the unpublished
+decision-model spike package. Install that candidate explicitly for development.
+Finalize the small shared contract's packaging before publishing this feature;
+ordinary provider startup does not import or require it. No generic decision
+bundle should own this provider's credentials or wire implementation.
+
+Wire reference: [OpenAI Decisions](https://developers.openai.com/api/docs/guides/decisions).
+
 The [draft image-operation contract](contracts/image-generation.v1.md) describes
 an optional provider-owned image boundary. Its promises remain proposed,
 not certification of live API acceptance or every consuming host.

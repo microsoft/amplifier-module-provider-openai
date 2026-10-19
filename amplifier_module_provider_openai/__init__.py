@@ -191,6 +191,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     from .images import register_image_backend
 
     remove_image_backend = register_image_backend(coordinator, provider, config)
+    from .decisions import register_decision_backend
+
+    remove_decision_backend = register_decision_backend(coordinator, provider, config)
 
     coordinator.register_contributor(
         "session.cost",
@@ -210,6 +213,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # Return cleanup function
     async def cleanup():
         remove_image_backend()
+        remove_decision_backend()
         await provider.close()
 
     return cleanup
@@ -2655,6 +2659,16 @@ class OpenAIProvider:
         from .images import image_generation_info
 
         return image_generation_info()
+
+    def get_decision_info(self) -> dict:
+        """Describe optional decision setup without creating a client or signing in."""
+        if self.name != "openai":
+            # Compatible chat providers may inherit this class while owning a
+            # different API/auth route. They must opt in through their adapter.
+            return {"schema_version": 1, "provider": self.name, "available": False}
+        from .decisions import decision_info
+
+        return decision_info()
 
     def get_image_generation_capabilities(self) -> dict:
         """Describe the optional instance-bound image operation without I/O."""
