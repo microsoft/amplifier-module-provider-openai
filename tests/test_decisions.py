@@ -178,3 +178,23 @@ async def test_cancellation_is_not_converted_to_fallback():
         )
         with pytest.raises(asyncio.CancelledError):
             await backend.decide(request())
+
+
+async def test_named_models_share_account_and_close_without_removing_other_owners():
+    registry = {}
+    coordinator = SimpleNamespace(get_capability=registry.get, register_capability=registry.__setitem__)
+    provider = SimpleNamespace(client=object())
+    cleanup = register_decision_backend(coordinator, provider, {'decisions': {
+        'enabled': True, 'backends': {
+            'browser': {'enabled': True, 'model': 'browser-model'},
+            'desktop': {'enabled': True, 'model': 'desktop-model'},
+            'disabled': {'enabled': False, 'model': 'unused'},
+        }}})
+    backends = registry['decision.backends']
+    assert set(backends) == {'browser', 'desktop'}
+    assert backends['browser'].provider is provider
+    assert backends['desktop'].provider is provider
+    other = object()
+    registry['decision.backends']['other'] = other
+    cleanup()
+    assert registry['decision.backends'] == {'other': other}

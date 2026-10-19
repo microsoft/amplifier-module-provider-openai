@@ -1,6 +1,6 @@
 """Optional Decisions capability, owned by the configured OpenAI provider.
 
-Only enabled mounts import the small shared spike contract. Authentication,
+Only enabled mounts import the small shared decision contract. Authentication,
 account endpoint and transport come from the existing provider client. Chat
 model selection and reasoning settings are deliberately separate from Decisions.
 """
@@ -47,7 +47,7 @@ class OpenAIDecisionBackend:
             from amplifier_decisions.contracts import Capabilities
         except ImportError as exc:
             raise ValueError(
-                "The development Decisions capability requires the shared decision contract package"
+                "Install the provider decisions extra to use Decisions"
             ) from exc
         model = config.get("model")
         if not isinstance(model, str) or not model.strip():
@@ -340,28 +340,35 @@ class OpenAIDecisionBackend:
 
 
 def register_decision_backend(coordinator, provider, config):
-    row = config.get("decisions") or {}
-    if row.get("enabled") is not True:
+    if (config.get("decisions") or {}).get("enabled") is not True:
         return lambda: None
-    identity = row.get("id", "openai-decisions")
+    from amplifier_decisions.config import configured_backends
     backends = dict(coordinator.get_capability("decision.backends") or {})
-    if not isinstance(identity, str) or not identity or identity in backends:
-        raise ValueError("Decision backend identifiers must be unique")
-    backend = OpenAIDecisionBackend(provider, row, coordinator)
-    backends[identity] = backend
-    coordinator.register_capability("decision.backends", backends)
-    if hasattr(coordinator, "register_contributor"):
-        coordinator.register_contributor(
-            "observability.events",
-            "provider-openai-decisions",
-            lambda: ["decision:request", "decision:response"],
-        )
-
+    owned = {}
+    for identity, row in configured_backends(config, "openai-decisions").items():
+        if not isinstance(identity, str) or not identity or identity in backends:
+            raise ValueError("Decision backend identifiers must be unique")
+        owned[identity] = OpenAIDecisionBackend(provider, row, coordinator)
+        backends[identity] = owned[identity]
+    if owned:
+        coordinator.register_capability("decision.backends", backends)
+        if hasattr(coordinator, "register_contributor"):
+            coordinator.register_contributor("observability.events", "provider-openai-decisions",
+                                             lambda: ["decision:request", "decision:response"])
     def remove():
-        backend.closed = True
         current = dict(coordinator.get_capability("decision.backends") or {})
-        if current.get(identity) is backend:
-            del current[identity]
+        for identity, backend in owned.items():
+            backend.closed = True
+            if current.get(identity) is backend:
+                del current[identity]
+        if owned:
             coordinator.register_capability("decision.backends", current)
-
     return remove
+
+
+def catalog():
+    from amplifier_decisions.config import validate
+    return {"schema_version": 2, "provider_module": "provider-openai", "validate": validate,
+            "backends": [{"kind": "openai-decisions", "label": "OpenAI Decisions",
+                          "default_model": "gpt-6-luna", "models": ["gpt-6-luna"],
+                          "configuration_key": "decisions"}]}

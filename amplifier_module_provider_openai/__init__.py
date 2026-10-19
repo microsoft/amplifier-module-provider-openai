@@ -1069,6 +1069,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "close_timeout",
         "tool_search",
         "image_generation",
+        "decisions",
     }
 )
 

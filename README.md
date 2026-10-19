@@ -31,11 +31,16 @@ propagates cancellation, avoids automatic retries, and returns typed per-questio
 outcomes, usage and request identity. Decision usage events are separate from chat;
 this spike does not fabricate a decision dollar price or add it to chat pricing.
 
-The shared `amplifier_decisions` contract is currently staged in the unpublished
-decision-model spike package. Install that candidate explicitly for development.
-Finalize the small shared contract's packaging before publishing this feature;
-ordinary provider startup does not import or require it. No generic decision
+The shared `amplifier_decisions` contract is packaged as `amplifier-lib-decisions`.
+Install this provider with its `decisions` extra when using that capability. The
+contract package is unpublished in this spike, so development uses explicit local
+wheel/source overrides. Ordinary provider startup does not import or require it. No generic decision
 bundle should own this provider's credentials or wire implementation.
+
+An account can expose independent named models with
+`decisions: {enabled: true, backends: {browser: {enabled: true, model: gpt-6-luna},
+computer: {enabled: true, model: gpt-6-luna}}}`. Backend IDs must be unique in a
+session. Disabling a consumer selection does not disable the account or chat.
 
 Wire reference: [OpenAI Decisions](https://developers.openai.com/api/docs/guides/decisions).
 
