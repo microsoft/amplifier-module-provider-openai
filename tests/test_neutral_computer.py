@@ -988,6 +988,79 @@ async def test_incomplete_native_batch_is_not_continued_or_executed():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("auto_continue", [False, True])
+@pytest.mark.parametrize("call_kind", ["function_call", "computer_call", "apply_patch_call"])
+async def test_incomplete_neutral_response_has_bounded_diagnostics_without_replay(
+    streaming, auto_continue, call_kind,
+):
+    from unittest.mock import AsyncMock
+
+    call = block() if call_kind == "computer_call" else {
+        "type": call_kind, "id": "item_fixture", "call_id": "call_fixture",
+        "name": "lookup", "arguments": '{"private":"DO_NOT_PUBLISH"}',
+        "status": "in_progress",
+    }
+    if call_kind == "apply_patch_call":
+        call = {"type": call_kind, "id": "item_fixture", "call_id": "call_fixture",
+                "status": "in_progress", "operation": {"type": "create_file",
+                "path": "fixture.txt", "diff": "+DO_NOT_PUBLISH"}}
+    payload = envelope([call], status="incomplete")
+    payload["incomplete_details"] = {"reason": "max_output_tokens", "private": "DO_NOT_PUBLISH"}
+    driver, wires = sdk_driver(None, streaming=streaming, response_factory=lambda body: payload)
+    driver.auto_continue = auto_continue
+    driver.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=AsyncMock()))
+    req = request(max_output_tokens=1024)
+    req.tools.append(ToolSpec(name="lookup", description="Synthetic lookup", parameters={"type": "object"}))
+    original = req.model_dump_json()
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await driver.complete(req)
+        error = caught.value
+        assert error.code == "computer_use_response_invalid" and error.retryable is False
+        expected = {"status": "incomplete", "incomplete_reason": "max_output_tokens",
+                    "max_output_tokens": 1024, "output_types": {call_kind: 1}}
+        assert error.response_details == expected
+        failures = [call.args[1] for call in driver.coordinator.hooks.emit.await_args_list
+                    if call.args[0] == "llm:response" and call.args[1].get("status") == "error"]
+        assert len(failures) == 1
+        assert failures[0]["response_details"] == expected
+        assert failures[0]["error_code"] == error.code
+        assert "DO_NOT_PUBLISH" not in json.dumps(failures)
+        assert len([body for path, body in wires if not path.endswith("input_tokens")]) == 1
+        assert req.model_dump_json() == original
+        assert not driver._native_call_types
+    finally:
+        await driver.close()
+
+
+def test_incomplete_response_diagnostics_drop_unknown_payloads_and_invalid_numbers():
+    from amplifier_module_provider_openai.neutral_computer import incomplete_response_details
+
+    details = incomplete_response_details({
+        "status": "incomplete", "incomplete_details": {"reason": ["PRIVATE"]},
+        "output": [{"type": "function_call", "arguments": "PRIVATE"},
+                   {"type": "PRIVATE"}, {"type": ["PRIVATE"]}],
+    }, True)
+    assert details == {"status": "incomplete", "incomplete_reason": "unknown",
+                       "output_types": {"function_call": 1, "unknown": 2}}
+    assert "PRIVATE" not in json.dumps(details)
+
+
+@pytest.mark.parametrize("budget", [1, 10_000_000, 0, -1, 10_000_001, True, 1.5, "1024", None])
+def test_incomplete_response_diagnostics_numeric_bounds(budget):
+    from amplifier_module_provider_openai.neutral_computer import incomplete_response_details
+
+    details = incomplete_response_details(
+        {"output": [{"type": "function_call"}] * 10_001}, budget)
+    assert details["output_types"] == {"function_call": 10_000}
+    if type(budget) is int and 0 < budget <= 10_000_000:
+        assert details["max_output_tokens"] == budget
+    else:
+        assert "max_output_tokens" not in details
+
+
+@pytest.mark.asyncio
 async def test_native_adapter_full_and_delta_views_keep_neutral_alias(monkeypatch):
     from unittest.mock import AsyncMock
 
@@ -1082,8 +1155,9 @@ def sdk_driver(output_factory, *, streaming=False, response_factory=None):
             return httpx.Response(200, json={"input_tokens": 100})
         payload = response_factory(body) if response_factory else envelope(output_factory(body))
         if body.get("stream"):
+            terminal = "response.incomplete" if payload.get("status") == "incomplete" else "response.completed"
             sse = "".join("data: " + json.dumps({"type": kind, "sequence_number": seq, "response": payload}) + "\n\n"
-                          for seq, kind in enumerate(["response.created", "response.completed"]))
+                          for seq, kind in enumerate(["response.created", terminal]))
             return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
         return httpx.Response(200, json=payload)
 
