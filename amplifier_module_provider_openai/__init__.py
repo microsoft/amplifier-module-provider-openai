@@ -205,6 +205,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             else None
         ),
     )
+    coordinator.register_contributor(
+        "observability.events",
+        "provider-openai",
+        lambda: ["provider:token_count_failed"],
+    )
     logger.info("Mounted OpenAIProvider (Responses API)")
 
     # Return cleanup function
@@ -1927,10 +1932,28 @@ class OpenAIProvider:
             if temporary_client:
                 await count_client.close()
             return None
-        from ._token_count import count_tokens
+        from ._token_count import TokenCountError, count_tokens
 
         try:
             return await count_tokens(count_client, count_params)
+        except TokenCountError as error:
+            try:
+                hooks = getattr(self.coordinator, "hooks", None)
+                if hooks is not None:
+                    await hooks.emit(
+                        "provider:token_count_failed",
+                        {
+                            "provider": self.name,
+                            "operation": "responses.input_tokens.count",
+                            "count_failure": dict(error.count_failure),
+                            "outer_retryable": error.retryable,
+                        },
+                    )
+            except Exception:
+                logger.warning("Could not emit token count failure event.")
+            # Re-raise outside the observer handler so its exception (which may
+            # contain private data) cannot become the count failure's context.
+            raise
         finally:
             if temporary_client:
                 await count_client.close()
