@@ -136,7 +136,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             ):
                 raise self._send_refused()
             return admission
-        except Exception:
+        except Exception:  # noqa: BLE001 - arbitrary host failures must refuse without private error text
             raise self._send_refused() from None
 
     def _admit_send(self, envelope, admission, *, input_id=None):
@@ -153,7 +153,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             if decision is not True:
                 raise self._send_refused()
             return wire
-        except Exception:
+        except Exception:  # noqa: BLE001 - never send after a failed host decision or serialization
             raise self._send_refused() from None
 
     def _prepare_native_messages(self, messages, *, ordinary_names=frozenset()):
@@ -741,7 +741,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                      "input": owner._text(command)},
                     admission, input_id=input_id,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - pre-send failures cannot enter transport retry handling
                 raise self._send_refused() from None
             finally:
                 self._steer_preparing = False
@@ -936,8 +936,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             )
         payload.pop("stream", None)
         # SDK transport-only options are not Responses wire fields.
-        for field in ("timeout", "extra_headers", "extra_query"):
-            if field in payload:
+        for transport_field in ("timeout", "extra_headers", "extra_query"):
+            if transport_field in payload:
                 raise RuntimeError(
                     "Native transport cannot preserve this per-request transport override"
                 )

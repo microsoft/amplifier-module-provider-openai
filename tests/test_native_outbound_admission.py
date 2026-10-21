@@ -11,8 +11,7 @@ import pytest
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest, Message
 
-from amplifier_module_provider_openai import OpenAIProvider
-from amplifier_module_provider_openai import native
+from amplifier_module_provider_openai import OpenAIProvider, native
 from tests.test_native_transport import Owner, Socket, created, finished, wait_created
 
 
