@@ -47,12 +47,36 @@ KEYS = frozenset({"enter", "return", "tab", "space", "backspace",
                   "end", "page_up", "page_down"})
 
 
-def refuse(reason: str, code: str = "computer_use_invalid") -> None:
+def incomplete_response_details(response: Any, max_output_tokens: Any) -> dict[str, Any]:
+    """Bounded diagnostic facts only, never response text, arguments or images."""
+    def field(value, name):
+        return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+    reason = field(field(response, "incomplete_details"), "reason")
+    known_reasons = {"max_output_tokens", "content_filter"}
+    result = {"status": "incomplete", "incomplete_reason":
+              reason if isinstance(reason, str) and reason in known_reasons else "unknown"}
+    if type(max_output_tokens) is int and 0 < max_output_tokens <= 10_000_000:
+        result["max_output_tokens"] = max_output_tokens
+    counts: dict[str, int] = {}
+    known_types = {"message", "reasoning", "computer_call", "function_call", "tool_call", "apply_patch_call"}
+    for item in field(response, "output") or []:
+        kind = field(item, "type")
+        kind = kind if isinstance(kind, str) and kind in known_types else "unknown"
+        counts[kind] = min(counts.get(kind, 0) + 1, 10_000)
+    result["output_types"] = counts
+    return result
+
+
+def refuse(reason: str, code: str = "computer_use_invalid", *,
+           response_details: dict[str, Any] | None = None) -> None:
     error = InvalidRequestError(
         f"Neutral computer-use request refused: {reason}. This provider request did not execute a computer action.",
         provider="openai", retryable=False,
     )
     error.code = code
+    if response_details is not None:
+        error.response_details = response_details
     raise error
 
 
