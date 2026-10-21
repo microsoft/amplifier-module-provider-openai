@@ -299,7 +299,7 @@ async def test_real_complete_observes_entire_checkpoint_window_and_suffix():
     assert p.socket.wire == [records[0].payload]
     sent = json.loads(records[0].payload)
     assert sent["input"][:len(opaque)] == opaque
-    assert sent["input"][-1]["content"] == "suffix"
+    assert sent["input"][-1]["content"] == [{"type": "input_text", "text": "suffix"}]
     assert "previous_response_id" not in sent
 
 
@@ -358,3 +358,90 @@ async def test_receive_trace_binds_each_early_tool_before_dispatch_not_final_agg
     assert socket.wire == [e.payload for e in records]
     assert [e.kind for e in records] == ["response.create", "response.steer", "response.steer"]
     assert [json.loads(e.payload)["previous_response_id"] for e in records[1:]] == ["r1", "r2"]
+    assert [(e["input_id"], e["response_id"]) for e in o.events
+            if e["type"] == "steering.applied"] == [("local-1", "r2"), ("local-2", "r3")]
+
+
+@pytest.mark.asyncio
+async def test_unsent_create_cannot_silently_reuse_advanced_delta_state():
+    records = []
+    p, o = make(lambda *args, **kwargs: admission(records, decision=False))
+    p.owner = None
+    request = ChatRequest(messages=[Message(role="user", content="one")], max_output_tokens=32)
+    o.messages = [m.model_dump() for m in request.messages]
+    with pytest.raises(LLMError):
+        await p.complete(request)
+    p.prepare_send = lambda *args, **kwargs: admission(records)
+    with pytest.raises(LLMError, match="not sent.*recovery"):
+        await p.complete(request)
+    assert not p.socket.wire and len(records) == 1
+    assert not p.request_uncertain  # known unsent, not a fabricated unknown send
+
+
+@pytest.mark.asyncio
+async def test_awaiting_steer_preparation_does_not_hold_completed_parent_open():
+    entered, release = asyncio.Event(), asyncio.Event()
+    records = []
+
+    async def prepare(kind, *, input_id):
+        if kind == "response.steer":
+            entered.set()
+            await release.wait()
+        return admission(records)
+
+    p, _ = make(prepare)
+    socket = p.socket
+    socket.feed(created("parent"))
+    parent = asyncio.create_task(p._native_response({"input": []}))
+    await wait_created(p)
+    steer = asyncio.create_task(p.steer_live(SimpleNamespace(id="local-1", text="later")))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not await p.steer_live(SimpleNamespace(id="local-2", text="duplicate"))
+        socket.feed(finished("parent"))
+        await asyncio.wait_for(parent, 2)  # no unsent steer is awaited by recv
+        release.set()
+        with pytest.raises(LLMError):
+            await asyncio.wait_for(steer, 2)
+    finally:
+        for task in (parent, steer):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(parent, steer, return_exceptions=True)
+    assert len(socket.wire) == 1 and len(records) == 1 and p.inflight is None
+    assert not p.request_uncertain
+
+
+@pytest.mark.asyncio
+async def test_steer_freezes_after_preparation_before_send():
+    records, order = [], []
+    command = SimpleNamespace(id="local-1", text="before")
+
+    async def prepare(kind, *, input_id):
+        assert (kind, input_id) == ("response.steer", "local-1")
+        await asyncio.sleep(0)
+        command.text = "after preparation"
+
+        def admit(envelope):
+            records.append(envelope)
+            order.append("admit")
+            command.text = "after admission"
+            asyncio.get_running_loop().call_soon(order.append, "later")
+            return True
+
+        return native.NativeSendAdmission(attempt_id="steer-attempt", admit=admit)
+
+    p, _ = make(prepare)
+    p.response_id = "parent"
+    original_send = p.socket.send
+
+    async def send(value):
+        assert order == ["admit"]
+        assert value is records[0].payload
+        order.append("send")
+        await original_send(value)
+
+    p.socket.send = send
+    assert await p.steer_live(command)
+    assert json.loads(p.socket.wire[0])["input"] == "after preparation"
+    assert records[0].attempt_id == "steer-attempt"

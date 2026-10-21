@@ -14,6 +14,8 @@ import os
 import time
 import uuid
 from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import websockets
@@ -27,6 +29,24 @@ from .native_checkpoint import NativeCheckpointMixin
 
 NATIVE_REQUEST = contextvars.ContextVar("openai_native_request", default=None)
 NATIVE_BUDGET = contextvars.ContextVar("openai_native_budget", default=None)
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOutboundEnvelope:
+    """Private local send candidate, not proof of remote receipt."""
+
+    attempt_id: str
+    kind: str
+    input_id: str | None
+    payload: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSendAdmission:
+    """Host identity and synchronous final decision after optional async prep."""
+
+    attempt_id: str
+    admit: Callable[[NativeOutboundEnvelope], bool] = field(repr=False)
 
 
 def key(message):
@@ -46,7 +66,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
 
     @classmethod
     def wrap(
-        cls, original, *, owner_getter, trace=None, trace_context=None, lifecycle=None
+        cls, original, *, owner_getter, trace=None, trace_context=None, lifecycle=None,
+        prepare_send=None,
     ):
         if "complete" in original.__dict__:
             raise ValueError(
@@ -59,6 +80,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         provider._observer_failure = None
         provider._close_failure = None
         provider.lifecycle = lifecycle
+        provider.prepare_send = prepare_send
+        provider._steer_preparing = False
+        provider._native_send_refused = False
         provider.owner_getter = owner_getter
         provider.trace = trace or (lambda *args: None)
         provider.trace_context = trace_context or (lambda *args: None)
@@ -91,6 +115,46 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             await self.lifecycle(kind, data)
         if self.owner is not None:
             await self.owner.runtime.emit(kind, **data)
+
+    def _send_refused(self):
+        # No callback exception text or private payload enters this error.
+        return LLMError(
+            "Native outbound admission refused before send; no automatic replay",
+            provider=self.name, retryable=False,
+        )
+
+    async def _prepare_send_admission(self, kind, *, input_id=None):
+        try:
+            admission = self.prepare_send(kind, input_id=input_id)
+            if inspect.isawaitable(admission):
+                admission = await admission
+            if (
+                not isinstance(admission, NativeSendAdmission)
+                or not isinstance(admission.attempt_id, str)
+                or not admission.attempt_id.strip()
+                or not callable(admission.admit)
+            ):
+                raise self._send_refused()
+            return admission
+        except Exception:
+            raise self._send_refused() from None
+
+    def _admit_send(self, envelope, admission, *, input_id=None):
+        """Freeze once; a synchronous final check must admit these exact bytes."""
+        try:
+            wire = json.dumps(envelope)
+            record = NativeOutboundEnvelope(
+                attempt_id=admission.attempt_id, kind=envelope["type"],
+                input_id=input_id, payload=wire,
+            )
+            decision = admission.admit(record)
+            if inspect.iscoroutine(decision):
+                decision.close()  # Refuse, don't schedule an async final check.
+            if decision is not True:
+                raise self._send_refused()
+            return wire
+        except Exception:
+            raise self._send_refused() from None
 
     def _prepare_native_messages(self, messages, *, ordinary_names=frozenset()):
         from .computer_history import project_failed_computer_history
@@ -599,6 +663,13 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
     async def _renew_idle_connection(self):
         # Called before serialization of a NEW request. Never retry a send/recv:
         # if the previous generation ended ambiguously, its tools may have run.
+        if self._native_send_refused:
+            # Assembly already advanced delta/checkpoint bookkeeping. An unsent
+            # candidate must not make the next request silently omit its input.
+            raise LLMError(
+                "Native request was not sent; explicit host recovery is required",
+                provider=self.name, retryable=False,
+            )
         if self.request_uncertain:
             raise LLMError(
                 "Native response outcome is uncertain; no automatic replay",
@@ -646,8 +717,45 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             or not self.response_id
             or self.inflight
             or self.awaiting_successor
+            or self._steer_preparing
         ):
             return False
+        if self.prepare_send is not None:
+            owner, socket, parent = self.owner, self.socket, self.response_id
+            self._steer_preparing = True
+            try:
+                input_id = command.id
+                if not isinstance(input_id, str) or not input_id.strip():
+                    raise self._send_refused()
+                admission = await self._prepare_send_admission(
+                    "response.steer", input_id=input_id,
+                )
+                if (
+                    self.owner is not owner or self.socket is not socket
+                    or self.response_id != parent or self.inflight
+                    or self.awaiting_successor or command.id != input_id
+                ):
+                    raise self._send_refused()
+                wire = self._admit_send(
+                    {"type": "response.steer", "previous_response_id": parent,
+                     "input": owner._text(command)},
+                    admission, input_id=input_id,
+                )
+            except Exception:
+                raise self._send_refused() from None
+            finally:
+                self._steer_preparing = False
+            # Preparation isn't inflight: the receive loop must be free to finish
+            # the parent while preparation awaits. No await from admission to send.
+            self.inflight = {"command": command, "accepted": False, "parent": parent}
+            self.request_uncertain = True
+            try:
+                await socket.send(wire)
+            except BaseException:
+                await self._uncertain("steer_send")
+                raise
+            await self._emit("steering.sent", input_id=input_id, response_id=parent)
+            return True
         self.inflight = {
             "command": command,
             "accepted": False,
@@ -880,9 +988,26 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         mark(payload.get("tools", []))
         self.trace_context(payload)
         self.trace("native.send", {"type": "response.create", **payload})
-        self.request_uncertain = True
-        await self._emit("native.submitting", execution_replayed=False)
-        await self.socket.send(json.dumps({"type": "response.create", **payload}))
+        if self.prepare_send is None:
+            # Preserve the existing receipt/uncertainty contract for old callers.
+            self.request_uncertain = True
+            await self._emit("native.submitting", execution_replayed=False)
+            await self.socket.send(json.dumps({"type": "response.create", **payload}))
+        else:
+            owner, socket = self.owner, self.socket
+            try:
+                await self._emit("native.submitting", execution_replayed=False)
+                admission = await self._prepare_send_admission("response.create")
+                if self.owner is not owner or self.socket is not socket:
+                    raise self._send_refused()
+                wire = self._admit_send({"type": "response.create", **payload}, admission)
+            except BaseException:
+                self._native_send_refused = True
+                raise
+            # Linearization is local admission of this immutable send argument.
+            # No intervening await; delivery can still fail or be cancelled.
+            self.request_uncertain = True
+            await socket.send(wire)
         await self._emit(
             "native.request",
             continuation=bool(self.previous_response_id),

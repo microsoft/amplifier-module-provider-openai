@@ -54,12 +54,11 @@ events to 100,000 per request, asynchronous call identities to 1,024 and native
 call history to 10,000. Configured request timeout still applies. Reaching a
 bound is a visible unknown/recovery boundary, never silently truncated success.
 
-## Optional immutable outbound admission (proposed)
+## Optional immutable outbound admission
 
-The regression tests specify `wrap(..., prepare_send=prepare)` for both
-`response.create` and `response.steer`. This interface is not implemented or
-qualified yet. Omitting it must preserve existing callers. It must not enable
-native transport, change provider selection, or authorize tools.
+`wrap(..., prepare_send=prepare)` adds a private, fail-closed boundary for both
+`response.create` and `response.steer`. Omitting it preserves existing callers.
+It does not enable native transport, change provider selection, or authorize tools.
 
 ```python
 from amplifier_module_provider_openai.native import NativeSendAdmission
@@ -97,13 +96,19 @@ callbacks remain private and mutable, not send proofs.
 
 Only literal `True` admits; false, missing/malformed admission, exceptions, or an
 awaitable returned by `admit` prevent this send. Cancellation during preparation
-also prevents it. Steering reserves its local slot during preparation and
+also prevents it. Steering reserves a separate preparation slot and
 rechecks the owner, socket and parent afterward; a completed/replaced parent
 cannot receive stale steering. A refused unsent steer clears only its own slot,
 does not enter the boundary queue, and does not close an independently running
 create. A candidate observation is not a sent or remotely accepted receipt.
+An unsent create is known unsent, but its delta/checkpoint bookkeeping has already
+advanced. That adapter refuses further completions with an explicit host-recovery
+error; it does not silently omit the unsent input or reset lineage to retry.
+The host must retain canonical history and its original attempt disposition.
+Reconstructing an adapter is a deliberate host recovery decision, not permission
+to replay. No-callback callers keep their existing submitting/unknown semantics.
 
-There must be no intervening await between synchronous final admission and
+There is no intervening await between synchronous final admission and
 selecting the immutable argument handed to `socket.send`. This is a **local
 admission/argument-selection point**, not proof of remote receipt, network
 atomicity, writer exclusion through delivery, or model comprehension. A send can
