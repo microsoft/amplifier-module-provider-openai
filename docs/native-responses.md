@@ -54,6 +54,75 @@ events to 100,000 per request, asynchronous call identities to 1,024 and native
 call history to 10,000. Configured request timeout still applies. Reaching a
 bound is a visible unknown/recovery boundary, never silently truncated success.
 
+## Optional immutable outbound admission (proposed)
+
+The regression tests specify `wrap(..., prepare_send=prepare)` for both
+`response.create` and `response.steer`. This interface is not implemented or
+qualified yet. Omitting it must preserve existing callers. It must not enable
+native transport, change provider selection, or authorize tools.
+
+```python
+from amplifier_module_provider_openai.native import NativeSendAdmission
+
+async def prepare(kind, *, input_id):
+    # Capture the host's current attempt, not an identity from provider content.
+    attempt = current_attempt()
+    await prepare_host_validation(attempt)
+
+    def admit(envelope):
+        # Synchronous final currentness check and private observation.
+        if not still_current(attempt):
+            return False
+        observe_private_candidate(attempt, envelope)
+        return True
+
+    return NativeSendAdmission(attempt_id=attempt.id, admit=admit)
+```
+
+The preparation callable may be synchronous or awaitable. It receives the wire
+kind and `input_id=None` for create, or the local `command.id` for steer. It must
+return `NativeSendAdmission` with a nonempty host-supplied string `attempt_id`
+and a synchronous `admit` callable. The provider does not generate, persist,
+deduplicate, or establish authority for these host identities.
+
+For create, existing `trace_context`, `trace("native.send", ...)`, and awaited
+`native.submitting` lifecycle/runtime calls still run first. Preparation runs
+after checkpoint/delta construction. The provider then serializes the final
+envelope and passes a frozen `NativeOutboundEnvelope` to `admit`. Its fields are
+`attempt_id`, `kind`, `input_id`, and `payload`: the exact JSON string to be
+passed to `socket.send`, not a mutable dictionary or the full preflight request.
+Parsing it produces a separate copy. The payload is omitted from the record's
+repr; hosts must not place private content in ordinary logs. Existing diagnostic
+callbacks remain private and mutable, not send proofs.
+
+Only literal `True` admits; false, missing/malformed admission, exceptions, or an
+awaitable returned by `admit` prevent this send. Cancellation during preparation
+also prevents it. Steering reserves its local slot during preparation and
+rechecks the owner, socket and parent afterward; a completed/replaced parent
+cannot receive stale steering. A refused unsent steer clears only its own slot,
+does not enter the boundary queue, and does not close an independently running
+create. A candidate observation is not a sent or remotely accepted receipt.
+
+There must be no intervening await between synchronous final admission and
+selecting the immutable argument handed to `socket.send`. This is a **local
+admission/argument-selection point**, not proof of remote receipt, network
+atomicity, writer exclusion through delivery, or model comprehension. A send can
+still fail or be cancelled after observation; existing unknown-outcome and
+no-replacement/no-replay rules apply. Neither observation nor refusal authorizes
+a replacement attempt. Hosts must reconcile the original attempt, not retry
+just to obtain an observation.
+
+For early tool provenance, the existing synchronous `trace("native.receive",
+event)` runs before async tool dispatch. Hosts can associate each
+`response.created` and each subsequent `response.output_item.done` (original
+call ID/name/arguments) with that response in wire event order. Steering
+acceptance is not application: correlate local input IDs with the existing
+accepted/applied identities and the distinct successor response. One completion
+can aggregate tools from several responses; its final response ID is **not** the
+origin of every tool. Validate missing/conflicting identities in the host before
+execution. No provenance is inferred from `previous_response_id` or opaque
+checkpoint content, and this API supplies no canonical store or Work policy.
+
 ## Explicit opaque compaction
 
 `native_compact(canonical=..., identity=...)` requires an idle, settled transport
