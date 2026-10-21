@@ -4060,11 +4060,12 @@ class OpenAIProvider:
                     for item in getattr(final_response, "output", []) or []
                 )
             ):
-                from .neutral_computer import refuse
+                from .neutral_computer import incomplete_response_details, refuse
 
                 refuse(
                     "incomplete neutral response cannot authorize continuation or tool replay",
                     "computer_use_response_invalid",
+                    response_details=incomplete_response_details(final_response, params.get("max_output_tokens")),
                 )
 
             while (
@@ -4078,11 +4079,12 @@ class OpenAIProvider:
                     in {"computer_call", "function_call", "tool_call", "apply_patch_call"}
                     for item in getattr(final_response, "output", []) or []
                 ):
-                    from .neutral_computer import refuse
+                    from .neutral_computer import incomplete_response_details, refuse
 
                     refuse(
                         "incomplete neutral tool calls cannot be replayed by continuation",
                         "computer_use_response_invalid",
+                        response_details=incomplete_response_details(final_response, params.get("max_output_tokens")),
                     )
                 # P4: a response that ended INSIDE a function_call cannot be
                 # resumed by continuation — arguments are not resumable, so
@@ -4435,6 +4437,9 @@ class OpenAIProvider:
                         "error": error_msg,
                         "provider": self.name,
                         "model": params["model"],
+                        **({"error_code": e.code, "response_details": e.response_details}
+                           if getattr(e, "code", None) == "computer_use_response_invalid"
+                           and isinstance(getattr(e, "response_details", None), dict) else {}),
                     },
                 )
             raise
