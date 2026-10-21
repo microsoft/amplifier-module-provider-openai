@@ -444,3 +444,230 @@ async def test_steer_freezes_after_preparation_before_send():
     assert await p.steer_live(command)
     assert json.loads(p.socket.wire[0])["input"] == "after preparation"
     assert records[0].attempt_id == "steer-attempt"
+
+
+class ReceiptHost:
+    """Synthetic durable consumer: never infer not-sent from a local exception."""
+
+    def __init__(self, path):
+        self.path = path
+        self.host_identity = {
+            "attempt": "host-attempt", "owner": "host-owner", "budget": "original-budget",
+        }
+        self.events = []
+
+    async def save(self, kind, data):
+        if kind not in {"native.submitting", "native.not_sent"}:
+            return
+        self.events.append({"kind": kind, **copy.deepcopy(data), **self.host_identity})
+        self.path.write_text(json.dumps(self.events))
+
+    def restart(self):
+        records = {}
+        for event in json.loads(self.path.read_text()):
+            identity = event["send_id"]
+            if event["kind"] == "native.submitting":
+                records[identity] = {**event, "status": "unknown"}
+            elif event["kind"] == "native.not_sent":
+                original = records[identity]
+                for field in ("operation", "epoch", "response_id", "input_id",
+                              "attempt", "owner", "budget"):
+                    assert original[field] == event[field]
+                records[identity] = {**event, "status": "not_sent"}
+        return list(records.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["refuse", "prepare-error", "prepare-cancel", "admit-cancel", "submitting-error"])
+async def test_not_sent_survives_host_restart_with_original_identity(tmp_path, failure):
+    host = ReceiptHost(tmp_path / "receipts.json")
+    records = []
+
+    async def prepare(*args, **kwargs):
+        if failure == "prepare-error":
+            raise ValueError("PRIVATE callback detail")
+        if failure == "prepare-cancel":
+            raise asyncio.CancelledError("PRIVATE cancellation")
+
+        def decide(envelope):
+            records.append(envelope)
+            if failure == "admit-cancel":
+                raise asyncio.CancelledError("PRIVATE cancellation")
+            return False
+
+        return native.NativeSendAdmission(attempt_id="attempt-1", admit=decide)
+
+    p, _ = make(prepare)
+    p.owner = None  # exercise complete(), including its terminal error handling
+    request = ChatRequest(messages=[Message(role="user", content="PRIVATE input")], max_output_tokens=32)
+    socket = p.socket
+    epoch = p.epoch
+    p.previous_response_id = "earlier-settled-response"
+
+    async def lifecycle(kind, data):
+        await host.save(kind, data)
+        if kind == "native.submitting" and failure == "submitting-error":
+            raise OSError("PRIVATE persistence detail")
+
+    p.lifecycle = lifecycle
+    with pytest.raises((LLMError, asyncio.CancelledError)):
+        await p.complete(request)
+    restored = host.restart()
+    assert len(restored) == 1 and restored[0]["status"] == "not_sent"
+    record = restored[0]
+    assert record["epoch"] == epoch and record["response_id"] == "earlier-settled-response"
+    assert record["operation"] == "response.create" and record["input_id"] is None
+    assert record["attempt_id"] == ("attempt-1" if records else None)
+    assert record["reason"] == ("cancelled" if "cancel" in failure else "rejected")
+    assert record["execution_replayed"] is False
+    assert "PRIVATE" not in host.path.read_text()
+    assert not socket.wire and not socket.closed and p._native_send_refused
+    assert not p.request_uncertain
+    with pytest.raises(LLMError, match="not sent.*recovery"):
+        await p.complete(request)
+    await p.close_live()  # must settle original resources before reconstruction
+    assert socket.closed and p.socket is None
+    assert host.restart()[0]["status"] == "not_sent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "cancel", "timeout"])
+async def test_not_sent_receipt_failure_is_visible_and_restart_stays_unknown(tmp_path, monkeypatch, failure):
+    host = ReceiptHost(tmp_path / "receipts.json")
+    p, o = make(lambda *args, **kwargs: admission([], decision=False))
+    monkeypatch.setattr(native, "_NOT_SENT_RECEIPT_TIMEOUT", 0.01)
+
+    async def lifecycle(kind, data):
+        if kind == "native.not_sent":
+            if failure == "timeout":
+                await asyncio.Future()
+            if failure == "cancel":
+                raise asyncio.CancelledError("PRIVATE sink cancellation")
+            raise OSError("PRIVATE sink error")
+        await host.save(kind, data)
+
+    p.lifecycle = lifecycle
+    token = native.NATIVE_REQUEST.set(p)
+    try:
+        with pytest.raises(LLMError) as error:
+            await asyncio.wait_for(p._create_response({"input": []}), 2)
+    finally:
+        native.NATIVE_REQUEST.reset(token)
+    assert error.value.retryable is False and "PRIVATE" not in str(error.value)
+    assert host.restart()[0]["status"] == "unknown"
+    assert p.native_status()["observerFailed"] is True
+    assert any(e["type"] == "native.not_sent" for e in o.events)  # other sink still attempted
+    assert not p.socket.wire and not p.request_uncertain
+
+
+@pytest.mark.asyncio
+async def test_not_sent_receipt_uses_captured_sinks_after_owner_changes(tmp_path):
+    host = ReceiptHost(tmp_path / "receipts.json")
+    replacement = Owner()
+
+    async def prepare(*args, **kwargs):
+        p.owner = replacement
+        p.lifecycle = AsyncMock()
+        p.epoch = "replacement-epoch"
+        return admission([])
+
+    p, original = make(prepare)
+    epoch = p.epoch
+    p.lifecycle = host.save
+    with pytest.raises(LLMError):
+        await p._native_response({"input": []})
+    assert host.restart()[0]["epoch"] == epoch
+    assert host.restart()[0]["status"] == "not_sent"
+    assert any(e["type"] == "native.not_sent" for e in original.events)
+    assert not replacement.events and p.lifecycle.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["refuse", "cancel", "parent-completes"])
+async def test_unsent_steer_receipt_cannot_terminate_or_downgrade_parent(tmp_path, ending):
+    host = ReceiptHost(tmp_path / "receipts.json")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def prepare(kind, *, input_id):
+        if kind == "response.steer":
+            entered.set()
+            await release.wait()
+            if ending == "cancel":
+                raise asyncio.CancelledError()
+            return admission([], decision=False)
+        return admission([])
+
+    p, _ = make(prepare)
+    p.lifecycle = host.save
+    socket = p.socket
+    socket.feed(created("parent"))
+    parent = asyncio.create_task(p._native_response({"input": []}))
+    await wait_created(p)
+    steer = asyncio.create_task(p.steer_live(SimpleNamespace(id="local-1", text="PRIVATE steer")))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if ending == "parent-completes":
+            socket.feed(finished("parent"))
+            await asyncio.wait_for(parent, 2)
+        release.set()
+        with pytest.raises((LLMError, asyncio.CancelledError)):
+            await asyncio.wait_for(steer, 2)
+        persisted = host.restart()
+        assert [(e["operation"], e["status"]) for e in persisted] == [
+            ("response.create", "unknown"), ("response.steer", "not_sent"),
+        ]  # synthetic consumer deliberately has no completion handler
+        assert persisted[1]["input_id"] == "local-1"
+        assert persisted[1]["response_id"] == "parent"
+        assert p.request_uncertain is (ending != "parent-completes")
+        assert not socket.closed and len(socket.wire) == 1
+        assert p.inflight is None and not p._steer_preparing
+        if not parent.done():
+            socket.feed(finished("parent"))
+            await asyncio.wait_for(parent, 2)
+    finally:
+        for task in (parent, steer):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(parent, steer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "steer"])
+@pytest.mark.parametrize("failure", [ConnectionError("PRIVATE send"), asyncio.CancelledError()])
+async def test_send_entry_failure_never_publishes_not_sent(tmp_path, operation, failure):
+    host = ReceiptHost(tmp_path / "receipts.json")
+    p, o = make(lambda *args, **kwargs: admission([]))
+    p.lifecycle = host.save
+    socket = p.socket
+    socket.failure = failure
+    token = native.NATIVE_REQUEST.set(p)
+    try:
+        if operation == "steer":
+            p.response_id = "parent"
+            p.request_uncertain = True
+            call = p.steer_live(SimpleNamespace(id="local-1", text="PRIVATE steer"))
+        else:
+            call = p._create_response({"input": []})
+        with pytest.raises((LLMError, ConnectionError, asyncio.CancelledError)):
+            await call
+    finally:
+        native.NATIVE_REQUEST.reset(token)
+    assert host.restart()[0]["status"] == "unknown"
+    assert len(socket.wire) == 1 and socket.closed and p.request_uncertain
+    assert not any(e["type"] == "native.not_sent" for e in o.events)
+
+
+@pytest.mark.asyncio
+async def test_not_sent_does_not_hide_failed_socket_cleanup(tmp_path):
+    host = ReceiptHost(tmp_path / "receipts.json")
+    p, _ = make(lambda *args, **kwargs: admission([], decision=False))
+    p.lifecycle = host.save
+    with pytest.raises(LLMError):
+        await p._native_response({"input": []})
+    socket = p.socket
+    socket.close = AsyncMock(side_effect=OSError("synthetic close failure"))
+    with pytest.raises(OSError, match="synthetic close failure"):
+        await p.close_live()
+    assert p.socket is socket and not socket.closed
+    assert host.restart()[0]["status"] == "not_sent"  # not a cleanup success
+    assert p._native_send_refused and not socket.wire
