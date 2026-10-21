@@ -106,7 +106,61 @@ advanced. That adapter refuses further completions with an explicit host-recover
 error; it does not silently omit the unsent input or reset lineage to retry.
 The host must retain canonical history and its original attempt disposition.
 Reconstructing an adapter is a deliberate host recovery decision, not permission
-to replay. No-callback callers keep their existing submitting/unknown semantics.
+to replay. Await `close_live()` on the original adapter **before** reconstructing
+it; a failed close remains a cleanup failure, not successful resource disposal.
+No-callback callers keep their existing submitting/unknown semantics.
+
+### Persisting known-unsent outcomes
+
+Hosts opting into `prepare_send` must also consume the following lifecycle
+contract. It is not installed automatically in existing CLI/app consumers:
+ignoring the terminal event leaves their earlier submitting receipt unresolved.
+Bind the injected lifecycle sink to the original host attempt, owner and budget
+before calling `complete`/`steer_live`; do not select a new attempt from mutable
+global state after an await.
+
+For an opted-in create **or steer**, `native.submitting` carries a fresh local
+`send_id`, `operation` (`response.create` or `response.steer`), captured `epoch`,
+`response_id` (previous response for create; parent for steer), `input_id`
+(`None` for create; local command ID for steer), `attempt_id=None`, and
+`execution_replayed=False`. This ID correlates lifecycle records; it is not a
+server idempotency key, new host attempt, budget or authorization.
+
+If initial persistence, preparation, final admission or the pre-send identity
+check fails/cancels, `native.not_sent` carries those same identities plus a fixed
+`reason` (`rejected` or `cancelled`). `attempt_id` is the host-supplied admission
+ID if validated preparation returned one; otherwise it remains `None`. Resolve
+that `None` using the original host binding and `send_id`, never a new attempt.
+There is no callback exception, prompt, tool payload or response content in the
+receipt. It means this operation never entered `socket.send`; it does not
+dispose of resources, complete an active parent, or authorize replay.
+
+The provider snapshots the lifecycle and owner-runtime sinks before submission
+and passes separate copies of the receipt to each. Terminal delivery tries each
+captured sink once, with a one-second **cooperative** timeout per sink, without
+changing the original exception/cancellation or send uncertainty. A failed,
+cancelled or timed-out sink sets the existing `native_status().observerFailed`;
+there is no hidden retry. Non-yielding or cancellation-suppressing host callbacks
+cannot be forcibly bounded by asyncio. Hosts must keep sinks cooperative.
+
+Durable consumer rules (exercised by the synthetic disk/restart fixture):
+
+1. Persist `submitting`, keyed by `send_id`, under the original host attempt,
+   owner/budget and captured connection epoch. A steer has its own record.
+2. On matching `native.not_sent`, persist terminal `not_sent` for **only** that
+   send. Validate the operation, parent, epoch and local input identity; retain
+   the original attempt and budget. Never terminate its parent or erase another
+   send's unknown outcome.
+3. On restart, retain persisted `not_sent`. A submitting record with no persisted
+   terminal remains `unknown`, including a crash or receipt-sink failure.
+   An in-memory flag, caught local exception or successful socket close cannot
+   substitute for the terminal record.
+
+Once send is entered, cancellation/failure follows the existing unknown outcome
+path, **never** `native.not_sent`. A rejected/cancelled unsent steer can be
+recorded while the parent is still running, completes, or becomes unknown; its
+terminal does not reclassify that parent. Downstream hosts must implement this
+distinction before opting in. These tests do not claim installed host adoption.
 
 There is no intervening await between synchronous final admission and
 selecting the immutable argument handed to `socket.send`. This is a **local

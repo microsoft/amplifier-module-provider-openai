@@ -671,3 +671,40 @@ async def test_not_sent_does_not_hide_failed_socket_cleanup(tmp_path):
     assert p.socket is socket and not socket.closed
     assert host.restart()[0]["status"] == "not_sent"  # not a cleanup success
     assert p._native_send_refused and not socket.wire
+
+
+@pytest.mark.asyncio
+async def test_missing_terminal_negative_control_leaves_known_local_unsent_unknown_on_restart(tmp_path):
+    host = ReceiptHost(tmp_path / "receipts.json")
+    p, _ = make(lambda *args, **kwargs: admission([], decision=False))
+
+    async def old_consumer(kind, data):
+        if kind != "native.not_sent":
+            await host.save(kind, data)
+
+    p.lifecycle = old_consumer
+    with pytest.raises(LLMError):
+        await p._native_response({"input": []})
+    assert not p.socket.wire and p._native_send_refused
+    assert host.restart()[0]["status"] == "unknown"  # original host-visible gap
+    assert p.native_status()["observerFailed"] is False  # ignored event cannot be detected
+
+
+@pytest.mark.asyncio
+async def test_submitting_runtime_failure_still_persists_known_unsent(tmp_path):
+    host = ReceiptHost(tmp_path / "receipts.json")
+    p, o = make(lambda *args, **kwargs: admission([]))
+    p.lifecycle = host.save
+    original_emit = o.runtime.emit
+
+    async def emit(kind, **data):
+        if kind == "native.submitting":
+            raise OSError("PRIVATE runtime submitting error")
+        await original_emit(kind, **data)
+
+    o.runtime.emit = emit
+    with pytest.raises(LLMError) as error:
+        await p._native_response({"input": []})
+    assert "PRIVATE" not in str(error.value) and error.value.__cause__ is None
+    assert host.restart()[0]["status"] == "not_sent"
+    assert not p.socket.wire and not p.request_uncertain

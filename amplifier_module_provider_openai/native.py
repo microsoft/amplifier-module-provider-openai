@@ -29,6 +29,7 @@ from .native_checkpoint import NativeCheckpointMixin
 
 NATIVE_REQUEST = contextvars.ContextVar("openai_native_request", default=None)
 NATIVE_BUDGET = contextvars.ContextVar("openai_native_budget", default=None)
+_NOT_SENT_RECEIPT_TIMEOUT = 1.0  # Per cooperative sink; never a model deadline.
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +156,38 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             return wire
         except Exception:  # noqa: BLE001 - never send after a failed host decision or serialization
             raise self._send_refused() from None
+
+    def _send_receipt(self, operation, *, input_id=None, response_id=None):
+        # Correlate the submitting/unsent pair even if preparation never returns
+        # an attempt ID. Host attempt/owner/budget stay bound by the captured sink.
+        return {
+            "send_id": str(uuid.uuid4()), "operation": operation,
+            "epoch": self.epoch, "response_id": response_id,
+            "input_id": input_id, "attempt_id": None, "execution_replayed": False,
+        }
+
+    async def _emit_send_receipt(self, kind, receipt, sinks):
+        async def deliver(sink, index):
+            if index == 0:
+                await sink(kind, dict(receipt))
+            else:
+                await sink(kind, **dict(receipt))
+
+        for index, sink in enumerate(sinks):
+            if sink is None:
+                continue
+            # Each captured sink gets its own copy; an observer cannot change
+            # the identity delivered to the other sink or a later terminal.
+            if kind != "native.not_sent":
+                await deliver(sink, index)  # Initial persistence failure prevents send.
+                continue
+            try:
+                async with asyncio.timeout(_NOT_SENT_RECEIPT_TIMEOUT):
+                    await deliver(sink, index)
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001 - preserve original refusal/cancellation, try the other sink once
+                # Missing terminal persistence is NOT a durable known-unsent
+                # outcome. Existing public native_status exposes observerFailed.
+                self._observer_failure = "native.not_sent"
 
     def _prepare_native_messages(self, messages, *, ordinary_names=frozenset()):
         from .computer_history import project_failed_computer_history
@@ -722,14 +755,20 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             return False
         if self.prepare_send is not None:
             owner, socket, parent = self.owner, self.socket, self.response_id
+            input_id = getattr(command, "id", None)
+            if not isinstance(input_id, str) or not input_id.strip():
+                raise self._send_refused()
+            receipt = self._send_receipt(
+                "response.steer", input_id=input_id, response_id=parent,
+            )
+            sinks = self.lifecycle, owner.runtime.emit
             self._steer_preparing = True
             try:
-                input_id = command.id
-                if not isinstance(input_id, str) or not input_id.strip():
-                    raise self._send_refused()
+                await self._emit_send_receipt("native.submitting", receipt, sinks)
                 admission = await self._prepare_send_admission(
                     "response.steer", input_id=input_id,
                 )
+                receipt["attempt_id"] = admission.attempt_id
                 if (
                     self.owner is not owner or self.socket is not socket
                     or self.response_id != parent or self.inflight
@@ -741,7 +780,14 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                      "input": owner._text(command)},
                     admission, input_id=input_id,
                 )
-            except Exception:  # noqa: BLE001 - pre-send failures cannot enter transport retry handling
+            except BaseException as exc:
+                await self._emit_send_receipt(
+                    "native.not_sent",
+                    {**receipt, "reason": "cancelled" if isinstance(exc, asyncio.CancelledError) else "rejected"},
+                    sinks,
+                )
+                if not isinstance(exc, Exception):
+                    raise
                 raise self._send_refused() from None
             finally:
                 self._steer_preparing = False
@@ -995,15 +1041,27 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             await self.socket.send(json.dumps({"type": "response.create", **payload}))
         else:
             owner, socket = self.owner, self.socket
+            receipt = self._send_receipt(
+                "response.create", response_id=self.previous_response_id,
+            )
+            sinks = self.lifecycle, owner.runtime.emit
             try:
-                await self._emit("native.submitting", execution_replayed=False)
+                await self._emit_send_receipt("native.submitting", receipt, sinks)
                 admission = await self._prepare_send_admission("response.create")
+                receipt["attempt_id"] = admission.attempt_id
                 if self.owner is not owner or self.socket is not socket:
                     raise self._send_refused()
                 wire = self._admit_send({"type": "response.create", **payload}, admission)
-            except BaseException:
+            except BaseException as exc:
                 self._native_send_refused = True
-                raise
+                await self._emit_send_receipt(
+                    "native.not_sent",
+                    {**receipt, "reason": "cancelled" if isinstance(exc, asyncio.CancelledError) else "rejected"},
+                    sinks,
+                )
+                if not isinstance(exc, Exception):
+                    raise
+                raise self._send_refused() from None
             # Linearization is local admission of this immutable send argument.
             # No intervening await; delivery can still fail or be cancelled.
             self.request_uncertain = True
