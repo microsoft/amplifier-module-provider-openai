@@ -898,9 +898,11 @@ input to make the request fit.
 
 The byte estimate applies only to text payloads. Typed image/file content and
 computer screenshots require the native count below: encoded bytes, URLs, and
-file identifiers cannot establish their model token cost. If counting is
-unavailable or fails, their preflight budget is `None` and the unchanged request
-is sent for API validation, with a scalar-only warning once per model. Model,
+file identifiers cannot establish their model token cost. If the counting
+capability is unavailable, their preflight budget is `None` and the unchanged
+request is sent for API validation, with a scalar-only warning once per model.
+A failed native count instead raises `TokenCountError` after the bounded
+count-only policy below; it does not fall back or dispatch generation. Model,
 output-reservation, and serialization checks still apply. Multimodal response
 usage remains in actual usage accounting but never calibrates the text byte
 estimate. Data URLs or image-shaped JSON inside ordinary text, tool arguments,
@@ -930,9 +932,11 @@ Create-only response settings are not sent to the counter.
 
 The `request_budget:provider_count` capability means that `request_budget`
 returns an awaitable native decision. Consumers of that capability must await
-the result and handle `None`: an individual count can fail, be malformed, or
-be unprojectable after the capability was advertised. The instance capability
-remains advertised in those cases.
+the result and distinguish unavailable measurement (`None`, including an
+unprojectable finalized payload) from a failed operation (`TokenCountError`,
+including a malformed count response). A failed operation never becomes a local
+estimate or permission to generate. The instance capability remains advertised
+in those cases.
 
 Native counting is unavailable when the installed SDK lacks the stable helper,
 its version is missing, malformed, unsupported, or pre-release, or the
@@ -941,14 +945,45 @@ routes retain their established synchronous estimate-based `dict` or `None`
 `request_budget` result; they do not advertise
 `request_budget:provider_count`.
 
-There is no count cache. A Context/Loop measured preflight calls the counter once
-for its frozen candidate. Separately, generation takes one final pre-event count
-for its first SDK create/stream dispatch and refreshes that count immediately
-before every physical retry. Therefore a Context/Loop flow with `N` physical
-generation attempts makes `N + 1` count requests; a direct generation with `N`
-attempts makes `N`. The preflight does not mutate provider state or emit completion
-events. A successful final count overrides a stale serialized-byte calibration; an
-over-allowance count blocks generation before its SDK create/stream request.
+Ordinary native counting makes at most **three count-only attempts**, with a
+**30-second timeout per attempt** and SDK retries disabled. Timeouts, connection
+failures, HTTP 408, transient rate limits (429), and service failures (5xx) retry
+with one- then two-second backoff. Supported numeric `Retry-After` seconds or
+`retry-after-ms` delays of at most ten seconds are honored without shortening
+that backoff. Longer, negative, nonfinite, malformed, or date-form delays end
+the operation rather than retrying early. Authentication, permission, invalid
+requests/responses, and exhausted billing/quota errors stop after one attempt.
+The bounded single-attempt completion mode above remains an exception: one native
+count, no retries, under its separately admitted timeout contract.
+
+The final `TokenCountError.retryable` is deliberately `False`: the count policy
+has finished, so an outer generation retry must not replay generation or multiply
+the count budget. Its sanitized `count_failure.retryable` describes whether the
+underlying failure category is transient, not permission for another outer retry.
+A later, separately requested operation can still succeed.
+
+Mount contributes `provider:token_count_failed` through `observability.events`
+under `provider-openai` so observability collectors can discover and persist it.
+Each terminal count failure awaits one such event, carrying only `provider`,
+`operation: "responses.input_tokens.count"`, a copy of the sanitized `count_failure`,
+and `outer_retryable`. The diagnostic contains `category`, inner `retryable`,
+`attempts`, and optional `httpStatus` and validated `requestId`. It contains no
+model, prompt, request parameters, headers, request/response bodies, SDK exception,
+or traceback. Transient failures that recover emit no terminal event. Missing
+observers or ordinary observer failures do not replace the count error;
+cancellation still propagates.
+
+There is no count cache. A Context/Loop measured preflight starts one logical
+count operation for its frozen candidate. Separately, generation takes one final
+pre-event count for its first SDK create/stream dispatch and refreshes that count
+immediately before every provider-managed physical retry. When all counts succeed,
+a Context/Loop flow with `N` generation attempts makes `N + 1` logical count
+operations; direct generation makes `N`. These equal physical count requests only
+when each count succeeds on its first attempt. Count retries add physical count
+requests; a terminal count failure prevents the next generation dispatch.
+Preflight does not mutate provider state or emit completion events. A successful
+final count overrides a stale serialized-byte calibration; an over-allowance count
+blocks generation before its SDK create/stream request.
 
 ### Metadata Keys
 
