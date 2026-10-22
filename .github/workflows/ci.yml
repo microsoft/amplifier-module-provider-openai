@@ -34,7 +34,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
+
+      - name: Native boundary lint
+        run: uv run --no-sync ruff check amplifier_module_provider_openai/native.py tests/test_native_outbound_admission.py
+
+      - name: Native boundary focused regressions
+        if: ${{ !cancelled() }}
+        run: |
+          uv run --no-sync python -c 'import sys, importlib.metadata as m; print(sys.version); print({n: m.version(n) for n in ("amplifier-core", "openai", "websockets", "pytest", "pytest-asyncio", "ruff")})'
+          uv run --no-sync pytest -q --tb=short -m "not live" \
+            tests/test_native_outbound_admission.py tests/test_native_transport.py \
+            tests/test_native_checkpoint.py tests/test_native_compaction.py \
+            tests/test_wait_policy.py tests/test_retry.py tests/test_streaming.py \
+            tests/test_streaming_error_classification.py
 
       - name: Run test suite
         # Deselects tests marked `live`: two tests need a genuine OpenAI
