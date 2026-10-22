@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
@@ -27,6 +27,11 @@ wheels = [
 ]
 
 [[package]]
+name = "amplifier-lib-decisions"
+version = "0.1.0.dev0"
+source = { git = "https://github.com/microsoft/amplifier-lib-decisions?rev=main#6c9e064acb93d4a6ed090ee58a111b8e77648784" }
+
+[[package]]
 name = "amplifier-module-provider-openai"
 version = "1.0.0"
 source = { editable = "." }
@@ -37,6 +42,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+decisions = [
+    { name = "amplifier-lib-decisions" },
+]
 native = [
     { name = "websockets" },
 ]
@@ -53,12 +61,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "amplifier-lib-decisions", marker = "extra == 'decisions'", git = "https://github.com/microsoft/amplifier-lib-decisions?rev=main" },
     { name = "httpx", specifier = ">=0.27.0,<1" },
     { name = "openai", specifier = ">=3.29.0" },
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "websockets", marker = "extra == 'native'", specifier = ">=15,<17" },
 ]
-provides-extras = ["native"]
+provides-extras = ["decisions", "native"]
 
 [package.metadata.requires-dev]
 dev = [

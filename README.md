@@ -105,7 +105,7 @@ Capability advertisement, catalogue visibility and preparation do not prove acce
 
 Offline provider contracts run without real credentials: their scoped fixtures
 mount with a nonfunctional key and replace model listing and inference transport. Run
-`uv run pytest -q -m "not live"` for all offline checks; separately marked
+`uv run --all-extras pytest -q -m "not live"` for all offline checks; separately marked
 inference tests require explicitly supplied live credentials.
 
 - **Python 3.11+**
