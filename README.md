@@ -33,8 +33,9 @@ this spike does not fabricate a decision dollar price or add it to chat pricing.
 
 The shared `amplifier_decisions` contract is packaged as `amplifier-lib-decisions`.
 Install this provider with its `decisions` extra when using that capability. The
-contract package is unpublished in this spike, so development uses explicit local
-wheel/source overrides. Ordinary provider startup does not import or require it. No generic decision
+extra resolves the lightweight contract library from its canonical Microsoft Git
+repository; it installs no model weights or inference server. Ordinary provider
+startup does not import or require it. No generic decision
 bundle should own this provider's credentials or wire implementation.
 
 An account can expose independent named models with
