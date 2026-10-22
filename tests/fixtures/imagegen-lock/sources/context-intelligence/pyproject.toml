@@ -1,0 +1,66 @@
+[project]
+name = "amplifier-bundle-context-intelligence"
+version = "0.2.0"
+requires-python = ">=3.11"
+dependencies = [
+    # context_intelligence/auth.py imports azure.identity.DefaultAzureCredential
+    # (lazily, on the entra auth path). Declared here — the package that ships
+    # that code — so every consumer (query/blob read tools, upload, hook) that
+    # uses auth_mode: entra gets it, instead of relying on the upload module
+    # happening to be co-installed. Static-key callers pay a small install cost
+    # but the import stays lazy, so importing this package never requires azure.
+    "azure-identity>=1.19",
+]
+
+[project.optional-dependencies]
+client = ["httpx>=0.25"]
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "context_intelligence",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=0.24",
+    "pyright>=1.1.411",
+    "ruff>=0.14",
+    "httpx>=0.25",
+    "idna>=3.15",
+    "PyYAML>=6.0",
+    # context_intelligence/whoami_tool.py imports amplifier_core.models.ToolResult
+    # (WhoamiTool is mounted from two tool modules -- see whoami_tool.py's own
+    # docstring -- and lives here in the shared library, not in either module's
+    # own package, so it needs amplifier-core as a dev dep for pyright/pytest
+    # the same way the module pyproject.toml files already do).
+    "amplifier-core>=1.6.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+include = ["context_intelligence", "tests"]
+extraPaths = ["."]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

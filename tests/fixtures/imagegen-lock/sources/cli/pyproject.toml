@@ -1,0 +1,83 @@
+[project]
+name = "amplifier-app-cli"
+version = "0.1.1"
+description = "Reference CLI implementation for Amplifier AI development platform"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Microsoft MADE:Explorations Team" }]
+dependencies = [
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pygments>=2.13.0",
+    "pydantic>=2.0.0",
+    "amplifier-core>=1.5.3",
+    # Tool installs consume published metadata, not this repository's uv.lock.
+    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
+    "pyyaml>=6.0.3",
+    "prompt-toolkit>=3.0.52",
+    "httpx[socks]>=0.28.1",
+    # The TLS concurrency shim runs at CLI import, before provider activation.
+    "truststore>=0.10",
+    "packaging>=24.0",
+    "filelock>=3.29.6",
+]
+
+[project.scripts]
+amplifier = "amplifier_app_cli.main:main"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_app_cli"]
+
+# Ship the repo-root bundle overlay (bundle.md + behaviors/ + agents/ +
+# context/ + docs/) inside the wheel.
+#
+# Sibling repos (amplifier, amplifier-core, amplifier-foundation) put these
+# dirs at their repo root too, but they are CLONED into ~/.amplifier/cache,
+# so their whole tree is on disk at runtime. This repo is installed with
+# `uv tool install` -- only the wheel ships -- so without this block the
+# overlay would reach a dev checkout and nobody else.
+#
+# docs/ is included because agents/cli-expert.md @-mentions it; the repo root
+# stays the single source of truth and the wheel carries a copy.
+#
+# Targets are under `_bundle/` INSIDE the package deliberately. Targeting
+# `amplifier_app_cli/agents` would create a directory with no __init__.py
+# that shadows the real package namespace and breaks `import amplifier_app_cli`
+# in built wheels (see foundation BUNDLE_GUIDE.md, "force-include Shadowing
+# Python Namespace"). Resolution lives in runtime/config.py.
+[tool.hatch.build.targets.wheel.force-include]
+"bundle.md" = "amplifier_app_cli/_bundle/bundle.md"
+"behaviors" = "amplifier_app_cli/_bundle/behaviors"
+"agents" = "amplifier_app_cli/_bundle/agents"
+"context" = "amplifier_app_cli/_bundle/context"
+"docs" = "amplifier_app_cli/_bundle/docs"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=0.24.0",
+    # Real context used by the repair/save/resume regression, not a runtime default.
+    "amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main",
+]
+
+[tool.uv.sources]
+amplifier-foundation = { git = "https://github.com/microsoft/amplifier-foundation", rev = "main" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib -m \"not integration\""
+asyncio_mode = "strict"
+markers = [
+    "integration: marks tests that fork a real pty child process and probe real termios state (deselected by default; run with '-m integration')",
+]

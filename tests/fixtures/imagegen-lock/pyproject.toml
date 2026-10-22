@@ -1,0 +1,80 @@
+[project]
+name = "image-routing-combined-ad2410"
+version = "0.0.0"
+requires-python = ">=3.13"
+dependencies = [
+  "amplifier-unified==0.21.1",
+  "amplifier-app-cli==0.1.1",
+  "amplifier-foundation==1.0.0",
+  "amplifier-module-tool-delegate==0.1.0",
+  "amplifier-module-hooks-session-naming==0.2.0",
+  "amplifier-module-provider-openai==1.0.0",
+  "amplifier-module-provider-gemini==1.0.0",
+  "amplifier-module-tool-image==0.1.0",
+  "amplifier-module-hooks-routing==0.1.1",
+  "amplifier-module-loop-live==0.2.0",
+  "amplifier-module-loop-streaming==1.0.0",
+  "amplifier-module-loop-basic==1.0.0",
+  "amplifier-module-context-simple==1.0.0",
+  "amplifier-memory==0.1.0",
+  "amplifier-bundle-context-intelligence[client]==0.2.0",
+  "amplifier-module-tool-recipes==0.1.0",
+  "amplifier-recipe-runner==0.1.0",
+  "amplifier-module-tool-skills==1.0.0",
+  "amplifier-core @ https://files.pythonhosted.org/packages/92/7f/80c9d27f76a3a1f0168ba4410e289d2eac21b01f5728e61be39df6ed9333/amplifier_core-2.0.2-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl#sha256=cba63bf80af198819ca648edbac4998735d2656fd19af0a569ef1849547a97ac",
+  "openai==3.29.0",
+  "google-genai==2.30.1",
+  "Pillow==12.3.0",
+  "httpx==0.28.1",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "pytest-aiohttp==1.1.1",
+  "pytest-timeout==2.4.0",
+  "google-api-core==2.42.0",
+  "hatchling==1.32.4",
+  "websockets==15.0.1",
+]
+
+[tool.uv]
+package = false
+no-build-package = ["amplifier-core"]
+override-dependencies = [
+  "amplifier-unified==0.21.1",
+  "amplifier-app-cli==0.1.1",
+  "amplifier-foundation==1.0.0",
+  "amplifier-module-tool-delegate==0.1.0",
+  "amplifier-module-hooks-session-naming==0.2.0",
+  "amplifier-module-provider-openai==1.0.0",
+  "amplifier-module-provider-gemini==1.0.0",
+  "amplifier-module-tool-image==0.1.0",
+  "amplifier-module-hooks-routing==0.1.1",
+  "amplifier-module-loop-live==0.2.0",
+  "amplifier-module-loop-streaming==1.0.0",
+  "amplifier-module-loop-basic==1.0.0",
+  "amplifier-module-context-simple==1.0.0",
+  "amplifier-memory==0.1.0",
+  "amplifier-bundle-context-intelligence==0.2.0",
+  "amplifier-module-tool-recipes==0.1.0",
+  "amplifier-recipe-runner==0.1.0",
+  "amplifier-module-tool-skills==1.0.0",
+]
+
+[tool.uv.sources]
+amplifier-unified = { path = "sources/unified", editable = false }
+amplifier-app-cli = { path = "sources/cli", editable = false }
+amplifier-foundation = { path = "sources/foundation", editable = false }
+amplifier-module-tool-delegate = { path = "sources/delegate", editable = false }
+amplifier-module-hooks-session-naming = { path = "sources/naming", editable = false }
+amplifier-module-provider-openai = { path = "sources/openai", editable = false }
+amplifier-module-provider-gemini = { path = "sources/gemini", editable = false }
+amplifier-module-tool-image = { path = "sources/imagegen", editable = false }
+amplifier-module-hooks-routing = { path = "sources/routing", editable = false }
+amplifier-module-loop-live = { path = "sources/loop-live", editable = false }
+amplifier-module-loop-streaming = { path = "sources/loop-streaming", editable = false }
+amplifier-module-loop-basic = { path = "sources/loop-basic", editable = false }
+amplifier-module-context-simple = { path = "sources/context-simple", editable = false }
+amplifier-memory = { path = "sources/memory", editable = false }
+amplifier-bundle-context-intelligence = { path = "sources/context-intelligence", editable = false }
+amplifier-module-tool-recipes = { path = "sources/recipes", editable = false }
+amplifier-recipe-runner = { path = "sources/runner", editable = false }
+amplifier-module-tool-skills = { path = "sources/skills", editable = false }

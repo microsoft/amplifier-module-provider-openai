@@ -1,0 +1,64 @@
+[project]
+name = "amplifier-module-provider-gemini"
+version = "1.0.0"
+description = "Reference provider module - Google Gemini integration for Amplifier"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Microsoft MADE:Explorations Team" },
+]
+dependencies = [
+    # 1.56.0 is the floor because that is the first google-genai release
+    # whose ThinkingConfig exposes the full thinking_level enum this module
+    # needs (minimal/low/medium/high). Verified by probing the SDK's own
+    # installed types directly (not just changelog text) on 2026-08-29:
+    #   - 1.46.0: no thinking_level field on ThinkingConfig at all.
+    #   - 1.51.0: thinking_level added, but only LOW/HIGH values exist.
+    #   - 1.56.0: adds MINIMAL and MEDIUM -- the full four-level enum.
+    # See amplifier_module_provider_gemini/__init__.py's
+    # _THINKING_LEVEL_TABLE comment for the per-model support matrix.
+    # 2.30.1 qualifies the optional Interactions image transport and its
+    # independent generated retry policy; keep the operation transport tests.
+    "google-genai>=2.30.1,<3",
+    "httpx>=0.28.1",
+    "Pillow>=11.0.0",
+]
+
+[project.entry-points."amplifier.modules"]
+provider-gemini = "amplifier_module_provider_gemini:mount"
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "amplifier_module_provider_gemini",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+asyncio_mode = "strict"
+markers = [
+    "live: requires real network access / real provider credentials; deselected in CI via `-m \"not live\"`",
+]
+
+[dependency-groups]
+dev = [
+    "amplifier-core>=1.6.0",
+    "google-api-core>=2.0.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.2.0",
+    "ruff>=0.14.6",
+]

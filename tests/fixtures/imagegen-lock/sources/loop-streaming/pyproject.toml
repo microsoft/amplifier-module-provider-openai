@@ -1,0 +1,48 @@
+[project]
+name = "amplifier-module-loop-streaming"
+version = "1.0.0"
+description = "Streaming orchestrator module for Amplifier"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Microsoft MADE:Explorations Team" },
+]
+dependencies = [
+]
+
+[project.entry-points."amplifier.modules"]
+loop-streaming = "amplifier_module_loop_streaming:mount"
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "amplifier_module_loop_streaming",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[dependency-groups]
+dev = [
+    "amplifier-core",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.0.0",
+]
+
+[tool.uv.sources]
+amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch = "main" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+asyncio_mode = "strict"
+

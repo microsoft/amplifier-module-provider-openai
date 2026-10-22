@@ -1,0 +1,74 @@
+[project]
+name = "amplifier-unified"
+version = "0.21.1"
+description = "A local voice-first Amplifier workspace with a shared user and agent interface"
+readme = "README.md"
+requires-python = ">=3.13"
+# python-pam imports six but does not declare it in its distribution metadata.
+dependencies = [
+    "amplifier-memory @ git+https://github.com/microsoft/amplifier-bundle-memory@main",
+    "amplifier-core>=2.0.2",
+    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
+    "amplifier-module-hooks-session-naming @ git+https://github.com/microsoft/amplifier-foundation@main#subdirectory=modules/hooks-session-naming",
+    "aiohttp>=3.12,<4",
+    "packaging>=24",
+    "cryptography>=44,<51",
+    "python-pam>=2.0.2,<3",
+    "six>=1.16,<2",
+    "jsonschema>=4.23,<5",
+    "tinycss2>=1.4,<2",
+    "pyyaml>=6.0.3,<7",
+    "filelock>=3.20,<4",
+    "watchfiles>=1.1,<2",
+    "mcp>=2.2,<3",
+    "httpx>=0.28,<1",
+    "amplifier-bundle-context-intelligence[client] @ git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main",
+]
+
+[project.optional-dependencies]
+tui = ["amplifier-app-tui @ git+https://github.com/microsoft/amplifier-app-tui@main"]
+native-desktop = ["amplifier-module-tool-computer-use @ git+https://github.com/microsoft/amplifier-bundle-computer-use@main#subdirectory=modules/tool-computer-use"]
+
+[project.scripts]
+amplifier-unified = "amplifier_web.cli:main"
+amplifier-unified-status = "amplifier_web.status_protocol.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_web", "amplifier_operations", "amplifier_kernels", "amplifier_scheduling", "amplifier_recall", "amplifier_outputs", "amplifier_worktrees", "amplifier_publishing", "amplifier_portability"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.ci/**"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"bundle.yaml" = "amplifier_web/bundle_data/bundle.yaml"
+"behaviors" = "amplifier_web/bundle_data/behaviors"
+"context" = "amplifier_web/bundle_data/context"
+"skills" = "amplifier_web/bundle_data/skills"
+"docs/shell" = "amplifier_web/bundle_data/docs/shell"
+"packages/shell-sdk" = "amplifier_web/bundle_data/packages/shell-sdk"
+"examples/shell-navigator" = "amplifier_web/bundle_data/examples/shell-navigator"
+"examples/shell-reader" = "amplifier_web/bundle_data/examples/shell-reader"
+"examples/shell-controls" = "amplifier_web/bundle_data/examples/shell-controls"
+
+[tool.uv]
+# Core publishes native wheels; never compile it while installing this app.
+no-build-package = ["amplifier-core"]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.25", "pytest-aiohttp>=1.1"]
+artifacts = ["python-docx>=1.1,<2", "python-pptx>=1,<2", "openpyxl>=3.1,<4", "reportlab>=4,<5", "pypdf>=6,<7", "Pillow>=11,<13"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

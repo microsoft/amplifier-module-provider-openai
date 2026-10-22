@@ -1,0 +1,35 @@
+[project]
+name = "amplifier-module-loop-live"
+version = "0.2.0"
+description = "Event-driven Amplifier sessions with identified input, background work, and finite-turn compatibility"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "jsonschema>=4.23,<5",
+  "amplifier-module-loop-streaming @ git+https://github.com/microsoft/amplifier-module-loop-streaming@main",
+]
+
+[project.entry-points."amplifier.modules"]
+loop-live = "amplifier_module_loop_live:mount"
+
+[dependency-groups]
+dev = [
+  "amplifier-core>=1.6.1",
+  "amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main",
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_module_loop_live"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
