@@ -217,8 +217,9 @@ async def test_parse_failure_retains_paid_image_and_safe_provenance_once(malform
         item = request()
         plan = (await provider.prepare_image_generation(item))["plan"]
         result = await provider.generate_image(item, plan=plan)
-        assert result["status"] == "unknown"
-        assert result["reason_code"] == "generation_outcome_unknown"
+        assert result["status"] == "failed"
+        assert result["reason_code"] == "invalid_response"
+        assert result["dispatch_state"] == "response_received"
         assert result["outputs"][0] == {"kind": "image", "mime_type": "image/png", "data": png()}
         assert sum(o["kind"] == "image" for o in result["outputs"]) == 1
         assert len(result["outputs"]) <= 16
@@ -261,11 +262,12 @@ async def test_requested_geometry_failure_keeps_safe_image_evidence_once(transpo
         item["output"]["size"] = "1024x1024"
         plan = (await provider.prepare_image_generation(item))["plan"]
         result = await provider.generate_image(item, plan=plan)
-        assert result["status"] == ("completed" if matching else "unknown")
+        assert result["status"] == ("completed" if matching else "failed")
+        assert result["dispatch_state"] == "response_received"
         images = [part for part in result["outputs"] if part["kind"] == "image"]
         assert images == [{"kind": "image", "mime_type": "image/png", "data": data}]
         if not matching:
-            assert result["reason_code"] == "generation_outcome_unknown"
+            assert result["reason_code"] == "output_control_mismatch"
         with pytest.raises(ValueError, match="consumed"):
             await provider.generate_image(item, plan=plan)
         assert len(sent) == 1
@@ -288,7 +290,8 @@ async def test_incomplete_response_retains_completed_image_without_continuation(
         item = request()
         plan = (await provider.prepare_image_generation(item))["plan"]
         result = await provider.generate_image(item, plan=plan)
-        assert result["status"] == "unknown" and result["reason_code"] == "incomplete_response"
+        assert result["status"] == "failed" and result["reason_code"] == "incomplete_response"
+        assert result["dispatch_state"] == "response_received"
         assert result["outputs"] == [
             {"kind": "image", "mime_type": "image/png", "data": png()},
             {"kind": "text", "text": "Accompanying text"}]
@@ -297,6 +300,57 @@ async def test_incomplete_response_retains_completed_image_without_continuation(
         assert [model["resolved"] for model in result["models"]] == ["gpt-6.1-sol", "gpt-image-2.5-flare"]
         assert result["usage"]["normalized"] == payload["usage"]
         assert result["continuation"] is None
+        with pytest.raises(ValueError, match="consumed"):
+            await provider.generate_image(item, plan=plan)
+        assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["responses", "images"])
+async def test_image_disconnect_retains_uncertain_dispatch_without_replay(transport):
+    sent = []
+
+    def respond(req):
+        sent.append(req)
+        raise httpx.RemoteProtocolError("private-disconnect-detail")
+
+    async with AsyncOpenAI(api_key="fixture-blue", max_retries=5,
+                          http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))) as client:
+        provider = OpenAIProvider(api_key="fixture-blue", client=client)
+        item = request(transport=transport)
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        result = await provider.generate_image(item, plan=plan)
+        assert result["status"] == "unknown"
+        assert result["dispatch_state"] == "unknown"
+        assert result["reason_code"] == "generation_outcome_unknown"
+        assert result["outputs"] == []
+        assert "private-disconnect-detail" not in repr(result)
+        with pytest.raises(ValueError, match="consumed"):
+            await provider.generate_image(item, plan=plan)
+        assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_status", ["queued", "in_progress", "unrecognized-state"])
+async def test_nonterminal_image_response_remains_unknown_but_received(response_status):
+    payload = response()
+    payload["status"] = response_status
+    payload["output"] = []
+    sent = []
+
+    def respond(req):
+        sent.append(req)
+        return httpx.Response(200, json=payload)
+
+    async with AsyncOpenAI(api_key="fixture-blue",
+                          http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))) as client:
+        provider = OpenAIProvider(api_key="fixture-blue", client=client)
+        item = request()
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        result = await provider.generate_image(item, plan=plan)
+        assert result["status"] == "unknown"
+        assert result["dispatch_state"] == "response_received"
+        assert result["outputs"] == []
         with pytest.raises(ValueError, match="consumed"):
             await provider.generate_image(item, plan=plan)
         assert len(sent) == 1
