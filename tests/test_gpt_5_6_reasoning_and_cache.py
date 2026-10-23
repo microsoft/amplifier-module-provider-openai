@@ -10,7 +10,7 @@ Also covers the D2 guardrail (spec section 2.4): a live probe on 2026-08-28
 confirmed that `prompt_cache_options.mode == "explicit"` with zero
 `prompt_cache_breakpoint` markers in `input` disables prompt caching entirely
 (cache_write_tokens == 0 AND cached_tokens == 0 on every request). Even with
-automatic Luna/Terra tool-result boundaries, some requests have no eligible
+automatic Luna/Terra/Astra tool-result boundaries, some requests have no eligible
 results. Session-wide explicit-only mode can therefore disable caching. The
 guardrail is now validated ONCE AT MOUNT (not scanned per-request): mode is
 downgraded to implicit and a warning fires exactly once per provider
@@ -76,6 +76,7 @@ def _captured_params(provider: OpenAIProvider) -> Any:
 
 @pytest.mark.parametrize("model,marked", [
     ("gpt-5.6-luna", True), ("gpt-5.6-terra-preview", True),
+    ("gpt-6-astra", True), ("gpt-6-astra-preview", False),
     ("unrecognized-model", False), ("gpt-5.6-sol", False),
 ])
 def test_effective_model_and_caller_input_cache_contract(model, marked):
@@ -131,11 +132,12 @@ def test_cache_boundaries_copy_only_eligible_blocks_and_are_idempotent():
     assert _add_tool_output_cache_breakpoints(result) is result
 
 
-def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged():
+@pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-6-astra"])
+def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged(model):
     supplied = [{"type": "function_call_output", "call_id": str(i), "output": f"result-{i}"}
                 for i in range(7)]
     provider = _make_provider(
-        default_model="gpt-5.6-terra", extra_request_params={"input": supplied},
+        default_model=model, extra_request_params={"input": supplied},
     )
     incomplete = SimpleNamespace(
         status="incomplete", id="incomplete", output=[], incomplete_details=None,
@@ -149,8 +151,49 @@ def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged():
             {"mode": "explicit"}
         ] * 7
         assert call.kwargs.get("prompt_cache_options") is None
-        assert call.kwargs["prompt_cache_retention"] == provider.prompt_cache_retention
+        if model == "gpt-6-astra":
+            assert "prompt_cache_retention" not in call.kwargs
+        else:
+            assert call.kwargs["prompt_cache_retention"] == provider.prompt_cache_retention
     assert all(isinstance(item["output"], str) for item in supplied)
+
+
+def test_astra_boundary_keeps_fresh_observation_and_native_output_in_counted_payload():
+    """A changing request-only tail must not remove the reusable tool boundary."""
+    supplied = [
+        {"type": "function_call_output", "call_id": "tool", "output": "saved result"},
+        {"type": "apply_patch_call_output", "call_id": "native",
+         "status": "completed", "output": "native result"},
+        {"role": "user", "content": "Current authority: allowed; observed at 1"},
+    ]
+    provider = _make_provider(
+        default_model="gpt-6-astra", extra_request_params={"input": supplied},
+    )
+    provider.client.responses.create = AsyncMock(return_value=DummyResponse())
+    captured = []
+    for observation in [
+        "Current authority: allowed; observed at 1",
+        "Current authority: stopped; observed at 2",
+    ]:
+        supplied[-1]["content"] = observation
+        before = copy.deepcopy(supplied)
+        request = _simple_request()
+        planned = provider._budget_params(request)
+        asyncio.run(provider.complete(request))
+        params = _captured_params(provider)
+        assert params["input"] == planned["input"]
+        assert supplied == before
+        assert params["input"][1:] == supplied[1:]
+        assert params["input"][-1]["content"] == observation
+        assert params.get("prompt_cache_options", {}).get("mode") != "explicit"
+        assert "prompt_cache_retention" not in params
+        assert params["input"][0]["output"] == [{
+            "type": "input_text", "text": "saved result",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }]
+        captured.append(params["input"])
+    assert captured[0][0] == captured[1][0]
+    assert captured[0][-1] != captured[1][-1]
 
 
 # ---------------------------------------------------------------------------

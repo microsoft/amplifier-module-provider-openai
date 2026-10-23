@@ -109,6 +109,42 @@ async def wait_created(provider):
 
 
 @pytest.mark.asyncio
+async def test_complete_marks_owned_tool_deltas_and_keeps_fresh_observation():
+    p, owner = make()
+    p.owner = None  # Public complete acquires the owner itself.
+    p._guard_assembled_params_with_provider_count = AsyncMock(return_value=None)
+    owner.messages = [{"role": "user", "content": "Read the synthetic result"}]
+    socket = p.socket
+    for step in range(2):
+        call_id = f"read-{step}"
+        observation = {"role": "user", "content": f"Fresh authority observation {step}"}
+        owner.messages.extend([
+            {"role": "assistant", "content": [
+                {"type": "tool_call", "id": call_id, "name": "read", "input": {}}
+            ]},
+            {"role": "tool", "tool_call_id": call_id, "content": f"saved result {step}"},
+            observation,
+        ])
+        before = copy.deepcopy(owner.messages)
+        socket.feed(created(f"response-{step}"), finished(f"response-{step}"))
+        await p.complete(ChatRequest(
+            messages=[Message(**m) for m in owner.messages], max_output_tokens=32,
+        ))
+        sent = socket.sent[-1]
+        results = [item for item in sent["input"] if item.get("type") == "function_call_output"]
+        assert len(results) == 1 and results[0]["call_id"] == call_id
+        assert results[0]["output"] == [{
+            "type": "input_text", "text": f"saved result {step}",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }]
+        assert sent["input"][-1]["content"][0]["text"] == observation["content"]
+        assert p._guard_assembled_params_with_provider_count.call_args.args[0]["input"] == sent["input"]
+        assert owner.messages == before
+        if step:
+            assert sent["previous_response_id"] == "response-0"
+
+
+@pytest.mark.asyncio
 async def test_acceptance_is_not_application_and_successor_does_not_recreate():
     p, o = make()
     p.socket.feed(created("parent"))

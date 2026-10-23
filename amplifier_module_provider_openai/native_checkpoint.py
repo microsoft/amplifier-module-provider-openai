@@ -7,7 +7,7 @@ import math
 
 from amplifier_core.message_models import Message
 
-from . import OpenAIProvider, _read_raw_json_body
+from . import OpenAIProvider, _add_tool_output_cache_breakpoints, _read_raw_json_body
 
 FORMAT = "openai.responses.compact.v1"
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
@@ -258,6 +258,7 @@ class NativeCheckpointMixin:
         planner._native_call_types = dict(self._native_call_types)
         planner._assembly_log_records = []
         original = OpenAIProvider._convert_messages(planner, canonical[:count])
+        original = _add_tool_output_cache_breakpoints(original)
         if len(original) != wire_count or digest(original) != record["wireRevision"]:
             return None
         covered = [item for item in original if item.get("type") != "reasoning"]
