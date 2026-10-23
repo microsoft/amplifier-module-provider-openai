@@ -109,9 +109,11 @@ async def wait_created(provider):
 
 
 @pytest.mark.asyncio
-async def test_complete_marks_owned_tool_deltas_and_keeps_fresh_observation():
+@pytest.mark.parametrize("effective_model", ["gpt-6-astra", "gpt-6-sol"])
+async def test_complete_preserves_final_model_cache_policy_and_fresh_observation(effective_model):
     p, owner = make()
     p.owner = None  # Public complete acquires the owner itself.
+    p.extra_request_params["model"] = effective_model
     p._guard_assembled_params_with_provider_count = AsyncMock(return_value=None)
     owner.messages = [{"role": "user", "content": "Read the synthetic result"}]
     socket = p.socket
@@ -131,12 +133,16 @@ async def test_complete_marks_owned_tool_deltas_and_keeps_fresh_observation():
             messages=[Message(**m) for m in owner.messages], max_output_tokens=32,
         ))
         sent = socket.sent[-1]
+        assert sent["model"] == effective_model
         results = [item for item in sent["input"] if item.get("type") == "function_call_output"]
         assert len(results) == 1 and results[0]["call_id"] == call_id
-        assert results[0]["output"] == [{
-            "type": "input_text", "text": f"saved result {step}",
-            "prompt_cache_breakpoint": {"mode": "explicit"},
-        }]
+        if effective_model == "gpt-6-astra":
+            assert results[0]["output"] == [{
+                "type": "input_text", "text": f"saved result {step}",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            }]
+        else:
+            assert results[0]["output"] == f"saved result {step}"
         assert sent["input"][-1]["content"][0]["text"] == observation["content"]
         assert p._guard_assembled_params_with_provider_count.call_args.args[0]["input"] == sent["input"]
         assert owner.messages == before
