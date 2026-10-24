@@ -2,6 +2,49 @@
 
 GPT model integration for Amplifier via OpenAI's Responses API.
 
+## Optional Decisions capability (development candidate)
+
+The provider can register a named `decision.backends` capability using the same
+configured client, authentication, base URL, organization and project as chat.
+It follows the provider-owned image capability pattern. Explicit setup is required:
+
+```yaml
+providers:
+  - module: provider-openai
+    config:
+      default_model: gpt-6-luna
+      decisions:
+        enabled: true
+        id: openai-ui
+        model: gpt-6-luna
+```
+
+The decision model is independent of the chat model and does not inherit chat
+reasoning options. Capability registration does not select it for a consumer;
+UI-use or routing must explicitly bind to `openai-ui`. No second API key is needed
+when the configured account/endpoint supports the Decisions API. Custom gateways
+and Azure endpoints are not assumed to expose OpenAI's Decisions route.
+
+`get_decision_info()` describes implementation support without account discovery
+or inference. The backend uses `client.decisions.create`, applies bounded requests,
+propagates cancellation, avoids automatic retries, and returns typed per-question
+outcomes, usage and request identity. Decision usage events are separate from chat;
+this spike does not fabricate a decision dollar price or add it to chat pricing.
+
+The shared `amplifier_decisions` contract is packaged as `amplifier-lib-decisions`.
+Install this provider with its `decisions` extra when using that capability. The
+extra resolves the lightweight contract library from its canonical Microsoft Git
+repository; it installs no model weights or inference server. Ordinary provider
+startup does not import or require it. No generic decision
+bundle should own this provider's credentials or wire implementation.
+
+An account can expose independent named models with
+`decisions: {enabled: true, backends: {browser: {enabled: true, model: gpt-6-luna},
+computer: {enabled: true, model: gpt-6-luna}}}`. Backend IDs must be unique in a
+session. Disabling a consumer selection does not disable the account or chat.
+
+Wire reference: [OpenAI Decisions](https://developers.openai.com/api/docs/guides/decisions).
+
 The [draft image-operation contract](contracts/image-generation.v1.md) describes
 an optional provider-owned image boundary. Its promises remain proposed,
 not certification of live API acceptance or every consuming host.
@@ -62,7 +105,7 @@ Capability advertisement, catalogue visibility and preparation do not prove acce
 
 Offline provider contracts run without real credentials: their scoped fixtures
 mount with a nonfunctional key and replace model listing and inference transport. Run
-`uv run pytest -q -m "not live"` for all offline checks; separately marked
+`uv run --all-extras pytest -q -m "not live"` for all offline checks; separately marked
 inference tests require explicitly supplied live credentials.
 
 - **Python 3.11+**

@@ -565,7 +565,7 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
         | _DEPRECATED_ALIAS_CONFIG_KEYS
         | _INFRASTRUCTURE_CONFIG_KEYS
     )
-    # 32 keys: the 28 the config-surface-V2 survey counted (32 - 5 removed
+    # 34 keys: the 28 the config-surface-V2 survey counted (32 - 5 removed
     # [enable_state, enable_reasoning_context, enable_response_chaining,
     # thinking_budget_tokens, thinking_budget_buffer] + 1 added
     # [extra_request_params]), + 1 added by the reasoning.context gate fix
@@ -574,11 +574,13 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
     # shutdown), + 1 added by deferred tool loading (tool_search -- ONE
     # key holding the whole {mode, namespaces, always_loaded} mapping, so
     # the surface grows by one entry, not three), + 1 optional Images API
-    # backend configuration object (image_generation). Audited against every
+    # backend configuration object (image_generation), and 1 optional decision
+    # backend configuration object (decisions). Audited against every
     # `self.config.get(...)` call site in the constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 33
+    assert len(_CONSUMED_CONFIG_KEYS) == 34
     assert "auto_continue" in _CONSUMED_CONFIG_KEYS
     assert "image_generation" in _CONSUMED_CONFIG_KEYS
+    assert "decisions" in _CONSUMED_CONFIG_KEYS
 
 
 def test_image_backend_configuration_is_consumed_without_changing_chat_wire(caplog):
