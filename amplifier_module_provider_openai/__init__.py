@@ -1133,6 +1133,8 @@ def _supports_tool_output_cache_breakpoints(model: str) -> bool:
     """Whether *model* supports automatic function-output cache breakpoints."""
     if not isinstance(model, str):
         return False
+    if model == "gpt-6-astra":
+        return True
     return any(
         model == tier or model.startswith(f"{tier}-")
         for tier in ("gpt-5.6-luna", "gpt-5.6-terra")
