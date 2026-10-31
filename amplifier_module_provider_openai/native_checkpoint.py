@@ -11,7 +11,6 @@ from . import (
     OpenAIProvider,
     _add_tool_output_cache_breakpoints,
     _read_raw_json_body,
-    _supports_tool_output_cache_breakpoints,
 )
 
 FORMAT = "openai.responses.compact.v1"
@@ -263,7 +262,7 @@ class NativeCheckpointMixin:
         planner._native_call_types = dict(self._native_call_types)
         planner._assembly_log_records = []
         original = OpenAIProvider._convert_messages(planner, canonical[:count])
-        if _supports_tool_output_cache_breakpoints(params.get("model")):
+        if self._tool_output_cache_breakpoints_supported(params.get("model")):
             original = _add_tool_output_cache_breakpoints(original)
         if len(original) != wire_count or digest(original) != record["wireRevision"]:
             return None

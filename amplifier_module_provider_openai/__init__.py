@@ -1133,11 +1133,13 @@ def _supports_tool_output_cache_breakpoints(model: str) -> bool:
     """Whether *model* supports automatic function-output cache breakpoints."""
     if not isinstance(model, str):
         return False
-    if model == "gpt-6-astra":
+    # OpenAI documents explicit function-result boundaries for GPT-5.6+.
+    # Use the curated GPT-6 family, not a second tier-specific allowlist.
+    if model in GPT_6_MODELS or model == "gpt-5.6":
         return True
     return any(
         model == tier or model.startswith(f"{tier}-")
-        for tier in ("gpt-5.6-luna", "gpt-5.6-terra")
+        for tier in ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra")
     )
 
 
@@ -1863,7 +1865,10 @@ class OpenAIProvider:
         # their own proven counter rather than inheriting this API claim.
         if type(self) is not OpenAIProvider:
             return False
+        return self._has_standard_openai_endpoint()
 
+    def _has_standard_openai_endpoint(self) -> bool:
+        """Check the actual route, including the native transport's client."""
         if self._client is not None:
             # An injected client is the actual dispatch path. Its endpoint is
             # therefore authoritative, even when config or the environment
@@ -1883,6 +1888,10 @@ class OpenAIProvider:
             and parsed.port in (None, 443)
             and parsed.path.rstrip("/") == "/v1"
         )
+
+    def _tool_output_cache_breakpoints_supported(self, model: str) -> bool:
+        """Endpoint owners opt in to their proven wire/deployment capability."""
+        return self._has_standard_openai_endpoint() and _supports_tool_output_cache_breakpoints(model)
 
     def _provider_count_available(self) -> bool:
         """Return whether this instance can honestly advertise native counting."""
@@ -2258,7 +2267,7 @@ class OpenAIProvider:
                 params["max_output_tokens"] = request.max_output_tokens
             params = self._prepare_computer_images(params, request, **kwargs)
             self._prepare_gpt_6_params(params)
-            if _supports_tool_output_cache_breakpoints(params.get("model")) and isinstance(
+            if self._tool_output_cache_breakpoints_supported(params.get("model")) and isinstance(
                 params.get("input"), list
             ):
                 params["input"] = _add_tool_output_cache_breakpoints(params["input"])
@@ -4274,7 +4283,7 @@ class OpenAIProvider:
                     continue_params, request, **kwargs
                 )
                 self._prepare_gpt_6_params(continue_params)
-                if _supports_tool_output_cache_breakpoints(
+                if self._tool_output_cache_breakpoints_supported(
                     continue_params.get("model")
                 ) and isinstance(continue_params.get("input"), list):
                     continue_params["input"] = _add_tool_output_cache_breakpoints(

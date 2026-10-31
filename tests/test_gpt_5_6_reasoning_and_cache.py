@@ -77,7 +77,10 @@ def _captured_params(provider: OpenAIProvider) -> Any:
 @pytest.mark.parametrize("model,marked", [
     ("gpt-5.6-luna", True), ("gpt-5.6-terra-preview", True),
     ("gpt-6-astra", True), ("gpt-6-astra-preview", False),
-    ("unrecognized-model", False), ("gpt-5.6-sol", False),
+    ("unrecognized-model", False), ("gpt-5.5", False),
+    ("gpt-5.6-sol", True), ("gpt-5.6-sol-2026-07-09", True),
+    ("gpt-5.6", True), ("gpt-6-sol", True), ("gpt-6-luna", True),
+    ("gpt-6.1-sol", True),
 ])
 def test_effective_model_and_caller_input_cache_contract(model, marked):
     """Final normalization applies to overrides but never mutates their objects."""
@@ -132,7 +135,26 @@ def test_cache_boundaries_copy_only_eligible_blocks_and_are_idempotent():
     assert _add_tool_output_cache_breakpoints(result) is result
 
 
-@pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-6-astra"])
+@pytest.mark.parametrize("endpoint,supported", [
+    ("https://api.openai.com/v1", True),
+    ("https://example.openai.azure.com/openai/v1/", False),
+    ("https://compatible.example/v1", False), (None, False),
+])
+def test_automatic_boundaries_follow_actual_endpoint_on_initial_and_continued_calls(endpoint, supported):
+    supplied = [{"type": "function_call_output", "call_id": "c", "output": "result"}]
+    provider = _make_provider(default_model="gpt-6.1-sol", extra_request_params={"input": supplied})
+    provider.client.base_url = endpoint
+    incomplete = SimpleNamespace(status="incomplete", id="incomplete", output=[], incomplete_details=None)
+    provider.client.responses.create = AsyncMock(side_effect=[incomplete, DummyResponse()])
+    asyncio.run(provider.complete(_simple_request()))
+    calls = provider.client.responses.create.call_args_list
+    assert len(calls) == 2
+    for call in calls:
+        assert isinstance(call.kwargs["input"][0]["output"], list) is supported
+    assert supplied[0]["output"] == "result"
+
+
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
 def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged(model):
     supplied = [{"type": "function_call_output", "call_id": str(i), "output": f"result-{i}"}
                 for i in range(7)]
@@ -151,14 +173,15 @@ def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged(model
             {"mode": "explicit"}
         ] * 7
         assert call.kwargs.get("prompt_cache_options") is None
-        if model == "gpt-6-astra":
+        if model.startswith("gpt-6"):
             assert "prompt_cache_retention" not in call.kwargs
         else:
             assert call.kwargs["prompt_cache_retention"] == provider.prompt_cache_retention
     assert all(isinstance(item["output"], str) for item in supplied)
 
 
-def test_astra_boundary_keeps_fresh_observation_and_native_output_in_counted_payload():
+@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
+def test_boundary_keeps_fresh_observation_and_native_output_in_counted_payload(model):
     """A changing request-only tail must not remove the reusable tool boundary."""
     supplied = [
         {"type": "function_call_output", "call_id": "tool", "output": "saved result"},
@@ -167,7 +190,7 @@ def test_astra_boundary_keeps_fresh_observation_and_native_output_in_counted_pay
         {"role": "user", "content": "Current authority: allowed; observed at 1"},
     ]
     provider = _make_provider(
-        default_model="gpt-6-astra", extra_request_params={"input": supplied},
+        default_model=model, extra_request_params={"input": supplied},
     )
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     captured = []
@@ -448,3 +471,11 @@ def test_explicit_mode_kwarg_override_bypasses_mount_validation(caplog):
         for r in caplog.records
         if r.levelno == logging.WARNING
     )
+
+
+def test_curated_gpt6_models_share_the_documented_cache_contract():
+    """Adding a supported tier must not silently omit its cache policy."""
+    from amplifier_module_provider_openai import _supports_tool_output_cache_breakpoints
+    from amplifier_module_provider_openai._capabilities import GPT_6_MODELS
+
+    assert all(_supports_tool_output_cache_breakpoints(model) for model in GPT_6_MODELS)
