@@ -109,7 +109,7 @@ async def wait_created(provider):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("effective_model", ["gpt-6-astra", "gpt-6-sol"])
+@pytest.mark.parametrize("effective_model", ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "unrecognized-model"])
 async def test_complete_preserves_final_model_cache_policy_and_fresh_observation(effective_model):
     p, owner = make()
     p.owner = None  # Public complete acquires the owner itself.
@@ -136,7 +136,7 @@ async def test_complete_preserves_final_model_cache_policy_and_fresh_observation
         assert sent["model"] == effective_model
         results = [item for item in sent["input"] if item.get("type") == "function_call_output"]
         assert len(results) == 1 and results[0]["call_id"] == call_id
-        if effective_model == "gpt-6-astra":
+        if effective_model != "unrecognized-model":
             assert results[0]["output"] == [{
                 "type": "input_text", "text": f"saved result {step}",
                 "prompt_cache_breakpoint": {"mode": "explicit"},

@@ -438,13 +438,14 @@ OpenAI's July 2025 guidance.
 
 ### `prompt_cache_options` — tool-result boundaries alongside implicit caching
 
-For exact `gpt-6-astra`, plus `gpt-5.6-luna`, `gpt-5.6-terra` and their
+For the curated GPT-6 models (`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
+`gpt-6.1-sol`), `gpt-5.6`, and the GPT-5.6 Sol/Luna/Terra tiers and their
 hyphenated variants, the provider adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
 result. A string output becomes an `input_text` block with identical text;
 structured outputs receive the marker on their last string-valued `input_text`
 block. Existing markers and non-text blocks are preserved. Instructions, roles,
 reasoning and native tool outputs are not rewritten.
-Native Astra transport uses the same boundaries in its compared and counted
+Native transport uses the same effective-model boundaries in its compared and counted
 request views; provider-returned opaque checkpoint items remain unchanged.
 
 These boundaries let a completed tool result remain a reusable prefix when
@@ -452,7 +453,10 @@ current observations appended after it change between requests. Fresh
 observations stay in the request; no authority or stop checks are removed.
 See OpenAI's [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
 for the supported function-output content blocks and implicit/explicit caching.
-Other GPT-6 names and unrecognized Astra aliases do not inherit this behavior.
+The GPT-6 model set is shared with the provider's capability owner so newly
+curated tiers cannot silently miss this cache policy. Unrecognized model names
+and older models retain their existing caching behavior; this does not infer
+support for arbitrary aliases or other API providers.
 
 Implicit caching, cache keys and TTL defaults are unchanged. Configured
 `mode: "explicit"` is still removed at mount with a warning, preserving `ttl`:
@@ -627,8 +631,8 @@ The legacy `prompt_cache_retention` field is removed from every GPT-6 and
 GPT-6.1 Sol wire payload, including continuation calls. The existing explicit-cache-mode safety
 guard remains: requests without eligible tool results may have no breakpoint,
 so session-wide explicit mode is dropped rather than disabling caching.
-Exact `gpt-6-astra` receives the tool-result boundaries described above;
-other GPT-6 models retain their existing implicit caching behavior.
+All curated GPT-6 models receive the tool-result boundaries described above,
+alongside their existing implicit caching behavior.
 
 ### Context and token estimates
 

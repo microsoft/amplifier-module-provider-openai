@@ -1133,11 +1133,13 @@ def _supports_tool_output_cache_breakpoints(model: str) -> bool:
     """Whether *model* supports automatic function-output cache breakpoints."""
     if not isinstance(model, str):
         return False
-    if model == "gpt-6-astra":
+    # OpenAI documents explicit function-result boundaries for GPT-5.6+.
+    # Use the curated GPT-6 family, not a second tier-specific allowlist.
+    if model in GPT_6_MODELS or model == "gpt-5.6":
         return True
     return any(
         model == tier or model.startswith(f"{tier}-")
-        for tier in ("gpt-5.6-luna", "gpt-5.6-terra")
+        for tier in ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra")
     )
 
 
