@@ -28,7 +28,6 @@ from . import (
     OpenAIProvider,
     _add_tool_output_cache_breakpoints,
     _RawResponseObject,
-    _supports_tool_output_cache_breakpoints,
 )
 from .native_checkpoint import NativeCheckpointMixin
 
@@ -872,7 +871,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 [],
                 function_lineage=function_computer,
             )["input"]
-            if _supports_tool_output_cache_breakpoints(full_params.get("model")):
+            if self._tool_output_cache_breakpoints_supported(full_params.get("model")):
                 ordinary = _add_tool_output_cache_breakpoints(ordinary)
             if ordinary != full_params.get("input"):
                 raise LLMError(
@@ -906,7 +905,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             }
             # Follow the final model, including caller overrides. Normalize the
             # owned delta before inserting an opaque checkpoint; keep it exact.
-            if _supports_tool_output_cache_breakpoints(params.get("model")):
+            if self._tool_output_cache_breakpoints_supported(params.get("model")):
                 params["input"] = _add_tool_output_cache_breakpoints(params["input"])
             params = self._apply_checkpoint(params, full_params)
             params = prepare_computer_images(

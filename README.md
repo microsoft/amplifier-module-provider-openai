@@ -448,6 +448,12 @@ reasoning and native tool outputs are not rewritten.
 Native transport uses the same effective-model boundaries in its compared and counted
 request views; provider-returned opaque checkpoint items remain unchanged.
 
+Automatic markers are limited to the standard OpenAI endpoint. Inherited
+adapters opt in through their own endpoint/deployment policy; a model name alone
+does not establish protocol support. Azure Standard and PTU have different
+breakpoint support. Unknown compatible routes keep their existing request shape
+and caller-supplied cache settings. The same policy applies to continuations.
+
 These boundaries let a completed tool result remain a reusable prefix when
 current observations appended after it change between requests. Fresh
 observations stay in the request; no authority or stop checks are removed.
