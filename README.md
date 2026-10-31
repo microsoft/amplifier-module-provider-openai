@@ -438,12 +438,21 @@ OpenAI's July 2025 guidance.
 
 ### `prompt_cache_options` — tool-result boundaries alongside implicit caching
 
-For `gpt-5.6-luna`, `gpt-5.6-terra` and their hyphenated variants, the provider
-adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
+For exact `gpt-6-astra`, plus `gpt-5.6-luna`, `gpt-5.6-terra` and their
+hyphenated variants, the provider adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
 result. A string output becomes an `input_text` block with identical text;
 structured outputs receive the marker on their last string-valued `input_text`
 block. Existing markers and non-text blocks are preserved. Instructions, roles,
 reasoning and native tool outputs are not rewritten.
+Native Astra transport uses the same boundaries in its compared and counted
+request views; provider-returned opaque checkpoint items remain unchanged.
+
+These boundaries let a completed tool result remain a reusable prefix when
+current observations appended after it change between requests. Fresh
+observations stay in the request; no authority or stop checks are removed.
+See OpenAI's [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+for the supported function-output content blocks and implicit/explicit caching.
+Other GPT-6 names and unrecognized Astra aliases do not inherit this behavior.
 
 Implicit caching, cache keys and TTL defaults are unchanged. Configured
 `mode: "explicit"` is still removed at mount with a warning, preserving `ttl`:
@@ -466,7 +475,7 @@ request-level `reasoning.effort="none"`; top-level `logprobs` remains invalid fo
 Responses. Unsupported reasoning-effort and cache-TTL values fail before the SDK
 call; legacy cache retention is removed.
 
-**Luna/Terra cache exception:** after the final merge, automatic tool-result
+**Tool-result cache exception:** after the final merge, automatic tool-result
 boundaries also apply to caller-supplied `input`, using the effective `model`.
 This can change a string output's wire representation to a block list while
 preserving its text. Caller-owned objects and existing markers are not mutated.
@@ -613,11 +622,13 @@ Active/default reasoning rejects
 `include: ["message.output_text.logprobs"]` after `extra_request_params` has
 performed its final merge. Top-level Responses `logprobs` is always rejected.
 
-Prompt caching uses `prompt_cache_options.ttl: "30m"` (the only documented TTL).
+The provider supports `prompt_cache_options.ttl: "30m"` for these models.
 The legacy `prompt_cache_retention` field is removed from every GPT-6 and
 GPT-6.1 Sol wire payload, including continuation calls. The existing explicit-cache-mode safety
-guard remains: this provider does not create cache breakpoints, so explicit
-mode is dropped rather than disabling caching.
+guard remains: requests without eligible tool results may have no breakpoint,
+so session-wide explicit mode is dropped rather than disabling caching.
+Exact `gpt-6-astra` receives the tool-result boundaries described above;
+other GPT-6 models retain their existing implicit caching behavior.
 
 ### Context and token estimates
 
