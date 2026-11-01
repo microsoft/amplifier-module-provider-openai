@@ -838,6 +838,10 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 params, native_input_tokens=native_input_tokens, timeout=timeout,
                 dispatch_snapshot=dispatch_snapshot,
             )
+        # The initial assembly is the full checkpoint-applied accounting view.
+        # Keep it before constructing the connection delta below; full_params
+        # instead retains pre-checkpoint originals for lineage validation.
+        accounting_params = copy.deepcopy(params)
         try:
             if getattr(self, "_native_request_attempted", False):
                 raise LLMError(
@@ -932,10 +936,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             self._native_request_attempted = True
             self._computer_function_lineage = function_computer
             if dispatch_snapshot is not None:
-                # Native accounting retains the complete prepared context, not
-                # just a WebSocket delta whose usage includes server-held input.
                 dispatch_snapshot.clear()
-                dispatch_snapshot.update(full_params)
+                dispatch_snapshot.update(accounting_params)
             return await self._native_response(params, timeout=timeout)
         except asyncio.CancelledError:
             await self._uncertain("cancelled")
