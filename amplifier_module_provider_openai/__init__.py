@@ -3425,6 +3425,8 @@ class OpenAIProvider:
         extra_timeout = params.pop("timeout", self.timeout)
         request_timeout = extra_timeout if timeout is openai.NOT_GIVEN else timeout
         effective_timeout = None if isinstance(request_timeout, openai.Timeout) else request_timeout
+        if effective_timeout is not None and effective_timeout <= 0:
+            raise TimeoutError("Request deadline expired before dispatch.")
         started = time.monotonic()
         # Counting and raw-response decoding remain inside the caller's finite
         # request allowance. Only bounded diagnostic-observer time is excluded.
@@ -3435,6 +3437,8 @@ class OpenAIProvider:
                 self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         remaining = (None if effective_timeout is None else
                      max(0, effective_timeout - (time.monotonic() - started)))
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("Request deadline expired before dispatch.")
         params = await self._before_counted_dispatch(params, native_input_tokens,
                                                     operation="responses.create")
         async with asyncio.timeout(remaining):

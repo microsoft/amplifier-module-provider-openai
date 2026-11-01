@@ -195,3 +195,24 @@ async def test_direct_create_deadline_still_bounds_count_and_raw_parse(slow_phas
         await provider._create_response({"model": "gpt-6-astra", "input": [],
                                          "tools": [{"type": "computer"}]}, timeout=.01)
     assert create.await_count == (1 if slow_phase == "raw-parse" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exhaustion", ["initial", "during-count"])
+async def test_expired_direct_create_deadline_never_enters_sdk(monkeypatch, exhaustion):
+    import amplifier_module_provider_openai as module
+    counter = AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+    create = AsyncMock(return_value=SimpleNamespace(**completed()))
+    sdk = SimpleNamespace(base_url="https://api.openai.com/v1",
+                          responses=SimpleNamespace(
+                              input_tokens=SimpleNamespace(count=counter), create=create))
+    provider = OpenAIProvider(client=sdk)
+    if exhaustion == "during-count":
+        # Change only provider accounting, not the event loop's clock.
+        clock = iter([10.0, 12.0])
+        monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    with pytest.raises(TimeoutError):
+        await provider._create_response({"model": "gpt-6-astra", "input": []},
+                                         timeout=0 if exhaustion == "initial" else 1)
+    assert counter.await_count == (0 if exhaustion == "initial" else 1)
+    create.assert_not_called()
