@@ -1143,10 +1143,16 @@ def _supports_tool_output_cache_breakpoints(model: str) -> bool:
     )
 
 
+class _CanonicalWindowItem(dict):
+    """Copy-stable provenance, never a wire field, for native compact output."""
+
+
 def _add_tool_output_cache_breakpoints(input_items: list[Any]) -> list[Any]:
     """Mark each eligible function result without mutating caller-owned input."""
     updated_items: list[Any] | None = None
     for index, item in enumerate(input_items):
+        if isinstance(item, _CanonicalWindowItem):
+            continue
         if not isinstance(item, dict) or item.get("type") != "function_call_output":
             continue
         output = item.get("output")
@@ -4654,6 +4660,9 @@ class OpenAIProvider:
                 # Standalone compact output is already canonical. Preserve the
                 # full list byte-for-byte in JSON values, including retained
                 # items before/after encrypted state; do not repair inside it.
+                # This provenance survives later request copies and prevents
+                # cache normalization from rewriting returned tool results.
+                window = [_CanonicalWindowItem(item) for item in window]
                 openai_messages.extend(window)
                 canonical_item_ids.update(id(item) for item in window)
                 i += 1
