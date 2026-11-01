@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import httpx
 import openai
 import pytest
-from amplifier_core.llm_errors import LLMError, LLMTimeoutError
+from amplifier_core.llm_errors import ContextLengthError, LLMError, LLMTimeoutError
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -172,3 +172,89 @@ def test_explicit_request_deadline_overrides_configuration():
     assert provider._request_timeout(request(timeout=3)) == 3
     assert provider._request_timeout(request(timeout=None)) is None
     assert provider._request_timeout(request(timeout=None), background=True) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_phase", ["count", "raw-parse"])
+async def test_direct_create_deadline_still_bounds_count_and_raw_parse(slow_phase):
+    async def slow(**kwargs):
+        await asyncio.sleep(10)
+        return SimpleNamespace(input_tokens=1)
+    async def parse():
+        await asyncio.sleep(10)
+        return SimpleNamespace(**completed())
+    counter = AsyncMock(side_effect=slow) if slow_phase == "count" else AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+    create = AsyncMock(return_value=SimpleNamespace(parse=parse))
+    sdk = SimpleNamespace(base_url="https://api.openai.com/v1",
+                          responses=SimpleNamespace(
+                              input_tokens=SimpleNamespace(count=counter),
+                              with_raw_response=SimpleNamespace(create=create),
+                              create=AsyncMock()))
+    provider = OpenAIProvider(client=sdk)
+    with pytest.raises(TimeoutError):
+        await provider._create_response({"model": "gpt-6-astra", "input": [],
+                                         "tools": [{"type": "computer"}]}, timeout=.01)
+    assert create.await_count == (1 if slow_phase == "raw-parse" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exhaustion", ["initial", "during-count"])
+async def test_expired_direct_create_deadline_never_enters_sdk(monkeypatch, exhaustion):
+    import amplifier_module_provider_openai as module
+    counter = AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+    create = AsyncMock(return_value=SimpleNamespace(**completed()))
+    sdk = SimpleNamespace(base_url="https://api.openai.com/v1",
+                          responses=SimpleNamespace(
+                              input_tokens=SimpleNamespace(count=counter), create=create))
+    provider = OpenAIProvider(client=sdk)
+    if exhaustion == "during-count":
+        # Change only provider accounting, not the event loop's clock.
+        clock = iter([10.0, 12.0])
+        monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    with pytest.raises(TimeoutError):
+        await provider._create_response({"model": "gpt-6-astra", "input": []},
+                                         timeout=0 if exhaustion == "initial" else 1)
+    assert counter.await_count == (0 if exhaustion == "initial" else 1)
+    create.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["direct", "continuation", "external-cancel"])
+async def test_rejected_count_keeps_primary_error_with_slow_observer(path):
+    entered = asyncio.Event()
+    async def observe(event, data):
+        if event == "provider:request_attribution" and data["stage"] == "rejected":
+            entered.set()
+            await asyncio.sleep(10)  # Observer's own bounded wait, not model work.
+    counter = AsyncMock(side_effect=[
+        SimpleNamespace(input_tokens=value)
+        for value in ([100, 10_000_000] if path != "direct" else [10_000_000])
+    ])
+    partial = SimpleNamespace(**{
+        **completed(), "status": "incomplete",
+        "incomplete_details": SimpleNamespace(reason="max_output_tokens"),
+    })
+    create = AsyncMock(return_value=partial)
+    provider = OpenAIProvider(
+        client=SimpleNamespace(base_url="https://api.openai.com/v1",
+            responses=SimpleNamespace(create=create, input_tokens=SimpleNamespace(count=counter))),
+        config={"use_streaming": False, "max_retries": 2},
+    )
+    provider.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=observe))
+    if path == "direct":
+        work = provider._create_response(
+            {"model": "gpt-6-astra", "input": []}, timeout=.01)
+    else:
+        work = provider.complete(request(timeout=.01))
+    if path == "external-cancel":
+        task = asyncio.create_task(work)
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(ContextLengthError):
+            await work
+    assert entered.is_set()
+    assert counter.await_count == (1 if path == "direct" else 2)
+    assert create.await_count == (0 if path == "direct" else 1)

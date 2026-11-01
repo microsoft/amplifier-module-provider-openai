@@ -196,6 +196,14 @@ async def test_real_complete_guards_and_sends_same_opaque_payload_after_compacti
     )
     p.owner_getter = lambda: owner
     p._guard_assembled_params_with_provider_count = AsyncMock(return_value=None)
+    calibration_inputs = []
+    record_calibration = p._record_budget_calibration
+
+    def capture_calibration(params, response):
+        calibration_inputs.append(copy.deepcopy(params["input"]))
+        record_calibration(params, response)
+
+    p._record_budget_calibration = capture_calibration
     p.socket = SimpleNamespace(
         send=AsyncMock(),
         close=AsyncMock(),
@@ -224,6 +232,9 @@ async def test_real_complete_guards_and_sends_same_opaque_payload_after_compacti
         call.args[0]["input"] == expected_input
         for call in p._guard_assembled_params_with_provider_count.call_args_list
     )
+    # Usage belongs to the full checkpoint-applied view, not pre-checkpoint
+    # originals (nor a later connection delta with server-retained context).
+    assert calibration_inputs == [expected_input]
 
 
 @pytest.mark.asyncio

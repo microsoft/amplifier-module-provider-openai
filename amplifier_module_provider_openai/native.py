@@ -830,12 +830,18 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         return True
 
     async def _create_response(
-        self, params, *, native_input_tokens=None, timeout=NOT_GIVEN
+        self, params, *, native_input_tokens=None, timeout=NOT_GIVEN,
+        dispatch_snapshot=None,
     ):
         if NATIVE_REQUEST.get() is not self:
             return await super()._create_response(
-                params, native_input_tokens=native_input_tokens, timeout=timeout
+                params, native_input_tokens=native_input_tokens, timeout=timeout,
+                dispatch_snapshot=dispatch_snapshot,
             )
+        # The initial assembly is the full checkpoint-applied accounting view.
+        # Keep it before constructing the connection delta below; full_params
+        # instead retains pre-checkpoint originals for lineage validation.
+        accounting_params = copy.deepcopy(params)
         try:
             if getattr(self, "_native_request_attempted", False):
                 raise LLMError(
@@ -929,6 +935,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 )
             self._native_request_attempted = True
             self._computer_function_lineage = function_computer
+            if dispatch_snapshot is not None:
+                dispatch_snapshot.clear()
+                dispatch_snapshot.update(accounting_params)
             return await self._native_response(params, timeout=timeout)
         except asyncio.CancelledError:
             await self._uncertain("cancelled")

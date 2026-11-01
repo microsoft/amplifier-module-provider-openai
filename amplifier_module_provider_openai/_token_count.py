@@ -1,8 +1,15 @@
 """Bounded retries for counting only; never retry model generation here."""
 
 import asyncio
+import hashlib
+import hmac
+import json
 import math
 import re
+import secrets
+import uuid
+from functools import lru_cache
+from pathlib import Path
 
 import openai
 from amplifier_core.llm_errors import LLMError
@@ -10,6 +17,107 @@ from amplifier_core.llm_errors import LLMError
 MAX_ATTEMPTS = 3
 ATTEMPT_TIMEOUT = 30
 MAX_RETRY_DELAY = 10
+
+
+class CountedInput(int):
+    """Request-local count receipt; remains numeric for existing guard callers."""
+
+    def __new__(cls, value, attribution=None):
+        result = super().__new__(cls, value)
+        result.attribution = attribution
+        return result
+
+
+@lru_cache(maxsize=1)
+def source_provenance(provider_file):
+    """Observe source files once per worker, not a claim about imported bytes."""
+    result = {"imported_bytes_verified": False}
+    for label, path in (("provider_source_sha256", provider_file),
+                        ("count_source_sha256", __file__)):
+        try:
+            result[label] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError:
+            result[label] = None
+    return result
+
+
+class RequestAttribution:
+    """Content-free JSON identity within one provider instance, not across runs.
+
+    A raw/publicly salted digest permits guessing low-entropy prompts. This key
+    stays in memory and is never exported. Tags compare canonical JSON values,
+    not HTTP byte order, vendor tokenization, or semantic equivalence.
+    """
+
+    TYPES = frozenset({
+        "message", "function_call", "function_call_output", "compaction",
+        "reasoning", "computer_call", "computer_call_output",
+        "apply_patch_call", "apply_patch_call_output", "item_reference",
+    })
+
+    def __init__(self):
+        self._key = secrets.token_bytes(32)
+        self.scope_id = uuid.uuid4().hex
+
+    @staticmethod
+    def _encoded(value):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False,
+                          separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+    def tag(self, params):
+        if not isinstance(params, dict):
+            return None
+        try:
+            return hmac.new(self._key, b"responses-input-v1\0" + self._encoded(params),
+                            hashlib.sha256).hexdigest()
+        except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+            return None
+
+    def describe(self, params, fields=None):
+        """Bounded metadata only. Unsupported JSON yields unknown attribution."""
+        if not isinstance(params, dict):
+            return None
+        try:
+            # Serialize each component once and compose canonical JSON, so the
+            # full envelope and compact subset reuse the large input encoding.
+            fields = fields if fields is not None else {k: self._encoded(v) for k, v in params.items()}
+            encoded = b"{" + b",".join(self._encoded(k) + b":" + fields[k] for k in sorted(params)) + b"}"
+            items = params.get("input", [])
+            tools = params.get("tools", [])
+            types = {}
+            for item in items if isinstance(items, list) else []:
+                kind = item.get("type", "message") if isinstance(item, dict) else "other"
+                kind = kind if isinstance(kind, str) and kind in self.TYPES else "other"
+                types[kind] = types.get(kind, 0) + 1
+            return {
+                "payload_tag": hmac.new(self._key, b"responses-input-v1\0" + encoded,
+                                        hashlib.sha256).hexdigest(),
+                "serialized_bytes": len(encoded),
+                "input_items": len(items) if isinstance(items, list) else 1,
+                "input_types": types,
+                "input_bytes": len(fields["input"]) if "input" in params else 2,
+                "instructions_bytes": len(fields["instructions"]) if "instructions" in params else 4,
+                "tools": len(tools) if isinstance(tools, list) else 0,
+                "tools_bytes": len(fields["tools"]) if "tools" in params else 2,
+            }
+        except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+            return None
+
+    def receipt(self, params):
+        try:
+            fields = {k: self._encoded(v) for k, v in params.items()}
+        except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+            return None
+        request = self.describe(params, fields)
+        if request is None:
+            return None
+        return {
+            "version": 1, "scope_id": self.scope_id, "count_id": uuid.uuid4().hex,
+            "request": request,
+            # Compact dispatch omits tools/options that the full preflight counts.
+            "compact_input": self.describe({k: params[k] for k in
+                                           ("model", "input", "instructions") if k in params}, fields),
+        }
 
 
 class TokenCountError(LLMError):

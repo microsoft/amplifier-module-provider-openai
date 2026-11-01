@@ -208,7 +208,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_contributor(
         "observability.events",
         "provider-openai",
-        lambda: ["provider:token_count_failed"],
+        lambda: ["provider:token_count_failed", "provider:request_attribution"],
     )
     logger.info("Mounted OpenAIProvider (Responses API)")
 
@@ -1318,6 +1318,11 @@ class OpenAIProvider:
         self._client: AsyncOpenAI | None = client  # Lazy init if None
         self.config = config or {}
         self.coordinator = coordinator
+        from ._token_count import RequestAttribution, source_provenance
+        self._request_attribution = RequestAttribution()
+        self._count_provenance = {
+            **source_provenance(__file__), "sdk_version": openai.__version__,
+        }
 
         # Configuration with sensible defaults (from _constants.py - single source of truth)
         self.base_url = self.config.get(
@@ -1949,10 +1954,12 @@ class OpenAIProvider:
             if temporary_client:
                 await count_client.close()
             return None
-        from ._token_count import TokenCountError, count_tokens
+        from ._token_count import CountedInput, TokenCountError, count_tokens
 
+        attribution = self._request_attribution.receipt(count_params)
         try:
-            return await count_tokens(count_client, count_params)
+            tokens = await count_tokens(count_client, count_params)
+            return CountedInput(tokens, attribution)
         except TokenCountError as error:
             try:
                 hooks = getattr(self.coordinator, "hooks", None)
@@ -1964,6 +1971,7 @@ class OpenAIProvider:
                             "operation": "responses.input_tokens.count",
                             "count_failure": dict(error.count_failure),
                             "outer_retryable": error.retryable,
+                            "attribution": copy.deepcopy(attribution),
                         },
                     )
             except Exception:
@@ -2395,7 +2403,9 @@ class OpenAIProvider:
                     measurement={
                         "kind": "provider_count",
                         "source": "official.operation",
-                        "input_tokens": count,
+                        "input_tokens": int(count),
+                        "attribution": copy.deepcopy(getattr(count, "attribution", None)),
+                        "implementation": copy.deepcopy(self._count_provenance),
                     },
                 )
 
@@ -2485,12 +2495,89 @@ class OpenAIProvider:
             self._budget_uncalibrated_warned_models.add(model)
 
     async def _guard_assembled_params_with_provider_count(
-        self, params: dict[str, Any]
+        self, params: dict[str, Any], *, timeout=None
     ) -> int | None:
         """Apply the final-dispatch guard using a fresh native count when possible."""
-        native_input_tokens = await self._native_input_token_count(params)
-        self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
+        # Only counting belongs to this deadline. Once a rejection is known,
+        # an observer must not replace it with the counting timer's TimeoutError.
+        # Genuine external cancellation still propagates through the observer.
+        async with asyncio.timeout(timeout):
+            native_input_tokens = await self._native_input_token_count(params)
+        try:
+            self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
+        except kernel_errors.ContextLengthError:
+            await self._emit_request_attribution(params, native_input_tokens,
+                                                 operation="context_preparation", stage="rejected")
+            raise
         return native_input_tokens
+
+    def _count_binding(self, params, count, *, compact=False, describe=False):
+        """Compare values at this SDK boundary, not inferred from equal counts."""
+        attribution = getattr(count, "attribution", None)
+        projection = params if compact else self._native_count_params(params)
+        dispatch = (self._request_attribution.describe(projection) if describe
+                    else self._request_attribution.tag(projection))
+        if attribution is None:
+            return "unavailable", dispatch
+        if dispatch is None:
+            return "mismatch", None
+        original = attribution["compact_input" if compact else "request"]
+        matched = (attribution["scope_id"] == self._request_attribution.scope_id
+                   and original is not None
+                   and original["payload_tag"] == (dispatch["payload_tag"] if describe else dispatch))
+        return ("subset_matched" if compact else "matched") if matched else "mismatch", dispatch
+
+    async def _emit_request_attribution(self, params, count, *, operation, stage, compact=False):
+        """Best-effort metadata: ready is not proof of transmission or completion."""
+        hooks = getattr(self.coordinator, "hooks", None)
+        if hooks is not None:
+            binding, dispatch = self._count_binding(params, count, compact=compact, describe=True)
+            try:
+                async with asyncio.timeout(0.1):
+                    await hooks.emit("provider:request_attribution", {
+                    "provider": self.name, "operation": operation, "stage": stage,
+                    "dispatch_id": uuid.uuid4().hex,
+                    "input_tokens": int(count) if count is not None else None,
+                    "attribution": copy.deepcopy(getattr(count, "attribution", None)),
+                    "dispatch": dispatch, "binding": binding,
+                    "measurement_scope": "count_projection",
+                    "dispatch_scope": "compact_subset" if compact else "count_projection",
+                    "implementation": copy.deepcopy(self._count_provenance),
+                    })
+            except Exception:
+                # Observer text may contain content. Do not expose it or retry
+                # any model/count operation because diagnostics failed.
+                logger.warning("Could not emit request attribution event.")
+
+    async def _before_counted_dispatch(self, params, count, *, operation, compact=False):
+        if count is None and getattr(self.coordinator, "hooks", None) is None:
+            return params
+        await self._emit_request_attribution(params, count, operation=operation,
+                                             stage="dispatch_ready", compact=compact)
+        # Freeze the SDK-owned nested values before any further scheduling
+        # point. Observers may retain references to the assembled input.
+        params = copy.deepcopy(params)
+        # Recheck AFTER awaited observers. A changed request cannot reuse a
+        # count obtained for different values, even if both counts would match.
+        binding, _ = self._count_binding(params, count, compact=compact)
+        if binding == "mismatch":
+            await self._emit_request_attribution(params, count, operation=operation,
+                                                 stage="rejected", compact=compact)
+            raise kernel_errors.LLMError(
+                "Request changed after token counting; no model request was sent.",
+                provider=self.name, retryable=False,
+            )
+        if not compact:
+            # Output reserve is intentionally outside the input-count projection.
+            # Revalidate it after observers rather than implying tag equality
+            # establishes the complete generation allowance.
+            try:
+                self._guard_assembled_params(params, native_input_tokens=count)
+            except kernel_errors.ContextLengthError:
+                await self._emit_request_attribution(params, count, operation=operation,
+                                                     stage="rejected")
+                raise
+        return params
 
     def _record_budget_calibration(self, params: dict[str, Any], response: Any) -> None:
         """Learn only valid raw Responses gross input usage for the dispatched params."""
@@ -3122,6 +3209,8 @@ class OpenAIProvider:
         params = self._budget_params(request)
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
+        compact_params = await self._before_counted_dispatch(
+            compact_params, input_tokens, operation="responses.compact", compact=True)
         response = await self.client.responses.compact(
             **compact_params, timeout=self._transport_timeout(self._request_timeout(request))
         )
@@ -3135,7 +3224,9 @@ class OpenAIProvider:
         if hasattr(usage, "model_dump"):
             usage = usage.model_dump()
         return {"kind": "native", "message": compacted_message(params["model"], output),
-                "usage": canonical_usage(usage), "input_tokens": input_tokens}
+                "usage": canonical_usage(usage),
+                "input_tokens": int(input_tokens) if input_tokens is not None else None,
+                "measurement": copy.deepcopy(getattr(input_tokens, "attribution", None))}
 
     async def complete(
         self,
@@ -3297,7 +3388,7 @@ class OpenAIProvider:
 
     async def _create_response(
         self, params: dict[str, Any], *, native_input_tokens: int | None = None,
-        timeout=openai.NOT_GIVEN,
+        timeout=openai.NOT_GIVEN, dispatch_snapshot: dict[str, Any] | None = None,
     ) -> Any:
         """Call `client.responses.create(**params)`.
 
@@ -3337,17 +3428,35 @@ class OpenAIProvider:
         params = dict(params)
         extra_timeout = params.pop("timeout", self.timeout)
         request_timeout = extra_timeout if timeout is openai.NOT_GIVEN else timeout
+        effective_timeout = None if isinstance(request_timeout, openai.Timeout) else request_timeout
+        if effective_timeout is not None and effective_timeout <= 0:
+            raise TimeoutError("Request deadline expired before dispatch.")
+        started = time.monotonic()
+        # Counting and raw-response decoding share the caller's finite request
+        # allowance. The intervening _before_counted_dispatch interval is
+        # excluded, including its bounded observer wait, copy and validation.
         if native_input_tokens is None:
-            native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
+            native_input_tokens = await self._guard_assembled_params_with_provider_count(
+                params, timeout=effective_timeout)
         else:
             self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
-        transport_timeout = self._transport_timeout(request_timeout)
+        remaining = (None if effective_timeout is None else
+                     max(0, effective_timeout - (time.monotonic() - started)))
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("Request deadline expired before dispatch.")
+        params = await self._before_counted_dispatch(params, native_input_tokens,
+                                                    operation="responses.create")
+        if dispatch_snapshot is not None:
+            dispatch_snapshot.clear()
+            dispatch_snapshot.update(params)
+        async with asyncio.timeout(remaining):
+            return await self._send_create_response(params, self._transport_timeout(request_timeout))
+
+    async def _send_create_response(self, params, transport_timeout):
         if not _params_declare_computer_tool(params):
             return await self.client.responses.create(**params, timeout=transport_timeout)
-
         raw_response = await self.client.responses.with_raw_response.create(
-            **params, timeout=transport_timeout
-        )
+            **params, timeout=transport_timeout)
         try:
             return await _maybe_await(raw_response.parse())
         except ValidationError as e:
@@ -3458,6 +3567,9 @@ class OpenAIProvider:
         failed_stream_responses: list[Any] = []
         failed_stream_response_ids: set[int] = set()
         generation_attempt = 0
+        # Request-local output from the final boundary, never provider-global
+        # "last params". Calibration and continuation must use the sent snapshot.
+        dispatched_params: dict[str, Any] = {}
 
         def _record_failed_stream_response(response: Any) -> None:
             if response is not None and id(response) not in failed_stream_response_ids:
@@ -3514,6 +3626,10 @@ class OpenAIProvider:
 
             try:
                 if _use_streaming:
+                    dispatch_params = await self._before_counted_dispatch(
+                        params, attempt_native_input_tokens, operation="responses.stream")
+                    dispatched_params.clear()
+                    dispatched_params.update(dispatch_params)
                     # Streaming path — chunked HTTP transport prevents timeouts on
                     # large context requests. The event loop emits contract events
                     # (llm:stream_*); get_final_response() collects the complete
@@ -3539,7 +3655,7 @@ class OpenAIProvider:
                     try:
                         async with asyncio.timeout(effective_timeout):
                             async with self.client.responses.stream(
-                                **params, timeout=self._transport_timeout(request_timeout)
+                                **dispatch_params, timeout=self._transport_timeout(request_timeout)
                             ) as stream:
                                 if emit_stream_events:
                                     async for event in stream:
@@ -3710,12 +3826,9 @@ class OpenAIProvider:
                         raise
                 else:
                     # Non-streaming path — preserved for tests and backward compat.
-                    return await asyncio.wait_for(
-                        self._create_response(
-                            params, native_input_tokens=attempt_native_input_tokens,
-                            timeout=request_timeout,
-                        ),
-                        timeout=effective_timeout,
+                    return await self._create_response(
+                        params, native_input_tokens=attempt_native_input_tokens,
+                        timeout=request_timeout, dispatch_snapshot=dispatched_params,
                     )
             except openai.RateLimitError as e:
                 retry_after = None
@@ -3971,6 +4084,7 @@ class OpenAIProvider:
                 self._retry_config,
                 on_retry=_on_retry,
             )
+            params = dispatched_params
             self._record_budget_calibration(params, response)
 
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -4146,10 +4260,10 @@ class OpenAIProvider:
                             )
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
-                        final_response = await asyncio.wait_for(
-                            self._create_response(params, timeout=request_timeout),
-                            timeout=effective_timeout,
-                        )
+                        retry_snapshot: dict[str, Any] = {}
+                        final_response = await self._create_response(
+                            params, timeout=request_timeout, dispatch_snapshot=retry_snapshot)
+                        params = retry_snapshot
                         self._record_budget_calibration(params, final_response)
                         billed_responses.append(final_response)
                         elapsed_ms += int((time.time() - retry_start) * 1000)
@@ -4299,11 +4413,10 @@ class OpenAIProvider:
                 # Make continuation call
                 try:
                     continue_start = time.time()
-                    final_response = await asyncio.wait_for(
-                        self._create_response(continue_params, timeout=request_timeout),
-                        timeout=effective_timeout,
-                    )
-                    self._record_budget_calibration(continue_params, final_response)
+                    continue_snapshot: dict[str, Any] = {}
+                    final_response = await self._create_response(
+                        continue_params, timeout=request_timeout, dispatch_snapshot=continue_snapshot)
+                    self._record_budget_calibration(continue_snapshot, final_response)
                     billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
                     elapsed_ms += continue_elapsed

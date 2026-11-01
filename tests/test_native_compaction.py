@@ -86,6 +86,11 @@ async def test_native_window_results_survive_count_dispatch_and_second_compactio
     provider, responses, window = fixture(
         default_model=model, use_streaming=False, max_retries=0,
     )
+    events = []
+    async def observe(name, data):
+        if name == "provider:request_attribution":
+            events.append(copy.deepcopy(data))
+    provider.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=observe))
     window.insert(2, {"type": "function_call_output", "call_id": "c1", "output": output})
     responses.compact.return_value.output = copy.deepcopy(window)
 
@@ -101,6 +106,9 @@ async def test_native_window_results_survive_count_dispatch_and_second_compactio
     first = await provider.compact_context(
         ChatRequest(messages=[Message(role="user", content="Original task")])
     )
+    assert events[-1]["binding"] == "subset_matched"
+    assert events[-1]["operation"] == "responses.compact"
+    assert events[-1]["dispatch"] == first["measurement"]["compact_input"]
     original_carrier = copy.deepcopy(first["message"])
     tools = [ToolSpec(name="read", description="Read evidence", parameters={"type": "object", "properties": {}})]
     request = ChatRequest(
@@ -131,6 +139,10 @@ async def test_native_window_results_survive_count_dispatch_and_second_compactio
     sent = responses.create.call_args.kwargs
     for key in ("model", "input", "instructions", "tools"):
         assert sent[key] == counted[key]
+    first_attribution = decision["measurement"]["attribution"]
+    assert events[-1]["binding"] == "matched"
+    assert events[-1]["dispatch"] == first_attribution["request"]
+    assert events[-1]["attribution"]["count_id"] != first_attribution["count_id"]
     assert responses.create.await_count == 1
     assert request.model_dump() == original_request
     assert first["message"] == original_carrier
@@ -146,12 +158,20 @@ async def test_native_window_results_survive_count_dispatch_and_second_compactio
     second_request = ChatRequest(messages=[
         Message(**second["message"]), Message(role="user", content="Continue twice"),
     ])
-    await provider.request_budget(second_request, context_estimate=0)
+    second_decision = await provider.request_budget(second_request, context_estimate=0)
     second_counted = responses.input_tokens.count.call_args.kwargs
     assert second_counted["input"][:len(second_window)] == second_window
     assert second["message"]["metadata"]["openai:compaction"]["output"] == second_window
     assert responses.compact.await_count == 2
     assert responses.create.await_count == 1
+    second_attribution = second_decision["measurement"]["attribution"]
+    assert second_attribution["scope_id"] == first_attribution["scope_id"]
+    assert second_attribution["request"]["payload_tag"] != first_attribution["request"]["payload_tag"]
+    await provider.complete(second_request)
+    assert responses.create.call_args.kwargs["input"] == second_counted["input"]
+    assert events[-1]["binding"] == "matched"
+    assert events[-1]["dispatch"] == second_attribution["request"]
+    assert responses.create.await_count == 2
     print(json.dumps({
         "model": model, "output_shape": type(output).__name__,
         "first_window_sha256": hashlib.sha256(json.dumps(window, sort_keys=True).encode()).hexdigest(),
@@ -173,6 +193,10 @@ async def test_canonical_results_reach_real_sdk_json_and_incomplete_continuation
         {"type": "input_text", "text": "RETAINED_AFTER_OPAQUE"},
     ]})
     captured = []
+    events = []
+    async def observe(name, data):
+        if name == "provider:request_attribution":
+            events.append(copy.deepcopy(data))
 
     async def handler(request):
         body = json.loads(request.content)
@@ -192,7 +216,7 @@ async def test_canonical_results_reach_real_sdk_json_and_incomplete_continuation
                          max_retries=0)
     provider = OpenAIProvider(api_key="offline", client=client, config={
         "default_model": "gpt-6.1-sol", "use_streaming": False, "max_retries": 0,
-    })
+    }, coordinator=SimpleNamespace(hooks=SimpleNamespace(emit=observe)))
     request = ChatRequest(messages=[
         Message(**compacted_message("gpt-6.1-sol", window)),
         Message(role="assistant", content="", tool_calls=[{"id": "new", "name": "read", "arguments": {}}]),
@@ -208,6 +232,14 @@ async def test_canonical_results_reach_real_sdk_json_and_incomplete_continuation
     assert len(generations) == 2
     counts = [body for path, body in captured if path.endswith("/input_tokens")]
     assert counts
+    assert len(events) == len(generations) == len(counts) == 2
+    for event, count, generation in zip(events, counts, generations, strict=True):
+        assert event["binding"] == "matched"
+        assert event["dispatch"] == provider._request_attribution.describe(count)
+        assert event["dispatch"] == provider._request_attribution.describe({
+            key: generation[key] for key in provider._COUNT_FIELDS if key in generation
+        })
+    assert events[0]["dispatch_id"] != events[1]["dispatch_id"]
     for body in [*counts, *generations]:
         assert body["input"][:len(window)] == window
         fresh = next(item for item in body["input"] if item.get("call_id") == "new" and item["type"] == "function_call_output")

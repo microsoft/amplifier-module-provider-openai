@@ -28,12 +28,19 @@ def observe(model, hooks=None):
     return hooks
 
 
-def failure_event(diagnostic):
+def failure_event(diagnostic, events):
+    attribution = next(data['attribution'] for event, data in events
+                       if event == 'provider:token_count_failed')
+    assert attribution['version'] == 1
+    assert len(attribution['scope_id']) == len(attribution['count_id']) == 32
+    assert len(attribution['request']['payload_tag']) == 64
+    assert 'private prompt' not in json.dumps(attribution)
     return ('provider:token_count_failed', {
         'provider': 'openai',
         'operation': 'responses.input_tokens.count',
         'count_failure': diagnostic,
         'outer_retryable': False,
+        'attribution': attribution,
     })
 
 
@@ -104,7 +111,7 @@ async def test_mount_contributes_token_count_failure_event_without_client():
         contributed = coordinator.contributors[
             'observability.events', 'provider-openai'
         ]()
-        assert contributed == ['provider:token_count_failed']
+        assert contributed == ['provider:token_count_failed', 'provider:request_attribution']
         assert ('session.cost', 'provider-openai') in coordinator.contributors
     finally:
         await cleanup()
@@ -160,7 +167,7 @@ async def test_failure_is_bounded_sanitized_and_later_measurement_can_succeed(op
         assert result.value.__context__ is None
         assert result.value.__cause__ is None
         assert 'SECRET' not in str(result.value) + json.dumps(result.value.count_failure)
-        assert hooks.events == [failure_event(result.value.count_failure)]
+        assert hooks.events == [failure_event(result.value.count_failure, hooks.events)]
         assert hooks.events[0][1]['count_failure'] is not result.value.count_failure
         assert delays == ([1, 2] if retryable else [])
         recovered = True
@@ -209,7 +216,7 @@ async def test_quota_exhaustion_does_not_retry(operation, code, delays):
             'category': 'quota', 'retryable': False, 'httpStatus': 429, 'attempts': 1,
         }
         assert result.value.retryable is False
-        assert hooks.events == [failure_event(result.value.count_failure)]
+        assert hooks.events == [failure_event(result.value.count_failure, hooks.events)]
         assert all(call.url.path == '/v1/responses/input_tokens' for call in calls)
         assert len(calls) == 1 and delays == []
     finally:
@@ -235,7 +242,7 @@ async def test_timeout_has_a_bounded_wire_count(monkeypatch, delays):
         }
         assert len(calls) == 3
         assert delays == [1, 2]
-        assert hooks.events == [failure_event(result.value.count_failure)]
+        assert hooks.events == [failure_event(result.value.count_failure, hooks.events)]
     finally:
         await sdk.close()
 
@@ -337,7 +344,7 @@ async def test_transport_failures_recover_or_emit_once(category, recover, delays
             assert result.value.retryable is False
             assert result.value.__context__ is None
             assert result.value.__cause__ is None
-            assert hooks.events == [failure_event(result.value.count_failure)]
+            assert hooks.events == [failure_event(result.value.count_failure, hooks.events)]
         assert len(calls) == 3 and len(set(calls)) == 1
         assert delays == [1, 2]
         assert sdk.max_retries == 7 and not sdk.is_closed()
@@ -361,7 +368,7 @@ async def test_invalid_native_response_is_failure_not_unavailable(operation, del
             await invoke(model, operation)
         diagnostic = {'category': 'invalid_response', 'retryable': False, 'attempts': 1}
         assert result.value.count_failure == diagnostic
-        assert hooks.events == [failure_event(diagnostic)]
+        assert hooks.events == [failure_event(diagnostic, hooks.events)]
         assert calls == ['/v1/responses/input_tokens'] and delays == []
     finally:
         await sdk.close()
@@ -386,7 +393,7 @@ async def test_hostile_request_id_and_sdk_body_stay_out_of_terminal_diagnostic(o
             await invoke(model, operation)
         diagnostic = {'category': 'service', 'retryable': True, 'httpStatus': 503, 'attempts': 3}
         assert result.value.count_failure == diagnostic
-        assert hooks.events == [failure_event(diagnostic)]
+        assert hooks.events == [failure_event(diagnostic, hooks.events)]
         assert result.value.__context__ is None and result.value.__cause__ is None
         published = json.dumps(hooks.events) + ''.join(traceback.format_exception(result.value))
         assert hostile_id not in published and private_body not in published
@@ -449,7 +456,7 @@ async def test_observer_failure_preserves_original_error_without_private_chain(
             await measure(model)
         assert original_errors == [result.value]
         assert result.value.__context__ is None and result.value.__cause__ is None
-        assert hooks.events == [failure_event(result.value.count_failure)]
+        assert hooks.events == [failure_event(result.value.count_failure, hooks.events)]
         assert hooks.events[0][1]['count_failure'] is not result.value.count_failure
         published = (json.dumps(hooks.events) + caplog.text
                      + ''.join(traceback.format_exception(result.value)))
@@ -539,7 +546,7 @@ async def test_failed_refresh_count_stops_outer_retry_without_replaying_generati
         }
         assert result.value.__context__ is None and result.value.__cause__ is None
         assert [entry for entry in hooks.events if entry[0] == 'provider:token_count_failed'] == [
-            failure_event(result.value.count_failure),
+            failure_event(result.value.count_failure, hooks.events),
         ]
         assert sum(event == 'llm:request' for event, _ in hooks.events) == 1
         assert sum(event == 'provider:retry' for event, _ in hooks.events) == 1
