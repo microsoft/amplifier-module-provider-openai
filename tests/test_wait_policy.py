@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import httpx
 import openai
 import pytest
-from amplifier_core.llm_errors import LLMError, LLMTimeoutError
+from amplifier_core.llm_errors import ContextLengthError, LLMError, LLMTimeoutError
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -216,3 +216,45 @@ async def test_expired_direct_create_deadline_never_enters_sdk(monkeypatch, exha
                                          timeout=0 if exhaustion == "initial" else 1)
     assert counter.await_count == (0 if exhaustion == "initial" else 1)
     create.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["direct", "continuation", "external-cancel"])
+async def test_rejected_count_keeps_primary_error_with_slow_observer(path):
+    entered = asyncio.Event()
+    async def observe(event, data):
+        if event == "provider:request_attribution" and data["stage"] == "rejected":
+            entered.set()
+            await asyncio.sleep(10)  # Observer's own bounded wait, not model work.
+    counter = AsyncMock(side_effect=[
+        SimpleNamespace(input_tokens=value)
+        for value in ([100, 10_000_000] if path != "direct" else [10_000_000])
+    ])
+    partial = SimpleNamespace(**{
+        **completed(), "status": "incomplete",
+        "incomplete_details": SimpleNamespace(reason="max_output_tokens"),
+    })
+    create = AsyncMock(return_value=partial)
+    provider = OpenAIProvider(
+        client=SimpleNamespace(base_url="https://api.openai.com/v1",
+            responses=SimpleNamespace(create=create, input_tokens=SimpleNamespace(count=counter))),
+        config={"use_streaming": False, "max_retries": 0},
+    )
+    provider.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=observe))
+    if path == "direct":
+        work = provider._create_response(
+            {"model": "gpt-6-astra", "input": []}, timeout=.01)
+    else:
+        work = provider.complete(request(timeout=.01))
+    if path == "external-cancel":
+        task = asyncio.create_task(work)
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(ContextLengthError):
+            await work
+    assert entered.is_set()
+    assert counter.await_count == (1 if path == "direct" else 2)
+    assert create.await_count == (0 if path == "direct" else 1)

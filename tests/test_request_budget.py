@@ -806,6 +806,155 @@ def test_scheduled_observer_mutation_cannot_change_frozen_sdk_payload():
     assert params["input"][0]["content"] == "later mutation"
 
 
+@pytest.mark.parametrize("use_streaming", [False, True], ids=["create", "stream"])
+def test_completed_calibration_uses_dispatched_snapshot_after_old_input_mutation(
+    monkeypatch, use_streaming,
+):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini", use_streaming=use_streaming, raw=False,
+        input_tokens=23,
+    )
+    request = _request("counted-original", system="policy-a", output=1_000)
+    expected = copy.deepcopy(provider._budget_params(request))
+    retained_params = []
+    assemble = provider._assemble_initial_responses_params
+
+    def assemble_and_retain(*args, **kwargs):
+        result = assemble(*args, **kwargs)
+        retained_params.append(result[0])
+        return result
+
+    # Retain the real assembly result without exposing it through raw events.
+    monkeypatch.setattr(
+        provider, "_assemble_initial_responses_params", assemble_and_retain,
+    )
+    response = _response(23)
+    response.output = []
+    sdk_params = []
+    mutated_text = "changed-after-sdk-entry-" * 100
+
+    def sdk(**kwargs):
+        sdk_params.append(copy.deepcopy(_wire_params(kwargs)))
+        # The first SDK call has already received the counted snapshot. Only
+        # mutate the older assembly reference, not the SDK-owned parameters.
+        retained_params[0]["input"][0]["content"][0]["text"] = mutated_text
+        return response
+
+    if use_streaming:
+        provider.client.responses.stream.side_effect = (
+            lambda **kwargs: _StreamContext(sdk(**kwargs))
+        )
+    else:
+        provider.client.responses.create.side_effect = sdk
+
+    assert provider._budget_calibration == {}
+    asyncio.run(provider.complete(request))
+
+    assert len(retained_params) == 1
+    assert retained_params[0]["input"][0]["content"][0]["text"] == mutated_text
+    assert sdk_params == [expected]
+    assert counter.call_args.kwargs == _count_projection(expected)
+    assert counter.await_count == 1
+    assert provider.client.responses.create.await_count == (0 if use_streaming else 1)
+    assert provider.client.responses.stream.call_count == (1 if use_streaming else 0)
+    # Distinct byte lengths make calibration against the stale mutable object
+    # observably wrong even though the first SDK dispatch itself was correct.
+    dispatched_bytes = _json_bytes(expected)
+    assert _json_bytes(retained_params[0]) != dispatched_bytes
+    ratio, size, tokens = provider._budget_calibration["gpt-5-mini"]
+    assert size == dispatched_bytes
+    assert tokens == 23
+    assert ratio == pytest.approx(23 / dispatched_bytes)
+
+
+@pytest.mark.parametrize("use_streaming", [False, True], ids=["create", "stream"])
+def test_continuation_preserves_counted_prefix_after_old_input_mutation(
+    monkeypatch, use_streaming,
+):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini", use_streaming=use_streaming, raw=False,
+    )
+    request = _request("counted-original", system="policy-a", output=1_000)
+    expected = copy.deepcopy(provider._budget_params(request))
+    retained_params = []
+    assemble = provider._assemble_initial_responses_params
+
+    def assemble_and_retain(*args, **kwargs):
+        result = assemble(*args, **kwargs)
+        retained_params.append(result[0])
+        return result
+
+    monkeypatch.setattr(
+        provider, "_assemble_initial_responses_params", assemble_and_retain,
+    )
+    calibrations = []
+    record_calibration = provider._record_budget_calibration
+
+    def observe_calibration(params, response):
+        calibrations.append((copy.deepcopy(params), response.status))
+        record_calibration(params, response)
+
+    monkeypatch.setattr(provider, "_record_budget_calibration", observe_calibration)
+    incomplete = _response(10, status="incomplete")
+    incomplete.id = "resp_snapshot_incomplete"
+    incomplete.output = [
+        SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="partial answer")],
+        ),
+    ]
+    completed = _response(20)
+    completed.output = []
+    counter.side_effect = [
+        SimpleNamespace(input_tokens=10),
+        SimpleNamespace(input_tokens=20),
+    ]
+    sdk_params = []
+    mutated_text = "changed-after-first-sdk-entry-" * 100
+
+    def sdk(**kwargs):
+        sdk_params.append(copy.deepcopy(_wire_params(kwargs)))
+        if len(sdk_params) == 1:
+            retained_params[0]["input"][0]["content"][0]["text"] = mutated_text
+            return incomplete
+        return completed
+
+    # Continuation uses create even when the first dispatch is a stream.
+    provider.client.responses.create.side_effect = sdk
+    if use_streaming:
+        provider.client.responses.stream.side_effect = (
+            lambda **kwargs: _StreamContext(sdk(**kwargs))
+        )
+
+    asyncio.run(provider.complete(request))
+
+    assert len(retained_params) == 1
+    assert retained_params[0]["input"][0]["content"][0]["text"] == mutated_text
+    assert len(sdk_params) == counter.await_count == 2
+    assert provider.client.responses.create.await_count == (1 if use_streaming else 2)
+    assert provider.client.responses.stream.call_count == (1 if use_streaming else 0)
+    first, continuation = sdk_params
+    assert first == expected
+    # Check the prefix directly, not by calling the continuation builder under
+    # test: recounting a mutated prefix would otherwise look internally valid.
+    prefix_length = len(first["input"])
+    assert continuation["input"][:prefix_length] == first["input"]
+    assert len(continuation["input"]) == prefix_length + 1
+    assert continuation["input"][-1]["role"] == "assistant"
+    assert continuation["input"][-1]["content"] == [
+        {"type": "output_text", "text": "partial answer", "annotations": []},
+    ]
+    assert continuation["instructions"] == first["instructions"]
+    assert [call.kwargs for call in counter.call_args_list] == [
+        _count_projection(first), _count_projection(continuation),
+    ]
+    assert calibrations == [(first, "incomplete"), (continuation, "completed")]
+    ratio, size, tokens = provider._budget_calibration["gpt-5-mini"]
+    assert size == _json_bytes(continuation)
+    assert tokens == 20
+    assert ratio == pytest.approx(20 / size)
+
+
 @pytest.mark.parametrize("unknown_projection", [False, True])
 def test_unavailable_native_measurement_is_not_fabricated_at_dispatch(unknown_projection):
     provider, counter = _native_provider(

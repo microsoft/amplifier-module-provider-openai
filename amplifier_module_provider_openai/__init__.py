@@ -2495,10 +2495,14 @@ class OpenAIProvider:
             self._budget_uncalibrated_warned_models.add(model)
 
     async def _guard_assembled_params_with_provider_count(
-        self, params: dict[str, Any]
+        self, params: dict[str, Any], *, timeout=None
     ) -> int | None:
         """Apply the final-dispatch guard using a fresh native count when possible."""
-        native_input_tokens = await self._native_input_token_count(params)
+        # Only counting belongs to this deadline. Once a rejection is known,
+        # an observer must not replace it with the counting timer's TimeoutError.
+        # Genuine external cancellation still propagates through the observer.
+        async with asyncio.timeout(timeout):
+            native_input_tokens = await self._native_input_token_count(params)
         try:
             self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         except kernel_errors.ContextLengthError:
@@ -3384,7 +3388,7 @@ class OpenAIProvider:
 
     async def _create_response(
         self, params: dict[str, Any], *, native_input_tokens: int | None = None,
-        timeout=openai.NOT_GIVEN,
+        timeout=openai.NOT_GIVEN, dispatch_snapshot: dict[str, Any] | None = None,
     ) -> Any:
         """Call `client.responses.create(**params)`.
 
@@ -3431,17 +3435,20 @@ class OpenAIProvider:
         # Counting and raw-response decoding share the caller's finite request
         # allowance. The intervening _before_counted_dispatch interval is
         # excluded, including its bounded observer wait, copy and validation.
-        async with asyncio.timeout(effective_timeout):
-            if native_input_tokens is None:
-                native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
-            else:
-                self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
+        if native_input_tokens is None:
+            native_input_tokens = await self._guard_assembled_params_with_provider_count(
+                params, timeout=effective_timeout)
+        else:
+            self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         remaining = (None if effective_timeout is None else
                      max(0, effective_timeout - (time.monotonic() - started)))
         if remaining is not None and remaining <= 0:
             raise TimeoutError("Request deadline expired before dispatch.")
         params = await self._before_counted_dispatch(params, native_input_tokens,
                                                     operation="responses.create")
+        if dispatch_snapshot is not None:
+            dispatch_snapshot.clear()
+            dispatch_snapshot.update(params)
         async with asyncio.timeout(remaining):
             return await self._send_create_response(params, self._transport_timeout(request_timeout))
 
@@ -3560,6 +3567,9 @@ class OpenAIProvider:
         failed_stream_responses: list[Any] = []
         failed_stream_response_ids: set[int] = set()
         generation_attempt = 0
+        # Request-local output from the final boundary, never provider-global
+        # "last params". Calibration and continuation must use the sent snapshot.
+        dispatched_params: dict[str, Any] = {}
 
         def _record_failed_stream_response(response: Any) -> None:
             if response is not None and id(response) not in failed_stream_response_ids:
@@ -3618,6 +3628,8 @@ class OpenAIProvider:
                 if _use_streaming:
                     dispatch_params = await self._before_counted_dispatch(
                         params, attempt_native_input_tokens, operation="responses.stream")
+                    dispatched_params.clear()
+                    dispatched_params.update(dispatch_params)
                     # Streaming path — chunked HTTP transport prevents timeouts on
                     # large context requests. The event loop emits contract events
                     # (llm:stream_*); get_final_response() collects the complete
@@ -3816,7 +3828,7 @@ class OpenAIProvider:
                     # Non-streaming path — preserved for tests and backward compat.
                     return await self._create_response(
                         params, native_input_tokens=attempt_native_input_tokens,
-                        timeout=request_timeout,
+                        timeout=request_timeout, dispatch_snapshot=dispatched_params,
                     )
             except openai.RateLimitError as e:
                 retry_after = None
@@ -4072,6 +4084,7 @@ class OpenAIProvider:
                 self._retry_config,
                 on_retry=_on_retry,
             )
+            params = dispatched_params
             self._record_budget_calibration(params, response)
 
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -4247,7 +4260,10 @@ class OpenAIProvider:
                             )
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
-                        final_response = await self._create_response(params, timeout=request_timeout)
+                        retry_snapshot: dict[str, Any] = {}
+                        final_response = await self._create_response(
+                            params, timeout=request_timeout, dispatch_snapshot=retry_snapshot)
+                        params = retry_snapshot
                         self._record_budget_calibration(params, final_response)
                         billed_responses.append(final_response)
                         elapsed_ms += int((time.time() - retry_start) * 1000)
@@ -4397,8 +4413,10 @@ class OpenAIProvider:
                 # Make continuation call
                 try:
                     continue_start = time.time()
-                    final_response = await self._create_response(continue_params, timeout=request_timeout)
-                    self._record_budget_calibration(continue_params, final_response)
+                    continue_snapshot: dict[str, Any] = {}
+                    final_response = await self._create_response(
+                        continue_params, timeout=request_timeout, dispatch_snapshot=continue_snapshot)
+                    self._record_budget_calibration(continue_snapshot, final_response)
                     billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
                     elapsed_ms += continue_elapsed
