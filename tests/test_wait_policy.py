@@ -238,7 +238,7 @@ async def test_rejected_count_keeps_primary_error_with_slow_observer(path):
     provider = OpenAIProvider(
         client=SimpleNamespace(base_url="https://api.openai.com/v1",
             responses=SimpleNamespace(create=create, input_tokens=SimpleNamespace(count=counter))),
-        config={"use_streaming": False, "max_retries": 0},
+        config={"use_streaming": False, "max_retries": 2},
     )
     provider.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=observe))
     if path == "direct":
