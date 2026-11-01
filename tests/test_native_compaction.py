@@ -117,7 +117,7 @@ async def test_native_window_results_survive_count_dispatch_and_second_compactio
         max_output_tokens=1000,
     )
     original_request = request.model_dump()
-    decision = await provider.request_budget(request)
+    decision = await provider.request_budget(request, context_estimate=0)
     counted = responses.input_tokens.count.call_args.kwargs
     assert counted["input"][:len(window)] == window
     assert counted["model"] == model
@@ -146,7 +146,7 @@ async def test_native_window_results_survive_count_dispatch_and_second_compactio
     second_request = ChatRequest(messages=[
         Message(**second["message"]), Message(role="user", content="Continue twice"),
     ])
-    await provider.request_budget(second_request)
+    await provider.request_budget(second_request, context_estimate=0)
     second_counted = responses.input_tokens.count.call_args.kwargs
     assert second_counted["input"][:len(second_window)] == second_window
     assert second["message"]["metadata"]["openai:compaction"]["output"] == second_window
