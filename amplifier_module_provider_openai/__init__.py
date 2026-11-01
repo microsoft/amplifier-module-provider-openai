@@ -3428,8 +3428,9 @@ class OpenAIProvider:
         if effective_timeout is not None and effective_timeout <= 0:
             raise TimeoutError("Request deadline expired before dispatch.")
         started = time.monotonic()
-        # Counting and raw-response decoding remain inside the caller's finite
-        # request allowance. Only bounded diagnostic-observer time is excluded.
+        # Counting and raw-response decoding share the caller's finite request
+        # allowance. The intervening _before_counted_dispatch interval is
+        # excluded, including its bounded observer wait, copy and validation.
         async with asyncio.timeout(effective_timeout):
             if native_input_tokens is None:
                 native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
