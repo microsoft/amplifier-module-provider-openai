@@ -1,9 +1,11 @@
 import copy
+import hashlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from amplifier_core import ChatRequest, Message
+from amplifier_core import ChatRequest, Message, ToolSpec
 from amplifier_core.llm_errors import ContextLengthError
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -32,7 +34,7 @@ def test_native_usage_has_disjoint_cache_write_tokens_and_unknown_cost():
     assert "cost_usd" not in usage
 
 
-def fixture():
+def fixture(**config):
     # A retained call's result may live inside opaque state. The returned
     # canonical window must not acquire a fabricated "missing result" item.
     window = [
@@ -72,9 +74,146 @@ def fixture():
         client=SimpleNamespace(
             base_url="https://api.openai.com/v1/", responses=responses
         ),
-        config={"default_model": "gpt-6-astra", "enable_long_context": True},
+        config={"default_model": "gpt-6-astra", "enable_long_context": True, **config},
     )
     return provider, responses, window
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol", "gpt-5.6"])
+@pytest.mark.parametrize("output", ["COMPLETED_RESULT", [{"type": "input_text", "text": "COMPLETED_RESULT"}]])
+async def test_native_window_results_survive_count_dispatch_and_second_compaction(model, output):
+    provider, responses, window = fixture(
+        default_model=model, use_streaming=False, max_retries=0,
+    )
+    window.insert(2, {"type": "function_call_output", "call_id": "c1", "output": output})
+    responses.compact.return_value.output = copy.deepcopy(window)
+
+    async def count(**params):
+        # Deterministic wire-size oracle, not vendor tokenization.
+        payload = {key: value for key, value in params.items() if key != "timeout"}
+        return SimpleNamespace(input_tokens=len(json.dumps(payload, sort_keys=True)))
+
+    responses.input_tokens.count.side_effect = count
+    responses.create.return_value = SimpleNamespace(
+        status="completed", output=[], usage=SimpleNamespace(input_tokens=100),
+    )
+    first = await provider.compact_context(
+        ChatRequest(messages=[Message(role="user", content="Original task")])
+    )
+    original_carrier = copy.deepcopy(first["message"])
+    tools = [ToolSpec(name="read", description="Read evidence", parameters={"type": "object", "properties": {}})]
+    request = ChatRequest(
+        messages=[
+            Message(role="system", content="Accepted instruction: never repeat completed effects."),
+            Message(**first["message"]),
+            Message(role="assistant", content="", tool_calls=[
+                {"id": "new-call", "name": "read", "arguments": {}},
+            ]),
+            Message(role="tool", tool_call_id="new-call", content="NEW_RESULT"),
+            Message(role="user", content="Correction: keep the completed result."),
+        ],
+        tools=tools,
+        max_output_tokens=1000,
+    )
+    original_request = request.model_dump()
+    decision = await provider.request_budget(request)
+    counted = responses.input_tokens.count.call_args.kwargs
+    assert counted["input"][:len(window)] == window
+    assert counted["model"] == model
+    assert counted["instructions"] == "Accepted instruction: never repeat completed effects."
+    fresh_output = next(item for item in counted["input"] if item.get("call_id") == "new-call" and item["type"] == "function_call_output")
+    assert fresh_output["output"][-1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert decision["measurement"]["input_tokens"] == len(json.dumps(
+        {key: value for key, value in counted.items() if key != "timeout"}, sort_keys=True,
+    ))
+    await provider.complete(request)
+    sent = responses.create.call_args.kwargs
+    for key in ("model", "input", "instructions", "tools"):
+        assert sent[key] == counted[key]
+    assert responses.create.await_count == 1
+    assert request.model_dump() == original_request
+    assert first["message"] == original_carrier
+
+    # The next native operation receives the first window unchanged, including
+    # results before opaque state; new suffix items remain ordinarily serialized.
+    second_window = copy.deepcopy(window)
+    second_window[3]["id"] = "cmp2"
+    second_window.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Second correction"}]})
+    responses.compact.return_value.output = copy.deepcopy(second_window)
+    second = await provider.compact_context(request)
+    assert responses.compact.call_args.kwargs["input"][:len(window)] == window
+    second_request = ChatRequest(messages=[
+        Message(**second["message"]), Message(role="user", content="Continue twice"),
+    ])
+    await provider.request_budget(second_request)
+    second_counted = responses.input_tokens.count.call_args.kwargs
+    assert second_counted["input"][:len(second_window)] == second_window
+    assert second["message"]["metadata"]["openai:compaction"]["output"] == second_window
+    assert responses.compact.await_count == 2
+    assert responses.create.await_count == 1
+    print(json.dumps({
+        "model": model, "output_shape": type(output).__name__,
+        "first_window_sha256": hashlib.sha256(json.dumps(window, sort_keys=True).encode()).hexdigest(),
+        "second_window_sha256": hashlib.sha256(json.dumps(second_window, sort_keys=True).encode()).hexdigest(),
+        "first_count": decision["measurement"]["input_tokens"],
+        "compact_calls": responses.compact.await_count,
+        "completion_calls": responses.create.await_count,
+    }, sort_keys=True))
+
+
+@pytest.mark.asyncio
+async def test_canonical_results_reach_real_sdk_json_and_incomplete_continuation_unchanged():
+    import httpx
+    from openai import AsyncOpenAI
+
+    _, _, window = fixture()
+    window.insert(2, {"type": "function_call_output", "call_id": "c1", "output": "SAME_RESULT"})
+    window.append({"type": "function_call_output", "call_id": "retained", "output": [
+        {"type": "input_text", "text": "RETAINED_AFTER_OPAQUE"},
+    ]})
+    captured = []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        captured.append((request.url.path, body))
+        if request.url.path.endswith("/input_tokens"):
+            return httpx.Response(200, json={"input_tokens": len(request.content)})
+        generation = sum(path.endswith("/responses") for path, _ in captured)
+        return httpx.Response(200, json={
+            "id": f"resp_{generation}", "object": "response", "created_at": 1,
+            "status": "incomplete" if generation == 1 else "completed",
+            "incomplete_details": None, "model": "gpt-6.1-sol",
+            "output": [], "usage": {"input_tokens": 100, "output_tokens": 1, "total_tokens": 101},
+        })
+
+    client = AsyncOpenAI(api_key="offline", base_url="https://api.openai.com/v1",
+                         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+                         max_retries=0)
+    provider = OpenAIProvider(api_key="offline", client=client, config={
+        "default_model": "gpt-6.1-sol", "use_streaming": False, "max_retries": 0,
+    })
+    request = ChatRequest(messages=[
+        Message(**compacted_message("gpt-6.1-sol", window)),
+        Message(role="assistant", content="", tool_calls=[{"id": "new", "name": "read", "arguments": {}}]),
+        Message(role="tool", tool_call_id="new", content="SAME_RESULT"),
+        Message(role="user", content="Continue"),
+    ])
+    before = request.model_dump()
+    try:
+        await provider.complete(request)
+    finally:
+        await client.close()
+    generations = [body for path, body in captured if path.endswith("/responses")]
+    assert len(generations) == 2
+    counts = [body for path, body in captured if path.endswith("/input_tokens")]
+    assert counts
+    for body in [*counts, *generations]:
+        assert body["input"][:len(window)] == window
+        fresh = next(item for item in body["input"] if item.get("call_id") == "new" and item["type"] == "function_call_output")
+        assert fresh["output"] == [{"type": "input_text", "text": "SAME_RESULT",
+                                   "prompt_cache_breakpoint": {"mode": "explicit"}}]
+    assert request.model_dump() == before
 
 
 @pytest.mark.asyncio
