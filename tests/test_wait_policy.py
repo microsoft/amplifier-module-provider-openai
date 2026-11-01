@@ -172,3 +172,26 @@ def test_explicit_request_deadline_overrides_configuration():
     assert provider._request_timeout(request(timeout=3)) == 3
     assert provider._request_timeout(request(timeout=None)) is None
     assert provider._request_timeout(request(timeout=None), background=True) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_phase", ["count", "raw-parse"])
+async def test_direct_create_deadline_still_bounds_count_and_raw_parse(slow_phase):
+    async def slow(**kwargs):
+        await asyncio.sleep(10)
+        return SimpleNamespace(input_tokens=1)
+    async def parse():
+        await asyncio.sleep(10)
+        return SimpleNamespace(**completed())
+    counter = AsyncMock(side_effect=slow) if slow_phase == "count" else AsyncMock(return_value=SimpleNamespace(input_tokens=1))
+    create = AsyncMock(return_value=SimpleNamespace(parse=parse))
+    sdk = SimpleNamespace(base_url="https://api.openai.com/v1",
+                          responses=SimpleNamespace(
+                              input_tokens=SimpleNamespace(count=counter),
+                              with_raw_response=SimpleNamespace(create=create),
+                              create=AsyncMock()))
+    provider = OpenAIProvider(client=sdk)
+    with pytest.raises(TimeoutError):
+        await provider._create_response({"model": "gpt-6-astra", "input": [],
+                                         "tools": [{"type": "computer"}]}, timeout=.01)
+    assert create.await_count == (1 if slow_phase == "raw-parse" else 0)

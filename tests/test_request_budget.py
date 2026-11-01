@@ -8,6 +8,7 @@ import asyncio
 import base64
 import copy
 import json
+import re
 from importlib.metadata import PackageNotFoundError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -114,6 +115,111 @@ def _count_projection(params):
     }
 
 
+def _json_bytes(value):
+    """Independent JSON-byte oracle, never a token estimate."""
+    return len(
+        json.dumps(
+            value, sort_keys=True, ensure_ascii=False,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+    )
+
+
+def _assert_hex(value, length):
+    assert type(value) is str
+    assert re.fullmatch(rf"[0-9a-f]{{{length}}}", value)
+
+
+def _assert_descriptor(descriptor, params):
+    # Exact keys also prevent exporting content, credentials, or an HMAC key.
+    assert type(descriptor) is dict
+    assert set(descriptor) == {
+        "payload_tag", "serialized_bytes", "input_items", "input_types",
+        "input_bytes", "instructions_bytes", "tools", "tools_bytes",
+    }
+    _assert_hex(descriptor["payload_tag"], 64)
+    items = params.get("input", [])
+    tools = params.get("tools", [])
+    expected_sizes = {
+        "serialized_bytes": _json_bytes(params),
+        "input_items": len(items) if isinstance(items, list) else 1,
+        "input_bytes": _json_bytes(items),
+        "instructions_bytes": _json_bytes(params.get("instructions")),
+        "tools": len(tools) if isinstance(tools, list) else 0,
+        "tools_bytes": _json_bytes(tools),
+    }
+    for key, expected in expected_sizes.items():
+        assert type(descriptor[key]) is int
+        assert descriptor[key] == expected
+    # Version 1 uses a bounded enum, not caller-controlled type names.
+    known_types = {
+        "message", "function_call", "function_call_output", "compaction",
+        "reasoning", "computer_call", "computer_call_output",
+        "apply_patch_call", "apply_patch_call_output", "item_reference",
+    }
+    expected_types = {}
+    for item in items if isinstance(items, list) else []:
+        kind = item.get("type", "message") if isinstance(item, dict) else "other"
+        kind = kind if isinstance(kind, str) and kind in known_types else "other"
+        expected_types[kind] = expected_types.get(kind, 0) + 1
+    assert type(descriptor["input_types"]) is dict
+    assert descriptor["input_types"] == expected_types
+    assert all(type(count) is int for count in descriptor["input_types"].values())
+
+
+def _assert_attribution(attribution, params):
+    assert type(attribution) is dict
+    assert set(attribution) == {
+        "version", "scope_id", "count_id", "request", "compact_input",
+    }
+    assert type(attribution["version"]) is int
+    assert attribution["version"] == 1
+    _assert_hex(attribution["scope_id"], 32)
+    _assert_hex(attribution["count_id"], 32)
+    _assert_descriptor(attribution["request"], params)
+    _assert_descriptor(
+        attribution["compact_input"],
+        {key: params[key] for key in ("model", "input", "instructions") if key in params},
+    )
+
+
+def _capture_events(provider, callback=None):
+    events = []
+
+    async def emit(name, payload):
+        # Freeze the observation before any intentionally hostile callback.
+        events.append((name, copy.deepcopy(payload)))
+        if callback is not None:
+            await callback(name, payload)
+
+    provider.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=AsyncMock(side_effect=emit)))
+    return events
+
+
+def _attribution_events(events):
+    return [payload for name, payload in events if name == "provider:request_attribution"]
+
+
+def _assert_dispatch_event(event, *, operation, stage, input_tokens, binding):
+    assert type(event) is dict
+    assert set(event) == {
+        "provider", "operation", "stage", "dispatch_id", "input_tokens",
+        "attribution", "dispatch", "binding",
+        "implementation", "measurement_scope", "dispatch_scope",
+    }
+    assert event["provider"] == "openai"
+    assert event["operation"] == operation
+    assert event["stage"] == stage
+    _assert_hex(event["dispatch_id"], 32)
+    assert event["input_tokens"] == input_tokens
+    if input_tokens is not None:
+        assert type(event["input_tokens"]) is int
+    assert event["binding"] == binding
+    assert event["measurement_scope"] == "count_projection"
+    assert event["dispatch_scope"] == "count_projection"
+    assert event["implementation"]["imported_bytes_verified"] is False
+
+
 @pytest.mark.parametrize("estimate", [True, False, 1.5, "1", None, -1])
 def test_invalid_context_estimate_keeps_value_error_without_dispatch(estimate):
     provider, counter = _native_provider()
@@ -191,11 +297,16 @@ def test_native_count_returns_official_measurement_for_the_finalized_projection(
 
     assert decision["estimated_input_tokens"] == 10
     assert decision["context_token_budget"] == 123
+    attribution = decision["measurement"]["attribution"]
     assert decision["measurement"] == {
         "kind": "provider_count",
         "source": "official.operation",
         "input_tokens": 10,
+        "attribution": attribution,
+        "implementation": decision["measurement"]["implementation"],
     }
+    assert type(decision["measurement"]["input_tokens"]) is int
+    _assert_attribution(attribution, _count_projection(expected))
     assert "request_budget:provider_count" in provider.get_info().capabilities
     assert counter.call_args.kwargs == _count_projection(expected)
     assert "max_output_tokens" not in counter.call_args.kwargs
@@ -210,6 +321,7 @@ def test_native_count_and_generation_share_final_assembly_for_both_dispatch_path
     provider, counter = _native_provider(
         default_model="gpt-5-mini", use_streaming=use_streaming
     )
+    events = _capture_events(provider)
     request = _request("hello", system="be concise", output=1_000)
     response = _response(10)
     response.output = []
@@ -241,6 +353,17 @@ def test_native_count_and_generation_share_final_assembly_for_both_dispatch_path
     assert counter.call_args.kwargs == _count_projection(expected)
     assert _wire_params(sdk_call.call_args.kwargs) == expected
     assert "request_options" not in sdk_call.call_args.kwargs
+    [event] = _attribution_events(events)
+    _assert_dispatch_event(
+        event,
+        operation="responses.stream" if use_streaming else "responses.create",
+        stage="dispatch_ready", input_tokens=10, binding="matched",
+    )
+    _assert_attribution(event["attribution"], _count_projection(expected))
+    _assert_descriptor(event["dispatch"], _count_projection(expected))
+    assert event["dispatch"] == event["attribution"]["request"]
+    assert counter.await_count == 1
+    assert sdk_call.call_count == 1
 
 
 def test_native_count_overrides_a_stale_calibrated_estimate_before_dispatch():
@@ -258,6 +381,7 @@ def test_native_count_overrides_a_stale_calibrated_estimate_before_dispatch():
 
 def test_native_preflight_is_pure_and_final_dispatch_uses_a_fresh_count():
     provider, counter = _native_provider(default_model="gpt-5-mini")
+    events = _capture_events(provider)
     request = _request("native count")
     state_before = (
         provider._client,
@@ -272,6 +396,7 @@ def test_native_preflight_is_pure_and_final_dispatch_uses_a_fresh_count():
     decision = asyncio.run(provider.request_budget(request, context_estimate=10))
 
     assert decision["measurement"]["input_tokens"] == 10
+    assert events == []  # Successful preflight emits no attribution/request event.
     assert (
         provider._client,
         provider._pending_additional_tools_item,
@@ -291,10 +416,23 @@ def test_native_preflight_is_pure_and_final_dispatch_uses_a_fresh_count():
     # protects the exact payload immediately before the create dispatch.
     assert counter.await_count == 2
     assert provider.client.responses.create.await_count == 1
+    [event] = _attribution_events(events)
+    before = decision["measurement"]["attribution"]
+    after = event["attribution"]
+    assert before["scope_id"] == after["scope_id"]
+    assert before["count_id"] != after["count_id"]
+    assert before["request"] == after["request"] == event["dispatch"]
 
 
-def test_native_count_over_allowance_blocks_generation_dispatch():
+@pytest.mark.parametrize("observer_fails", [False, True])
+def test_native_count_over_allowance_blocks_generation_dispatch(observer_fails, caplog):
     provider, counter = _native_provider(default_model="gpt-5-mini")
+
+    async def observer(name, _payload):
+        if observer_fails and name == "provider:request_attribution":
+            raise RuntimeError("private-rejection-observer-error")
+
+    events = _capture_events(provider, observer)
     params = provider._budget_params(_request())
     counter.return_value = SimpleNamespace(
         input_tokens=provider._budget_input_limit(params) + 1
@@ -305,6 +443,487 @@ def test_native_count_over_allowance_blocks_generation_dispatch():
 
     assert counter.await_count == 1
     provider.client.responses.create.assert_not_called()
+    provider.client.responses.stream.assert_not_called()
+    [event] = _attribution_events(events)
+    _assert_dispatch_event(
+        event, operation="context_preparation", stage="rejected",
+        input_tokens=counter.return_value.input_tokens, binding="matched",
+    )
+    _assert_attribution(event["attribution"], _count_projection(params))
+    assert event["dispatch"] == event["attribution"]["request"]
+    assert not any(name == "llm:request" for name, _ in events)
+    assert "private-rejection-observer-error" not in caplog.text
+
+
+def _attribution_request(*, content="réponse-a", instructions="policy-a", tool="tool_a"):
+    return ChatRequest(
+        messages=[
+            Message(role="system", content=instructions),
+            Message(role="user", content=content),
+        ],
+        tools=[
+            ToolSpec(
+                name=tool,
+                description="A deterministic test tool.",
+                parameters={"type": "object", "properties": {"value": {"type": "string"}}},
+            )
+        ],
+        max_output_tokens=1_000,
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"content": "réponse-b"}, {"instructions": "policy-b"}, {"tool": "tool_b"}],
+    ids=["content", "instructions", "tools"],
+)
+def test_equal_native_counts_do_not_identify_different_same_length_requests(change):
+    # This reproduces equal numbers, not the historical incident's cause.
+    # All requests use real assembly/count/dispatch; only the SDK is fake.
+    provider, counter = _native_provider(
+        default_model="gpt-5.6-terra", enable_long_context=True, input_tokens=499_947,
+    )
+    events = _capture_events(provider)
+    original = _attribution_request()
+    changed = _attribution_request(**change)
+    decisions = [
+        asyncio.run(provider.request_budget(request, context_estimate=400_000))
+        for request in (original, original, changed)
+    ]
+    assert events == []
+    projections = [call.kwargs for call in counter.call_args_list]
+    assert projections[0] == projections[1]
+    assert projections[0] != projections[2]
+    assert _json_bytes(projections[0]) == _json_bytes(projections[2])
+    receipts = []
+    for decision, projection in zip(decisions, projections, strict=True):
+        measurement = decision["measurement"]
+        receipt = measurement["attribution"]
+        assert measurement == {
+            "kind": "provider_count", "source": "official.operation",
+            "input_tokens": 499_947, "attribution": receipt,
+            "implementation": measurement["implementation"],
+        }
+        assert type(measurement["input_tokens"]) is int
+        _assert_attribution(receipt, projection)
+        assert receipt["request"]["serialized_bytes"] != measurement["input_tokens"]
+        receipts.append(receipt)
+    first, identical, different = receipts
+    assert len({receipt["scope_id"] for receipt in receipts}) == 1
+    assert len({receipt["count_id"] for receipt in receipts}) == 3
+    assert first["request"] == identical["request"]
+    assert first["compact_input"] == identical["compact_input"]
+    assert first["request"]["payload_tag"] != different["request"]["payload_tag"]
+    # Sizes/type counts alone cannot distinguish this pair.
+    assert {k: v for k, v in first["request"].items() if k != "payload_tag"} == {
+        k: v for k, v in different["request"].items() if k != "payload_tag"
+    }
+    if "tool" in change:
+        assert first["compact_input"] == different["compact_input"]
+    else:
+        assert first["compact_input"]["payload_tag"] != different["compact_input"]["payload_tag"]
+
+    response = _response(499_947)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    for request in (original, changed):
+        asyncio.run(provider.complete(request))
+    dispatches = _attribution_events(events)
+    assert len(dispatches) == 2
+    for event, receipt in zip(dispatches, (first, different), strict=True):
+        _assert_dispatch_event(
+            event, operation="responses.create", stage="dispatch_ready",
+            input_tokens=499_947, binding="matched",
+        )
+        assert event["dispatch"] == receipt["request"]
+        assert event["attribution"]["count_id"] not in {r["count_id"] for r in receipts}
+    assert dispatches[0]["dispatch_id"] != dispatches[1]["dispatch_id"]
+    assert dispatches[0]["attribution"]["count_id"] != dispatches[1]["attribution"]["count_id"]
+    assert counter.await_count == 5
+    assert provider.client.responses.create.await_count == 2
+
+
+def test_attribution_scope_and_payload_tags_are_provider_local():
+    request = _attribution_request()
+    first, first_counter = _native_provider(default_model="gpt-5-mini")
+    second, second_counter = _native_provider(default_model="gpt-5-mini")
+    first_receipt = asyncio.run(
+        first.request_budget(request, context_estimate=10)
+    )["measurement"]["attribution"]
+    second_receipt = asyncio.run(
+        second.request_budget(request, context_estimate=10)
+    )["measurement"]["attribution"]
+
+    assert first_counter.call_args.kwargs == second_counter.call_args.kwargs
+    for receipt in (first_receipt, second_receipt):
+        _assert_attribution(receipt, first_counter.call_args.kwargs)
+    assert first_receipt["scope_id"] != second_receipt["scope_id"]
+    assert first_receipt["count_id"] != second_receipt["count_id"]
+    for key in ("request", "compact_input"):
+        assert first_receipt[key]["serialized_bytes"] == second_receipt[key]["serialized_bytes"]
+        assert first_receipt[key]["payload_tag"] != second_receipt[key]["payload_tag"]
+
+
+def test_concurrent_measurements_keep_their_own_counts_and_payload_attribution():
+    provider, counter = _native_provider(default_model="gpt-5-mini")
+    events = _capture_events(provider)
+    requests = [_request("first", system="policy-a"), _request("second-longer", system="policy-b")]
+    projections = []
+
+    async def measure_concurrently():
+        first_started = asyncio.Event()
+        second_finished = asyncio.Event()
+
+        async def count(**params):
+            index = len(projections)
+            projections.append(copy.deepcopy(params))
+            if index == 0:
+                first_started.set()
+                await second_finished.wait()
+            else:
+                second_finished.set()
+            return SimpleNamespace(input_tokens=(101, 202)[index])
+
+        counter.side_effect = count
+        async with asyncio.timeout(5):
+            first = asyncio.create_task(provider.request_budget(requests[0], context_estimate=1))
+            try:
+                await first_started.wait()
+                second = await provider.request_budget(requests[1], context_estimate=2)
+                return [await first, second]
+            finally:
+                if not first.done():
+                    first.cancel()
+                    await asyncio.gather(first, return_exceptions=True)
+
+    decisions = asyncio.run(measure_concurrently())
+    counter.side_effect = None
+    for index, decision in enumerate(decisions):
+        tokens = (101, 202)[index]
+        assert type(decision["measurement"]["input_tokens"]) is int
+        assert decision["measurement"]["input_tokens"] == tokens
+        receipt = decision["measurement"]["attribution"]
+        _assert_attribution(receipt, projections[index])
+        counter.return_value = SimpleNamespace(input_tokens=tokens)
+        control = asyncio.run(
+            provider.request_budget(requests[index], context_estimate=index + 1)
+        )["measurement"]["attribution"]
+        assert receipt["request"] == control["request"]
+        assert receipt["count_id"] != control["count_id"]
+    first_receipt, second_receipt = [d["measurement"]["attribution"] for d in decisions]
+    assert first_receipt["scope_id"] == second_receipt["scope_id"]
+    assert first_receipt["count_id"] != second_receipt["count_id"]
+    assert first_receipt["request"]["payload_tag"] != second_receipt["request"]["payload_tag"]
+    assert counter.await_count == 4
+    assert events == []
+    provider.client.responses.create.assert_not_called()
+    provider.client.responses.stream.assert_not_called()
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+@pytest.mark.parametrize("mutation_event", ["llm:request", "provider:request_attribution"])
+def test_post_count_hook_mutation_fails_without_recount_retry_or_foreground_dispatch(
+    monkeypatch, use_streaming, mutation_event,
+):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini", use_streaming=use_streaming, max_retries=2,
+    )
+    retained_params = []
+    real_count = provider._native_input_token_count
+
+    async def count_and_retain(params):
+        result = await real_count(params)
+        retained_params.append(params)
+        return result
+
+    monkeypatch.setattr(provider, "_native_input_token_count", count_and_retain)
+
+    async def mutate(name, _payload):
+        if name == mutation_event:
+            assert counter.await_count == 1
+            assert len(retained_params) == 1
+            # Mutate nested input so this remains observable even when the
+            # low-level create seam makes a shallow copy of the parameter dict.
+            retained_params[0]["input"][0]["content"] = "changed-after-count"
+
+    events = _capture_events(provider, mutate)
+    with pytest.raises(kernel_errors.LLMError) as raised:
+        asyncio.run(provider.complete(_request("hello", system="policy-a")))
+
+    assert raised.value.retryable is False
+    assert counter.await_count == 1
+    provider.client.responses.create.assert_not_called()
+    provider.client.responses.stream.assert_not_called()
+    event, rejected = _attribution_events(events)
+    assert rejected["stage"] == "rejected" and rejected["binding"] == "mismatch"
+    # A callback can mutate after the ready observation itself. That earlier
+    # matched observation must not be interpreted as proof of an SDK/server send.
+    _assert_dispatch_event(
+        event, operation="responses.stream" if use_streaming else "responses.create",
+        stage="dispatch_ready", input_tokens=10,
+        binding="mismatch" if mutation_event == "llm:request" else "matched",
+    )
+
+
+@pytest.mark.parametrize("mutate", [False, True], ids=["unchanged-control", "changed"])
+def test_direct_create_binds_a_retained_count_without_recount(mutate):
+    provider, counter = _native_provider(default_model="gpt-5-mini", max_retries=2)
+    events = _capture_events(provider)
+    params = provider._budget_params(_request("hello", system="policy-a"))
+    response = _response(10)
+    provider.client.responses.create.return_value = response
+
+    async def dispatch():
+        # Reuse the existing count/dispatch seams, not new attribution helpers.
+        count = await provider._native_input_token_count(params)
+        if mutate:
+            params["instructions"] = "policy-b"
+        return await provider._create_response(params, native_input_tokens=count)
+
+    if mutate:
+        with pytest.raises(kernel_errors.LLMError) as raised:
+            asyncio.run(dispatch())
+        assert raised.value.retryable is False
+        provider.client.responses.create.assert_not_called()
+    else:
+        assert asyncio.run(dispatch()) is response
+        provider.client.responses.create.assert_awaited_once()
+    assert counter.await_count == 1
+    observations = _attribution_events(events)
+    assert len(observations) == (2 if mutate else 1)
+    event = observations[0]
+    if mutate:
+        assert observations[-1]["stage"] == "rejected"
+    _assert_dispatch_event(
+        event, operation="responses.create", stage="dispatch_ready",
+        input_tokens=10, binding="mismatch" if mutate else "matched",
+    )
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_plain_integer_count_never_claims_matched_attribution(monkeypatch, use_streaming):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini", use_streaming=use_streaming,
+    )
+    plain_counter = AsyncMock(return_value=10)
+    monkeypatch.setattr(provider, "_native_input_token_count", plain_counter)
+    events = _capture_events(provider)
+    request = _request()
+    decision = asyncio.run(provider.request_budget(request, context_estimate=10))
+    assert decision["measurement"] == {
+        "kind": "provider_count", "source": "official.operation",
+        "input_tokens": 10, "attribution": None,
+        "implementation": decision["measurement"]["implementation"],
+    }
+    assert type(decision["measurement"]["input_tokens"]) is int
+    assert events == []
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    provider.client.responses.stream.return_value = _StreamContext(response)
+    asyncio.run(provider.complete(request))
+
+    [event] = _attribution_events(events)
+    _assert_dispatch_event(
+        event, operation="responses.stream" if use_streaming else "responses.create",
+        stage="dispatch_ready", input_tokens=10, binding="unavailable",
+    )
+    assert event["attribution"] is None
+    _assert_descriptor(event["dispatch"], _count_projection(provider._budget_params(request)))
+    assert plain_counter.await_count == 2
+    counter.assert_not_called()
+    assert provider.client.responses.create.call_count == (0 if use_streaming else 1)
+    assert provider.client.responses.stream.call_count == (1 if use_streaming else 0)
+
+
+@pytest.mark.parametrize("mutation", ["lost-projection", "output-reserve"])
+def test_post_count_projection_loss_and_output_reserve_change_cannot_dispatch(mutation):
+    provider, counter = _native_provider(default_model="gpt-5-mini", input_tokens=100_000)
+    params = provider._budget_params(_request(output=1000))
+
+    async def change(name, payload):
+        if name == "provider:request_attribution" and payload["stage"] == "dispatch_ready":
+            if mutation == "lost-projection":
+                params["input"][0]["content"] = "changed"
+                params["extra_body"] = {"input": "changed"}
+            else:
+                params["max_output_tokens"] = 390_000
+
+    _capture_events(provider, change)
+
+    async def dispatch():
+        counted = await provider._native_input_token_count(params)
+        # Exercise the dispatch helper's exact mutable parameter instance.
+        await provider._before_counted_dispatch(params, counted, operation="responses.create")
+
+    with pytest.raises(kernel_errors.LLMError):
+        asyncio.run(dispatch())
+    assert counter.await_count == 1
+    provider.client.responses.create.assert_not_called()
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_slow_attribution_observer_is_bounded_without_generation_retry(use_streaming):
+    provider, counter = _native_provider(default_model="gpt-5-mini",
+                                         use_streaming=use_streaming, max_retries=2)
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    provider.client.responses.stream.return_value = _StreamContext(response)
+    async def slow(name, payload):
+        if name == "provider:request_attribution":
+            await asyncio.sleep(10)
+    _capture_events(provider, slow)
+    async def run():
+        async with asyncio.timeout(1):
+            await provider.complete(_request(), timeout=0.01)
+    asyncio.run(run())
+    assert counter.await_count == 1
+    assert provider.client.responses.create.call_count == (0 if use_streaming else 1)
+    assert provider.client.responses.stream.call_count == (1 if use_streaming else 0)
+
+
+def test_scheduled_observer_mutation_cannot_change_frozen_sdk_payload():
+    provider, counter = _native_provider(default_model="gpt-5-mini")
+    params = provider._budget_params(_request("counted-original"))
+    expected = copy.deepcopy(params["input"])
+
+    async def observer(name, payload):
+        if name == "provider:request_attribution":
+            asyncio.get_running_loop().call_soon(
+                lambda: params["input"][0].update(content="later mutation"))
+    _capture_events(provider, observer)
+    async def sdk(**kwargs):
+        await asyncio.sleep(0)
+        assert kwargs["input"] == expected
+        return _response(10)
+    provider.client.responses.create.side_effect = sdk
+    async def dispatch():
+        count = await provider._native_input_token_count(params)
+        await provider._create_response(params, native_input_tokens=count, timeout=1)
+    asyncio.run(dispatch())
+    assert counter.await_count == provider.client.responses.create.await_count == 1
+    assert params["input"][0]["content"] == "later mutation"
+
+
+@pytest.mark.parametrize("unknown_projection", [False, True])
+def test_unavailable_native_measurement_is_not_fabricated_at_dispatch(unknown_projection):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini",
+        extra_request_params={"unproved_input_option": "value"} if unknown_projection else {},
+    )
+    if not unknown_projection:
+        provider.client.responses.input_tokens = SimpleNamespace()
+    events = _capture_events(provider)
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    asyncio.run(provider.complete(_request()))
+
+    [event] = _attribution_events(events)
+    _assert_dispatch_event(
+        event, operation="responses.create", stage="dispatch_ready",
+        input_tokens=None, binding="unavailable",
+    )
+    assert event["attribution"] is None
+    if unknown_projection:
+        assert event["dispatch"] is None
+    else:
+        _assert_descriptor(event["dispatch"], _count_projection(provider._budget_params(_request())))
+    counter.assert_not_called()
+    provider.client.responses.create.assert_awaited_once()
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_attribution_observer_failure_is_best_effort_without_model_or_count_replay(
+    use_streaming, caplog,
+):
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini", use_streaming=use_streaming, max_retries=2,
+    )
+    private_error = "private-observer-exception-do-not-export"
+
+    async def fail_observer(name, _payload):
+        if name == "provider:request_attribution":
+            raise RuntimeError(private_error)
+
+    events = _capture_events(provider, fail_observer)
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    provider.client.responses.stream.return_value = _StreamContext(response)
+    asyncio.run(provider.complete(_request()))
+
+    [event] = _attribution_events(events)
+    assert event["binding"] == "matched"
+    assert counter.await_count == 1
+    assert provider.client.responses.create.call_count == (0 if use_streaming else 1)
+    assert provider.client.responses.stream.call_count == (1 if use_streaming else 0)
+    assert private_error not in caplog.text
+
+
+def test_attribution_diagnostics_never_export_prompt_tool_arguments_url_or_unknown_type(caplog):
+    sentinels = {
+        "prompt": "private-prompt-sentinel",
+        "instructions": "private-instructions-sentinel",
+        "tool": "private_tool_name_sentinel",
+        "argument": "private-argument-sentinel",
+        "url": "https://private.invalid/secret-path?q=private-url-sentinel",
+        "unknown_type": "private-unknown-type-sentinel",
+    }
+    wire_input = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": sentinels["prompt"]},
+                {"type": "input_image", "image_url": sentinels["url"]},
+            ],
+        },
+        {
+            "type": "function_call", "call_id": "call_private",
+            "name": sentinels["tool"], "arguments": json.dumps({"arg": sentinels["argument"]}),
+        },
+        {"type": "function_call_output", "call_id": "call_private", "output": "done"},
+        {"type": sentinels["unknown_type"], "content": sentinels["prompt"]},
+        {"type": "another-private-unknown-type", "content": sentinels["argument"]},
+    ]
+    provider, counter = _native_provider(
+        default_model="gpt-5-mini", raw=False,
+        extra_request_params={"input": wire_input},
+    )
+    events = _capture_events(provider)
+    request = _attribution_request(
+        content=sentinels["prompt"], instructions=sentinels["instructions"],
+        tool=sentinels["tool"],
+    )
+    decision = asyncio.run(provider.request_budget(request, context_estimate=10))
+    assert events == []
+    receipt = decision["measurement"]["attribution"]
+    projection = counter.call_args.kwargs
+    assert projection["input"] == wire_input
+    _assert_attribution(receipt, projection)
+    assert receipt["request"]["input_types"] == {
+        "message": 1, "function_call": 1, "function_call_output": 1, "other": 2,
+    }
+    response = _response(10)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    asyncio.run(provider.complete(request))
+    [event] = _attribution_events(events)
+    _assert_dispatch_event(
+        event, operation="responses.create", stage="dispatch_ready",
+        input_tokens=10, binding="matched",
+    )
+    _assert_attribution(event["attribution"], projection)
+    _assert_descriptor(event["dispatch"], projection)
+    # Round-trip the external contract: no private helper object/key is exported.
+    exported = json.dumps({"measurement": decision["measurement"], "event": event})
+    assert json.loads(exported)["measurement"] == decision["measurement"]
+    for sentinel in (*sentinels.values(), "another-private-unknown-type", "test-key"):
+        assert sentinel not in exported
+        assert sentinel not in caplog.text
+    assert counter.await_count == 2
+    provider.client.responses.create.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
