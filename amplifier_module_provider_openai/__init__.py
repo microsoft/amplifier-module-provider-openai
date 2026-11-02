@@ -23,6 +23,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AsyncExitStack
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as installed_package_version
@@ -186,42 +187,44 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     provider = OpenAIProvider(
         api_key=api_key, config=config, coordinator=coordinator, add_cost=_add_cost
     )
-    await coordinator.mount("providers", provider, name="openai")
+    cleanup = AsyncExitStack()
+    cleanup.push_async_callback(provider.close)
+    try:
+        await coordinator.mount("providers", provider, name="openai")
 
-    from .images import register_image_backend
+        from .images import register_image_backend
 
-    remove_image_backend = register_image_backend(coordinator, provider, config)
-    from .decisions import register_decision_backend
+        cleanup.callback(register_image_backend(coordinator, provider, config))
+        from .decisions import register_decision_backend
 
-    remove_decision_backend = register_decision_backend(coordinator, provider, config)
+        cleanup.callback(register_decision_backend(coordinator, provider, config))
 
-    coordinator.register_contributor(
-        "session.cost",
-        "provider-openai",
-        lambda: (
-            {
-                "cost_usd": str(_totals["cost_usd"])
-                if _totals["cost_usd"] is not None
+        coordinator.register_contributor(
+            "session.cost",
+            "provider-openai",
+            lambda: (
+                {
+                    "cost_usd": str(_totals["cost_usd"])
+                    if _totals["cost_usd"] is not None
+                    else None
+                }
+                if _totals["has_data"]
                 else None
-            }
-            if _totals["has_data"]
-            else None
-        ),
-    )
-    coordinator.register_contributor(
-        "observability.events",
-        "provider-openai",
-        lambda: ["provider:token_count_failed"],
-    )
-    logger.info("Mounted OpenAIProvider (Responses API)")
-
-    # Return cleanup function
-    async def cleanup():
-        remove_image_backend()
-        remove_decision_backend()
-        await provider.close()
-
-    return cleanup
+            ),
+        )
+        coordinator.register_contributor(
+            "observability.events",
+            "provider-openai",
+            lambda: ["provider:token_count_failed"],
+        )
+        logger.info("Mounted OpenAIProvider (Responses API)")
+    except BaseException as error:
+        try:
+            await cleanup.aclose()
+        except BaseException as cleanup_error:
+            error.add_note(f"Provider mount rollback failed: {type(cleanup_error).__name__}")
+        raise
+    return cleanup.pop_all().aclose
 
 
 # gpt-5.5-pro accepts only {medium, high, xhigh} (verified live API 2026-04-24).

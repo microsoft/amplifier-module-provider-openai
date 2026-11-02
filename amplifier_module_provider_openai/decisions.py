@@ -350,11 +350,6 @@ def register_decision_backend(coordinator, provider, config):
             raise ValueError("Decision backend identifiers must be unique")
         owned[identity] = OpenAIDecisionBackend(provider, row, coordinator)
         backends[identity] = owned[identity]
-    if owned:
-        coordinator.register_capability("decision.backends", backends)
-        if hasattr(coordinator, "register_contributor"):
-            coordinator.register_contributor("observability.events", "provider-openai-decisions",
-                                             lambda: ["decision:request", "decision:response"])
     def remove():
         current = dict(coordinator.get_capability("decision.backends") or {})
         for identity, backend in owned.items():
@@ -363,6 +358,18 @@ def register_decision_backend(coordinator, provider, config):
                 del current[identity]
         if owned:
             coordinator.register_capability("decision.backends", current)
+    try:
+        if owned:
+            coordinator.register_capability("decision.backends", backends)
+            if hasattr(coordinator, "register_contributor"):
+                coordinator.register_contributor("observability.events", "provider-openai-decisions",
+                                                 lambda: ["decision:request", "decision:response"])
+    except BaseException as error:
+        try:
+            remove()
+        except BaseException as cleanup_error:
+            error.add_note(f"Decision registration rollback failed: {type(cleanup_error).__name__}")
+        raise
     return remove
 
 
