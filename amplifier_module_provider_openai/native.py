@@ -24,7 +24,11 @@ from amplifier_core.message_models import ToolCall
 from openai import NOT_GIVEN, Timeout
 from websockets.protocol import State
 
-from . import OpenAIProvider, _RawResponseObject
+from . import (
+    OpenAIProvider,
+    _add_tool_output_cache_breakpoints,
+    _RawResponseObject,
+)
 from .native_checkpoint import NativeCheckpointMixin
 
 NATIVE_REQUEST = contextvars.ContextVar("openai_native_request", default=None)
@@ -867,6 +871,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 [],
                 function_lineage=function_computer,
             )["input"]
+            if self._tool_output_cache_breakpoints_supported(full_params.get("model")):
+                ordinary = _add_tool_output_cache_breakpoints(ordinary)
             if ordinary != full_params.get("input"):
                 raise LLMError(
                     "Native transport cannot preserve this input assembly extension; use ordinary transport",
@@ -897,6 +903,10 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             params = {
                 **params, "input": self._compile_neutral_input(full_params, params["input"])
             }
+            # Follow the final model, including caller overrides. Normalize the
+            # owned delta before inserting an opaque checkpoint; keep it exact.
+            if self._tool_output_cache_breakpoints_supported(params.get("model")):
+                params["input"] = _add_tool_output_cache_breakpoints(params["input"])
             params = self._apply_checkpoint(params, full_params)
             params = prepare_computer_images(
                 params,

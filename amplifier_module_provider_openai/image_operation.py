@@ -224,12 +224,13 @@ async def _dispatch_with_client(client, request, plan):
 def _parse_response(response, plan):
     """Retain bounded, independently validated evidence even on parse failure."""
     responses = plan["transport"] == "responses"
-    reason = "incomplete_response" if responses and getattr(response, "status", None) != "completed" else None
+    response_status = getattr(response, "status", None) if responses else "completed"
+    reason = "incomplete_response" if response_status == "incomplete" else None
     outputs, calls = [], []
 
-    def invalid():
+    def invalid(code="invalid_response"):
         nonlocal reason
-        reason = reason or "generation_outcome_unknown"
+        reason = reason or code
 
     def identifier(value):
         if value is None or isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,512}", value):
@@ -275,7 +276,7 @@ def _parse_response(response, plan):
                     from PIL import Image
                     with Image.open(BytesIO(data)) as image:
                         if plan["output"]["size"] != f"{image.width}x{image.height}":
-                            invalid()
+                            invalid("output_control_mismatch")
             elif kind == "message":
                 if getattr(item, "status", None) != "completed" or not isinstance(item.content, list):
                     raise ValueError("Incomplete or malformed message output.")
@@ -304,10 +305,14 @@ def _parse_response(response, plan):
     count = sum(o["kind"] == "image" for o in outputs)
     normalized = {k: usage[k] for k in ("input_tokens", "output_tokens", "total_tokens")
                   if isinstance(usage, dict) and type(usage.get(k)) is int and usage[k] >= 0}
-    result = {"protocol": PROTOCOL, "status": "unknown" if reason else "completed" if count == 1 else "failed",
+    # Receiving a response establishes dispatch evidence, not image completion.
+    # Nonterminal or unrecognized states remain uncertain even with safe output.
+    status = ("unknown" if response_status not in ("completed", "incomplete")
+              else "failed" if reason or count != 1 else "completed")
+    result = {"protocol": PROTOCOL, "status": status, "dispatch_state": "response_received",
               "outputs": outputs, "models": models, "upstream": upstream,
               "usage": {"normalized": normalized or None, "provider": usage},
               "effective_options": plan["output"], "warnings": [], "continuation": None}
     if reason:
-        result.update(reason_code=reason, dispatch_state="unknown")
+        result["reason_code"] = reason
     return result

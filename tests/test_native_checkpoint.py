@@ -161,13 +161,14 @@ async def test_budget_and_initial_guard_measure_exact_opaque_window_without_adva
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("new_user_after_reasoning", [False, True])
+@pytest.mark.parametrize("opaque_tool_output", [False, True])
 async def test_real_complete_guards_and_sends_same_opaque_payload_after_compaction(
-    new_user_after_reasoning,
+    new_user_after_reasoning, opaque_tool_output,
 ):
     import json
 
     if new_user_after_reasoning:
-        p, messages, _, opaque, _ = await reasoning_checkpoint()
+        p, messages, _, opaque, _ = await reasoning_checkpoint(opaque_tool_output=opaque_tool_output)
         messages = [*messages, {"role": "user", "content": "Repeat the value"}]
         request = ChatRequest(
             messages=[Message(**m) for m in messages], max_output_tokens=32
@@ -175,7 +176,13 @@ async def test_real_complete_guards_and_sends_same_opaque_payload_after_compacti
         params, _, _ = p._assemble_initial_responses_params(request)
         expected_input = [*opaque, params["input"][-1]]
     else:
-        p, messages, opaque, _ = make()
+        p, messages, opaque, api = make()
+        if opaque_tool_output:
+            opaque.extend([
+                {"type": "function_call", "call_id": "opaque-tool", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "opaque-tool", "output": "opaque result"},
+            ])
+            api.return_value.content = json.dumps({"output": opaque})
         await p.native_compact(
             canonical=messages, identity={"instance": "one", "model": "gpt-6-astra"}
         )
@@ -265,11 +272,17 @@ async def test_compaction_retains_actual_factory_instructions_and_public_usage()
     assert p.native_export_checkpoint() is None
 
 
-async def reasoning_checkpoint():
+async def reasoning_checkpoint(*, opaque_tool_output=False):
     """A completed turn with tool evidence and real typed reasoning content."""
     from amplifier_core.message_models import ThinkingBlock
 
     p, _, opaque, api = make()
+    if opaque_tool_output:
+        opaque.extend([
+            {"type": "function_call", "call_id": "opaque-tool", "name": "read", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "opaque-tool", "output": "opaque result"},
+        ])
+        api.return_value.content = json.dumps({"output": opaque})
     canonical = [
         {"role": "user", "content": "Read the synthetic value"},
         {
