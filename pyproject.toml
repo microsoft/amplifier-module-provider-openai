@@ -18,6 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+decisions = ["amplifier-lib-decisions @ git+https://github.com/microsoft/amplifier-lib-decisions@main"]
 native = ["websockets>=15,<17"]
 
 [project.entry-points."amplifier.modules"]
@@ -59,3 +60,6 @@ dev = [
     # Native protocol tests import the optional transport even without live calls.
     "websockets>=15,<17",
 ]
+
+[project.entry-points."amplifier.decision_backends"]
+provider_openai = "amplifier_module_provider_openai.decisions:catalog"
