@@ -28,6 +28,11 @@ Notes
   / usage.prompt_tokens_details.cache_write_tokens (Chat Completions). Rate entries that omit
   "cache_write_per_m" bill any write tokens as ordinary input (correct for pre-5.6 models,
   which never emit the field). Verified against live gpt-5.6-sol usage on 2026-07-14.
+- GPT-6.1 Terra bills 30m writes at 1.25x and 12h writes at 2.5x input.
+  The non-overlapping usage cache_write_tokens_details buckets determine cost,
+  not the requested TTL. Missing/invalid lifetime evidence leaves cost unknown.
+  Source: https://developers.openai.com/api/docs/guides/prompt-caching.md
+  Rates: https://developers.openai.com/api/docs/pricing.md
 - cached_tokens / cache_write_tokens subtraction happens INSIDE compute_cost to prevent
   call-site double-charging.
 - Snapshot aliasing: the Responses API echoes back a dated snapshot id in response.model
@@ -39,6 +44,7 @@ Notes
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from decimal import Decimal
 
 from ._capabilities import GPT_6_MODELS, get_capabilities
@@ -59,7 +65,7 @@ _PER_M = Decimal(1_000_000)
 #
 # The threshold is NOT redefined here -- it is read per-model from the single
 # source of truth, ModelCapabilities.long_context_pricing_threshold in
-# _capabilities.py (272_000 for gpt-5.6 and the exact GPT-6/GPT-6.1 Sol models;
+# _capabilities.py (272_000 for gpt-5.6 and the exact GPT-6/GPT-6.1 models;
 # None for models with no split, which therefore never re-rate). Source,
 # verification date, and rationale live there.
 
@@ -83,7 +89,7 @@ _SNAPSHOT_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 # TODO: gpt-5.3-codex, gpt-5.2, gpt-5.2-pro, gpt-5.1, gpt-5.1-codex, gpt-5-mini
 #       not yet on pricing page; these models return None until rates are added.
 _RATES: dict[str, dict[str, Decimal]] = {
-    # GPT-6 and GPT-6.1 Sol short-context Standard pricing, per 1M tokens.
+    # GPT-6 and GPT-6.1 short-context Standard pricing, per 1M tokens.
     # Source: https://developers.openai.com/api/docs/pricing
     "gpt-6-astra": {
         "input_per_m": Decimal("10.00"),
@@ -102,6 +108,14 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "output_per_m": Decimal("10.00"),
         "cache_read_per_m": Decimal("0.10"),
         "cache_write_per_m": Decimal("2.50"),
+    },
+    # Terra offers two cache lifetimes; usage must identify each write bucket.
+    "gpt-6.1-terra": {
+        "input_per_m": Decimal("1.00"),
+        "output_per_m": Decimal("5.00"),
+        "cache_read_per_m": Decimal("0.05"),
+        "cache_write_per_m": Decimal("1.25"),
+        "cache_write_12h_per_m": Decimal("2.50"),
     },
     "gpt-6-luna": {
         "input_per_m": Decimal("0.10"),
@@ -197,10 +211,10 @@ _RATES: dict[str, dict[str, Decimal]] = {
 }
 
 
-# _LONG_RATES: GPT-5.6, GPT-6, and GPT-6.1 Sol long-context rates, applied to the
+# _LONG_RATES: GPT-5.6, GPT-6, and GPT-6.1 long-context rates, applied to the
 # WHOLE request when input tokens exceed the model's
 # ModelCapabilities.long_context_pricing_threshold (272K for these models). Same
-# four keys as _RATES entries.
+# keys as _RATES entries (including Terra's separate 12h-write rate).
 # Relative to short-context: input / cached / cache-write are 2x, output is 1.5x.
 # GPT-5.6 absolute rates read directly off the pricing page (not derived from
 # multipliers):
@@ -209,7 +223,7 @@ _RATES: dict[str, dict[str, Decimal]] = {
 #   luna  input $0.40  cached $0.04  cache-write  $0.50  output  $1.80
 # Source: https://developers.openai.com/api/docs/pricing (verified 2026-09-01).
 _LONG_RATES: dict[str, dict[str, Decimal]] = {
-    # GPT-6 and GPT-6.1 Sol long-context (>272K input) Standard pricing, per 1M tokens.
+    # GPT-6 and GPT-6.1 long-context (>272K input) Standard pricing, per 1M tokens.
     "gpt-6-astra": {
         "input_per_m": Decimal("20.00"),
         "output_per_m": Decimal("75.00"),
@@ -227,6 +241,13 @@ _LONG_RATES: dict[str, dict[str, Decimal]] = {
         "output_per_m": Decimal("15.00"),
         "cache_read_per_m": Decimal("0.20"),
         "cache_write_per_m": Decimal("5.00"),
+    },
+    "gpt-6.1-terra": {
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("7.50"),
+        "cache_read_per_m": Decimal("0.10"),
+        "cache_write_per_m": Decimal("2.50"),
+        "cache_write_12h_per_m": Decimal("5.00"),
     },
     "gpt-6-luna": {
         "input_per_m": Decimal("0.20"),
@@ -283,7 +304,7 @@ def _find_rates(
     m = _SNAPSHOT_RE.match(model)
     if m is None:
         return None
-    # GPT-6 plus GPT-6.1 Sol have exact documented model IDs and no dated snapshots. Do not
+    # GPT-6 plus GPT-6.1 have exact documented model IDs and no dated snapshots. Do not
     # assign their current prices to invented future snapshots.
     if m.group("base") in GPT_6_MODELS:
         return None
@@ -297,6 +318,7 @@ def compute_cost(
     completion_tokens: int = 0,
     cached_tokens: int = 0,
     cache_write_tokens: int = 0,
+    cache_write_tokens_details: Mapping[str, int] | None = None,
     service_tier: str | None = "default",
 ) -> Decimal | None:
     """Compute the cost of an OpenAI API call in USD.
@@ -314,6 +336,11 @@ def compute_cost(
             has that rate. usage.{prompt,input}_tokens_details.cache_write_tokens.
             Models without a cache_write_per_m rate never emit this field and bill
             it as ordinary input.
+        cache_write_tokens_details: Terra's non-overlapping ttl_30m_tokens and
+            ttl_12h_tokens buckets from usage.input_tokens_details. Their sum must
+            equal cache_write_tokens. If writes have no trustworthy lifetime
+            breakdown, Terra's cost is unknown rather than assumed to be 30m.
+            Ignored for older models, preserving their existing write pricing.
         service_tier: Actual response service tier for the GPT-6 family. Direct
             callers retain the historic Standard/default estimate. Explicit
             None or an unpriced tier returns None for GPT-6 rather than
@@ -352,9 +379,9 @@ def compute_cost(
     # bills at the long-context rates. Two independent gates:
     #   1. threshold -- read per-model from the single source of truth,
     #      ModelCapabilities.long_context_pricing_threshold (272_000 for gpt-5.6
-    #      and the exact GPT-6/GPT-6.1 Sol models; None for models with no
+    #      and the exact GPT-6/GPT-6.1 models; None for models with no
     #      documented split, which therefore never re-rate).
-    #   2. _LONG_RATES -- GPT-5.6 and the exact GPT-6/GPT-6.1 Sol models have
+    #   2. _LONG_RATES -- GPT-5.6 and the exact GPT-6/GPT-6.1 models have
     #      long rates modelled, so a model with a threshold but no long rates
     #      (e.g. gpt-5.4) keeps its single short-context rate set unchanged.
     threshold = get_capabilities(model).long_context_pricing_threshold
@@ -375,6 +402,28 @@ def compute_cost(
         # (billed at 1.25x input INSTEAD of the input rate, not on top of it).
         fresh_input = max(0, prompt_tokens - cached_tokens - cache_write_tokens)
         write_cost = Decimal(cache_write_tokens) * cache_write_rate / _PER_M
+
+    if model == "gpt-6.1-terra":
+        if cache_write_tokens_details is None:
+            if cache_write_tokens:
+                return None
+        else:
+            if not isinstance(cache_write_tokens_details, Mapping):
+                return None
+            writes_30m = cache_write_tokens_details.get("ttl_30m_tokens", 0)
+            writes_12h = cache_write_tokens_details.get("ttl_12h_tokens", 0)
+            if (
+                any(
+                    type(value) is not int or value < 0
+                    for value in (writes_30m, writes_12h)
+                )
+                or writes_30m + writes_12h != cache_write_tokens
+            ):
+                return None
+            write_cost = (
+                Decimal(writes_30m) * rates["cache_write_per_m"]
+                + Decimal(writes_12h) * rates["cache_write_12h_per_m"]
+            ) / _PER_M
 
     cost = Decimal(fresh_input) * rates["input_per_m"] / _PER_M
     cost += write_cost

@@ -90,7 +90,7 @@ def test_exact_gpt_6_1_sol_capabilities_and_exact_id_boundary() -> None:
     assert caps.supports_native_computer_use is True
     for unrecognized in (
         "gpt-6.1",
-        "gpt-6.1-terra",
+        "gpt-6.1-cyber",
         "gpt-6.1-luna",
         "gpt-6.1-sol-2099-01-01",
     ):

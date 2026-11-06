@@ -129,7 +129,7 @@ class TestConfigFieldGatingMetadata:
         field = _field(_make_provider(), "enable_long_context")
         assert field.requires_model is True
         assert field.show_when == {
-            "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna)|gpt-6\.1-sol)$"
+            "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna)|gpt-6\.1-(?:sol|terra))$"
         }
 
     def test_untouched_fields_keep_no_gating(self):
@@ -162,6 +162,7 @@ class TestShowWhenConsumerSimulation:
         "gpt-6-sol",
         "gpt-6-luna",
         "gpt-6.1-sol",
+        "gpt-6.1-terra",
     )
     NON_5_6_MODELS = (
         "gpt-5.4",
@@ -174,6 +175,7 @@ class TestShowWhenConsumerSimulation:
         "gpt-6-sol-2099-01-01",
         "gpt-6.1-luna",
         "gpt-6.1-sol-2099-01-01",
+        "gpt-6.1-terra-2099-01-01",
     )
 
     def _gated_fields(self, provider: OpenAIProvider) -> dict[str, dict[str, Any]]:
