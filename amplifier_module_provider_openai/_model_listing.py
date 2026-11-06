@@ -1,9 +1,9 @@
 """Provider-local model selectors; no credentials, transport, or Core changes."""
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-import re
 
 
 @dataclass(frozen=True)
@@ -17,7 +17,7 @@ class ModelFilters:
     @classmethod
     def parse(cls, value: Mapping[str, object]) -> "ModelFilters":
         if not isinstance(value, Mapping):
-            raise ValueError("model filters must be a mapping")
+            raise TypeError("model filters must be a mapping")
         if set(value) - {"include", "exclude", "hide_dated"}:
             raise ValueError("unknown model filter key")
 
@@ -32,7 +32,7 @@ class ModelFilters:
 
         hide_dated = value.get("hide_dated", False)
         if not isinstance(hide_dated, bool):
-            raise ValueError("model filters hide_dated must be a boolean")
+            raise TypeError("model filters hide_dated must be a boolean")
         return cls(patterns("include", ("*",)), patterns("exclude", ()), hide_dated)
 
     def select(self, ids: list[str]) -> list[str]:

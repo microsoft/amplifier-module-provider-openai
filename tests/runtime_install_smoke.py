@@ -50,6 +50,7 @@ async def main():
     ) as client:
         provider = OpenAIProvider(client=client)
         assert provider.get_model_list_info()["filters_keyword"] == "filters"
+        assert provider.get_model_list_info()["source"] == "provider-api"
         assert not hasattr(provider, "discover_models")
         assert await provider.list_models() == []
         rows = await provider.list_models(filters={})

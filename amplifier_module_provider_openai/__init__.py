@@ -2818,6 +2818,7 @@ class OpenAIProvider:
         """Describe the optional selector extension locally, without API I/O."""
         return {
             "version": 1,
+            "source": "provider-api",
             "filters_keyword": "filters",
             "filters_schema": selector_schema(),
             "default_filters": self._model_filters.as_dict(),

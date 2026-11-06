@@ -8,7 +8,8 @@ from copy import deepcopy
 
 import httpx
 import pytest
-from amplifier_core import ModelInfo, llm_errors as kernel_errors
+from amplifier_core import ModelInfo
+from amplifier_core import llm_errors as kernel_errors
 from openai import AsyncOpenAI
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -192,10 +193,10 @@ async def test_concurrent_overrides_snapshot_before_await_never_mutate_shared_st
     {"exclude": [1]}, {"hide_dated": "false"}, {"hide_dated": None}, {"typo": True},
 ])
 async def test_invalid_filters_fail_before_io_and_config_fails_at_construction(filters):
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, TypeError)):
         OpenAIProvider(config={"model_filters": filters})
     async with sdk_provider(lambda _: pytest.fail("invalid selector reached transport")) as (p, req, _):
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, TypeError)):
             await p.list_models(filters=filters)
         assert req == []
 
@@ -208,6 +209,7 @@ def test_optional_selector_advertisement_no_parallel_discovery_surface():
     assert signature.parameters["filters"].default is None
     info = p.get_model_list_info()
     assert info["version"] == 1 and info["filters_keyword"] == "filters"
+    assert info["source"] == "provider-api"
     assert info["unfiltered"] == {} and info["override"] == "replace"
     assert info["default_filters"] == {"include": ["gpt-6*"], "exclude": [], "hide_dated": True}
     assert p._client is None

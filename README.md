@@ -171,7 +171,7 @@ Its omitted keys mean `include: ["*"]`, `exclude: []`, `hide_dated: false`.
 Patterns use case-insensitive, OS-independent Python `fnmatch` glob semantics
 (`*`, `?`, `[seq]`, `[!seq]`); exact endpoint ID bytes are preserved.
 Any include match qualifies; any exclude match wins; `include: []` matches none.
-Invalid keys/types raise `ValueError` before I/O. `hide_dated` suppresses a terminal
+Invalid selectors raise `ValueError` or `TypeError` before I/O. `hide_dated` suppresses a terminal
 `-YYYY-MM-DD` snapshot only when its exact corresponding undated alias is also
 selected. A snapshot without that alias remains visible. Preview labels in IDs
 remain visible in display names; preview status is not guessed for opaque IDs.
@@ -187,10 +187,12 @@ Config is snapshotted at construction; each call snapshots its selector before
 I/O. Changing caller mappings, capability readback or legacy attributes cannot
 mutate another call's filtering. Reconstruct the provider to change defaults.
 
-Optional local `get_model_list_info()` returns version `1`, `filters_keyword`,
+Optional local `get_model_list_info()` returns version `1`, `source: "provider-api"`, `filters_keyword`,
 `filters_schema`, effective `default_filters`, `unfiltered: {}`, and
 `override: "replace"`. Consumers must inspect support before passing keywords;
 this is **not** a Core protocol change or a promise about legacy/other providers.
+`source` advertises fresh strict API-backed listing, not current account access;
+listing failures still raise rather than becoming successful static results.
 No Foundation dependency or shared transport keyword assumption is introduced.
 
 Listing fetches one complete Models API response per attempt on the original
