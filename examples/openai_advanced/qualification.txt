@@ -1,0 +1,121 @@
+Offline qualification evidence
+Observed: 2026-11-06 10:26:33 PST
+
+Input hashes before qualification
+4bc848d96bd9a10a40fd3f81a04d76d853fdc58d3e487e5ab7a514d8dd441e11  examples/openai_advanced/evaluate.py
+49a3c53c07dacbf9e53a0046da408daa0516b9b28a339c35f7261c5aebfe7489  examples/openai_advanced/hosted_agents.py
+d32cfa50a0ffa02c0b6ca42f3463a154f1a994ae18b90a8652f91cf63a6fdf83  examples/openai_advanced/multiplex.py
+4d0103514b75fc699803cab53d62eb644398b111958b3055b0648d09f5d1a6ad  examples/openai_advanced/programmatic.py
+39942e145531112e9f03b4d27bce03f71aad422ff3dea0e5f279c0723cc5a502  tests/experiments/test_evaluate.py
+a5330c8a4c5f16ce14265e18589c3d1f162f78ee04d14e43d056feb63e2cf68a  tests/experiments/test_hosted_agents.py
+e977ab0b051ffe0d874fe15c0848b7613e62890bc5871b5930ba6f2c4d6356f7  tests/experiments/test_multiplex.py
+bdffbee5879ed6feb9113936b611f56e6a8fd5633505f1bba3dd37a2aa11bcbf  tests/experiments/test_programmatic.py
+8d494cf3205cbb4cb1d4f8d314110691bb82b16fb469abcafc3478a889e2b8e8  tests/experiments/test_sdk_wire.py
+
+Command: python -m unittest discover -s tests/experiments -v
+test_all_three_experiments_have_outcomes_and_rollout_decisions (test_evaluate.EvaluationTests.test_all_three_experiments_have_outcomes_and_rollout_decisions) ... ok
+test_async_parallel_and_async_programmatic_fail (test_hosted_agents.HostedAgentTests.test_async_parallel_and_async_programmatic_fail) ... ok
+test_attribution_and_root_final_selection (test_hosted_agents.HostedAgentTests.test_attribution_and_root_final_selection) ... ok
+test_bad_arguments_and_denied_host_receipts_stop (test_hosted_agents.HostedAgentTests.test_bad_arguments_and_denied_host_receipts_stop) ... ok
+test_child_final_without_root_final_is_not_success (test_hosted_agents.HostedAgentTests.test_child_final_without_root_final_is_not_success) ... ok
+test_delta_cannot_override_recorded_child_attribution (test_hosted_agents.HostedAgentTests.test_delta_cannot_override_recorded_child_attribution) ... ok
+test_disconnect_after_send_is_unknown_not_accepted (test_hosted_agents.HostedAgentTests.test_disconnect_after_send_is_unknown_not_accepted) ... ok
+test_duplicate_and_cross_agent_wire_ids_do_not_repeat_calls (test_hosted_agents.HostedAgentTests.test_duplicate_and_cross_agent_wire_ids_do_not_repeat_calls) ... ok
+test_event_only_attribution_reaches_host_dispatch (test_hosted_agents.HostedAgentTests.test_event_only_attribution_reaches_host_dispatch) ... ok
+test_function_call_before_created_cannot_dispatch (test_hosted_agents.HostedAgentTests.test_function_call_before_created_cannot_dispatch) ... ok
+test_host_denial_receipt_is_retained (test_hosted_agents.HostedAgentTests.test_host_denial_receipt_is_retained) ... ok
+test_hosted_actions_and_encrypted_agent_messages_are_not_client_calls (test_hosted_agents.HostedAgentTests.test_hosted_actions_and_encrypted_agent_messages_are_not_client_calls) ... ok
+test_incompatible_features_are_rejected_not_stripped (test_hosted_agents.HostedAgentTests.test_incompatible_features_are_rejected_not_stripped) ... ok
+test_injection_envelope_exact_and_acks_serialized (test_hosted_agents.HostedAgentTests.test_injection_envelope_exact_and_acks_serialized) ... ok
+test_late_injection_returns_existing_output_without_reexecution (test_hosted_agents.HostedAgentTests.test_late_injection_returns_existing_output_without_reexecution) ... ok
+test_local_sdk_probe_never_creates_a_client_or_calls_create (test_hosted_agents.HostedAgentTests.test_local_sdk_probe_never_creates_a_client_or_calls_create) ... ok
+test_mismatched_ack_and_rejected_response_id_stop (test_hosted_agents.HostedAgentTests.test_mismatched_ack_and_rejected_response_id_stop) ... ok
+test_missing_or_conflicting_attribution_is_not_default_root (test_hosted_agents.HostedAgentTests.test_missing_or_conflicting_attribution_is_not_default_root) ... ok
+test_no_final_before_all_injection_receipts (test_hosted_agents.HostedAgentTests.test_no_final_before_all_injection_receipts) ... ok
+test_request_beta_and_model_evidence_not_availability (test_hosted_agents.HostedAgentTests.test_request_beta_and_model_evidence_not_availability) ... ok
+test_root_final_refusal_is_preserved (test_hosted_agents.HostedAgentTests.test_root_final_refusal_is_preserved) ... ok
+test_sdk_floor_with_missing_beta_seam_is_explicit (test_hosted_agents.HostedAgentTests.test_sdk_floor_with_missing_beta_seam_is_explicit) ... ok
+test_stop_at_send_gate_does_not_send (test_hosted_agents.HostedAgentTests.test_stop_at_send_gate_does_not_send) ... ok
+test_unknown_capability_does_not_build_request (test_hosted_agents.HostedAgentTests.test_unknown_capability_does_not_build_request) ... ok
+test_unknown_send_never_replays (test_hosted_agents.HostedAgentTests.test_unknown_send_never_replays) ... ok
+test_actual_interleaving_demux_and_same_stream_fifo (test_multiplex.MultiplexTests.test_actual_interleaving_demux_and_same_stream_fifo) ... ok
+test_all_fork_waiters_must_reach_guard (test_multiplex.MultiplexTests.test_all_fork_waiters_must_reach_guard) ... ok
+test_close_loses_all_caches_and_cannot_reuse_on_fresh_connection (test_multiplex.MultiplexTests.test_close_loses_all_caches_and_cannot_reuse_on_fresh_connection) ... ok
+test_connection_error_and_close_make_all_active_unknown (test_multiplex.MultiplexTests.test_connection_error_and_close_make_all_active_unknown) ... ok
+test_connection_lifetime_fences_without_reconnect (test_multiplex.MultiplexTests.test_connection_lifetime_fences_without_reconnect) ... ok
+test_cross_stream_response_id_collision_is_not_demuxed_as_peer_success (test_multiplex.MultiplexTests.test_cross_stream_response_id_collision_is_not_demuxed_as_peer_success) ... ok
+test_default_stream_has_explicit_echoed_identity (test_multiplex.MultiplexTests.test_default_stream_has_explicit_echoed_identity) ... ok
+test_duplicate_request_is_not_replay_and_input_is_snapshotted (test_multiplex.MultiplexTests.test_duplicate_request_is_not_replay_and_input_is_snapshotted) ... ok
+test_failed_and_incomplete_responses_are_stream_local (test_multiplex.MultiplexTests.test_failed_and_incomplete_responses_are_stream_local) ... ok
+test_fork_completion_without_progress_is_not_a_guard (test_multiplex.MultiplexTests.test_fork_completion_without_progress_is_not_a_guard) ... ok
+test_fork_error_before_guard_does_not_unlock_source (test_multiplex.MultiplexTests.test_fork_error_before_guard_does_not_unlock_source) ... ok
+test_fork_requires_source_custody_and_completed_cached_parent (test_multiplex.MultiplexTests.test_fork_requires_source_custody_and_completed_cached_parent) ... ok
+test_fork_waits_for_target_in_progress_not_created (test_multiplex.MultiplexTests.test_fork_waits_for_target_in_progress_not_created) ... ok
+test_invalid_json_does_not_charge_budget_or_poison_queue (test_multiplex.MultiplexTests.test_invalid_json_does_not_charge_budget_or_poison_queue) ... ok
+test_invalid_stream_ids_never_admitted (test_multiplex.MultiplexTests.test_invalid_stream_ids_never_admitted) ... ok
+test_local_error_for_idle_or_unowned_lane_never_blames_active_peer (test_multiplex.MultiplexTests.test_local_error_for_idle_or_unowned_lane_never_blames_active_peer) ... ok
+test_local_error_preserves_peer_and_queue_fifo (test_multiplex.MultiplexTests.test_local_error_preserves_peer_and_queue_fifo) ... ok
+test_malformed_or_wrong_response_identity_fences_connection (test_multiplex.MultiplexTests.test_malformed_or_wrong_response_identity_fences_connection) ... ok
+test_missing_provenance_and_invalid_budget_rejected (test_multiplex.MultiplexTests.test_missing_provenance_and_invalid_budget_rejected) ... ok
+test_mutual_fork_cycle_rejected_without_charging_or_poisoning_queue (test_multiplex.MultiplexTests.test_mutual_fork_cycle_rejected_without_charging_or_poisoning_queue) ... ok
+test_only_documented_create_fields_and_no_real_model_claim (test_multiplex.MultiplexTests.test_only_documented_create_fields_and_no_real_model_claim) ... ok
+test_owned_continuation_and_stale_queued_cache_reference (test_multiplex.MultiplexTests.test_owned_continuation_and_stale_queued_cache_reference) ... ok
+test_provenance_and_workdirs_remain_per_stream_not_wire_fields (test_multiplex.MultiplexTests.test_provenance_and_workdirs_remain_per_stream_not_wire_fields) ... ok
+test_queued_fork_barrier_survives_other_target_request (test_multiplex.MultiplexTests.test_queued_fork_barrier_survives_other_target_request) ... ok
+test_request_budget_is_per_stream_and_queues_count (test_multiplex.MultiplexTests.test_request_budget_is_per_stream_and_queues_count) ... ok
+test_same_local_request_id_is_scoped_to_owned_stream (test_multiplex.MultiplexTests.test_same_local_request_id_is_scoped_to_owned_stream) ... ok
+test_send_acknowledgement_loss_is_not_replayed (test_multiplex.MultiplexTests.test_send_acknowledgement_loss_is_not_replayed) ... ok
+test_shared_nested_or_relative_workdirs_rejected (test_multiplex.MultiplexTests.test_shared_nested_or_relative_workdirs_rejected) ... ok
+test_stop_fences_only_owner_and_late_success_cannot_undo_unknown (test_multiplex.MultiplexTests.test_stop_fences_only_owner_and_late_success_cannot_undo_unknown) ... ok
+test_stop_fork_before_guard_keeps_source_fenced (test_multiplex.MultiplexTests.test_stop_fork_before_guard_keeps_source_fenced) ... ok
+test_valid_id_boundary_and_default_counts_toward_32 (test_multiplex.MultiplexTests.test_valid_id_boundary_and_default_counts_toward_32) ... ok
+test_wrong_owner_stale_custody_and_duplicate_registration (test_multiplex.MultiplexTests.test_wrong_owner_stale_custody_and_duplicate_registration) ... ok
+test_capability_unknown_fails_before_any_request (test_programmatic.ProgrammaticTests.test_capability_unknown_fails_before_any_request) ... ok
+test_commentary_only_continues_and_is_not_merged_with_final_answer (test_programmatic.ProgrammaticTests.test_commentary_only_continues_and_is_not_merged_with_final_answer) ... ok
+test_complete_history_and_caller_preserved (test_programmatic.ProgrammaticTests.test_complete_history_and_caller_preserved) ... ok
+test_denied_call_is_not_result_or_retried (test_programmatic.ProgrammaticTests.test_denied_call_is_not_result_or_retried) ... ok
+test_entire_batch_is_validated_before_execution (test_programmatic.ProgrammaticTests.test_entire_batch_is_validated_before_execution) ... ok
+test_fixture_comparison_does_not_claim_an_efficiency_win (test_programmatic.ProgrammaticTests.test_fixture_comparison_does_not_claim_an_efficiency_win) ... ok
+test_historical_duplicate_rejects_whole_batch_before_any_new_call (test_programmatic.ProgrammaticTests.test_historical_duplicate_rejects_whole_batch_before_any_new_call) ... ok
+test_incomplete_response_dispatches_nothing (test_programmatic.ProgrammaticTests.test_incomplete_response_dispatches_nothing) ... ok
+test_no_generated_javascript_is_executed_locally (test_programmatic.ProgrammaticTests.test_no_generated_javascript_is_executed_locally) ... ok
+test_program_failure_retains_client_receipts_and_never_replays (test_programmatic.ProgrammaticTests.test_program_failure_retains_client_receipts_and_never_replays) ... ok
+test_program_output_alone_needs_final_message (test_programmatic.ProgrammaticTests.test_program_output_alone_needs_final_message) ... ok
+test_refusal_is_a_final_message (test_programmatic.ProgrammaticTests.test_refusal_is_a_final_message) ... ok
+test_repeated_call_identity_is_not_executed_twice (test_programmatic.ProgrammaticTests.test_repeated_call_identity_is_not_executed_twice) ... ok
+test_result_schema_rejects_wrong_sku_nonfinite_and_bool (test_programmatic.ProgrammaticTests.test_result_schema_rejects_wrong_sku_nonfinite_and_bool) ... ok
+test_tools_retain_programmatic_metadata (test_programmatic.ProgrammaticTests.test_tools_retain_programmatic_metadata) ... ok
+test_unknown_host_call_is_recorded_before_dispatch (test_programmatic.ProgrammaticTests.test_unknown_host_call_is_recorded_before_dispatch) ... ok
+test_beta_negotiation_and_attribution_survive_real_sdk_mock_wire (test_sdk_wire.SDKWireTests.test_beta_negotiation_and_attribution_survive_real_sdk_mock_wire) ... ok
+test_ptc_metadata_and_order_survive_real_sdk_mock_wire (test_sdk_wire.SDKWireTests.test_ptc_metadata_and_order_survive_real_sdk_mock_wire) ... ok
+
+----------------------------------------------------------------------
+Ran 75 tests in 0.650s
+
+OK
+
+Command: python -S -m unittest discover -s tests/experiments
+.........................................................................ss
+----------------------------------------------------------------------
+Ran 75 tests in 0.014s
+
+OK (skipped=2)
+
+Command: ruff check examples/openai_advanced tests/experiments
+All checks passed!
+
+Command: python -m examples.openai_advanced.evaluate (retained JSON equality)
+PASS: saved JSON equals fresh bounded evaluation; paid API calls = 0
+
+Input hashes after qualification
+4bc848d96bd9a10a40fd3f81a04d76d853fdc58d3e487e5ab7a514d8dd441e11  examples/openai_advanced/evaluate.py
+49a3c53c07dacbf9e53a0046da408daa0516b9b28a339c35f7261c5aebfe7489  examples/openai_advanced/hosted_agents.py
+d32cfa50a0ffa02c0b6ca42f3463a154f1a994ae18b90a8652f91cf63a6fdf83  examples/openai_advanced/multiplex.py
+4d0103514b75fc699803cab53d62eb644398b111958b3055b0648d09f5d1a6ad  examples/openai_advanced/programmatic.py
+39942e145531112e9f03b4d27bce03f71aad422ff3dea0e5f279c0723cc5a502  tests/experiments/test_evaluate.py
+a5330c8a4c5f16ce14265e18589c3d1f162f78ee04d14e43d056feb63e2cf68a  tests/experiments/test_hosted_agents.py
+e977ab0b051ffe0d874fe15c0848b7613e62890bc5871b5930ba6f2c4d6356f7  tests/experiments/test_multiplex.py
+bdffbee5879ed6feb9113936b611f56e6a8fd5633505f1bba3dd37a2aa11bcbf  tests/experiments/test_programmatic.py
+8d494cf3205cbb4cb1d4f8d314110691bb82b16fb469abcafc3478a889e2b8e8  tests/experiments/test_sdk_wire.py
+
+No live API requests or environments; local protocol + SDK MockTransport only.
