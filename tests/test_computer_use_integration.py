@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -467,14 +468,12 @@ class TestConvertResponseComputerCall:
         }
 
     def test_parses_computer_call_object_form(self) -> None:
-        """Same as dict form, but via SDK-object-shaped blocks (MagicMock
-        standing in for the pydantic response object), exercising the
-        `hasattr(block, "type")` branch instead of the dict branch."""
+        """SDK-shaped values have actual fields, not auto-created mock methods."""
         provider = _make_provider()
         provider._native_call_ids = set()
         provider._native_call_types = {}
 
-        action = MagicMock()
+        action = SimpleNamespace()
         action.type = "click"
         action.x = 10
         action.y = 20
@@ -483,7 +482,7 @@ class TestConvertResponseComputerCall:
             return_value={"type": "click", "x": 10, "y": 20, "button": "left"}
         )
 
-        block = MagicMock()
+        block = SimpleNamespace()
         block.type = "computer_call"
         block.call_id = "call_obj_123"
         block.actions = [action]
@@ -529,11 +528,11 @@ class TestConvertResponseComputerCall:
         assert provider._native_call_types.get("call_ap_1") != "computer"
 
 
-def _make_mock_response(output: list[Any]) -> MagicMock:
-    mock_response = MagicMock()
+def _make_mock_response(output: list[Any]) -> SimpleNamespace:
+    mock_response = SimpleNamespace()
     mock_response.model = "gpt-5.6-sol"
     mock_response.output = output
-    mock_response.usage = MagicMock()
+    mock_response.usage = SimpleNamespace()
     mock_response.usage.input_tokens = 10
     mock_response.usage.output_tokens = 5
     mock_response.usage.total_tokens = 15

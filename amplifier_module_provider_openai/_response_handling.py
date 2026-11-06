@@ -50,9 +50,12 @@ def field(value: Any, name: str, default: Any = None) -> Any:
 def _wire_value(value: Any) -> Any:
     """Own wire values without inventing SDK defaults or dropping explicit nulls."""
     if hasattr(value, "model_dump"):
-        return _wire_value(
-            value.model_dump(mode="json", exclude_unset=True, warnings=False)
-        )
+        dumped = value.model_dump(mode="json", exclude_unset=True, warnings=False)
+        if not isinstance(dumped, (dict, list)):
+            raise kernel_errors.LLMError(
+                "Response output model_dump did not return JSON items", retryable=False
+            )
+        return _wire_value(dumped)
     if isinstance(value, dict):
         return {key: _wire_value(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):

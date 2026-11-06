@@ -76,12 +76,16 @@ from ._constants import (
 from ._cost import compute_cost, requires_cache_usage_evidence
 from ._response_handling import (
     FunctionCallTruncationError,
+    UnsafeContinuationError,
     convert_response,
     describe_incomplete_function_calls,
-    field as response_field,
     merge_discarded_usage,
+    normalized_usage,
     replay_output_items,
     response_with_output,
+)
+from ._response_handling import (
+    field as response_field,
 )
 from ._tool_search import (
     DEFAULT_ALWAYS_LOADED,
@@ -3433,7 +3437,46 @@ class OpenAIProvider:
         # cannot be counted twice from both SSE and get_final_response().
         failed_stream_responses: list[Any] = []
         failed_stream_response_ids: set[int] = set()
+        billed_responses: list[Any] = []
+        billing_finalized = False
+        billed_usage = None
         generation_attempt = 0
+
+        def _finalize_billing():
+            """Account confirmed usage once, including terminal conversion errors.
+
+            Missing/unknown attempts remain unknown. Never infer their tokens or
+            cost from the request's limit. Failed stream observations are
+            de-duplicated at capture; each returned generation is a paid attempt
+            even when a test transport reuses the same response object.
+            """
+            nonlocal billing_finalized, billed_usage
+            if billing_finalized:
+                return billed_usage
+            billing_finalized = True
+            observations = [*failed_stream_responses, *billed_responses]
+            usages = [response_field(item, "usage") for item in observations]
+            if not any(usage is not None for usage in usages):
+                return None
+            billed_usage = merge_discarded_usage(normalized_usage(None), usages)
+            costs = [
+                self._compute_attempt_cost(item) if response_field(item, "usage") is not None else None
+                for item in observations
+            ]
+            if costs and all(cost is not None for cost in costs):
+                total = sum(costs, Decimal(0))
+                billed_usage = billed_usage.model_copy(update={"cost_usd": total})
+                self._add_cost(total)
+            return billed_usage
+
+        def _error_billing(error):
+            usage = _finalize_billing()
+            if usage is None:
+                return {}
+            # Error evidence is not an executable response or success. It makes
+            # known spent tokens inspectable while the original error propagates.
+            error.usage = usage
+            return {"usage": usage.model_dump(mode="json")}
 
         def _record_failed_stream_response(response: Any) -> None:
             if response is not None and id(response) not in failed_stream_response_ids:
@@ -4023,11 +4066,13 @@ class OpenAIProvider:
 
                 # Check for failed/cancelled status
                 if response.status == BACKGROUND_STATUS_FAILED:
+                    billed_responses.append(response)
                     error_msg = f"Background request failed after {poll_count} polls"
                     if hasattr(response, "error") and response.error:
                         error_msg = f"{error_msg}: {response.error}"
                     raise RuntimeError(error_msg)
                 if response.status == "cancelled":
+                    billed_responses.append(response)
                     raise kernel_errors.LLMError(
                         "Background response was cancelled by the provider",
                         provider=self.name, retryable=False,
@@ -4043,7 +4088,7 @@ class OpenAIProvider:
             final_response = response
             continuation_count = 0
             truncation_retry_done = False
-            billed_responses: list[Any] = [*failed_stream_responses, response]
+            billed_responses.append(response)
             if (
                 assembly_state["neutral_computer_context"]["neutral"]
                 and getattr(final_response, "status", None) == "incomplete"
@@ -4190,15 +4235,22 @@ class OpenAIProvider:
                 # Build continuation params using input-based pattern.
                 # params["input"] is the full converted history; the provider
                 # is always stateless.
-                continuation_input = self._build_continuation_input(
-                    params["input"], accumulated_output
-                )
+                original_input = response_field(params.get("extra_body"), "input", params["input"])
+                if not isinstance(original_input, list):
+                    raise UnsafeContinuationError(
+                        "Cannot losslessly auto-continue an opaque non-list input override"
+                    )
+                continuation_input = self._build_continuation_input(original_input, accumulated_output)
 
                 # Reuse the final validated request, including future SDK body
                 # fields and transport controls. Only input changes; do not
                 # re-merge overrides which could replace the accumulated input.
                 continue_params = copy.deepcopy(params)
                 continue_params["input"] = continuation_input
+                if isinstance(continue_params.get("extra_body"), dict) and "input" in continue_params["extra_body"]:
+                    # The SDK overlays extra_body after named fields. Reuse the
+                    # effective final input, not a stale pre-override history.
+                    continue_params["extra_body"]["input"] = copy.deepcopy(continuation_input)
                 if "tools" in params:
                     binding = assembly_state["neutral_computer_context"]["binding"]
                     continue_params["tools"] = [
@@ -4255,6 +4307,7 @@ class OpenAIProvider:
                                 timeout=self._transport_timeout(request_timeout),
                             )
                     if getattr(final_response, "status", None) in {"failed", "cancelled"}:
+                        billed_responses.append(final_response)
                         raise kernel_errors.LLMError(
                             f"Continuation response ended as {final_response.status}",
                             provider=self.name, retryable=False,
@@ -4269,7 +4322,7 @@ class OpenAIProvider:
                         accumulated_output.extend(final_response.output)
 
                 except Exception as e:
-                    if isinstance(e, kernel_errors.ContextLengthError):
+                    if isinstance(e, kernel_errors.LLMError) and not e.retryable:
                         raise
                     # A lost continuation can have generated hosted effects.
                     # Do not turn an unknown outcome into partial success or
@@ -4316,28 +4369,9 @@ class OpenAIProvider:
             # continuations and truncation retries whose output was discarded.
             # Merge raw vendor usage through the same normalization used by
             # the final response so cache writes remain counted exactly once.
-            preceding_usages = [
-                getattr(billed_response, "usage", None)
-                for billed_response in billed_responses[:-1]
-            ]
-            if preceding_usages and chat_response.usage is not None:
-                chat_response.usage = merge_discarded_usage(
-                    chat_response.usage, preceding_usages
-                )
-            if chat_response.usage is not None:
-                attempt_costs: list[Decimal | None] = []
-                for billed_response in billed_responses:
-                    attempt_costs.append(self._compute_attempt_cost(billed_response))
-                if attempt_costs and all(cost is not None for cost in attempt_costs):
-                    total_cost = sum(attempt_costs, Decimal(0))
-                    chat_response.usage = chat_response.usage.model_copy(
-                        update={"cost_usd": total_cost}
-                    )
-                    self._add_cost(total_cost)
-                else:
-                    chat_response.usage = chat_response.usage.model_copy(
-                        update={"cost_usd": None}
-                    )
+            accounted_usage = _finalize_billing()
+            if accounted_usage is not None:
+                chat_response.usage = accounted_usage
 
             # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4386,7 +4420,11 @@ class OpenAIProvider:
 
             return chat_response
 
+        except asyncio.CancelledError as e:
+            _error_billing(e)
+            raise
         except kernel_errors.LLMError as e:
+            error_billing = _error_billing(e)
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
@@ -4401,6 +4439,7 @@ class OpenAIProvider:
                         "error": error_msg,
                         "provider": self.name,
                         "model": params["model"],
+                        **error_billing,
                         **({"error_code": e.code, "response_details": e.response_details}
                            if getattr(e, "code", None) == "computer_use_response_invalid"
                            and isinstance(getattr(e, "response_details", None), dict) else {}),
@@ -4409,6 +4448,7 @@ class OpenAIProvider:
             raise
 
         except Exception as e:
+            error_billing = _error_billing(e)
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
@@ -4424,6 +4464,7 @@ class OpenAIProvider:
                         "error": error_msg,
                         "provider": self.name,
                         "model": params["model"],
+                        **error_billing,
                     },
                 )
             # Re-raise with meaningful message if original was empty
@@ -5318,6 +5359,16 @@ class OpenAIProvider:
                 # Keep a clean function declaration until final overrides and
                 # endpoint/model selection have been resolved by the compiler.
                 openai_tools.append(ordinary(tool))
+                continue
+            if response_field(tool, "type") == "custom":
+                # Custom tools have raw-text/grammar input, not JSON-schema
+                # function input. Keep their actual declaration and never
+                # silently convert them into a different callable contract.
+                declaration = tool if isinstance(tool, dict) else tool.model_dump()
+                openai_tools.append(copy.deepcopy({
+                    key: value for key, value in declaration.items()
+                    if key in {"type", "name", "description", "format"} and value is not None
+                }))
                 continue
             # Check if this is a native OpenAI tool (dict with recognized type)
             if isinstance(tool, dict):

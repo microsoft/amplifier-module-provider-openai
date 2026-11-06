@@ -229,6 +229,82 @@ class EndpointProvider(OpenAIProvider):
         return Decimal("0.125")
 
 
+@pytest.mark.parametrize("as_spec", [False, True])
+def test_custom_tool_declaration_keeps_raw_input_contract_and_grammar(as_spec):
+    from amplifier_core.message_models import ToolSpec
+
+    definition = {
+        "type": "custom",
+        "name": "query",
+        "description": "Raw query",
+        "format": {"type": "grammar", "syntax": "lark", "definition": 'start: "query"'},
+    }
+    tool = (
+        ToolSpec.model_validate({**definition, "parameters": {}})
+        if as_spec
+        else definition
+    )
+    provider = OpenAIProvider(api_key="offline")
+    assert provider._convert_tools_from_request([tool]) == [definition]
+    item = {
+        "type": "custom_tool_call",
+        "id": "ct_1",
+        "call_id": "call_custom",
+        "name": "query",
+        "input": "query",
+    }
+    reply = provider._convert_to_chat_response(payload([item]))
+    assert reply.metadata["openai:output_items"] == [item]
+    assert (
+        reply.tool_calls is None
+    )  # raw custom execution belongs to the native adapter
+
+
+@pytest.mark.asyncio
+async def test_final_extra_body_input_override_continues_effective_history():
+    overridden = [{"role": "user", "content": "effective final input"}]
+    provider = EndpointProvider(
+        extra_request_params={"extra_body": {"input": overridden}}
+    )
+    first = Response.model_validate(
+        payload([text()], status="incomplete", reason="max_output_tokens")
+    )
+    second = Response.model_validate(payload([text(1)]))
+    provider.client.responses.create = AsyncMock(side_effect=[first, second])
+    try:
+        await provider.complete(
+            ChatRequest(messages=[Message(role="user", content="superseded")])
+        )
+        continued = provider.client.responses.create.call_args_list[1].kwargs
+        assert continued["input"] == overridden + [text()]
+        assert continued["extra_body"]["input"] == continued["input"]
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_accounts_only_confirmed_previous_attempt_once():
+    import asyncio
+
+    provider = EndpointProvider()
+    first = Response.model_validate(
+        payload([text()], status="incomplete", reason="max_output_tokens")
+    )
+    provider.client.responses.create = AsyncMock(
+        side_effect=[first, asyncio.CancelledError()]
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await provider.complete(
+                ChatRequest(messages=[Message(role="user", content="go")])
+            )
+        assert provider.costs == [Decimal("0.125")]
+        assert caught.value.usage.input_tokens == 95
+        assert provider.client.responses.create.await_count == 2
+    finally:
+        await provider.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
 async def test_background_continuation_waits_for_same_response_terminal(
@@ -336,7 +412,11 @@ async def test_uncertain_continuation_is_not_partial_success_or_replayed(failure
             )
         assert caught.value.retryable is False
         assert provider.client.responses.create.await_count == 2
-        assert provider.converted == [] and provider.costs == []
+        assert provider.converted == []
+        # Only the confirmed first response is priced; the lost response is
+        # neither made free nor assigned invented tokens/cost.
+        assert provider.costs == [Decimal("0.125")]
+        assert caught.value.usage.input_tokens == 95
     finally:
         await provider.close()
 
@@ -355,6 +435,67 @@ async def test_content_filter_does_not_start_an_automatic_paid_continuation():
         assert result.finish_reason == "length"
         assert result.metadata["openai:incomplete_reason"] == "content_filter"
         assert provider.client.responses.create.await_count == 1
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_truncated_repair_bills_each_confirmed_attempt_once_and_emits_error_usage():
+    provider = EndpointProvider(max_tokens=4096)
+    hooks = SimpleNamespace(emit=AsyncMock())
+    provider.coordinator = SimpleNamespace(hooks=hooks)
+    truncated = {**FUNCTION, "status": "incomplete", "arguments": '{"path":'}
+    attempts = [
+        Response.model_validate(
+            payload(
+                [truncated],
+                status="incomplete",
+                reason="max_output_tokens",
+                index=index,
+            )
+        )
+        for index in range(2)
+    ]
+    provider.client.responses.create = AsyncMock(side_effect=attempts)
+    try:
+        with pytest.raises(FunctionCallTruncationError) as caught:
+            await provider.complete(
+                ChatRequest(messages=[Message(role="user", content="go")]),
+                max_tokens=4096,
+            )
+        assert provider.client.responses.create.await_count == 2
+        assert provider.converted == []
+        assert provider.costs == [Decimal("0.250")]
+        assert caught.value.usage.input_tokens == 190
+        assert caught.value.usage.output_tokens == 20
+        assert caught.value.usage.cache_write_tokens == 10
+        errors = [
+            call.args[1]
+            for call in hooks.emit.call_args_list
+            if call.args[0] == "llm:response" and call.args[1].get("status") == "error"
+        ]
+        assert len(errors) == 1
+        assert errors[0]["usage"]["cost_usd"] == "0.250"
+        assert errors[0]["usage"]["input_tokens"] == 190
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_usage_on_terminal_refusal_never_invents_cost():
+    provider = EndpointProvider()
+    no_usage = payload([{**PATCH, "status": "in_progress"}])
+    no_usage["usage"] = None
+    provider.client.responses.create = AsyncMock(
+        return_value=Response.model_validate(no_usage)
+    )
+    try:
+        with pytest.raises(UnsafeContinuationError) as caught:
+            await provider.complete(
+                ChatRequest(messages=[Message(role="user", content="go")])
+            )
+        assert not hasattr(caught.value, "usage")
+        assert provider.costs == []
     finally:
         await provider.close()
 

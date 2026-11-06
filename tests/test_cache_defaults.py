@@ -191,7 +191,7 @@ def test_continuation_inherits_default_24h():
         status="incomplete",
         id="resp_incomplete",
         output=[],
-        incomplete_details=None,
+        incomplete_details={"reason": "max_output_tokens"},
     )
     completed_resp = DummyResponse()
 
