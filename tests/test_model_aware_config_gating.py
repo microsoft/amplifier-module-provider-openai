@@ -5,12 +5,12 @@ chain (the wizard offered `prompt_cache_retention: in_memory` for every
 model, including gpt-5.6, which the request path then silently drops on
 every session):
 
-1. `prompt_cache_retention`, `text_verbosity`, and `enable_reasoning_context`
-   are now gated via `requires_model` + `show_when`, so the wizard only
-   offers values a model actually supports.
-2. The `_drop_unsupported_in_memory_retention` warning leads with omission
-   as the recommended remedy, and names `prompt_cache_options.ttl` as the
-   gpt-5.6-specific replacement mechanism.
+1. `enable_long_context` uses `requires_model` + `show_when`, so the wizard only
+   offers it for documented exact long-context models. Legacy cache and text
+   controls are settings-only, not wizard ConfigFields.
+2. Legacy in-memory retention warnings retain omission as the recommended remedy
+   for gpt-5.5. Exact gpt-5.6 IDs drop all legacy retention values and recommend
+   prompt_cache_options.ttl with either '30m' or '12h', never '24h'.
 3. A generic unknown-config-key sweep at construction time warns (once, with
    a nearest-match suggestion) about keys this provider does not recognize,
    while staying silent on every legitimate config.
@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
+import pytest
 from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -121,16 +122,18 @@ def _field_as_dict(field) -> dict[str, Any]:
 
 class TestConfigFieldGatingMetadata:
     """enable_long_context now carries requires_model=True and a show_when
-    gating it to gpt-5.6-family models (X1 decision). text_verbosity and
+    gating it to exact documented long-context models. text_verbosity and
     prompt_cache_retention are no longer ConfigFields at all (config-surface
     V2 reduced the wizard to 4 fields) -- see test_wizard_surface.py."""
 
-    def test_enable_long_context_requires_model_and_shows_for_5_6_and_exact_gpt_6(self):
+    def test_enable_long_context_requires_model_and_an_anchored_model_predicate(self):
         field = _field(_make_provider(), "enable_long_context")
         assert field.requires_model is True
-        assert field.show_when == {
-            "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna)|gpt-6\.1-(?:sol|terra))$"
-        }
+        assert field.show_when is not None
+        assert set(field.show_when) == {"default_model"}
+        predicate = field.show_when["default_model"]
+        assert predicate.startswith("matches:^")
+        assert predicate.endswith("$")
 
     def test_untouched_fields_keep_no_gating(self):
         """Do-NOT-touch scope check: reasoning_effort keeps its existing
@@ -153,7 +156,11 @@ class TestShowWhenConsumerSimulation:
     amplifier_app_cli.provider_config_utils.configure_provider evaluates
     post-model-selection fields."""
 
-    GPT_5_6_MODELS = (
+    LONG_CONTEXT_MODELS = (
+        "gpt-5.4",
+        "gpt-5.4-pro",
+        "gpt-5.5",
+        "gpt-5.5-pro",
         "gpt-5.6",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
@@ -164,12 +171,17 @@ class TestShowWhenConsumerSimulation:
         "gpt-6.1-sol",
         "gpt-6.1-terra",
     )
-    NON_5_6_MODELS = (
-        "gpt-5.4",
-        "gpt-5.5",
-        "gpt-5.5-pro",
+    OTHER_MODELS = (
         "gpt-4o",
         "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.6-mini",
+        "gpt-5.6-nano",
+        "gpt-5.6-terra-preview",
+        "gpt-5.6-sol-2026-07-09",
+        "unrecognized-model",
         "gpt-6",
         "gpt-6-terra",
         "gpt-6-sol-2099-01-01",
@@ -186,16 +198,16 @@ class TestShowWhenConsumerSimulation:
             if f.id in ("enable_long_context",)
         }
 
-    def test_enable_long_context_shown_only_for_5_6_tiers(self):
+    def test_enable_long_context_shown_only_for_documented_exact_models(self):
         fields = self._gated_fields(_make_provider())
-        for model in self.GPT_5_6_MODELS:
+        for model in self.LONG_CONTEXT_MODELS:
             assert (
                 _should_show_field(
                     fields["enable_long_context"], {"default_model": model}
                 )
                 is True
             ), f"enable_long_context should be shown for {model}"
-        for model in self.NON_5_6_MODELS:
+        for model in self.OTHER_MODELS:
             assert (
                 _should_show_field(
                     fields["enable_long_context"], {"default_model": model}
@@ -206,7 +218,7 @@ class TestShowWhenConsumerSimulation:
     def test_gpt_5_6_alias_bare_form_also_gates_correctly(self):
         """README: the bare 'gpt-5.6' alias resolves to gpt-5.6-sol, but the
         wizard gates on the STRING the user selected (before resolution) --
-        it must still match the 'gpt-5.6' substring."""
+        the exact alias must still be offered long context."""
         fields = self._gated_fields(_make_provider())
         collected = {"default_model": "gpt-5.6"}
         assert _should_show_field(fields["enable_long_context"], collected) is True
@@ -255,14 +267,19 @@ class TestInMemoryDropWarningWording:
         # gpt-5.5 has no prompt_cache_options -- must not be mentioned for it.
         assert "prompt_cache_options" not in message
 
-    def test_names_prompt_cache_options_for_gpt_5_6(self, caplog):
-        """For gpt-5.6, the doc-correct remedy (prompt_cache_options.ttl)
-        must be named explicitly, still leading with omission."""
+    @pytest.mark.parametrize("model", [
+        "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    ])
+    @pytest.mark.parametrize("retention", ["in_memory", "24h"])
+    def test_names_prompt_cache_options_for_gpt_5_6(self, model, retention, caplog):
+        """Drop either legacy value once and recommend only supported new TTLs."""
         caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
         provider = _make_provider(
-            prompt_cache_retention="in_memory", default_model="gpt-5.6-luna"
+            prompt_cache_retention=retention, default_model=model
         )
         provider.client.responses.create = AsyncMock(return_value=_DummyResponse())
+        asyncio.run(provider.complete(_simple_request()))
+        assert "prompt_cache_retention" not in _captured_params(provider)
         asyncio.run(provider.complete(_simple_request()))
 
         assert "prompt_cache_retention" not in _captured_params(provider)
@@ -276,14 +293,13 @@ class TestInMemoryDropWarningWording:
         assert len(warnings) == 1
         message = warnings[0]
 
-        assert "prompt_cache_options.ttl" in message
-        omit_idx = message.find("Omit")
-        options_idx = message.find("prompt_cache_options.ttl")
-        pass_24h_idx = message.find("pass '24h'")
-        assert -1 not in (omit_idx, options_idx, pass_24h_idx)
-        assert omit_idx < pass_24h_idx, (
-            f"omission must still lead over the '24h' alternative: {message!r}"
-        )
+        assert model in message
+        assert f"prompt_cache_retention={retention!r}" in message
+        assert "unsupported" in message
+        assert "Use prompt_cache_options.ttl instead" in message
+        remedy = message.split("Use prompt_cache_options.ttl instead", 1)[1]
+        assert "'30m'" in remedy and "'12h'" in remedy
+        assert "24h" not in remedy
 
     def test_existing_gpt_5_5_regression_assertions_still_hold(self, caplog):
         """Guards the pre-existing test_cache_params.py assertions (message

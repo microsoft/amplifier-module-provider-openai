@@ -48,7 +48,12 @@ from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from ._capabilities import GPT_6_MODELS, GPT_6_SOL_LUNA_MODELS, get_capabilities
+from ._capabilities import (
+    GPT_6_MODELS,
+    LONG_CONTEXT_MODEL_PATTERN,
+    get_capabilities,
+    get_request_policy,
+)
 from ._constants import (
     BACKGROUND_POLLING_STATUSES,
     BACKGROUND_STATUS_FAILED,
@@ -68,7 +73,7 @@ from ._constants import (
     METADATA_TOOL_SEARCH_ITEMS,
     NATIVE_TOOL_TYPES,
 )
-from ._cost import compute_cost
+from ._cost import compute_cost, requires_cache_usage_evidence
 from ._response_handling import (
     FunctionCallTruncationError,
     convert_response,
@@ -226,11 +231,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 # gpt-5.5-pro accepts only {medium, high, xhigh} (verified live API 2026-04-24).
 # Catching disallowed values pre-flight gives callers a clear error instead of
 # an opaque API HTTP 400.
-_GPT_5_5_PRO_ALLOWED_EFFORTS = frozenset({"medium", "high", "xhigh"})
-_GPT_6_ASTRA_ALLOWED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-_GPT_6_SOL_LUNA_ALLOWED_EFFORTS = frozenset(
-    {"none", "low", "medium", "high", "xhigh", "max"}
-)
+_GPT_5_5_PRO_ALLOWED_EFFORTS = get_request_policy("gpt-5.5-pro").allowed_efforts
 
 
 def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
@@ -267,17 +268,16 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
 def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     """Reject documented-invalid fields from a final exact GPT-6 wire payload."""
     model = params.get("model")
-    if model not in GPT_6_MODELS:
+    policy = get_request_policy(model)
+    if policy.allowed_efforts is None:
         return
 
     reasoning = params.get("reasoning")
     effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
-    allowed_efforts = (
-        _GPT_6_SOL_LUNA_ALLOWED_EFFORTS
-        if model in GPT_6_SOL_LUNA_MODELS or model == "gpt-6.1-terra"
-        else _GPT_6_ASTRA_ALLOWED_EFFORTS
-    )
-    if effort is not None and effort not in allowed_efforts:
+    allowed_efforts = policy.allowed_efforts
+    if effort is not None and (
+        not isinstance(effort, str) or effort not in allowed_efforts
+    ):
         raise kernel_errors.InvalidRequestError(
             f"Model {model!r} does not support reasoning.effort={effort!r}. "
             "Use 'low' for lightweight tasks, or omit reasoning.effort. "
@@ -287,7 +287,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     # GPT-6 Sol/Luna and GPT-6.1 Terra allow sampling fields only when an explicit
     # literal `reasoning.effort="none"` is sent. Astra and GPT-6.1 Sol never
     # allow `none`.
-    if effort != "none":
+    if model in GPT_6_MODELS and effort != "none":
         for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
             if field in params and params[field] is not None:
                 raise kernel_errors.InvalidRequestError(
@@ -295,7 +295,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
                     "is active; remove it from the request or extra_request_params."
                 )
             params.pop(field, None)
-    else:
+    elif model in GPT_6_MODELS:
         # `logprobs` remains an invalid top-level Responses field even when
         # the model explicitly disables reasoning.
         if params.get("logprobs") is not None:
@@ -306,7 +306,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
         params.pop("logprobs", None)
 
     include = params.get("include")
-    if effort == "none" and isinstance(include, (list, tuple)):
+    if model in GPT_6_MODELS and effort == "none" and isinstance(include, (list, tuple)):
         include = [
             value for value in include if value != "reasoning.encrypted_content"
         ]
@@ -315,7 +315,8 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
         else:
             params.pop("include", None)
     if (
-        effort != "none"
+        model in GPT_6_MODELS
+        and effort != "none"
         and isinstance(include, (list, tuple))
         and "message.output_text.logprobs" in include
     ):
@@ -325,16 +326,14 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
         )
 
     options = params.get("prompt_cache_options")
-    if model == "gpt-6.1-terra" and options is not None:
+    if policy.cache_ttls and options is not None:
         _validate_prompt_cache_options(options)
-    allowed_ttls = (None, "30m", "12h") if model == "gpt-6.1-terra" else (None, "30m")
-    if isinstance(options, dict) and (
-        options.get("ttl") not in allowed_ttls
-        or (model == "gpt-6.1-terra" and "ttl" in options and options["ttl"] is None)
+    if policy.cache_ttls and isinstance(options, dict) and "ttl" in options and (
+        not isinstance(options["ttl"], str) or options["ttl"] not in policy.cache_ttls
     ):
         raise kernel_errors.InvalidRequestError(
             f"Model {model!r} supports only prompt_cache_options.ttl in "
-            f"{list(allowed_ttls[1:])}."
+            f"{sorted(policy.cache_ttls)}."
         )
 
 
@@ -378,16 +377,16 @@ def _resolve_config_reasoning_effort(value: Any, model_id: str) -> str | None:
             f"Valid values: {', '.join(sorted(_KNOWN_REASONING_EFFORTS))}. "
             f"Fix the provider config (settings.yaml / bundle config block)."
         )
-    # Per-model accepted sets, where known. gpt-5.5-pro is the only model
-    # with a verified restricted set today (live API 2026-04-24).
-    if model_id.startswith("gpt-5.5-pro") and (
-        normalized not in _GPT_5_5_PRO_ALLOWED_EFFORTS
-    ):
+    # Preserve existing mount-time behavior. All other exact-model restrictions
+    # run after request overrides select the final wire model.
+    allowed = (
+        _GPT_5_5_PRO_ALLOWED_EFFORTS
+        if model_id.startswith("gpt-5.5-pro") else None
+    )
+    if allowed is not None and normalized not in allowed:
         raise ValueError(
             f"Config 'reasoning_effort'={value!r} is not accepted by model "
-            f"{model_id!r}: gpt-5.5-pro requires one of "
-            f"{sorted(_GPT_5_5_PRO_ALLOWED_EFFORTS)} "
-            f"(verified against live API 2026-04-24)."
+            f"{model_id!r}: requires one of {sorted(allowed)}."
         )
     return normalized
 
@@ -532,10 +531,9 @@ def _validate_reasoning_context(reasoning_param: Any) -> None:
     )
 
 
-# prompt_cache_options.mode is a stable enum; ttl currently accepts only "30m" but
-# is left to the API to validate (it is the more volatile field). Verified live
-# against gpt-5.6-sol 2026-07-14. Note: prompt_cache_options COEXISTS with
-# prompt_cache_retention -- it does not replace it.
+# GPT-5.6 and later use prompt_cache_options instead of legacy retention.
+# Exact-ID TTL eligibility is in _capabilities; unknown endpoint fields remain
+# subject to authoritative API validation.
 _PROMPT_CACHE_OPTIONS_MODES = frozenset({"implicit", "explicit"})
 
 _CONTEXT_OVERFLOW_ERROR_CODES = frozenset({"context_length_exceeded"})
@@ -1114,7 +1112,9 @@ _INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
     "thinking_budget_buffer": ("removed -- see thinking_budget_tokens."),
 }
 
-_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset(_INERT_CONFIG_KEY_MESSAGES)
+_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = (
+    frozenset(_INERT_CONFIG_KEY_MESSAGES) | {"shutdown_date"}
+)
 
 # Infrastructure keys the app/kernel may place in (or alongside) a provider's
 # config block that this module does not itself read. `default_model` and
@@ -1144,14 +1144,7 @@ def _supports_tool_output_cache_breakpoints(model: str) -> bool:
     """Whether *model* supports automatic function-output cache breakpoints."""
     if not isinstance(model, str):
         return False
-    # OpenAI documents explicit function-result boundaries for GPT-5.6+.
-    # Use the curated GPT-6 family, not a second tier-specific allowlist.
-    if model in GPT_6_MODELS or model == "gpt-5.6":
-        return True
-    return any(
-        model == tier or model.startswith(f"{tier}-")
-        for tier in ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra")
-    )
+    return bool(get_request_policy(model).cache_ttls)
 
 
 def _add_tool_output_cache_breakpoints(input_items: list[Any]) -> list[Any]:
@@ -1651,20 +1644,34 @@ class OpenAIProvider:
         # This stays in-memory and is bounded to one scalar model id per model.
         self._budget_uncalibrated_warned_models: set[str] = set()
         self._budget_nontext_warned_models: set[str] = set()
+        from ._lifecycle import shutdown_date
+
+        retirement = shutdown_date(self.default_model)
+        if (
+            retirement is not None and self.name == "openai"
+            and self._has_standard_openai_endpoint()
+        ):
+            logger.warning(
+                "[PROVIDER] Explicit model pin %r has OpenAI shutdown_date=%s. "
+                "The pin is preserved; select a replacement explicitly.",
+                self.default_model, retirement,
+            )
 
     def _prepare_gpt_6_params(self, params: dict[str, Any]) -> None:
-        """Apply exact GPT-6 final-wire compatibility rules after extras merge."""
+        """Apply exact-model final-wire rules; retain this internal call seam."""
         model = params.get("model")
-        if model not in GPT_6_MODELS:
-            return
-        legacy_retention = params.pop("prompt_cache_retention", None)
+        _validate_gpt_5_5_pro_effort(model, params.get("reasoning"))
+        policy = get_request_policy(model)
+        legacy_retention = (
+            params.pop("prompt_cache_retention", None) if policy.cache_ttls else None
+        )
         if legacy_retention is not None and not self._astra_legacy_retention_warned:
             self._astra_legacy_retention_warned = True
             self._assembly_log(
                 "warning",
                 "[PROVIDER] Dropping prompt_cache_retention=%r for %s; "
                 "it is unsupported. Use prompt_cache_options.ttl instead "
-                "('30m', or '12h' for gpt-6.1-terra).",
+                "('30m' or '12h').",
                 legacy_retention,
                 model,
             )
@@ -1760,11 +1767,6 @@ class OpenAIProvider:
                 provider=self.name,
             )
         caps = get_capabilities(model)
-        advertised = (
-            caps.context_window
-            if self.enable_long_context
-            else (caps.long_context_pricing_threshold or caps.context_window)
-        )
         # Direct SDK callers may omit an output cap. Reserve the model's full
         # advertised output capability without changing their wire parameters.
         output = params.get(
@@ -1775,13 +1777,25 @@ class OpenAIProvider:
                 "OpenAI request budget requires a nonnegative integer max_output_tokens.",
                 provider=self.name,
             )
-        allowance = advertised - output - 4096
+        if caps.max_output_tokens and output > caps.max_output_tokens:
+            raise kernel_errors.ContextLengthError(
+                f"OpenAI max_output_tokens={output} exceeds the model output "
+                f"ceiling ({caps.max_output_tokens}, model={model}).",
+                provider=self.name,
+            )
+        # Total context, independent input ceiling and price threshold are
+        # different constraints. Output consumes total context, not the input
+        # ceiling or the standard-price threshold.
+        allowance = caps.context_window - output
         if caps.max_input_tokens is not None:
-            allowance = min(allowance, caps.max_input_tokens - 4096)
+            allowance = min(allowance, caps.max_input_tokens)
+        if not self.enable_long_context and caps.long_context_pricing_threshold:
+            allowance = min(allowance, caps.long_context_pricing_threshold)
+        allowance -= 4096
         if allowance <= 0:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request has no input allowance after its output reserve "
-                f"(model={model}, context={advertised}, output={output}).",
+                f"(model={model}, context={caps.context_window}, output={output}).",
                 provider=self.name,
             )
         return allowance
@@ -2057,9 +2071,13 @@ class OpenAIProvider:
             if isinstance(self.extra_request_params.get("extra_body"), dict):
                 history_tools = self.extra_request_params["extra_body"].get("tools", history_tools)
             background_mode = kwargs.get("background", False)
-            if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
+            if (model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
                 ("o3-deep-research", "o4-mini-deep-research")
+            )) and not (
+                self.name == "openai" and self._has_standard_openai_endpoint()
             ):
+                # Retired direct-OpenAI model identity must not opt users into
+                # stored background work. Compatible endpoint owners retain it.
                 background_mode = kwargs.get("background", True)
 
             params: dict[str, Any] = {
@@ -2118,7 +2136,6 @@ class OpenAIProvider:
                     )
             if reasoning is None:
                 reasoning = self.reasoning
-            _validate_gpt_5_5_pro_effort(model_name, reasoning)
             _validate_reasoning_mode(reasoning)
             _validate_reasoning_context(reasoning)
             if reasoning:
@@ -2201,12 +2218,12 @@ class OpenAIProvider:
                 "prompt_cache_retention", self.prompt_cache_retention
             ) or None
             if (
-                model_name in GPT_6_MODELS
+                get_request_policy(model_name).cache_ttls
                 and "prompt_cache_retention" not in self.config
                 and "prompt_cache_retention" not in kwargs
             ):
                 retention = None
-            if model_name not in GPT_6_MODELS:
+            if not get_request_policy(model_name).cache_ttls:
                 retention = _drop_unsupported_in_memory_retention(
                     model_name,
                     retention,
@@ -2603,6 +2620,8 @@ class OpenAIProvider:
             reported_context = (
                 caps.long_context_pricing_threshold or caps.context_window
             )
+        if caps.max_input_tokens is not None:
+            reported_context = min(reported_context, caps.max_input_tokens)
         provider_capabilities = [
             "streaming",
             "tools",
@@ -2665,19 +2684,9 @@ class OpenAIProvider:
                     required=False,
                     default="false",
                     requires_model=True,  # NEW -- needed for show_when to see default_model
-                    # Matches exactly the models with modelled long rates
-                    # (_LONG_RATES, _cost.py) -- gpt-5.6-sol/-terra/-luna (and
-                    # the over-included -cyber, harmless: the flag still
-                    # widens its reported window correctly). gpt-5.5 has NO
-                    # threshold at all (the flag would be a total no-op) and
-                    # gpt-5.4*/-mini/-nano have a threshold but no long rates
-                    # (cost-neutral) -- neither belongs behind this specific
-                    # ~2x-cost prompt. show_when is AND-only with one
-                    # predicate per key, so a three-way set is not
-                    # expressible; this is the single expressible predicate
-                    # that matches the models where the flag has a real cost.
+                    # Exact supported SKU sets; no speculative GPT-6 suffixes.
                     show_when={
-                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna)|gpt-6\.1-(?:sol|terra))$"
+                        "default_model": LONG_CONTEXT_MODEL_PATTERN
                     },
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
@@ -2848,6 +2857,14 @@ class OpenAIProvider:
 
         for model in models_response.data:
             model_id = model.id
+            from ._lifecycle import is_shutdown, shutdown_date
+
+            # Model discovery is not a saved pin. Exclude only known shutdowns
+            # on the direct OpenAI endpoint; preserve custom deployment catalogs.
+            direct_openai = self.name == "openai" and self._has_standard_openai_endpoint()
+            reported_shutdown = getattr(model, "shutdown_date", None)
+            if direct_openai and is_shutdown(model_id, reported=reported_shutdown):
+                continue
 
             # Check if this is a deep research model
             is_deep_research = model_id in DEEP_RESEARCH_MODELS or model_id.startswith(
@@ -2882,11 +2899,19 @@ class OpenAIProvider:
                 reported_context = (
                     caps.long_context_pricing_threshold or caps.context_window
                 )
+            if caps.max_input_tokens is not None:
+                reported_context = min(reported_context, caps.max_input_tokens)
             max_output_tokens = caps.max_output_tokens
             if is_deep_research:
                 defaults = {"max_tokens": 32768, "background": True}
             else:
                 defaults = {"max_tokens": 16384, "reasoning_effort": "none"}
+            if direct_openai:
+                retirement = shutdown_date(model_id, reported_shutdown)
+                if retirement is not None:
+                    # ModelInfo has no lifecycle field; defaults is its
+                    # extensible metadata channel. This is inert request config.
+                    defaults["shutdown_date"] = retirement
 
             models.append(
                 ModelInfo(
@@ -2913,16 +2938,10 @@ class OpenAIProvider:
             o4-mini-deep-research -> o4-mini Deep Research
         """
         # Known display name mappings
+        policy_name = get_request_policy(model_id).display_name
+        if policy_name is not None:
+            return policy_name
         display_names = {
-            "gpt-6-astra": "GPT 6 Astra",
-            "gpt-6-sol": "GPT 6 Sol",
-            "gpt-6-luna": "GPT 6 Luna",
-            "gpt-6.1-sol": "GPT 6.1 Sol",
-            "gpt-6.1-terra": "GPT 6.1 Terra",
-            "gpt-5.6": "GPT 5.6",
-            "gpt-5.6-sol": "GPT 5.6 Sol",
-            "gpt-5.6-terra": "GPT 5.6 Terra",
-            "gpt-5.6-luna": "GPT 5.6 Luna",
             "gpt-5.6-cyber": "GPT 5.6 Cyber",
             "gpt-5.5": "GPT 5.5",
             "gpt-5.5-pro": "GPT 5.5 Pro",
@@ -5477,10 +5496,17 @@ class OpenAIProvider:
         if usage_obj is None:
             return None
         input_details = getattr(usage_obj, "input_tokens_details", None)
-        if getattr(response, "model", "") == "gpt-6.1-terra" and any(
-            type(getattr(input_details, key, None)) is not int
-            or getattr(input_details, key) < 0
-            for key in ("cached_tokens", "cache_write_tokens")
+        if requires_cache_usage_evidence(getattr(response, "model", "")) and (
+            any(
+                type(getattr(input_details, key, None)) is not int
+                or getattr(input_details, key) < 0
+                for key in ("cached_tokens", "cache_write_tokens")
+            )
+            or any(
+                type(getattr(usage_obj, key, None)) is not int
+                or getattr(usage_obj, key) < 0
+                for key in ("input_tokens", "output_tokens")
+            )
         ):
             # Missing evidence is not an explicit zero: fresh input, cache
             # reads, and the two write lifetimes have different prices.

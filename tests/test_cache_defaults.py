@@ -93,8 +93,8 @@ def _captured_params(provider: OpenAIProvider) -> Any:
 
 def test_default_retention_is_24h():
     """No config → prompt_cache_retention defaults to '24h'."""
-    # The GPT-5.6 retention contract; GPT-6 omits this legacy field.
-    provider = _make_provider(default_model="gpt-5.6-sol")
+    # Legacy models retain the preference; GPT-5.6 and later use ttl instead.
+    provider = _make_provider(default_model="gpt-5.4")
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     asyncio.run(provider.complete(_simple_request()))
     assert _captured_params(provider)["prompt_cache_retention"] == "24h"
