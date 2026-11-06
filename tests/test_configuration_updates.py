@@ -172,13 +172,15 @@ def test_original_omission_and_explicit_medium_are_different_baselines(effort):
     carrier = configuration_update_from_response({"metadata": {"openai:request_configuration": baseline}}, "high")
     original.messages.extend([Message(role="assistant", content="Answer"), Message(**carrier), Message(role="user", content="Next")])
     reloaded = ChatRequest.model_validate_json(original.model_dump_json())
-    assert p._budget_params(reloaded)["reasoning"] == params["reasoning"]
+    assert p._budget_params(reloaded).get("reasoning") == params.get("reasoning")
     different = "medium" if effort is None else None
     with pytest.raises(ValueError, match="original request-level effort"):
         provider({"reasoning_effort": different})._budget_params(reloaded)
 
 
 def test_config_none_sentinel_is_omitted_not_literal_request_none():
+    from amplifier_core.llm_errors import InvalidRequestError
+
     p = provider({"reasoning_effort": "none"})
     params = p._budget_params(ChatRequest(messages=[Message(role="user", content="Original")]))
     assert request_configuration(params)["request_effort"] is None
@@ -186,7 +188,7 @@ def test_config_none_sentinel_is_omitted_not_literal_request_none():
         configuration_update_message(MODEL, "none", request_effort=None)
     request = request_with_update()
     request.reasoning_effort = "none"
-    with pytest.raises(ValueError):
+    with pytest.raises(InvalidRequestError, match="does not support reasoning.effort"):
         p._budget_params(request)
 
 
@@ -345,7 +347,7 @@ async def test_real_sdk_unknown_input_item_survives_http_and_provider_complete()
     async with openai.AsyncOpenAI(
         api_key="offline", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
     ) as client:
-        p = provider(client=client)
+        p = provider({"use_streaming": False}, client=client)
         result = await p.complete(request_with_update(), auto_continue=False)
         assert result.content[0].text == "OK"
         carrier = configuration_update_from_response(result, "low")
@@ -354,6 +356,88 @@ async def test_real_sdk_unknown_input_item_survives_http_and_provider_complete()
         assert body["reasoning"]["effort"] == "low"
         assert body["input"][2] == {"type": "configuration_update", "reasoning": {"effort": "high"}}
         assert len([1 for path, _ in calls if path == "/v1/responses"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_low_high_low_across_responses_and_core_restart():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        if request.url.path.endswith("/input_tokens"):
+            return httpx.Response(200, json={"input_tokens": 30})
+        calls.append(body)
+        response = response_body()
+        response["id"] = f"resp_{len(calls)}"
+        response["output"][0]["id"] = f"msg_{len(calls)}"
+        return httpx.Response(200, json=response)
+
+    async with openai.AsyncOpenAI(
+        api_key="offline", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ) as client:
+        p = provider({"use_streaming": False}, client=client)
+        request = ChatRequest(messages=[Message(role="user", content="Original")])
+        first = await p.complete(request, auto_continue=False)
+        request.messages.extend([
+            Message(role="assistant", content=first.content, metadata=first.metadata),
+            Message(**configuration_update_from_response(first, "high")),
+            Message(role="user", content="Hard follow-up"),
+        ])
+        second = await p.complete(request, auto_continue=False)
+        request.messages.extend([
+            Message(role="assistant", content=second.content, metadata=second.metadata),
+            Message(**configuration_update_from_response(second, "low")),
+            Message(role="user", content="Routine follow-up"),
+        ])
+        original = request.model_dump()
+        restarted = ChatRequest.model_validate_json(request.model_dump_json())
+        fresh_provider = provider({"use_streaming": False}, client=client)
+        await fresh_provider.complete(restarted, auto_continue=False)
+        assert request.model_dump() == original
+    assert len(calls) == 3
+    assert calls[1]["input"][:len(calls[0]["input"])] == calls[0]["input"]
+    assert calls[2]["input"][:len(calls[1]["input"])] == calls[1]["input"]
+    assert [body["reasoning"]["effort"] for body in calls] == ["low"] * 3
+    assert [
+        item["reasoning"]["effort"]
+        for item in calls[2]["input"] if item.get("type") == "configuration_update"
+    ] == ["high", "low"]
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_streaming_records_actual_baseline_not_response_echo():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append((request.url.path, body))
+        if request.url.path.endswith("/input_tokens"):
+            return httpx.Response(200, json={"input_tokens": 30})
+        response = response_body()
+        # Deliberately distinct echo: it must not be used to capture wire effort.
+        response["reasoning"]["effort"] = "medium"
+        created = {**copy.deepcopy(response), "status": "in_progress", "output": []}
+        events = [
+            {"type": "response.created", "response": created, "sequence_number": 0},
+            {"type": "response.completed", "response": response, "sequence_number": 1},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            text="".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ),
+        )
+
+    async with openai.AsyncOpenAI(
+        api_key="offline", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ) as client:
+        result = await provider(client=client).complete(request_with_update(), auto_continue=False)
+        assert result.content[0].text == "OK"
+        assert configuration_update_from_response(result, "low")["metadata"][KEY]["request_effort"] == "low"
+        body = next(body for path, body in calls if path == "/v1/responses")
+        assert body["stream"] is True
+        assert body["input"][2]["type"] == "configuration_update"
 
 
 @pytest.mark.asyncio
