@@ -100,6 +100,75 @@ async def test_discovery_returns_only_exact_api_ids_without_legacy_filters_or_de
 
 
 @pytest.mark.asyncio
+async def test_discovery_preserves_absent_account_binding_after_environment_changes(monkeypatch):
+    # Absence is part of the bound account. SDK client reconstruction must not
+    # pick up organization/project values added after the original was created.
+    for name in (
+        "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
+        "OPENAI_ADMIN_KEY", "OPENAI_CUSTOM_HEADERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    requests = []
+    pages = [
+        catalog("first-page-id", has_more=True),
+        catalog("second-page-id", has_more=False),
+    ]
+
+    def transport(request):
+        requests.append(request)
+        # Check during the request too: temporarily mutating shared retry/account
+        # settings and restoring them afterwards is not safe for inference.
+        assert provider.client is client
+        assert client.max_retries == 2
+        assert client.organization is None
+        assert client.project is None
+        return httpx.Response(200, json=pages[len(requests) - 1])
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False)
+    async with AsyncOpenAI(
+        api_key="fixture-discovery-key",
+        base_url=ENDPOINT,
+        organization=None,
+        project=None,
+        default_headers={"X-Discovery-Fixture": "bound-header"},
+        http_client=http,
+        max_retries=2,
+    ) as client:
+        assert client.organization is None
+        assert client.project is None
+        headers_before = dict(client.default_headers)
+        provider = OpenAIProvider(
+            client=client, config={"max_retries": 0, "base_url": ENDPOINT},
+        )
+        monkeypatch.setenv("OPENAI_ORG_ID", "fixture-later-org")
+        monkeypatch.setenv("OPENAI_PROJECT_ID", "fixture-later-project")
+
+        assert await provider.discover_models() == discovered("first-page-id", "second-page-id")
+        assert [dict(request.url.params) for request in requests] == [
+            {}, {"after": "first-page-id"},
+        ]
+        for request in requests:
+            assert request.method == "GET"
+            assert str(request.url).split("?")[0] == ENDPOINT + "models"
+            assert not request.content
+            assert request.headers["authorization"] == "Bearer fixture-discovery-key"
+            assert request.headers["x-discovery-fixture"] == "bound-header"
+            assert "openai-organization" not in request.headers
+            assert "openai-project" not in request.headers
+
+        assert provider.client is client
+        assert client.organization is None
+        assert client.project is None
+        assert client.api_key == "fixture-discovery-key"
+        assert str(client.base_url) == ENDPOINT
+        assert client.default_headers == headers_before
+        assert client.max_retries == 2
+        assert not http.is_closed
+    assert http.is_closed
+
+
+@pytest.mark.asyncio
 async def test_successful_empty_catalog_is_not_a_default_or_error():
     async with sdk_provider(
         lambda _: httpx.Response(200, json=catalog()),

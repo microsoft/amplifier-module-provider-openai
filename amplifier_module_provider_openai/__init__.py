@@ -30,6 +30,7 @@ from importlib.metadata import version as installed_package_version
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
+import httpx
 import openai
 from amplifier_core import (
     ConfigField,
@@ -2823,22 +2824,25 @@ class OpenAIProvider:
                 provider=self.name,
             )
         try:
-            # Retain the bound endpoint, account and authentication. Do not
-            # mutate the inference client's retry settings or close its transport.
-            client = self.client.with_options(max_retries=0)
+            # Keep the bound client, including absent organization/project.
+            # SDK copies reconstruct those absent fields from the environment.
+            # Request-local retries leave concurrent inference settings alone.
+            client = self.client
             models: list[dict[str, str]] = []
             cursors: set[str] = set()
             query: dict[str, str] = {}
             while True:
                 response = await self._request_model_catalog(
-                    lambda query=query: client.models.with_raw_response.list(
-                        extra_query=query
+                    lambda query=query: client.get(
+                        "/models",
+                        cast_to=httpx.Response,
+                        options={"max_retries": 0, "params": query},
                     ),
                     operation="discover_models",
                 )
                 # SDK models are constructed permissively. Inspect the original
                 # JSON so missing data or coerced IDs cannot masquerade as success.
-                page = response.http_response.json()
+                page = response.json()
                 if (
                     not isinstance(page, dict)
                     or page.get("object") != "list"
