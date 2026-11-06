@@ -22,16 +22,36 @@ def test_setup_metadata_does_not_claim_account_entitlement():
     assert info["automaticModel"] == "auto"
 
 
-def test_latest_image_model_is_numeric_stable_and_account_scoped():
+def test_latest_image_model_is_documented_stable_full_and_account_scoped():
     rows = [{"id": model} for model in [
-        "gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5", "gpt-image-1.10",
-        "gpt-image-2-preview", "gpt-image-2-experimental",
+        "gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5", "gpt-image-2",
+        "gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
+        "gpt-image-2.6-flare", "gpt-image-2.6-sunburst",
+        "gpt-image-3-preview", "gpt-image-3-experimental",
     ]]
-    assert latest_image_model(rows) == "gpt-image-1.10"
-    assert latest_image_model([{"id": "gpt-image-1-mini"}]) == "gpt-image-1-mini"
+    assert latest_image_model(rows) == "gpt-image-2.6-sunburst"
+    assert latest_image_model(list(reversed(rows))) == "gpt-image-2.6-sunburst"
+    assert latest_image_model(rows[:6]) == "gpt-image-2.5-sunburst"
     assert latest_image_model(rows[:2]) == "gpt-image-1"
-    with pytest.raises(ValueError, match="No stable image model"):
-        latest_image_model([{"id": "gpt-image-2-preview"}])
+    assert latest_image_model([{"id": "gpt-image-1.5"}]) == "gpt-image-1.5"
+
+
+@pytest.mark.parametrize("model", [
+    "gpt-image-1-mini", "gpt-image-2.5-flare", "gpt-image-2.6-flare",
+    "gpt-image-2.6", "gpt-image-3", "gpt-image-99-sunburst",
+    "gpt-image-2.6-sunburst-preview", "gpt-image-2.6-sunburst-2026-11-01",
+    "gpt-image-2.6-other", "gpt-6.1-terra", "dall-e-3",
+])
+def test_auto_does_not_infer_tiers_or_future_model_support(model):
+    with pytest.raises(ValueError, match="Choose an image model explicitly"):
+        latest_image_model([{"id": model}])
+    # A newer name in another tier must not change a full-model selection.
+    assert latest_image_model([{"id": "gpt-image-1"}, {"id": model}]) == "gpt-image-1"
+
+
+def test_auto_empty_catalog_does_not_invent_model():
+    with pytest.raises(ValueError, match="No documented stable full image model"):
+        latest_image_model([])
 
 
 @pytest.mark.asyncio
@@ -129,13 +149,50 @@ async def test_automatic_image_model_follows_current_catalog_without_retrying_ge
     assert result["model"] == "gpt-image-1.5"
     assert client.images.generate.call_args.kwargs["model"] == "gpt-image-1.5"
     assert backend.describe()["model"] == "auto"
-    client.models.list.return_value.data = [SimpleNamespace(id="gpt-image-2")]
+    client.models.list.return_value.data = [SimpleNamespace(id=model) for model in [
+        "gpt-image-2", "gpt-image-2.5-sunburst",
+        "gpt-image-2.6-flare", "gpt-image-2.6-sunburst", "gpt-image-99",
+    ]]
     await backend.generate(**args)
-    assert client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
+    assert client.images.generate.call_args.kwargs["model"] == "gpt-image-2.6-sunburst"
     client.models.list.side_effect = PermissionError("no catalog")
     with pytest.raises(PermissionError, match="no catalog"):
         await backend.generate(**args)
     assert client.images.generate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_automatic_image_model_rejects_other_tier_before_paid_dispatch():
+    backend, _provider, client = fixture({"model": "auto"})
+    client.models = SimpleNamespace(list=AsyncMock(return_value=SimpleNamespace(
+        data=[SimpleNamespace(id="gpt-image-2.6-flare")]
+    )))
+    with pytest.raises(ValueError, match="auto does not switch tiers"):
+        await backend.generate(
+            action="generate", prompt="one", images=[], size="auto",
+            quality="auto", background="auto",
+        )
+    client.models.list.assert_awaited_once_with()
+    client.images.generate.assert_not_called()
+    client.images.edit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [
+    "gpt-image-1-mini", "gpt-image-2.5-flare", "gpt-image-2.6-flare",
+    "gpt-image-2.5-sunburst-2026-09-08",
+])
+async def test_explicit_tier_or_snapshot_pin_is_not_replaced_by_auto(model):
+    backend, _provider, client = fixture({"model": model})
+    client.models = SimpleNamespace(list=AsyncMock(side_effect=AssertionError("no discovery")))
+    result = await backend.generate(
+        action="generate", prompt="one", images=[], size="auto",
+        quality="auto", background="auto",
+    )
+    assert result["model"] == model
+    assert client.images.generate.call_args.kwargs["model"] == model
+    assert backend.describe()["entitlement"] == "unverified"
+    client.models.list.assert_not_called()
 
 
 @pytest.mark.asyncio

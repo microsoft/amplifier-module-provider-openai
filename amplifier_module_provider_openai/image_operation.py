@@ -14,7 +14,12 @@ import httpx
 PROTOCOL = "amplifier.image-operation.v1"
 MAX_BYTES = 8 * 1024 * 1024
 MODELS = {"gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5", "gpt-image-2",
-          "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}
+          "gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
+          "gpt-image-2.6-flare", "gpt-image-2.6-sunburst"}
+# 2.6 is documented for Images generation/edit, not yet for the Responses tool:
+# https://developers.openai.com/api/docs/guides/image-generation#gpt-image-26
+# https://developers.openai.com/api/docs/guides/tools-image-generation
+_IMAGES_ONLY_MODELS = {"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"}
 CONTROLLERS = {"gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-5", "gpt-5-mini",
                "gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.5", "gpt-5.6-sol",
                "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol",
@@ -140,7 +145,8 @@ async def prepare(provider, request):
     transport = config.get("transport", "responses")
     controller = request["selection"]["model"]
     output = request["output"]
-    if transport not in {"responses", "images"} or model not in MODELS:
+    if (transport not in {"responses", "images"} or model not in MODELS
+            or transport == "responses" and model in _IMAGES_ONLY_MODELS):
         return unavailable("unsupported_model_or_transport")
     if transport == "responses" and controller not in CONTROLLERS:
         return unavailable("unsupported_controller")

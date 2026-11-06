@@ -1,0 +1,114 @@
+OpenAI model/cache/lifecycle contribution — 2026-11-06
+
+Scope and provenance
+Base: 0c6278206c77030451125f2990f447fe0ad6485c.
+Foundation dependency: c4349ab15474f100951ec14c4daec1d548debd7b.
+Working branch: refactor/openai-model-policy.
+No push, merge, host settings, paid API generation, services or DTU launch.
+Parent owns integration, affected Azure qualification and the one-DTU budget.
+
+Integration contract
+from amplifier_module_provider_openai._capabilities import get_request_policy
+The frozen RequestPolicy has allowed_efforts (None means unknown), cache_ttls,
+supports_configuration_update, supports_steering, supports_async_tools and an
+optional display_name. New feature flags are exact-ID documentary eligibility,
+not combined-request compatibility, installed SDK support, API entitlement,
+host permission, or DTU/live qualification. No speculative GPT-6 prefix or
+snapshot expansion. GPT-5 historical capability/pricing readers are retained
+separately; they do not qualify new request features.
+
+Behavior and documentation payload for parent
+1. ModelCapabilities.context_window is the total window. GPT-5.6 alias and its
+   Sol/Terra/Luna IDs plus the five exact GPT-6 IDs have total 1,050,000,
+   independent max input 922,000, and max output 128,000. Request input allowance
+   is min(total minus output reserve, independent input ceiling, optional
+   standard-price input threshold) minus 4,096. At max output this is 267,904
+   Standard or 917,904 with long context enabled. Host compaction metadata still
+   reports the selected safe input/price cap, not the preflight allowance.
+2. GPT-5.2 and Pro use 400,000 total context and omit injected effort by default.
+   GPT-5.4 Mini uses 400,000 total and 272,000 max input without a long-price
+   threshold. GPT-5.5 and Pro use 1,050,000 total and a 272,000 pricing threshold.
+   The current pricing table explicitly gives Pro long rates too; an early
+   tentative no-threshold interpretation was rejected against that source.
+3. Exact GPT-5.6 and GPT-6 IDs accept prompt_cache_options.ttl 30m or 12h.
+   Legacy prompt_cache_retention is removed for those final models. Effort and
+   TTL validation runs after final model overrides. Cost needs explicit raw
+   input/output/cache counts and non-overlapping lifetime usage buckets for
+   writes; missing, malformed or inconsistent evidence stays unknown. Requested
+   TTL is not billing evidence. Historical GPT-5.6 snapshot pricing requires the
+   same usage evidence without inheriting new-feature eligibility.
+4. Pricing now includes documented legacy models and GPT-5.4/5.5 Standard/long
+   rates, explicit 12h write rates for modern models, and the GPT-5.6 Sol alias.
+   Numerical tests preserve whole-request rerating, the strict >272K boundary,
+   non-overlapping cache accounting and unknown costs. Existing service-tier
+   scope is preserved, not generalized from public model names.
+5. Direct OpenAI discovery excludes only documented/reported known shutdowns.
+   Optional valid shutdown_date is carried in ModelInfo.defaults as inert
+   metadata because Core has no lifecycle field. Explicit pins warn but are not
+   replaced or blocked. Azure/custom catalogs and deployment aliases are not
+   classified by OpenAI shutdown rules. Retired direct-OpenAI deep-research IDs
+   no longer automatically select stored background work; explicit background
+   and generic background polling remain. Compatible endpoints keep the old
+   model-identity behavior.
+6. Image auto selection uses the newest documented full/Sunburst alias actually
+   in the selected account catalog. It does not switch to Flare/mini or invent
+   future models. A mini-only/Flare-only catalog now errors; explicit tier and
+   snapshot pins remain unchanged. GPT Image 2.6 Flare/Sunburst are supported for
+   Images API generation/edit only. Their Responses-tool combination remains
+   unqualified and is rejected before dispatch. Catalog visibility is not
+   generation entitlement. Existing legacy image pins remain supported by the
+   adapter; this is not a claim that retired models work at api.openai.com.
+
+Verification observed in the task checkout
+- uv sync --locked; uv sync --locked --extra decisions succeeded.
+  Python 3.14.7, openai 3.29.0, amplifier-core 1.6.1; locked optional Decisions
+  library was needed for complete-suite collection. No lockfile changed.
+- .venv/bin/python -m pytest -q -m 'not live' --tb=short --disable-warnings
+  3442 passed, 1 deselected, 161 warnings in 313.58 seconds.
+  This stable-tree run followed all implementation and test repairs.
+- Foundation focused tests: 64 passed. Post-review model/budget/structural
+  focused tests: 917 passed. Lifecycle SDK catalog tests: 5 passed.
+- uv build --wheel succeeded. Wheel contains the new lifecycle module.
+- git diff --check passed.
+- Ruff passed for all new modules/tests and the other changed Python files.
+  __init__.py retains exactly two pre-existing BLE001 findings at mount rollback
+  and token-count observer handling. Both were reproduced against the original
+  base with Ruff stdin; no new finding was suppressed or repaired out of scope.
+- Read-only review found and repaired raw totals coerced to zero, missing cache
+  evidence on historical snapshot pricing, and pre-override Pro effort checks.
+- Earlier test failures and timeouts are not acceptance evidence: an initial
+  full run lacked the optional Decisions dependency; another timed out after
+  120 seconds; the intermediate full run had 2634 passed/21 failed while stale
+  fixtures and concurrent file revisions remained. Only the final stable run
+  above qualifies this contribution locally.
+
+Limits and parent-owned checks
+Offline SDK MockTransport tests prove serialization and local refusal behavior,
+not real provider/account behavior, model quality, paid image output or native
+feature combinations. No DTU or affected Azure integrated test was launched by
+this worker. Native/reasoning workers must use the parent's reviewed integrated
+foundation, not import this worktree. Parent should independently run affected
+integration checks against accepted revisions before release.
+
+Official sources fetched during this contribution
+https://developers.openai.com/api/docs/models/gpt-6.1-terra.md
+https://developers.openai.com/api/docs/models/gpt-6.1-sol.md
+https://developers.openai.com/api/docs/models/gpt-6-astra.md
+https://developers.openai.com/api/docs/models/gpt-5.6-sol.md
+https://developers.openai.com/api/docs/models/gpt-5.2.md
+https://developers.openai.com/api/docs/models/gpt-5.2-pro.md
+https://developers.openai.com/api/docs/models/gpt-5.4-mini.md
+https://developers.openai.com/api/docs/models/gpt-5.5.md
+https://developers.openai.com/api/docs/models/gpt-5.5-pro.md
+https://developers.openai.com/api/docs/pricing.md
+https://developers.openai.com/api/docs/guides/prompt-caching.md
+https://developers.openai.com/api/docs/guides/latest-model.md
+https://developers.openai.com/api/docs/guides/reasoning.md
+https://developers.openai.com/api/docs/guides/steering.md
+https://developers.openai.com/api/docs/guides/async-tool-calling.md
+https://developers.openai.com/api/docs/deprecations.md
+https://developers.openai.com/api/docs/guides/image-generation.md
+https://developers.openai.com/api/docs/models/gpt-image-2.6-sunburst.md
+https://developers.openai.com/api/docs/models/gpt-image-2.6-flare.md
+https://developers.openai.com/api/docs/guides/tools-image-generation.md
+https://raw.githubusercontent.com/microsoft/amplifier-module-provider-azure-openai/main/amplifier_module_provider_azure_openai/__init__.py
