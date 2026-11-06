@@ -299,6 +299,21 @@ def compile_request(params: dict[str, Any], source_tools: list[Any], endpoint: A
         refuse("native override removed the explicit alias binding")
     if by_alias and binding is None and native_required(result.get("tool_choice")):
         refuse("native-required request has no supported alias binding", "computer_use_native_unavailable")
+    # Canonical native output metadata retains the full original item. Only a
+    # validated neutral binding permits ordinary fallback; unbound native
+    # history is not translated by name or shape. Results are already carried
+    # as ordinary outputs with all original images and reference text intact.
+    if binding is None:
+        for index, item in enumerate(result.get("input", [])):
+            record = replay.get(item.get("call_id"))
+            if item.get("type") != "computer_call" or record is None:
+                continue
+            if item.get("actions") != record["vendor_actions"] or item.get("pending_safety_checks"):
+                refuse("canonical native history disagrees with saved provenance")
+            result["input"][index] = {
+                "type": "function_call", "call_id": item["call_id"],
+                "name": record["alias"], "arguments": json.dumps(record["canonical"]),
+            }
     def function_names(tools):
         for tool in tools:
             if tool.get("type") == "function":

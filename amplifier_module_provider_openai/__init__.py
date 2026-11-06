@@ -4621,6 +4621,13 @@ class OpenAIProvider:
 
         return info
 
+    def _canonical_pending_async_call(self, item: dict[str, Any]) -> bool:
+        """Only an owning native adapter can qualify a retained pending call.
+
+        Ordinary history, async flags and public metadata grant no exception.
+        """
+        return False
+
     def _convert_messages(
         self,
         messages: list[dict[str, Any]],
@@ -4692,7 +4699,7 @@ class OpenAIProvider:
                     ] if isinstance(b, dict)
                 }
                 metadata[CALLS] = {k: v for k, v in metadata[CALLS].items() if k in ids}
-        replay_calls(messages)
+        current_replay = replay_calls(messages)
         openai_messages = []
         canonical_item_ids = set()
         canonical_response_item_ids = set()
@@ -4761,13 +4768,41 @@ class OpenAIProvider:
 
                 if msg.get("role") != "assistant":
                     raise ValueError("Canonical response output requires an assistant message")
-                output = replay_output_items(msg["metadata"]["openai:output_items"])
-                for item in output:
+                output = []
+                for item in replay_output_items(msg["metadata"]["openai:output_items"]):
+                    if item.get("type") == "reasoning" and i <= _reasoning_cutoff:
+                        # Apply the same configured request-view policy as
+                        # metadata-less legacy turns; never edit saved items.
+                        continue
+                    identity = item.get("call_id")
+                    if item.get("type") == "computer_call" and identity in original_replay:
+                        # The failure projector can remove a validated neutral
+                        # call/result pair in this derived view after a new user
+                        # message. Do not resurrect it from output metadata.
+                        if identity not in current_replay:
+                            continue
+                        record = current_replay[identity]
+                        if (
+                            item.get("actions") != record["vendor_actions"]
+                            or item.get("pending_safety_checks")
+                        ):
+                            raise kernel_errors.InvalidRequestError(
+                                "Canonical neutral computer item disagrees with its binding "
+                                "or contains pending safety requirements",
+                                provider=self.name, retryable=False,
+                            )
+                        # Do not mark a neutral alias as legacy native. Its real
+                        # result needs neutral validation, reference retention
+                        # and final model/endpoint fallback in compile_request.
+                        self._native_call_ids.discard(identity)
+                        self._native_call_types.pop(identity, None)
+                        output.append(item)
+                        continue
                     if item.get("type") in {"computer_call", "apply_patch_call"}:
-                        identity = item.get("call_id")
                         self._native_call_ids.add(identity)
                         if item["type"] == "computer_call":
                             self._native_call_types[identity] = "computer"
+                    output.append(item)
                 openai_messages.extend(output)
                 canonical_item_ids.update(id(item) for item in output)
                 canonical_response_item_ids.update(id(item) for item in output)
@@ -4795,7 +4830,24 @@ class OpenAIProvider:
                         # must be checked before the generic native-call branch
                         # below, since computer call_ids are also present in
                         # _native_call_ids but need a different result shape.
-                        if self._native_call_types.get(tool_call_id) == "computer":
+                        if tool_call_id in current_replay:
+                            # The neutral compiler validates the actual screenshot
+                            # and retains accompanying reference text. A legacy
+                            # native image-only envelope would discard it or fail.
+                            rich_output = (
+                                _convert_function_tool_output_content(tool_content, model_name)
+                                if isinstance(tool_content, list) else None
+                            )
+                            openai_messages.append({
+                                "type": "function_call_output",
+                                "call_id": tool_call_id,
+                                "output": (
+                                    rich_output if rich_output is not None
+                                    else tool_content if isinstance(tool_content, str)
+                                    else json.dumps(tool_content)
+                                ),
+                            })
+                        elif self._native_call_types.get(tool_call_id) == "computer":
                             try:
                                 image_url = _extract_computer_screenshot_data_url(tool_content)
                             except ValueError as exc:
@@ -5404,11 +5456,22 @@ class OpenAIProvider:
             if id(item) not in canonical_response_item_ids or expected is None:
                 continue
             identity = item.get("call_id")
+            if item.get("type") == "computer_call" and identity in current_replay:
+                # This intermediate is consumed by compile_request before count
+                # or dispatch, never sent as a native result on its own.
+                expected = "function_call_output"
             results = [
                 (result_index, result)
                 for result_index, result in enumerate(openai_messages)
                 if result.get("call_id") == identity and result.get("type") == expected
             ]
+            any_results = any(
+                result.get("call_id") == identity
+                and result.get("type") in response_output_types.values()
+                for result in openai_messages
+            )
+            if identity and not any_results and self._canonical_pending_async_call(item):
+                continue
             if (
                 not identity or len(results) != 1 or results[0][0] <= index
             ):

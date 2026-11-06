@@ -228,10 +228,50 @@ def test_canonical_metadata_replays_opaque_items_without_duplicates():
         update(), Message(role="user", content="Next"),
     ]
     before = [m.model_dump() for m in messages]
-    wire = provider()._budget_params(ChatRequest(messages=messages))["input"]
+    wire = provider({"reasoning_replay_scope": "all"})._budget_params(ChatRequest(messages=messages))["input"]
     assert wire[1:4] == output
     assert len(wire) == 6
     assert [m.model_dump() for m in messages] == before
+
+
+@pytest.mark.parametrize("scope,old_count,active_count", [
+    ("none", 0, 0), ("turn", 0, 1), ("all", 1, 1),
+])
+def test_canonical_reasoning_obeys_request_scope_without_mutating_saved_output(
+    scope, old_count, active_count
+):
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    p = provider()
+    reasoning = {"type": "reasoning", "id": "rs1", "summary": [],
+                 "encrypted_content": "opaque"}
+    text = {"type": "message", "id": "msg1", "role": "assistant",
+            "phase": "commentary", "status": "completed",
+            "content": [{"type": "output_text", "text": "Answer", "annotations": []}]}
+    response = p._convert_to_chat_response(_RawResponseObject({
+        "id": "resp1", "status": "completed", "model": MODEL,
+        "output": [reasoning, text],
+    }))
+    saved = Message(role="assistant", content=response.content, metadata=response.metadata)
+    saved = Message.model_validate_json(saved.model_dump_json())
+    old = [
+        Message(role="user", content="Original"), saved,
+        Message(role="user", content="New turn"),
+    ]
+    active = [
+        Message(role="user", content="Original"), saved,
+        Message(role="user", content="Ephemeral", metadata={"ephemeral": True}),
+    ]
+    before = saved.model_dump()
+    for messages, count in [(old, old_count), (active, active_count)]:
+        wire = p._convert_messages(
+            [message.model_dump() for message in messages],
+            reasoning_replay_scope=scope,
+        )
+        assert len([item for item in wire if item.get("type") == "reasoning"]) == count
+        assert next(item for item in wire if item.get("id") == "msg1") == text
+    assert saved.model_dump() == before
+    assert saved.metadata["openai:output_items"] == [reasoning, text]
 
 
 @pytest.mark.parametrize("results", [[], [
@@ -252,6 +292,43 @@ def test_canonical_host_call_requires_unique_real_result(results):
     with pytest.raises(InvalidRequestError, match="unique following real result"):
         provider()._budget_params(request)
     assert request.model_dump() == before
+
+
+def test_canonical_async_flag_or_metadata_cannot_authorize_missing_result():
+    from amplifier_core.llm_errors import InvalidRequestError
+
+    item = {"type": "function_call", "call_id": "async1", "id": "fc1",
+            "name": "read", "arguments": "{}", "status": "completed", "async": True}
+    message = Message(role="assistant", content="", metadata={
+        "openai:output_items": [item], "native_pending_async": True,
+    })
+    with pytest.raises(InvalidRequestError, match="unique following real result"):
+        provider()._convert_messages([message.model_dump()])
+
+
+@pytest.mark.parametrize("invalid_results", ["duplicate", "before", "wrong_type"])
+def test_pending_async_hook_never_bypasses_duplicate_or_preceding_results(invalid_results):
+    from amplifier_core.llm_errors import InvalidRequestError
+
+    class PendingProvider(OpenAIProvider):
+        def _canonical_pending_async_call(self, item):
+            raise AssertionError("Private owner hook must not be consulted for present results")
+
+    call = Message(role="assistant", content="", metadata={"openai:output_items": [{
+        "type": "function_call", "call_id": "async1", "id": "fc1",
+        "name": "read", "arguments": "{}", "status": "completed", "async": True,
+    }]})
+    result = Message(role="tool", tool_call_id="async1", content="real result")
+    if invalid_results == "wrong_type":
+        result = Message(role="assistant", content="", metadata={"openai:output_items": [{
+            "type": "computer_call_output", "call_id": "async1",
+            "output": {"type": "computer_screenshot", "image_url": "unused"},
+        }]})
+        messages = [call, result]
+    else:
+        messages = [result, call] if invalid_results == "before" else [call, result, result]
+    with pytest.raises(InvalidRequestError, match="unique following real result"):
+        PendingProvider(api_key="offline")._convert_messages([m.model_dump() for m in messages])
 
 
 def test_canonical_host_call_with_real_result_replays_once():

@@ -295,6 +295,80 @@ async def test_sdk_object_response_core_serialization_alias_and_replay():
     assert json.loads(call["arguments"])["actions"][0]["action"] == "mouse_move"
 
 
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-4o"])
+def test_canonical_neutral_history_preserves_identity_order_and_real_result(model):
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    driver = provider()
+    vendor = block(
+        [{"type": "move", "x": 426, "y": 87}],
+        pending_safety_checks=[],
+    )
+    output = [
+        {"type": "reasoning", "id": "rs_fixture", "summary": [],
+         "encrypted_content": "opaque-reasoning"},
+        {"type": "message", "id": "msg_fixture", "role": "assistant",
+         "phase": "commentary", "status": "completed",
+         "content": [{"type": "output_text", "text": "Inspecting", "annotations": []}]},
+        vendor,
+    ]
+    response = driver._convert_to_chat_response(
+        _RawResponseObject(envelope(output)), computer_context=context(),
+    )
+    saved = stored_response(response)
+    result_content = [{"type": "text", "text": "real result reference"}, image()]
+    req = request(messages=[
+        saved, Message(role="tool", tool_call_id="call_fixture", content=result_content),
+    ])
+    before = req.model_dump()
+    # Reconstruct the provider and Core messages: no instance call-type cache.
+    fresh = provider(reasoning_replay_scope="all")
+    wire = fresh._budget_params(ChatRequest.model_validate_json(req.model_dump_json()), model=model)
+    assert wire["input"][:2] == output[:2]
+    assert req.model_dump() == before
+    assert not fresh._native_call_types
+    assert CALLS not in json.dumps(wire) and KEY not in json.dumps(wire)
+    call = wire["input"][2]
+    assert call["call_id"] == vendor["call_id"]
+    if model == "gpt-6.1-sol":
+        assert call == vendor
+        real = next(item for item in wire["input"] if item.get("type") == "computer_call_output")
+        assert real["output"]["image_url"] == neutral_screenshot([image()])[0]
+        assert "real result reference" in json.dumps(wire["input"])
+    else:
+        assert call["type"] == "function_call" and call["name"] == "desk"
+        assert json.loads(call["arguments"]) == response.tool_calls[0].arguments
+        real = next(item for item in wire["input"] if item.get("type") == "function_call_output")
+        assert real["output"][0] == {"type": "input_text", "text": "real result reference"}
+        assert real["output"][1]["image_url"] == neutral_screenshot([image()])[0]
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-4o"])
+@pytest.mark.parametrize("tamper", ["actions", "pending_safety_checks", "missing_result", "duplicate_result"])
+def test_canonical_neutral_history_never_weakens_safety_or_result_pairing(model, tamper):
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    driver = provider()
+    response = driver._convert_to_chat_response(
+        _RawResponseObject(envelope([block()])), computer_context=context(),
+    )
+    saved = stored_response(response)
+    if tamper == "actions":
+        saved.metadata["openai:output_items"][0]["actions"] = [{"type": "click", "x": 2, "y": 3}]
+    elif tamper == "pending_safety_checks":
+        saved.metadata["openai:output_items"][0]["pending_safety_checks"] = [{"id": "not-approved"}]
+    results = [] if tamper == "missing_result" else [
+        Message(role="tool", tool_call_id="call_fixture", content=[image()]),
+    ]
+    if tamper == "duplicate_result":
+        results.append(results[0].model_copy(deep=True))
+    req = request(messages=[saved, *results])
+    before = req.model_dump()
+    with pytest.raises(InvalidRequestError):
+        provider()._budget_params(req, model=model)
+    assert req.model_dump() == before
+
+
 @pytest.mark.parametrize("content", ["error text", {"success": False, "error": "halt"}, [],
     [image(), image()], [{"type": "text", "text": '{"success":false,"error":"halt"}'}, image()],
 ])
