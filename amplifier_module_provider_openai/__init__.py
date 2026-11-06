@@ -3136,10 +3136,11 @@ class OpenAIProvider:
         from .compaction import canonical_usage
         from .configuration_updates import compacted_update_message
 
+        body = {**params, **(params.get("extra_body") or {})}
         trigger_params = {
-            key: copy.deepcopy(params[key])
+            key: copy.deepcopy(body[key])
             for key in ("model", "input", "instructions", "reasoning")
-            if key in params
+            if key in body
         }
         trigger_params["input"].append({"type": "compaction_trigger"})
         trigger_params["store"] = False
@@ -3159,8 +3160,8 @@ class OpenAIProvider:
         return {
             "kind": "native",
             "message": compacted_update_message(
-                params["model"], output, updates,
-                request_effort=(params.get("reasoning") or {}).get("effort"),
+                body["model"], output, updates,
+                request_effort=(body.get("reasoning") or {}).get("effort"),
             ),
             "usage": canonical_usage(usage),
             "input_tokens": input_tokens,
