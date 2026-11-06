@@ -53,7 +53,7 @@ def _response(
                 content=[SimpleNamespace(type="output_text", text="Hi")],
             )
         ],
-        incomplete_details=None,
+        incomplete_details={"reason": "max_output_tokens"} if status == "incomplete" else None,
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -385,7 +385,7 @@ def test_astra_null_logprobs_is_omitted() -> None:
     assert "logprobs" not in provider.client.responses.create.call_args.kwargs
 
 
-def test_astra_continuation_validates_final_extra_params_before_second_sdk_call() -> None:
+def test_astra_continuation_reuses_validated_snapshot_not_mutated_global_params() -> None:
     provider = _provider(extra_request_params={"seed": 1})
     call_count = 0
 
@@ -398,13 +398,14 @@ def test_astra_continuation_validates_final_extra_params_before_second_sdk_call(
         return _response()
 
     provider.client.responses.create = AsyncMock(side_effect=create)
-    with pytest.raises(kernel_errors.InvalidRequestError):
-        asyncio.run(provider.complete(_request()))
+    asyncio.run(provider.complete(_request()))
+    assert provider.client.responses.create.await_count == 2
+    continued = provider.client.responses.create.call_args.kwargs
+    assert continued["seed"] == 1
+    assert "top_p" not in continued
 
-    assert provider.client.responses.create.await_count == 1
 
-
-def test_astra_continuation_rejects_logprobs_after_final_extra_merge() -> None:
+def test_astra_continuation_does_not_admit_new_logprobs_from_mutated_global_params() -> None:
     provider = _provider(extra_request_params={"seed": 1})
     call_count = 0
 
@@ -417,10 +418,11 @@ def test_astra_continuation_rejects_logprobs_after_final_extra_merge() -> None:
         return _response()
 
     provider.client.responses.create = AsyncMock(side_effect=create)
-    with pytest.raises(kernel_errors.InvalidRequestError, match="logprobs"):
-        asyncio.run(provider.complete(_request()))
-
-    assert provider.client.responses.create.await_count == 1
+    asyncio.run(provider.complete(_request()))
+    assert provider.client.responses.create.await_count == 2
+    continued = provider.client.responses.create.call_args.kwargs
+    assert continued["seed"] == 1
+    assert "logprobs" not in continued
 
 
 @pytest.mark.parametrize(

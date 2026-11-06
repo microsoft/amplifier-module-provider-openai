@@ -3501,7 +3501,7 @@ class OpenAIProvider:
         billed_usage = None
         generation_attempt = 0
 
-        def _finalize_billing():
+        def _finalize_billing(*, terminal_error=False):
             """Account confirmed usage once, including terminal conversion errors.
 
             Missing/unknown attempts remain unknown. Never infer their tokens or
@@ -3519,28 +3519,66 @@ class OpenAIProvider:
                 return None
             billed_usage = merge_discarded_usage(normalized_usage(None), usages)
             costs = [
-                self._compute_attempt_cost(item) if response_field(item, "usage") is not None else None
+                self._compute_attempt_cost(item)
+                if response_field(item, "usage") is not None
+                and isinstance(response_field(item, "model"), str)
+                else None
                 for item in observations
             ]
             if costs and all(cost is not None for cost in costs):
                 total = sum(costs, Decimal(0))
                 billed_usage = billed_usage.model_copy(update={"cost_usd": total})
                 self._add_cost(total)
+            elif terminal_error and any(cost is not None for cost in costs):
+                # The error's total stays unknown. Retain a labelled known
+                # subtotal rather than dropping already confirmed spend.
+                subtotal = sum((cost for cost in costs if cost is not None), Decimal(0))
+                billed_usage = billed_usage.model_copy(update={"known_cost_usd": subtotal})
+                self._add_cost(subtotal)
             return billed_usage
 
         def _error_billing(error):
-            usage = _finalize_billing()
+            usage = _finalize_billing(terminal_error=True)
             if usage is None:
                 return {}
             # Error evidence is not an executable response or success. It makes
             # known spent tokens inspectable while the original error propagates.
             error.usage = usage
-            return {"usage": usage.model_dump(mode="json")}
+            evidence = {"usage": usage.model_dump(mode="json")}
+            if getattr(usage, "known_cost_usd", None) is not None:
+                error.known_cost_usd = usage.known_cost_usd
+                evidence["known_cost_usd"] = str(usage.known_cost_usd)
+            return evidence
 
         def _record_failed_stream_response(response: Any) -> None:
             if response is not None and id(response) not in failed_stream_response_ids:
                 failed_stream_response_ids.add(id(response))
                 failed_stream_responses.append(response)
+
+        async def _wait_for_generated_response(value: Any) -> Any:
+            """Settle one generated response without starting another attempt."""
+            try:
+                while getattr(value, "status", None) in BACKGROUND_POLLING_STATUSES:
+                    remaining = None if effective_timeout is None else max(
+                        0, effective_timeout - (time.time() - start_time)
+                    )
+                    async with asyncio.timeout(remaining):
+                        await asyncio.sleep(poll_interval)
+                        value = await self.client.responses.retrieve(
+                            value.id, timeout=self._transport_timeout(request_timeout)
+                        )
+            except (TimeoutError, openai.APIError) as error:
+                raise kernel_errors.LLMError(
+                    "Could not settle generated response; its outcome is unknown",
+                    provider=self.name, retryable=False,
+                ) from error
+            if getattr(value, "status", None) in {"failed", "cancelled"}:
+                billed_responses.append(value)
+                raise kernel_errors.LLMError(
+                    f"Generated response ended as {value.status}",
+                    provider=self.name, retryable=False,
+                )
+            return value
 
         # Per-request streaming override (does NOT mutate self.use_streaming).
         # Callers like session-namer pass metadata={"stream": False} to force
@@ -4231,6 +4269,7 @@ class OpenAIProvider:
                             self._create_response(params, timeout=request_timeout),
                             timeout=effective_timeout,
                         )
+                        final_response = await _wait_for_generated_response(final_response)
                         self._record_budget_calibration(params, final_response)
                         billed_responses.append(final_response)
                         elapsed_ms += int((time.time() - retry_start) * 1000)
@@ -4353,24 +4392,7 @@ class OpenAIProvider:
                         self._create_response(continue_params, timeout=request_timeout),
                         timeout=effective_timeout,
                     )
-                    # Background applies to every generation, not only the
-                    # first one. Poll this same response; never regenerate.
-                    while getattr(final_response, "status", None) in BACKGROUND_POLLING_STATUSES:
-                        remaining = None if effective_timeout is None else max(
-                            0, effective_timeout - (time.time() - start_time)
-                        )
-                        async with asyncio.timeout(remaining):
-                            await asyncio.sleep(poll_interval)
-                            final_response = await self.client.responses.retrieve(
-                                final_response.id,
-                                timeout=self._transport_timeout(request_timeout),
-                            )
-                    if getattr(final_response, "status", None) in {"failed", "cancelled"}:
-                        billed_responses.append(final_response)
-                        raise kernel_errors.LLMError(
-                            f"Continuation response ended as {final_response.status}",
-                            provider=self.name, retryable=False,
-                        )
+                    final_response = await _wait_for_generated_response(final_response)
                     self._record_budget_calibration(continue_params, final_response)
                     billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
@@ -4405,7 +4427,7 @@ class OpenAIProvider:
             # Convert to ChatResponse FIRST (before emitting llm:response)
             # so event usage fields come from the canonical ChatResponse
             chat_response = self._convert_to_chat_response(
-                response_with_output(response, accumulated_output),
+                response_with_output(response, accumulated_output) if continuation_count > 0 else response,
                 computer_context=assembly_state["neutral_computer_context"],
             )
             if continuation_count > 0:

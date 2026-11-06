@@ -146,7 +146,10 @@ def test_automatic_boundaries_follow_actual_endpoint_on_initial_and_continued_ca
     supplied = [{"type": "function_call_output", "call_id": "c", "output": "result"}]
     provider = _make_provider(default_model="gpt-6.1-sol", extra_request_params={"input": supplied})
     provider.client.base_url = endpoint
-    incomplete = SimpleNamespace(status="incomplete", id="incomplete", output=[], incomplete_details=None)
+    incomplete = SimpleNamespace(
+        status="incomplete", id="incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+    )
     provider.client.responses.create = AsyncMock(side_effect=[incomplete, DummyResponse()])
     asyncio.run(provider.complete(_simple_request()))
     calls = provider.client.responses.create.call_args_list
@@ -167,7 +170,8 @@ def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged(model
         default_model=model, extra_request_params={"input": supplied},
     )
     incomplete = SimpleNamespace(
-        status="incomplete", id="incomplete", output=[], incomplete_details=None,
+        status="incomplete", id="incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     provider.client.responses.create = AsyncMock(side_effect=[incomplete, DummyResponse()])
     asyncio.run(provider.complete(_simple_request()))
@@ -344,7 +348,8 @@ def test_prompt_cache_options_forwarded_on_continuation(ttl):
     """
     provider = _make_provider(default_model="gpt-5.6-sol")
     incomplete_resp = SimpleNamespace(
-        status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
+        status="incomplete", id="resp_incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     provider.client.responses.create = AsyncMock(
         side_effect=[incomplete_resp, DummyResponse()]

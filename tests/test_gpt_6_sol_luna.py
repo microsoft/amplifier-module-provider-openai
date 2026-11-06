@@ -54,7 +54,9 @@ def _response(
                 content=[SimpleNamespace(type="output_text", text="Hi")],
             )
         ],
-        incomplete_details=None,
+        incomplete_details=(
+            SimpleNamespace(reason="max_output_tokens") if status == "incomplete" else None
+        ),
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -484,6 +486,6 @@ def test_subclass_cost_seam_controls_conversion_and_single_aggregation() -> None
 
     assert result.usage.cost_usd == Decimal(14)
     assert reported_costs == [Decimal(14)]
-    # Direct base conversion and every billed continuation attempt use the same
-    # override; session accumulation occurs only after the attempts complete.
-    assert provider.cost_calls == 3
+    # Standalone conversion, canonical continued conversion, and both actual
+    # attempts use the pure hook. Only aggregation invokes the accumulator.
+    assert provider.cost_calls == 4

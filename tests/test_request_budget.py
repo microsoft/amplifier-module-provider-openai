@@ -1037,6 +1037,7 @@ def test_continuation_rechecks_and_calibrates_its_exact_final_params():
     incomplete = _response(10, status="incomplete")
     incomplete.id = "resp_incomplete"
     incomplete.output = []
+    incomplete.incomplete_details = SimpleNamespace(reason="max_output_tokens")
     completed = _response(20)
     completed.output = []
     provider.client.responses.create = AsyncMock(side_effect=[incomplete, completed])
@@ -1058,6 +1059,7 @@ def test_over_budget_continuation_raises_without_a_second_sdk_dispatch():
     incomplete = _response(10, status="incomplete")
     incomplete.id = "resp_incomplete"
     incomplete.output = []
+    incomplete.incomplete_details = SimpleNamespace(reason="max_output_tokens")
     provider.client.responses.create = AsyncMock(return_value=incomplete)
     guard_calls = 0
 

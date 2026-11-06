@@ -139,7 +139,8 @@ def test_reasoning_context_forwarded_on_continuation():
     """
     provider = _make_provider(default_model="gpt-5.6-sol")
     incomplete_resp = SimpleNamespace(
-        status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
+        status="incomplete", id="resp_incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     provider.client.responses.create = AsyncMock(
         side_effect=[incomplete_resp, DummyResponse()]
@@ -282,7 +283,8 @@ def test_config_reasoning_context_forwarded_on_continuation():
         reasoning_context="current_turn",
     )
     incomplete_resp = SimpleNamespace(
-        status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
+        status="incomplete", id="resp_incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     provider.client.responses.create = AsyncMock(
         side_effect=[incomplete_resp, DummyResponse()]

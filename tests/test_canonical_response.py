@@ -340,6 +340,74 @@ async def test_background_continuation_waits_for_same_response_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+async def test_raised_budget_repair_settles_queued_response_without_regeneration(
+    terminal_status,
+):
+    provider = EndpointProvider(poll_interval=0)
+    initial = Response.model_validate(
+        payload(
+            [{**FUNCTION, "status": "incomplete", "arguments": '{"path":'}],
+            status="incomplete",
+            reason="max_output_tokens",
+        )
+    )
+    queued = Response.model_validate(payload([], status="queued", index=1))
+    terminal = Response.model_validate(
+        payload([text(1)], status=terminal_status, index=1)
+    )
+    provider.client.responses.create = AsyncMock(side_effect=[initial, queued])
+    provider.client.responses.retrieve = AsyncMock(return_value=terminal)
+    try:
+        if terminal_status == "completed":
+            result = await provider.complete(
+                ChatRequest(messages=[Message(role="user", content="go")]),
+                max_tokens=4096,
+            )
+            assert result.output_text == "text-1"
+            assert result.tool_calls is None
+        else:
+            with pytest.raises(llm_errors.LLMError) as caught:
+                await provider.complete(
+                    ChatRequest(messages=[Message(role="user", content="go")]),
+                    max_tokens=4096,
+                )
+            assert caught.value.retryable is False
+        provider.client.responses.retrieve.assert_awaited_once()
+        assert provider.client.responses.create.await_count == 2
+        assert provider.costs == [Decimal("0.250")]
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_mixed_missing_usage_retains_known_subtotal_not_false_total():
+    provider = EndpointProvider()
+    item = {**FUNCTION, "status": "incomplete", "arguments": '{"path":'}
+    initial = Response.model_validate(
+        payload([item], status="incomplete", reason="max_output_tokens")
+    )
+    unknown_wire = payload(
+        [item], status="incomplete", reason="max_output_tokens", index=1
+    )
+    unknown_wire["usage"] = None
+    provider.client.responses.create = AsyncMock(
+        side_effect=[initial, Response.model_validate(unknown_wire)]
+    )
+    try:
+        with pytest.raises(FunctionCallTruncationError) as caught:
+            await provider.complete(
+                ChatRequest(messages=[Message(role="user", content="go")]),
+                max_tokens=4096,
+            )
+        assert caught.value.usage.cost_usd is None
+        assert caught.value.known_cost_usd == Decimal("0.125")
+        assert provider.costs == [Decimal("0.125")]
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_two_successive_truncations_preserve_validated_options_order_and_each_attempt_cost():
     provider = EndpointProvider(
         extra_request_params={

@@ -63,7 +63,9 @@ def _response(
                 content=[SimpleNamespace(type="output_text", text="Hi")],
             )
         ],
-        incomplete_details=None,
+        incomplete_details=(
+            SimpleNamespace(reason="max_output_tokens") if status == "incomplete" else None
+        ),
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
