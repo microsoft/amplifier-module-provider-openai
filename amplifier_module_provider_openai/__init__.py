@@ -2277,6 +2277,7 @@ class OpenAIProvider:
                         model_name,
                     )
 
+            configuration_history_input = copy.deepcopy(params["input"])
             self._merge_extra_request_params(params)
             # A request-level cap is an explicit caller safety boundary. Keep
             # it authoritative over provider-wide extra params so a degraded
@@ -2300,6 +2301,13 @@ class OpenAIProvider:
                 params["max_output_tokens"] = request.max_output_tokens
             params = self._prepare_computer_images(params, request, **kwargs)
             self._prepare_gpt_6_params(params)
+            from .configuration_updates import validate_request
+
+            updates = validate_request(
+                params, messages, original_input=configuration_history_input
+            )
+            if updates and not self._uses_standard_openai_endpoint():
+                raise ValueError("configuration_update requires the documented OpenAI endpoint")
             if self._tool_output_cache_breakpoints_supported(params.get("model")) and isinstance(
                 params.get("input"), list
             ):
@@ -3100,6 +3108,11 @@ class OpenAIProvider:
         if not self.supports_native_compaction():
             raise NotImplementedError("This endpoint does not advertise native Responses compaction")
         params = self._budget_params(request)
+        from .configuration_updates import validate_request
+
+        updates = validate_request(params, [m.model_dump() for m in request.messages])
+        if updates:
+            return await self._compact_configuration_updates(request, params, updates)
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
         response = await self.client.responses.compact(
@@ -3116,6 +3129,42 @@ class OpenAIProvider:
             usage = usage.model_dump()
         return {"kind": "native", "message": compacted_message(params["model"], output),
                 "usage": canonical_usage(usage), "input_tokens": input_tokens}
+
+    async def _compact_configuration_updates(self, request, params, updates):
+        """One explicit Responses trigger; never retry or strip update history."""
+        from ._response_handling import response_items
+        from .compaction import canonical_usage
+        from .configuration_updates import compacted_update_message
+
+        trigger_params = {
+            key: copy.deepcopy(params[key])
+            for key in ("model", "input", "instructions", "reasoning")
+            if key in params
+        }
+        trigger_params["input"].append({"type": "compaction_trigger"})
+        trigger_params["store"] = False
+        input_tokens = await self._guard_assembled_params_with_provider_count(params)
+        # This separate operation has no retry/fallback path: a transport error
+        # can mean submission happened. The caller must reconcile before retrying.
+        client = self.client.with_options(max_retries=0)
+        response = await client.responses.create(
+            **trigger_params, timeout=self._transport_timeout(self._request_timeout(request))
+        )
+        if getattr(response, "status", None) != "completed":
+            raise ValueError("Explicit Responses compaction did not complete")
+        output = response_items(response.output)
+        usage = getattr(response, "usage", None)
+        if hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
+        return {
+            "kind": "native",
+            "message": compacted_update_message(
+                params["model"], output, updates,
+                request_effort=(params.get("reasoning") or {}).get("effort"),
+            ),
+            "usage": canonical_usage(usage),
+            "input_tokens": input_tokens,
+        }
 
     async def complete(
         self,
@@ -3168,6 +3217,15 @@ class OpenAIProvider:
         request = request.model_copy(deep=True)
         missing = self._find_missing_tool_results(request.messages)
         event_data = None
+        if any(
+            "openai:output_items" in (request.messages[index].metadata or {})
+            for index, _, _, _ in missing
+        ):
+            raise kernel_errors.InvalidRequestError(
+                "Canonical response call is missing its real result; original "
+                "history is preserved and no result was synthesized.",
+                provider=self.name, retryable=False,
+            )
         if missing:
             self._assembly_log(
                 "warning",
@@ -4355,6 +4413,13 @@ class OpenAIProvider:
                     "openai:continuation_count": continuation_count,
                 }
 
+            from .configuration_updates import REQUEST_KEY, request_configuration
+
+            chat_response.metadata = {
+                **(chat_response.metadata or {}),
+                REQUEST_KEY: request_configuration(params),
+            }
+
             # Publish only after HTTP success and validated response conversion.
             # Counts never commit these staged, request-local observations.
             if assembly_state["computer_images"] and getattr(response, "status", None) == "completed":
@@ -4553,6 +4618,7 @@ class OpenAIProvider:
         """
         from .compaction import canonical_window
         from .computer_history import project_failed_computer_history
+        from .configuration_updates import compaction_restatement, message_item
         from .neutral_computer import CALLS, KEY, plan_observations, replay_calls
 
         original_replay = replay_calls(messages)
@@ -4600,6 +4666,7 @@ class OpenAIProvider:
         replay_calls(messages)
         openai_messages = []
         canonical_item_ids = set()
+        canonical_response_item_ids = set()
         i = 0
         model_name = model or self.default_model
 
@@ -4643,6 +4710,11 @@ class OpenAIProvider:
 
         while i < len(messages):
             msg = messages[i]
+            update = message_item(msg)
+            if update is not None:
+                openai_messages.append(update)
+                i += 1
+                continue
             window = canonical_window(msg, model_name)
             if window is not None:
                 # Standalone compact output is already canonical. Preserve the
@@ -4650,6 +4722,26 @@ class OpenAIProvider:
                 # items before/after encrypted state; do not repair inside it.
                 openai_messages.extend(window)
                 canonical_item_ids.update(id(item) for item in window)
+                restatement = compaction_restatement(msg)
+                if restatement is not None:
+                    openai_messages.append(restatement)
+                i += 1
+                continue
+            if "openai:output_items" in (msg.get("metadata") or {}):
+                from ._response_handling import replay_output_items
+
+                if msg.get("role") != "assistant":
+                    raise ValueError("Canonical response output requires an assistant message")
+                output = replay_output_items(msg["metadata"]["openai:output_items"])
+                for item in output:
+                    if item.get("type") in {"computer_call", "apply_patch_call"}:
+                        identity = item.get("call_id")
+                        self._native_call_ids.add(identity)
+                        if item["type"] == "computer_call":
+                            self._native_call_types[identity] = "computer"
+                openai_messages.extend(output)
+                canonical_item_ids.update(id(item) for item in output)
+                canonical_response_item_ids.update(id(item) for item in output)
                 i += 1
                 continue
             role = msg.get("role")
@@ -5266,6 +5358,37 @@ class OpenAIProvider:
                 # Unknown role - skip
                 self._assembly_log("warning", f"Unknown message role: {role}")
                 i += 1
+
+        # Canonical response calls require real matching results, including
+        # after a failed-computer request projection. Never let authoritative
+        # metadata resurrect a call whose result was replaced by reference text.
+        # Standalone compact windows stay opaque and are deliberately exempt.
+        response_output_types = {
+            "function_call": "function_call_output",
+            "tool_call": "function_call_output",
+            "custom_tool_call": "custom_tool_call_output",
+            "apply_patch_call": "apply_patch_call_output",
+            "computer_call": "computer_call_output",
+        }
+        for index, item in enumerate(openai_messages):
+            expected = response_output_types.get(item.get("type"))
+            if id(item) not in canonical_response_item_ids or expected is None:
+                continue
+            identity = item.get("call_id")
+            results = [
+                (result_index, result)
+                for result_index, result in enumerate(openai_messages)
+                if result.get("call_id") == identity and result.get("type") == expected
+            ]
+            if (
+                not identity or len(results) != 1 or results[0][0] <= index
+            ):
+                raise kernel_errors.InvalidRequestError(
+                    "Canonical response call has no unique following real result; "
+                    "original history is preserved, no result was synthesized and "
+                    "no failed computer call was resurrected.",
+                    provider=self.name, retryable=False,
+                )
 
         # P4 wire-path invariant: every function_call item replayed into the
         # input MUST have a paired output by call_id, or the API rejects the
