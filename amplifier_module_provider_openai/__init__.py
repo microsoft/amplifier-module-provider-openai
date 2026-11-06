@@ -278,7 +278,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
     allowed_efforts = (
         _GPT_6_SOL_LUNA_ALLOWED_EFFORTS
-        if model in GPT_6_SOL_LUNA_MODELS
+        if model in GPT_6_SOL_LUNA_MODELS or model == "gpt-6.1-terra"
         else _GPT_6_ASTRA_ALLOWED_EFFORTS
     )
     if effort is not None and effort not in allowed_efforts:
@@ -288,7 +288,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
             f"Supported efforts: {sorted(allowed_efforts)}."
         )
 
-    # GPT-6 Sol/Luna allow Responses sampling fields only when an explicit
+    # GPT-6 Sol/Luna and GPT-6.1 Terra allow sampling fields only when an explicit
     # literal `reasoning.effort="none"` is sent. Astra and GPT-6.1 Sol never
     # allow `none`.
     if effort != "none":
@@ -301,7 +301,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
             params.pop(field, None)
     else:
         # `logprobs` remains an invalid top-level Responses field even when
-        # Sol/Luna explicitly disable reasoning.
+        # the model explicitly disables reasoning.
         if params.get("logprobs") is not None:
             raise kernel_errors.InvalidRequestError(
                 f"Model {model!r} does not support 'logprobs'; remove it from "
@@ -329,9 +329,16 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
         )
 
     options = params.get("prompt_cache_options")
-    if isinstance(options, dict) and options.get("ttl") not in (None, "30m"):
+    if model == "gpt-6.1-terra" and options is not None:
+        _validate_prompt_cache_options(options)
+    allowed_ttls = (None, "30m", "12h") if model == "gpt-6.1-terra" else (None, "30m")
+    if isinstance(options, dict) and (
+        options.get("ttl") not in allowed_ttls
+        or (model == "gpt-6.1-terra" and "ttl" in options and options["ttl"] is None)
+    ):
         raise kernel_errors.InvalidRequestError(
-            f"Model {model!r} supports only prompt_cache_options.ttl='30m'."
+            f"Model {model!r} supports only prompt_cache_options.ttl in "
+            f"{list(allowed_ttls[1:])}."
         )
 
 
@@ -1660,7 +1667,8 @@ class OpenAIProvider:
             self._assembly_log(
                 "warning",
                 "[PROVIDER] Dropping prompt_cache_retention=%r for %s; "
-                "it is unsupported. Use prompt_cache_options.ttl='30m' instead.",
+                "it is unsupported. Use prompt_cache_options.ttl instead "
+                "('30m', or '12h' for gpt-6.1-terra).",
                 legacy_retention,
                 model,
             )
@@ -2673,7 +2681,7 @@ class OpenAIProvider:
                     # expressible; this is the single expressible predicate
                     # that matches the models where the flag has a real cost.
                     show_when={
-                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna)|gpt-6\.1-sol)$"
+                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna)|gpt-6\.1-(?:sol|terra))$"
                     },
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
@@ -2914,6 +2922,7 @@ class OpenAIProvider:
             "gpt-6-sol": "GPT 6 Sol",
             "gpt-6-luna": "GPT 6 Luna",
             "gpt-6.1-sol": "GPT 6.1 Sol",
+            "gpt-6.1-terra": "GPT 6.1 Terra",
             "gpt-5.6": "GPT 5.6",
             "gpt-5.6-sol": "GPT 5.6 Sol",
             "gpt-5.6-terra": "GPT 5.6 Terra",
@@ -5561,12 +5570,29 @@ class OpenAIProvider:
         if usage_obj is None:
             return None
         input_details = getattr(usage_obj, "input_tokens_details", None)
+        if getattr(response, "model", "") == "gpt-6.1-terra" and any(
+            type(getattr(input_details, key, None)) is not int
+            or getattr(input_details, key) < 0
+            for key in ("cached_tokens", "cache_write_tokens")
+        ):
+            # Missing evidence is not an explicit zero: fresh input, cache
+            # reads, and the two write lifetimes have different prices.
+            return None
+        write_details = getattr(input_details, "cache_write_tokens_details", None)
+        # SDK 3.29 preserves this newer usage field as a dict. Also accept a
+        # typed SDK object so a future SDK upgrade does not lose the breakdown.
+        if write_details is not None and not isinstance(write_details, dict):
+            write_details = {
+                key: getattr(write_details, key, None)
+                for key in ("ttl_30m_tokens", "ttl_12h_tokens")
+            }
         return compute_cost(
             getattr(response, "model", ""),
             prompt_tokens=getattr(usage_obj, "input_tokens", 0) or 0,
             completion_tokens=getattr(usage_obj, "output_tokens", 0) or 0,
             cached_tokens=getattr(input_details, "cached_tokens", 0) or 0,
             cache_write_tokens=getattr(input_details, "cache_write_tokens", 0) or 0,
+            cache_write_tokens_details=write_details,
             service_tier=getattr(response, "service_tier", None),
         )
 
