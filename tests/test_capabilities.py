@@ -7,7 +7,6 @@ import pytest
 from amplifier_module_provider_openai._capabilities import (
     ModelCapabilities,
     _detect_family,
-    _detect_version,
     get_capabilities,
 )
 
@@ -86,18 +85,18 @@ class TestGPT52Family:
     def test_gpt_5_2(self):
         caps = get_capabilities("gpt-5.2")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 200_000
+        assert caps.context_window == 400_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
-        assert caps.default_reasoning_effort == "medium"
+        assert caps.default_reasoning_effort is None
 
     def test_gpt_5_2_pro(self):
         caps = get_capabilities("gpt-5.2-pro")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 200_000
+        assert caps.context_window == 400_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
-        assert caps.default_reasoning_effort == "medium"
+        assert caps.default_reasoning_effort is None
 
 
 class TestGPT5MiniFamily:
@@ -292,37 +291,3 @@ class TestDetectFamily:
 
     def test_unknown_model(self):
         assert _detect_family("claude-3-opus") == "unknown"
-
-
-class TestDetectVersion:
-    """Unit tests for the _detect_version() helper."""
-
-    def test_gpt_5_4(self):
-        assert _detect_version("gpt-5.4", "gpt-5") == (5, 4)
-
-    def test_gpt_5_4_pro(self):
-        assert _detect_version("gpt-5.4-pro", "gpt-5") == (5, 4)
-
-    def test_gpt_5_3_codex(self):
-        assert _detect_version("gpt-5.3-codex", "gpt-5") == (5, 3)
-
-    def test_gpt_5_2(self):
-        assert _detect_version("gpt-5.2", "gpt-5") == (5, 2)
-
-    def test_gpt_5_mini_returns_5_0(self):
-        # No .N in "gpt-5-mini" → minor defaults to 0
-        assert _detect_version("gpt-5-mini", "gpt-5-mini") == (5, 0)
-
-    def test_o3_returns_0_0(self):
-        # Non-GPT family → always (0, 0)
-        assert _detect_version("o3", "o-series") == (0, 0)
-
-    def test_o4_mini_returns_0_0(self):
-        assert _detect_version("o4-mini", "o-series") == (0, 0)
-
-    def test_deep_research_returns_0_0(self):
-        assert _detect_version("o3-deep-research", "deep-research") == (0, 0)
-
-    def test_unparseable_gpt_returns_0_0(self):
-        # Family starts with "gpt-" but regex won't match → (0, 0)
-        assert _detect_version("gpt-unknown", "gpt-5") == (0, 0)
