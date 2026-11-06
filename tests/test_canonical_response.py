@@ -229,6 +229,84 @@ class EndpointProvider(OpenAIProvider):
         return Decimal("0.125")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["terminal", "disconnect", "cancel"])
+async def test_adapter_error_observations_retain_confirmed_parent_without_duplicate_billing(
+    failure_kind,
+):
+    import asyncio
+
+    confirmed = Response.model_validate(payload([text()], index=91))
+    unresolved = SimpleNamespace(model="gpt-5.4", usage=None)
+
+    class ObservedEndpoint(EndpointProvider):
+        observation_calls = 0
+
+        def _error_response_observations(self, error):
+            self.observation_calls += 1
+            return (confirmed, unresolved)
+
+    provider = ObservedEndpoint()
+    hooks = SimpleNamespace(emit=AsyncMock())
+    provider.coordinator = SimpleNamespace(hooks=hooks)
+    failure = {
+        "terminal": llm_errors.LLMError("successor failed", retryable=False),
+        "disconnect": llm_errors.LLMError("successor outcome unknown", retryable=False),
+        "cancel": asyncio.CancelledError(),
+    }[failure_kind]
+    provider.client.responses.create = AsyncMock(side_effect=failure)
+    try:
+        with pytest.raises(type(failure)) as caught:
+            await provider.complete(
+                ChatRequest(messages=[Message(role="user", content="go")])
+            )
+        assert provider.observation_calls == 1
+        assert provider.priced == ["resp_91"]
+        assert provider.costs == [Decimal("0.125")]
+        assert caught.value.usage.input_tokens == 95
+        assert caught.value.usage.output_tokens == 10
+        assert caught.value.usage.cost_usd is None
+        assert caught.value.known_cost_usd == Decimal("0.125")
+        assert provider.converted == []
+        error_events = [
+            call.args[1]
+            for call in hooks.emit.call_args_list
+            if call.args[0] == "llm:response" and call.args[1].get("status") == "error"
+        ]
+        if failure_kind == "cancel":
+            assert (
+                error_events == []
+            )  # cancellation remains cancellation, not an ordinary error event
+        else:
+            assert len(error_events) == 1
+            assert error_events[0]["usage"]["cost_usd"] is None
+            assert error_events[0]["known_cost_usd"] == "0.125"
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_adapter_error_observation_hook_is_not_called_after_success_billing():
+    class ObservedEndpoint(EndpointProvider):
+        def _error_response_observations(self, error):
+            raise AssertionError(
+                "successful billing must not consume adapter failure evidence"
+            )
+
+    provider = ObservedEndpoint()
+    provider.client.responses.create = AsyncMock(
+        return_value=Response.model_validate(payload([text()]))
+    )
+    try:
+        result = await provider.complete(
+            ChatRequest(messages=[Message(role="user", content="go")])
+        )
+        assert result.usage.cost_usd == Decimal("0.125")
+        assert provider.costs == [Decimal("0.125")]
+    finally:
+        await provider.close()
+
+
 @pytest.mark.parametrize("as_spec", [False, True])
 def test_custom_tool_declaration_keeps_raw_input_contract_and_grammar(as_spec):
     from amplifier_core.message_models import ToolSpec

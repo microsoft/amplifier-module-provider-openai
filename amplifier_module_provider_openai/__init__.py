@@ -3538,6 +3538,12 @@ class OpenAIProvider:
             return billed_usage
 
         def _error_billing(error):
+            if not billing_finalized:
+                # Optional transports can own multiple terminal generations
+                # before returning (or failing) at the base response seam.
+                # They supply request-owned, non-overlapping observations;
+                # the base still finalizes billing exactly once.
+                billed_responses.extend(self._error_response_observations(error))
             usage = _finalize_billing(terminal_error=True)
             if usage is None:
                 return {}
@@ -5680,6 +5686,18 @@ class OpenAIProvider:
             [self._tool_search_extra[n] for n in sorted(self._tool_search_extra)]
         )
         return block, extra_item
+
+    def _error_response_observations(self, error: BaseException) -> tuple[Any, ...]:
+        """Return additional request-owned response evidence on transport failure.
+
+        The default HTTP path has no hidden generations. Adapters may return
+        confirmed terminal responses plus usage-less sentinels for unresolved
+        successors. Observations must belong to the current request and must
+        not duplicate responses already returned to base completion. This hook
+        neither dispatches work nor records costs; endpoint pricing still uses
+        ``_compute_attempt_cost`` and finalization remains base-owned.
+        """
+        return ()
 
     def _compute_attempt_cost(self, response: Any) -> Decimal | None:
         """Return one response's token cost without mutating provider state.
