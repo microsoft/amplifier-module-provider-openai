@@ -49,12 +49,14 @@ async def main():
         max_retries=0,
     ) as client:
         provider = OpenAIProvider(client=client)
-        assert await provider.discover_models() == {
-            "version": 1,
-            "source": "provider-api",
-            "models": [{"id": "installed-api-id", "display_name": "installed-api-id"}],
-        }
-    assert len(requests) == 1
+        assert provider.get_model_list_info()["filters_keyword"] == "filters"
+        assert not hasattr(provider, "discover_models")
+        assert await provider.list_models() == []
+        rows = await provider.list_models(filters={})
+        assert [row.id for row in rows] == ["installed-api-id"]
+        assert rows[0].context_window == rows[0].max_output_tokens == 0
+        assert rows[0].capabilities == [] and rows[0].defaults == {}
+    assert len(requests) == 2
 
 
 if __name__ == "__main__":

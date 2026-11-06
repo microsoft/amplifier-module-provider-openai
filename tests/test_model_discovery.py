@@ -1,18 +1,14 @@
-"""Strict optional discovery through the real SDK and an offline HTTP transport.
-
-At base b3388a679f1d0ef76dcdaedc8b51cfc7d04c7561 OpenAIProvider has no
-``discover_models`` method (source/AST baseline). These tests must fail there;
-none replaces discovery, SDK model listing, or the production error mapper.
-"""
+"""Canonical listing through the real SDK and offline HTTP MockTransport."""
 
 import asyncio
+import inspect
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 
 import httpx
 import pytest
-from amplifier_core import llm_errors as kernel_errors
+from amplifier_core import ModelInfo, llm_errors as kernel_errors
 from openai import AsyncOpenAI
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -20,36 +16,27 @@ from amplifier_module_provider_openai import OpenAIProvider
 ENDPOINT = "https://catalog.example.invalid/account/v1/"
 
 
-def catalog(*ids, **pagination):
-    return {
-        "object": "list",
-        "data": [
-            {"id": model_id, "object": "model", "created": 1, "owned_by": "fixture"}
-            for model_id in ids
-        ],
-        **pagination,
-    }
+def catalog(*ids, **extra):
+    return {"object": "list", "data": [
+        {"id": mid, "object": "model", "created": 1, "owned_by": "fixture"}
+        for mid in ids
+    ], **extra}
 
 
-def discovered(*ids):
-    return {
-        "version": 1,
-        "source": "provider-api",
-        "models": [{"id": model_id, "display_name": model_id} for model_id in ids],
-    }
+def ids(rows):
+    assert all(isinstance(row, ModelInfo) for row in rows)
+    return {row.id for row in rows}
 
 
 @asynccontextmanager
 async def sdk_provider(receive, **config):
-    """Exercise the real bound client; every test also forbids inference traffic."""
     requests = []
 
     def transport(request):
         requests.append(request)
         assert request.method == "GET"
-        assert str(request.url).split("?")[0] == ENDPOINT + "models"
-        assert set(request.url.params) <= {"after"}
-        assert not request.content
+        assert str(request.url) == ENDPOINT + "models"
+        assert not request.url.query and not request.content
         assert request.headers["authorization"] == "Bearer fixture-discovery-key"
         assert request.headers["openai-organization"] == "fixture-org"
         assert request.headers["openai-project"] == "fixture-project"
@@ -57,396 +44,326 @@ async def sdk_provider(receive, **config):
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False)
     async with AsyncOpenAI(
-        api_key="fixture-discovery-key",
-        base_url=ENDPOINT,
-        organization="fixture-org",
-        project="fixture-project",
-        http_client=http,
-        max_retries=2,
+        api_key="fixture-discovery-key", base_url=ENDPOINT,
+        organization="fixture-org", project="fixture-project",
+        http_client=http, max_retries=2,
     ) as client:
-        provider = OpenAIProvider(
-            client=client,
-            config={"max_retries": 0, "base_url": ENDPOINT, **config},
-        )
+        provider = OpenAIProvider(client=client, config={"max_retries": 0, **config})
         yield provider, requests, client
-        assert provider.client is client
-        assert client.max_retries == 2  # Discovery must not mutate inference settings.
-        assert not http.is_closed  # The bound transport still belongs to the caller.
+        assert provider.client is client and client.max_retries == 2
+        assert not http.is_closed  # Caller owns its transport.
     assert http.is_closed
 
 
 @pytest.mark.asyncio
-async def test_discovery_returns_only_exact_api_ids_without_legacy_filters_or_defaults():
-    ids = [
-        "gpt-4o",
-        "gpt-4.1-2025-04-14",
-        "o3-mini",
-        "gpt-5.6",  # Do not expand this into a configured alias target.
-        "gpt-5.6-sol-2026-07-09",
-        "gpt-6.1-sol",
-        "ft:gpt-4.1:fixture:custom:123",
-        "gpt-image-1",
-        "text-embedding-3-small",
-        "future-unrecognized-family",
-    ]
-    async with sdk_provider(
-        lambda _: httpx.Response(200, json=catalog(*ids)),
-        default_model="selection-only-not-on-api",
-        hide_dated_models=True,
-    ) as (provider, requests, _):
-        assert await provider.discover_models() == discovered(*ids)
-        assert len(requests) == 1
-        assert not requests[0].url.query
+async def test_default_gpt6_pattern_future_previews_and_only_endpoint_ids():
+    returned = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-new-tier", "gpt-6-preview",
+                "gpt-6-astra-2026-10-01", "gpt-6-orphan-2026-10-01",
+                "gpt-5.6", "o3-mini", "o3-deep-research", "gpt-image-1"]
+    async with sdk_provider(lambda _: httpx.Response(200, json=catalog(*returned))) as (p, req, _):
+        rows = await p.list_models()
+        assert ids(rows) == {"gpt-6-astra", "gpt-6.1-sol", "gpt-6-new-tier",
+                             "gpt-6-preview", "gpt-6-orphan-2026-10-01"}
+        assert rows == sorted(rows, key=lambda r: r.display_name.lower())
+        for row in rows:
+            if row.id not in {"gpt-6-astra", "gpt-6.1-sol"}:
+                assert row.context_window == row.max_output_tokens == 0
+                assert row.capabilities == [] and row.defaults == {}
+        assert "preview" in next(r.display_name for r in rows if r.id == "gpt-6-preview")
+        assert len(req) == 1
 
 
 @pytest.mark.asyncio
-async def test_discovery_preserves_absent_account_binding_after_environment_changes(monkeypatch):
-    # Absence is part of the bound account. SDK client reconstruction must not
-    # pick up organization/project values added after the original was created.
-    for name in (
-        "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
-        "OPENAI_ADMIN_KEY", "OPENAI_CUSTOM_HEADERS",
-    ):
-        monkeypatch.delenv(name, raising=False)
+async def test_explicit_all_bypasses_config_family_date_without_synthesis():
+    returned = ["gpt-4o", "gpt-5.6", "gpt-6-sol", "gpt-6-sol-2026-10-01",
+                "o3-mini", "gpt-image-1", "text-embedding-3-small", "ft:custom"]
+    async with sdk_provider(
+        lambda _: httpx.Response(200, json=catalog(*returned)),
+        model_filters={"include": [], "hide_dated": True}, default_model="not-in-catalog",
+    ) as (p, req, _):
+        assert await p.list_models() == []
+        assert ids(await p.list_models(filters={})) == set(returned)
+        assert ids(await p.list_models(filters={"include": ["*"], "hide_dated": False})) == set(returned)
+        assert len(req) == 3
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector, expected", [
+    ({"include": ["gpt-5*", "o3-*"], "exclude": ["*-deep-research"]}, {"gpt-5.6", "o3-mini"}),
+    ({"include": []}, set()),
+    ({"exclude": ["gpt-*"]}, {"o3-mini", "o3-deep-research"}),
+    ({"include": ["GPT-6*"]}, {"gpt-6-solx"}),
+    ({"include": ["gpt-6-????"]}, {"gpt-6-solx"}),
+])
+async def test_custom_include_exclude_replace_defaults(selector, expected):
+    async with sdk_provider(lambda _: httpx.Response(200, json=catalog(
+        "gpt-5.6", "gpt-6-solx", "o3-mini", "o3-deep-research",
+    ))) as (p, _, _):
+        assert ids(await p.list_models(filters=selector)) == expected
+
+
+@pytest.mark.asyncio
+async def test_case_insensitive_globs_preserve_exact_endpoint_bytes():
+    async with sdk_provider(lambda _: httpx.Response(200, json=catalog(
+        "GpT-6-NeW-Tier", "GPT-6-PREVIEW", "Gpt-5.6",
+    ))) as (p, _, _):
+        assert ids(await p.list_models()) == {"GpT-6-NeW-Tier", "GPT-6-PREVIEW"}
+        assert ids(await p.list_models(filters={
+            "include": ["gPt-6*"], "exclude": ["*preview"],
+        })) == {"GpT-6-NeW-Tier"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector, expected", [
+    ({"hide_dated": True}, {"gpt-6-sol", "gpt-6-only-2026-10-01", "gpt-6-preview"}),
+    ({"hide_dated": True, "exclude": ["gpt-6-sol"]},
+     {"gpt-6-sol-2026-10-01", "gpt-6-only-2026-10-01", "gpt-6-preview"}),
+    ({"include": ["*-2026-10-01"], "hide_dated": True},
+     {"gpt-6-sol-2026-10-01", "gpt-6-only-2026-10-01"}),
+])
+async def test_snapshots_hidden_only_when_corresponding_alias_selected(selector, expected):
+    async with sdk_provider(lambda _: httpx.Response(200, json=catalog(
+        "gpt-6-sol", "gpt-6-sol-2026-10-01", "gpt-6-only-2026-10-01", "gpt-6-preview",
+    ))) as (p, _, _):
+        assert ids(await p.list_models(filters=selector)) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config, hidden", [
+    ({}, True), ({"hide_dated_models": False}, False),
+    ({"filtered": False}, False), ({"filtered": "false"}, False),
+    ({"hide_dated_models": True, "filtered": False}, True),
+    ({"hide_dated_models": False, "model_filters": {"include": ["gpt-6*"], "hide_dated": True}}, True),
+])
+async def test_legacy_date_settings_and_precedence(config, hidden):
+    async with sdk_provider(lambda _: httpx.Response(200, json=catalog(
+        "gpt-6-sol", "gpt-6-sol-2026-10-01", "gpt-5.6",
+    )), **config) as (p, _, _):
+        expected = {"gpt-6-sol"} if hidden else {"gpt-6-sol", "gpt-6-sol-2026-10-01"}
+        assert ids(await p.list_models()) == expected
+        assert "gpt-5.6" in ids(await p.list_models(filters={}))
+
+
+@pytest.mark.asyncio
+async def test_config_and_capability_readback_detached_snapshots():
+    filters = {"include": ["gpt-5*"], "exclude": [], "hide_dated": False}
+    async with sdk_provider(lambda _: httpx.Response(200, json=catalog("gpt-5.6", "gpt-6-sol")),
+                            model_filters=filters) as (p, _, _):
+        filters["include"].append("*")
+        p.config["model_filters"]["exclude"].append("*")
+        p.hide_dated_models = True
+        info = p.get_model_list_info()
+        info["default_filters"]["include"].clear()
+        info["filters_schema"]["properties"].clear()
+        assert ids(await p.list_models()) == {"gpt-5.6"}
+        assert p.get_model_list_info()["default_filters"]["include"] == ["gpt-5*"]
+        assert p.get_model_list_info()["filters_schema"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_overrides_snapshot_before_await_never_mutate_shared_state():
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def transport(request):
+        assert request.method == "GET" and not request.url.query
+        started.set()
+        await release.wait()
+        return httpx.Response(200, json=catalog("gpt-5.6", "gpt-6-sol"))
+
+    async with AsyncOpenAI(api_key="fixture", http_client=httpx.AsyncClient(
+        transport=httpx.MockTransport(transport),
+    )) as client:
+        p = OpenAIProvider(client=client)
+        before = deepcopy(p.config)
+        custom = {"include": ["gpt-5*"]}
+        first = asyncio.create_task(p.list_models(filters=custom))
+        await started.wait()
+        custom["include"][:] = ["*"]
+        second = asyncio.create_task(p.list_models())
+        release.set()
+        assert ids(await first) == {"gpt-5.6"}
+        assert ids(await second) == {"gpt-6-sol"}
+        assert p.config == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filters", [
+    False, "all", [], {"include": "*"}, {"include": [None]}, {"include": [""]},
+    {"exclude": [1]}, {"hide_dated": "false"}, {"hide_dated": None}, {"typo": True},
+])
+async def test_invalid_filters_fail_before_io_and_config_fails_at_construction(filters):
+    with pytest.raises(ValueError):
+        OpenAIProvider(config={"model_filters": filters})
+    async with sdk_provider(lambda _: pytest.fail("invalid selector reached transport")) as (p, req, _):
+        with pytest.raises(ValueError):
+            await p.list_models(filters=filters)
+        assert req == []
+
+
+def test_optional_selector_advertisement_no_parallel_discovery_surface():
+    p = OpenAIProvider()
+    assert not hasattr(p, "discover_models")
+    signature = inspect.signature(p.list_models)
+    assert signature.parameters["filters"].kind == inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["filters"].default is None
+    info = p.get_model_list_info()
+    assert info["version"] == 1 and info["filters_keyword"] == "filters"
+    assert info["unfiltered"] == {} and info["override"] == "replace"
+    assert info["default_filters"] == {"include": ["gpt-6*"], "exclude": [], "hide_dated": True}
+    assert p._client is None
+
+
+@pytest.mark.asyncio
+async def test_bound_account_absence_and_headers_survive_environment_changes(monkeypatch):
+    for name in ("OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "OPENAI_ADMIN_KEY", "OPENAI_CUSTOM_HEADERS"):
+        monkeypatch.delenv(name, raising=False)
     requests = []
-    pages = [
-        catalog("first-page-id", has_more=True),
-        catalog("second-page-id", has_more=False),
-    ]
 
     def transport(request):
         requests.append(request)
-        # Check during the request too: temporarily mutating shared retry/account
-        # settings and restoring them afterwards is not safe for inference.
-        assert provider.client is client
-        assert client.max_retries == 2
-        assert client.organization is None
-        assert client.project is None
-        return httpx.Response(200, json=pages[len(requests) - 1])
+        assert request.method == "GET" and str(request.url) == ENDPOINT + "models"
+        assert p.client is client and client.max_retries == 2
+        assert client.organization is None and client.project is None
+        assert request.headers["authorization"] == "Bearer fixture-discovery-key"
+        assert request.headers["x-discovery-fixture"] == "bound-header"
+        assert "openai-organization" not in request.headers
+        assert "openai-project" not in request.headers
+        return httpx.Response(200, json=catalog("gpt-6-new-tier"))
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False)
     async with AsyncOpenAI(
-        api_key="fixture-discovery-key",
-        base_url=ENDPOINT,
-        organization=None,
-        project=None,
-        default_headers={"X-Discovery-Fixture": "bound-header"},
-        http_client=http,
-        max_retries=2,
+        api_key="fixture-discovery-key", base_url=ENDPOINT, organization=None, project=None,
+        default_headers={"X-Discovery-Fixture": "bound-header"}, http_client=http, max_retries=2,
     ) as client:
-        assert client.organization is None
-        assert client.project is None
-        # Absent fields use fresh Omit sentinel instances on each property read.
-        # Compare actual string header values, not sentinel object identities.
-        headers_before = {
-            name: value for name, value in client.default_headers.items()
-            if isinstance(value, str)
-        }
-        provider = OpenAIProvider(
-            client=client, config={"max_retries": 0, "base_url": ENDPOINT},
-        )
+        headers_before = {k: v for k, v in client.default_headers.items() if isinstance(v, str)}
+        p = OpenAIProvider(client=client, config={"max_retries": 0})
         monkeypatch.setenv("OPENAI_ORG_ID", "fixture-later-org")
         monkeypatch.setenv("OPENAI_PROJECT_ID", "fixture-later-project")
-
-        assert await provider.discover_models() == discovered("first-page-id", "second-page-id")
-        assert [dict(request.url.params) for request in requests] == [
-            {}, {"after": "first-page-id"},
-        ]
-        for request in requests:
-            assert request.method == "GET"
-            assert str(request.url).split("?")[0] == ENDPOINT + "models"
-            assert not request.content
-            assert request.headers["authorization"] == "Bearer fixture-discovery-key"
-            assert request.headers["x-discovery-fixture"] == "bound-header"
-            assert "openai-organization" not in request.headers
-            assert "openai-project" not in request.headers
-
-        assert provider.client is client
-        assert client.organization is None
-        assert client.project is None
-        assert client.api_key == "fixture-discovery-key"
-        assert str(client.base_url) == ENDPOINT
-        assert {
-            name: value for name, value in client.default_headers.items()
-            if isinstance(value, str)
-        } == headers_before
-        assert client.max_retries == 2
+        assert ids(await p.list_models()) == {"gpt-6-new-tier"}
+        assert ids(await p.list_models(filters={})) == {"gpt-6-new-tier"}
+        assert client.api_key == "fixture-discovery-key" and str(client.base_url) == ENDPOINT
+        assert {k: v for k, v in client.default_headers.items() if isinstance(v, str)} == headers_before
         assert not http.is_closed
-    assert http.is_closed
+    assert http.is_closed and len(requests) == 2
 
 
 @pytest.mark.asyncio
-async def test_discovery_rejects_admin_only_credentials_before_transport(monkeypatch):
-    for name in (
-        "OPENAI_API_KEY", "OPENAI_ADMIN_KEY", "OPENAI_CUSTOM_HEADERS",
-        "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
-    ):
+async def test_admin_only_credentials_rejected_before_transport(monkeypatch):
+    for name in ("OPENAI_API_KEY", "OPENAI_ADMIN_KEY", "OPENAI_CUSTOM_HEADERS", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"):
         monkeypatch.delenv(name, raising=False)
-
     requests = []
 
     def transport(request):
         requests.append(request)
-        # A valid response makes an unauthorized admin fallback observable as
-        # success, rather than a transport exception that discovery could wrap.
-        return httpx.Response(200, json=catalog("admin-fallback-must-not-be-used"))
+        return httpx.Response(200, json=catalog("gpt-6-admin-fallback-must-not-be-used"))
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False)
-    async with AsyncOpenAI(
-        api_key="",
-        admin_api_key="fixture-admin",
-        base_url=ENDPOINT,
-        http_client=http,
-        max_retries=2,
-    ) as client:
-        provider = OpenAIProvider(
-            client=client, config={"max_retries": 0, "base_url": ENDPOINT},
-        )
-        # The generated /models operation allows bearer_auth only. Generic
-        # client.get defaults also allow admin_api_key_auth in SDK 3.29.
+    async with AsyncOpenAI(api_key="", admin_api_key="fixture-admin", base_url=ENDPOINT,
+                           http_client=http, max_retries=2) as client:
+        p = OpenAIProvider(client=client, config={"max_retries": 0})
         with pytest.raises(TypeError, match="Could not resolve authentication method"):
             await client.models.list()
-        assert requests == []
-
         with pytest.raises(kernel_errors.LLMError) as raised:
-            await provider.discover_models()
-        assert raised.value.provider == "openai"
-        assert raised.value.retryable is False
-        assert requests == []  # Refuse locally, not after sending the admin key.
-        assert provider.client is client
-        assert client.api_key == ""
-        assert client.admin_api_key == "fixture-admin"
-        assert client.max_retries == 2
-        assert not http.is_closed
+            await p.list_models(filters={})
+        assert raised.value.provider == "openai" and raised.value.retryable is False
+        assert requests == []
+        assert p.client is client and client.api_key == "" and client.admin_api_key == "fixture-admin"
+        assert client.max_retries == 2 and not http.is_closed
     assert http.is_closed
 
 
 @pytest.mark.asyncio
-async def test_successful_empty_catalog_is_not_a_default_or_error():
-    async with sdk_provider(
-        lambda _: httpx.Response(200, json=catalog()),
-        default_model="selection-only-not-on-api",
-    ) as (provider, requests, _):
-        assert await provider.discover_models() == discovered()
-        assert len(requests) == 1
+async def test_fresh_refresh_and_empty_without_defaults_aliases_or_cache():
+    pages = [catalog("gpt-6-new-tier"), catalog(), catalog("gpt-6-other-tier")]
+    async with sdk_provider(lambda _: httpx.Response(200, json=pages.pop(0)), default_model="absent") as (p, req, _):
+        first = await p.list_models()
+        assert ids(first) == {"gpt-6-new-tier"}
+        assert await p.list_models() == []
+        assert ids(await p.list_models()) == {"gpt-6-other-tier"}
+        assert ids(first) == {"gpt-6-new-tier"} and len(req) == 3
 
 
 @pytest.mark.asyncio
-async def test_each_refresh_reads_every_page_and_observes_changes_without_a_cache():
-    pages = [
-        catalog("gpt-4o", has_more=True, last_id="cursor-first"),
-        catalog("o3-mini", has_more=True),  # SDK AsyncPage ignores this cursor.
-        catalog("gpt-5.6", has_more=False),
-        catalog("new-api-id", has_more=True, last_id="cursor-refresh"),
-        catalog(has_more=False),
-        catalog(),
-    ]
-    queries = []
-
-    def receive(request):
-        queries.append(dict(request.url.params))
-        return httpx.Response(200, json=pages[len(queries) - 1])
-
-    async with sdk_provider(receive) as (provider, requests, _):
-        first = await provider.discover_models()
-        assert first == discovered("gpt-4o", "o3-mini", "gpt-5.6")
-        assert await provider.discover_models() == discovered("new-api-id")
-        assert await provider.discover_models() == discovered()
-        assert first == discovered("gpt-4o", "o3-mini", "gpt-5.6")
-        assert len(requests) == 6
-    assert queries == [
-        {}, {"after": "cursor-first"}, {"after": "o3-mini"},
-        {}, {"after": "cursor-refresh"}, {},
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "selection",
-    [
-        {},
-        {"model": "not-in-catalog", "default_model": "gpt-4o",
-         "reasoning_effort": "low", "priority": 1},
-        {"model": "another-selection", "default_model": "gpt-5.6-sol",
-         "reasoning_effort": "high", "priority": 99, "hide_dated_models": False},
-    ],
-)
-async def test_selection_configuration_does_not_change_inventory_or_wire_request(selection):
-    async with sdk_provider(
-        lambda _: httpx.Response(200, json=catalog("exact-api-id", "gpt-4o-2024-08-06")),
-        **selection,
-    ) as (provider, requests, _):
-        before = deepcopy(provider.config)
-        default_before = provider.default_model
-        assert await provider.discover_models() == discovered(
-            "exact-api-id", "gpt-4o-2024-08-06"
-        )
-        assert provider.config == before
-        assert provider.default_model == default_before
-        assert len(requests) == 1
-        assert not requests[0].url.query
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status, error_type, retryable",
-    [
-        (400, kernel_errors.LLMError, False),
-        (401, kernel_errors.AuthenticationError, False),
-        (403, kernel_errors.AccessDeniedError, False),
-        (404, kernel_errors.NotFoundError, False),
-        (429, kernel_errors.RateLimitError, True),
-        (500, kernel_errors.ProviderUnavailableError, True),
-        (503, kernel_errors.ProviderUnavailableError, True),
-    ],
-)
-async def test_api_errors_are_typed_not_empty_or_unsupported(status, error_type, retryable):
-    async with sdk_provider(
-        lambda _: httpx.Response(status, json={"error": {"message": "fixture failure"}}),
-        max_retries=4,
-    ) as (provider, requests, _):
+@pytest.mark.parametrize("status, error_type, retryable", [
+    (400, kernel_errors.LLMError, False), (401, kernel_errors.AuthenticationError, False),
+    (403, kernel_errors.AccessDeniedError, False), (404, kernel_errors.NotFoundError, False),
+    (429, kernel_errors.RateLimitError, True), (500, kernel_errors.ProviderUnavailableError, True),
+    (503, kernel_errors.ProviderUnavailableError, True),
+])
+async def test_api_errors_typed_sanitized_not_empty(status, error_type, retryable, caplog):
+    secret = "fixture-secret-not-for-diagnostics"
+    async with sdk_provider(lambda _: httpx.Response(status, json={"error": {"message": secret}})) as (p, req, _):
         with pytest.raises(error_type) as raised:
-            await provider.discover_models()
+            await p.list_models()
         assert type(raised.value) is error_type
-        assert raised.value.provider == "openai"
-        assert raised.value.status_code == status
+        assert raised.value.provider == "openai" and raised.value.status_code == status
         assert raised.value.retryable is retryable
-        assert len(requests) == 1  # Neither SDK nor legacy retries are used.
+        assert secret not in str(raised.value) and secret not in caplog.text
+        assert len(req) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout])
-async def test_transport_failures_are_typed_and_retryable(error_type):
+async def test_transport_failures_typed_retryable_sanitized(error_type):
     def receive(request):
-        raise error_type("fixture transport failure", request=request)
-
-    async with sdk_provider(receive) as (provider, requests, _):
+        raise error_type("fixture-secret-transport", request=request)
+    async with sdk_provider(receive) as (p, req, _):
         with pytest.raises(kernel_errors.LLMError) as raised:
-            await provider.discover_models()
-        assert raised.value.provider == "openai"
+            await p.list_models()
         assert raised.value.retryable is True
-        assert len(requests) == 1
+        assert "fixture-secret" not in str(raised.value) and len(req) == 1
 
 
 @pytest.mark.asyncio
-async def test_cloudflare_challenge_is_typed_transient_without_hidden_retries():
-    async with sdk_provider(
-        lambda _: httpx.Response(
-            403, content="<html>Cloudflare challenge</html>",
-            headers={"content-type": "text/html"},
-        )
-    ) as (provider, requests, _):
+async def test_cloudflare_typed_transient():
+    async with sdk_provider(lambda _: httpx.Response(403, content="<html>Cloudflare challenge</html>",
+                                                    headers={"content-type": "text/html"})) as (p, req, _):
         with pytest.raises(kernel_errors.ProviderUnavailableError) as raised:
-            await provider.discover_models()
-        assert raised.value.status_code == 403
-        assert raised.value.retryable is True
-        assert len(requests) == 1
+            await p.list_models()
+        assert raised.value.status_code == 403 and raised.value.retryable is True
+        assert len(req) == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "body",
-    [
-        None, [], {}, {"data": []}, {"object": "model", "data": []},
-        {"object": "list"}, {"object": "list", "data": None},
-        {"object": "list", "data": {}},
-        {"object": "list", "data": [None]},
-        {"object": "list", "data": ["gpt-4o"]},
-        {"object": "list", "data": [{}]},
-        catalog(None), catalog(123), catalog(True), catalog(""), catalog(" "),
-        catalog(" padded-id "), catalog("gpt-4o", has_more="true"),
-        catalog("gpt-4o", has_more=None), catalog(has_more=True),
-        catalog("gpt-4o", has_more=True, last_id=""),
-        catalog("gpt-4o", has_more=True, last_id=123),
-    ],
-)
-async def test_malformed_payload_is_a_nonretryable_kernel_error(body):
-    # A null response must be JSON null, not httpx's absent-body sentinel.
-    async with sdk_provider(
-        lambda _: httpx.Response(
-            200, content=json.dumps(body), headers={"content-type": "application/json"}
-        )
-    ) as (provider, requests, _):
+@pytest.mark.parametrize("body", [
+    None, [], {}, {"data": []}, {"object": "model", "data": []}, {"object": "list"},
+    {"object": "list", "data": None}, {"object": "list", "data": {}},
+    {"object": "list", "data": [None]}, {"object": "list", "data": ["gpt-6-sol"]},
+    {"object": "list", "data": [{}]}, catalog(None), catalog(123), catalog(True),
+    catalog(""), catalog(" "), catalog(" padded-id "), catalog("gpt-6-sol", has_more="true"),
+    catalog("gpt-6-sol", has_more=None), catalog("gpt-6-sol", has_more=True),
+])
+async def test_malformed_or_partial_catalog_nonretryable_not_partial_success(body):
+    async with sdk_provider(lambda _: httpx.Response(200, content=json.dumps(body),
+                                                    headers={"content-type": "application/json"})) as (p, req, _):
         with pytest.raises(kernel_errors.LLMError) as raised:
-            await provider.discover_models()
-        assert raised.value.retryable is False
-        assert raised.value.provider == "openai"
-        assert len(requests) == 1
+            await p.list_models()
+        assert raised.value.retryable is False and raised.value.provider == "openai"
+        assert len(req) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", [b"not json", b"{", b"<html>login</html>", b"\xff"])
-async def test_unparseable_response_is_a_typed_error(body):
-    async with sdk_provider(
-        lambda _: httpx.Response(200, content=body, headers={"content-type": "text/html"})
-    ) as (provider, requests, _):
+async def test_unparseable_response_typed(body):
+    async with sdk_provider(lambda _: httpx.Response(200, content=body)) as (p, req, _):
         with pytest.raises(kernel_errors.LLMError) as raised:
-            await provider.discover_models()
-        assert raised.value.retryable is False
-        assert len(requests) == 1
+            await p.list_models()
+        assert raised.value.retryable is False and len(req) == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["auth", "malformed", "repeated-cursor"])
-async def test_later_page_failure_never_returns_partial_success_and_refresh_restarts(failure):
-    calls = 0
-
-    def receive(request):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return httpx.Response(200, json=catalog("first-page-id", has_more=True))
-        if calls == 2:
-            assert request.url.params["after"] == "first-page-id"
-            if failure == "auth":
-                return httpx.Response(401, json={"error": {"message": "fixture revoked"}})
-            if failure == "malformed":
-                return httpx.Response(200, json={"object": "list", "data": None})
-            return httpx.Response(200, json=catalog(
-                "second-page-id", has_more=True, last_id="first-page-id"
-            ))
-        assert not request.url.query
-        return httpx.Response(200, json=catalog("fresh-id"))
-
-    async with sdk_provider(receive) as (provider, requests, _):
-        error_type = (kernel_errors.AuthenticationError if failure == "auth"
-                      else kernel_errors.LLMError)
-        with pytest.raises(error_type):
-            await provider.discover_models()
-        assert await provider.discover_models() == discovered("fresh-id")
-        assert len(requests) == 3
-
-
-@pytest.mark.asyncio
-async def test_cancellation_propagates_instead_of_returning_empty_or_retrying():
+async def test_cancellation_propagates_without_retry_or_empty_success():
     def receive(_):
         raise asyncio.CancelledError
-
-    async with sdk_provider(receive) as (provider, requests, _):
+    async with sdk_provider(receive) as (p, req, _):
         with pytest.raises(asyncio.CancelledError):
-            await provider.discover_models()
-        assert len(requests) == 1
+            await p.list_models()
+        assert len(req) == 1
 
 
 @pytest.mark.asyncio
-async def test_missing_credentials_are_typed_without_creating_a_client():
-    provider = OpenAIProvider()
+async def test_missing_credentials_typed_without_creating_client():
+    p = OpenAIProvider()
     with pytest.raises(kernel_errors.AuthenticationError):
-        await provider.discover_models()
-    assert provider._client is None
-
-
-@pytest.mark.asyncio
-async def test_discovery_does_not_change_legacy_listing_filter_metadata_or_order():
-    ids = ["gpt-5.6", "gpt-4o", "gpt-5.1-2025-11-13", "gpt-5.1", "o3-mini"]
-    async with sdk_provider(
-        lambda _: httpx.Response(200, json=catalog(*ids)), hide_dated_models=True,
-    ) as (provider, requests, _):
-        before = await provider.list_models()
-        assert [row.id for row in before] == ["gpt-5.1", "gpt-5.6"]
-        assert all(row.defaults for row in before)
-        assert await provider.discover_models() == discovered(*ids)
-        after = await provider.list_models()
-        assert before == after
-        assert len(requests) == 3
+        await p.list_models()
+    assert p._client is None

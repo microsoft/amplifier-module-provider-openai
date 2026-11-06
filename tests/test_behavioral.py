@@ -3,7 +3,6 @@
 Inherits authoritative tests from amplifier-core.
 """
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,8 +18,6 @@ class TestOpenaiProviderBehavior(ProviderBehaviorTests):
 
     @pytest.mark.asyncio
     async def test_list_models_returns_list(self, provider_module):
-        """Exercise actual catalog mapping against the SDK boundary offline."""
-        provider_module.client.models.list = AsyncMock(return_value=SimpleNamespace(
-            data=[SimpleNamespace(id="gpt-6.1-sol")]
-        ))
+        """Exercise the Core no-argument contract with offline catalog IDs."""
+        provider_module._fetch_model_ids = AsyncMock(return_value=["gpt-6.1-sol"])
         await super().test_list_models_returns_list(provider_module)

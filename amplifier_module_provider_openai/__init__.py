@@ -73,6 +73,7 @@ from ._constants import (
     NATIVE_TOOL_TYPES,
 )
 from ._cost import compute_cost
+from ._model_listing import ModelFilters, selector_schema
 from ._response_handling import (
     FunctionCallTruncationError,
     convert_response_with_accumulated_output,
@@ -1056,6 +1057,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "raw",
         "timeout",
         "hide_dated_models",
+        "model_filters",
         "prompt_cache_key",
         "prompt_cache_retention",
         "prompt_cache_options",
@@ -1408,7 +1410,13 @@ class OpenAIProvider:
             "hide_dated_models",
             _read_renamed_config(self.config, "hide_dated_models", "filtered"),
             True,
-        )  # Filter to curated model list by default
+        )  # Legacy date-only option; never meant "all model families".
+        configured_filters = self.config.get("model_filters")
+        self._model_filters = (
+            ModelFilters(("gpt-6*",), (), self.hide_dated_models)
+            if configured_filters is None
+            else ModelFilters.parse(configured_filters)
+        )
 
         # Prompt-caching hint parameters (Responses API top-level fields).
         # All three default to None = "don't send the field, use OpenAI's
@@ -2736,30 +2744,25 @@ class OpenAIProvider:
     async def _request_model_catalog(
         self, request: Callable[[], Awaitable[Any]], *, operation: str = "list_models"
     ) -> Any:
-        """Share catalog error translation, not listing/filtering/retry policy."""
+        """Translate catalog errors without echoing remote bodies or credentials."""
         try:
             return await request()
         except openai.RateLimitError as e:
-            body = getattr(e, "body", None)
-            error_msg = json.dumps(body) if body is not None else str(e)
             raise kernel_errors.RateLimitError(
-                error_msg,
+                "OpenAI model catalog rate limit (HTTP 429)",
                 provider=self.name,
                 status_code=429,
                 retryable=True,
             ) from e
         except openai.AuthenticationError as e:
-            body = getattr(e, "body", None)
-            error_msg = json.dumps(body) if body is not None else str(e)
             raise kernel_errors.AuthenticationError(
-                error_msg,
+                "OpenAI model catalog authentication failed",
                 provider=self.name,
                 status_code=getattr(e, "status_code", 401),
             ) from e
         except openai.APIStatusError as e:
             status = getattr(e, "status_code", 500)
-            body = getattr(e, "body", None)
-            error_msg = json.dumps(body) if body is not None else str(e)
+            error_msg = f"OpenAI model catalog request failed (HTTP {status})"
             if status == 403:
                 if self._is_cloudflare_challenge(e):
                     logger.warning(
@@ -2804,23 +2807,29 @@ class OpenAIProvider:
             # Transport-level failures (DNS, connection reset, timeout) are
             # genuinely transient.
             raise kernel_errors.LLMError(
-                str(e) or f"{type(e).__name__}: (no message)",
+                "OpenAI model catalog transport failed",
                 provider=self.name,
                 retryable=True,
             ) from e
         except kernel_errors.LLMError:
             raise  # Already translated, don't double-wrap
 
-    async def discover_models(self) -> dict[str, Any]:
-        """Return a fresh, strict API inventory, independent of model selection.
+    def get_model_list_info(self) -> dict[str, Any]:
+        """Describe the optional selector extension locally, without API I/O."""
+        return {
+            "version": 1,
+            "filters_keyword": "filters",
+            "filters_schema": selector_schema(),
+            "default_filters": self._model_filters.as_dict(),
+            "unfiltered": {},
+            "override": "replace",
+        }
 
-        This optional surface does not use list_models' curated family/date
-        filters or capability guesses. The catalog does not establish inference
-        compatibility or entitlement. No cache, defaults, aliases or fallback.
-        """
+    async def _fetch_model_ids(self) -> list[str]:
+        """Fetch and validate one complete catalog using the original client."""
         if self._client is None and self._api_key is None:
             raise kernel_errors.AuthenticationError(
-                "api_key or client must be provided for model discovery",
+                "api_key or client must be provided for model listing",
                 provider=self.name,
             )
         try:
@@ -2828,79 +2837,62 @@ class OpenAIProvider:
             # SDK copies reconstruct those absent fields from the environment.
             # Request-local retries leave concurrent inference settings alone.
             client = self.client
-            models: list[dict[str, str]] = []
-            cursors: set[str] = set()
-            query: dict[str, str] = {}
-            while True:
-                response = await self._request_model_catalog(
-                    lambda query=query: client.get(
-                        "/models",
-                        cast_to=httpx.Response,
-                        options={
-                            "max_retries": 0,
-                            "params": query,
-                            # Match the generated Models API; generic requests
-                            # otherwise also allow admin-key authentication.
-                            "security": {"bearer_auth": True},
-                        },
-                    ),
-                    operation="discover_models",
+            response = await self._request_model_catalog(
+                lambda: client.get(
+                    "/models",
+                    cast_to=httpx.Response,
+                    options={
+                        "max_retries": 0,
+                        # Match the generated Models API; generic requests
+                        # otherwise also allow admin-key authentication.
+                        "security": {"bearer_auth": True},
+                    },
                 )
-                # SDK models are constructed permissively. Inspect the original
-                # JSON so missing data or coerced IDs cannot masquerade as success.
-                page = response.json()
+            )
+            # SDK model construction is permissive. Validate original JSON so
+            # absent data or coerced IDs cannot masquerade as an empty success.
+            page = response.json()
+            if (
+                not isinstance(page, dict)
+                or page.get("object") != "list"
+                or not isinstance(page.get("data"), list)
+            ):
+                raise ValueError("Expected a model list with a data array")
+            # OpenAI documents neither pagination nor native name filters.
+            # Reject a partial compatible-endpoint response; never invent a
+            # cursor parameter or return an incomplete catalog as success.
+            if page.get("has_more", False) is not False:
+                raise ValueError("Expected a complete unpaginated model catalog")
+            ids = []
+            for row in page["data"]:
+                model_id = row.get("id") if isinstance(row, dict) else None
                 if (
-                    not isinstance(page, dict)
-                    or page.get("object") != "list"
-                    or not isinstance(page.get("data"), list)
+                    not isinstance(model_id, str)
+                    or not model_id.strip()
+                    or model_id != model_id.strip()
                 ):
-                    raise ValueError("Expected a model list with a data array")
-                for row in page["data"]:
-                    model_id = row.get("id") if isinstance(row, dict) else None
-                    if (
-                        not isinstance(model_id, str)
-                        or not model_id.strip()
-                        or model_id != model_id.strip()
-                    ):
-                        raise ValueError("Expected a nonblank exact model ID")
-                    models.append({"id": model_id, "display_name": model_id})
-
-                # OpenAI's standard /models response is not paginated (AsyncPage).
-                # Compatible endpoints may explicitly use has_more/last_id. Do
-                # not silently truncate those pages or follow remote next URLs.
-                has_more = page.get("has_more", False)
-                if not isinstance(has_more, bool):
-                    raise TypeError("Expected boolean has_more")
-                if not has_more:
-                    break
-                cursor = page.get("last_id")
-                if cursor is None and page["data"]:
-                    cursor = page["data"][-1]["id"]
-                if (
-                    not isinstance(cursor, str)
-                    or not cursor.strip()
-                    or cursor != cursor.strip()
-                    or cursor in cursors
-                ):
-                    raise ValueError("Missing or repeated model catalog cursor")
-                cursors.add(cursor)
-                query = {"after": cursor}
-            return {"version": 1, "source": "provider-api", "models": models}
+                    raise ValueError("Expected a nonblank exact model ID")
+                ids.append(model_id)
+            return ids
         except kernel_errors.LLMError:
             raise
         except (openai.APIError, ValueError, TypeError, AttributeError) as e:
             raise kernel_errors.LLMError(
-                "Invalid model discovery response or client",
+                "Invalid model catalog response or client",
                 provider=self.name,
                 retryable=False,
             ) from e
 
-    async def list_models(self) -> list[ModelInfo]:
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
         """
         List available OpenAI models.
 
-        Queries the OpenAI API for available models and filters to GPT-5+ series
-        and deep research models. The query is retried with the same shared
+        None uses the frozen provider defaults (gpt-6*). An explicit selector
+        replaces those defaults; {} is unfiltered, including dated/non-chat IDs.
+        See get_model_list_info() for the optional provider-local selector schema.
+        One full API fetch is filtered locally. The query uses the same shared
         retry_with_backoff()/_retry_config machinery used by complete() on
         transient failures (5xx, timeouts, connection errors, Cloudflare
         challenges). Raises the translated kernel error once retries are
@@ -2908,8 +2900,9 @@ class OpenAIProvider:
         no fallback; caller handles empty lists.
         """
 
-        async def _do_list_models():
-            return await self._request_model_catalog(lambda: self.client.models.list())
+        # Snapshot before the first await; caller/config mutations and concurrent
+        # listings cannot change this call's policy or inference configuration.
+        selector = self._model_filters if filters is None else ModelFilters.parse(filters)
 
         async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
             """Callback invoked before each retry sleep."""
@@ -2926,44 +2919,39 @@ class OpenAIProvider:
                     },
                 )
 
-        models_response = await retry_with_backoff(
-            _do_list_models,
+        model_ids = await retry_with_backoff(
+            self._fetch_model_ids,
             self._retry_config,
             on_retry=_on_retry,
         )
         models = []
 
-        import re as regex_module
-
-        for model in models_response.data:
-            model_id = model.id
+        for model_id in selector.select(model_ids):
 
             # Check if this is a deep research model
             is_deep_research = model_id in DEEP_RESEARCH_MODELS or model_id.startswith(
                 ("o3-deep-research", "o4-mini-deep-research")
             )
 
-            # Filter to GPT-5+ series models or deep research models
-            if not (
-                model_id.startswith("gpt-5")
-                or model_id in GPT_6_MODELS
-                or is_deep_research
-            ):
-                continue
-
-            # Skip dated versions when hide_dated_models (e.g., gpt-5-2025-08-07) - duplicates of aliases
-            # But always include deep research aliases (o3-deep-research, o4-mini-deep-research)
-            if (
-                self.hide_dated_models
-                and not is_deep_research
-                and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id)
-            ):
-                continue
-
             # Generate display name from model ID
             display_name = self._model_id_to_display_name(model_id)
 
             caps = get_capabilities(model_id)
+            if caps.family == "unknown":
+                # ModelInfo requires integers. Zero means unknown here, not an
+                # inference limit. Never advertise guessed capabilities/defaults
+                # for future endpoint IDs or borrow their alias's metadata.
+                models.append(
+                    ModelInfo(
+                        id=model_id,
+                        display_name=display_name,
+                        context_window=0,
+                        max_output_tokens=0,
+                        capabilities=[],
+                        defaults={},
+                    )
+                )
+                continue
             capabilities = list(caps.capability_tags)
             if self.enable_long_context and caps.long_context_pricing_threshold:
                 reported_context = caps.context_window

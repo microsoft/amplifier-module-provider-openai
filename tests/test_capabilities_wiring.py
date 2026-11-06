@@ -7,7 +7,6 @@ Verifies that:
 """
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -24,19 +23,10 @@ def _make_provider(**config_overrides) -> OpenAIProvider:
     return provider
 
 
-def _fake_models_response(model_ids: list[str]):
-    """Create a fake OpenAI models.list() response."""
-    data = [SimpleNamespace(id=mid) for mid in model_ids]
-    return SimpleNamespace(data=data)
-
-
 def _make_list_models_provider(*model_ids: str) -> OpenAIProvider:
     """Create a provider wired to return specific model IDs from list_models()."""
-    provider = _make_provider(filtered=False)
-    provider._client = AsyncMock()
-    provider._client.models.list = AsyncMock(
-        return_value=_fake_models_response(list(model_ids))
-    )
+    provider = _make_provider(model_filters={})
+    provider._fetch_model_ids = AsyncMock(return_value=list(model_ids))
     return provider
 
 
