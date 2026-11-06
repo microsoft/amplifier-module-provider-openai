@@ -454,8 +454,10 @@ async def test_observer_failure_preserves_original_error_without_private_chain(
         published = (json.dumps(hooks.events) + caplog.text
                      + ''.join(traceback.format_exception(result.value)))
         assert private_body not in published and private_observer not in published
+        # A model-pin lifecycle warning is unrelated to the observer failure.
         records = [record for record in caplog.records
-                   if record.name == 'amplifier_module_provider_openai']
+                   if record.name == 'amplifier_module_provider_openai'
+                   and record.getMessage() == 'Could not emit token count failure event.']
         assert len(records) == 1
         assert records[0].getMessage() == 'Could not emit token count failure event.'
         assert records[0].exc_info is None and records[0].args == ()

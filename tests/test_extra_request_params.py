@@ -211,7 +211,8 @@ def test_store_false_overrides_background_mode_forced_true():
 def test_extra_request_params_survive_continuation():
     provider = _make_provider(extra_request_params={"seed": 42})
     incomplete_resp = SimpleNamespace(
-        status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
+        status="incomplete", id="resp_incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     provider.client.responses.create = AsyncMock(
         side_effect=[incomplete_resp, DummyResponse()]
@@ -229,7 +230,8 @@ def test_extra_request_params_survive_continuation():
 def test_instructions_still_propagate_alongside_extras():
     provider = _make_provider(extra_request_params={"seed": 42})
     incomplete_resp = SimpleNamespace(
-        status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
+        status="incomplete", id="resp_incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     provider.client.responses.create = AsyncMock(
         side_effect=[incomplete_resp, DummyResponse()]

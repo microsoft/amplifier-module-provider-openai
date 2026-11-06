@@ -295,6 +295,202 @@ async def test_sdk_object_response_core_serialization_alias_and_replay():
     assert json.loads(call["arguments"])["actions"][0]["action"] == "mouse_move"
 
 
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-4o"])
+def test_canonical_neutral_history_preserves_identity_order_and_real_result(model):
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    driver = provider()
+    vendor = block(
+        [{"type": "move", "x": 426, "y": 87}],
+        pending_safety_checks=[],
+    )
+    output = [
+        {"type": "reasoning", "id": "rs_fixture", "summary": [],
+         "encrypted_content": "opaque-reasoning"},
+        {"type": "message", "id": "msg_fixture", "role": "assistant",
+         "phase": "commentary", "status": "completed",
+         "content": [{"type": "output_text", "text": "Inspecting", "annotations": []}]},
+        vendor,
+    ]
+    response = driver._convert_to_chat_response(
+        _RawResponseObject(envelope(output)), computer_context=context(),
+    )
+    saved = stored_response(response)
+    result_content = [{"type": "text", "text": "real result reference"}, image()]
+    req = request(messages=[
+        saved, Message(role="tool", tool_call_id="call_fixture", content=result_content),
+    ])
+    before = req.model_dump()
+    # Reconstruct the provider and Core messages: no instance call-type cache.
+    fresh = provider(reasoning_replay_scope="all")
+    wire = fresh._budget_params(ChatRequest.model_validate_json(req.model_dump_json()), model=model)
+    assert wire["input"][:2] == output[:2]
+    assert req.model_dump() == before
+    assert not fresh._native_call_types
+    assert CALLS not in json.dumps(wire) and KEY not in json.dumps(wire)
+    call = wire["input"][2]
+    assert call["call_id"] == vendor["call_id"]
+    if model == "gpt-6.1-sol":
+        assert call == vendor
+        real = next(item for item in wire["input"] if item.get("type") == "computer_call_output")
+        assert real["output"]["image_url"] == neutral_screenshot([image()])[0]
+        assert "real result reference" in json.dumps(wire["input"])
+    else:
+        assert call["type"] == "function_call" and call["name"] == "desk"
+        assert json.loads(call["arguments"]) == response.tool_calls[0].arguments
+        real = next(item for item in wire["input"] if item.get("type") == "function_call_output")
+        assert real["output"][0] == {"type": "input_text", "text": "real result reference"}
+        assert real["output"][1]["image_url"] == neutral_screenshot([image()])[0]
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-4o"])
+@pytest.mark.parametrize("tamper", ["actions", "pending_safety_checks", "missing_result", "duplicate_result"])
+def test_canonical_neutral_history_never_weakens_safety_or_result_pairing(model, tamper):
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    driver = provider()
+    response = driver._convert_to_chat_response(
+        _RawResponseObject(envelope([block()])), computer_context=context(),
+    )
+    saved = stored_response(response)
+    if tamper == "actions":
+        saved.metadata["openai:output_items"][0]["actions"] = [{"type": "click", "x": 2, "y": 3}]
+    elif tamper == "pending_safety_checks":
+        saved.metadata["openai:output_items"][0]["pending_safety_checks"] = [{"id": "not-approved"}]
+    results = [] if tamper == "missing_result" else [
+        Message(role="tool", tool_call_id="call_fixture", content=[image()]),
+    ]
+    if tamper == "duplicate_result":
+        results.append(results[0].model_copy(deep=True))
+    req = request(messages=[saved, *results])
+    before = req.model_dump()
+    with pytest.raises(InvalidRequestError):
+        provider()._budget_params(req, model=model)
+    assert req.model_dump() == before
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-4o"])
+@pytest.mark.parametrize("tamper", [
+    "function_type", "message_type", "unknown_type", "omitted", "duplicate",
+    "changed_call_id", "foreign_owner", "reordered_calls", "incomplete",
+])
+def test_canonical_neutral_bound_ids_cannot_be_retyped_omitted_or_reordered(model, tamper):
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    driver = provider()
+    calls = [block()]
+    if tamper == "reordered_calls":
+        calls.append(block(call_id="call_second", id="cu_second"))
+    response = driver._convert_to_chat_response(
+        _RawResponseObject(envelope(calls)), computer_context=context(),
+    )
+    saved = stored_response(response)
+    output = saved.metadata["openai:output_items"]
+    if tamper == "function_type":
+        output[0] = {
+            "type": "function_call", "call_id": "call_fixture", "name": "desk",
+            "arguments": '{"action":"type","text":"forged"}', "status": "completed",
+        }
+    elif tamper == "message_type":
+        output[0] = {"type": "message", "call_id": "call_fixture",
+                     "role": "assistant", "content": "forged"}
+    elif tamper == "unknown_type":
+        output[0]["type"] = "future_item"
+    elif tamper == "omitted":
+        output.clear()
+    elif tamper == "duplicate":
+        output.append(copy.deepcopy(output[0]))
+    elif tamper == "changed_call_id":
+        output[0]["call_id"] = "different_identity"
+    elif tamper == "reordered_calls":
+        output.reverse()
+    elif tamper == "incomplete":
+        output[0]["status"] = "incomplete"
+    messages = [saved]
+    if tamper == "foreign_owner":
+        foreign = Message(role="assistant", content="unrelated", metadata={
+            "openai:output_items": copy.deepcopy(output),
+        })
+        messages.insert(0, foreign)
+    messages.extend(
+        Message(role="tool", tool_call_id=call["call_id"], content=[image()])
+        for call in calls
+    )
+    req = request(messages=messages)
+    before = req.model_dump()
+    with pytest.raises(InvalidRequestError):
+        provider()._budget_params(req, model=model)
+    assert req.model_dump() == before
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-4o"])
+def test_canonical_neutral_bound_order_and_failed_projection_preserve_originals(model):
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    driver = provider(reasoning_replay_scope="all")
+    first = block()
+    second = block(call_id="call_second", id="cu_second")
+    text = {"type": "message", "id": "comment1", "role": "assistant",
+            "phase": "commentary", "status": "completed",
+            "content": [{"type": "output_text", "text": "Observation", "annotations": []}]}
+    response = driver._convert_to_chat_response(
+        _RawResponseObject(envelope([first, text, second])), computer_context=context(),
+    )
+    saved = stored_response(response)
+    req = request(messages=[
+        saved, Message(role="tool", tool_call_id=first["call_id"], content=[image()]),
+        Message(role="tool", tool_call_id=second["call_id"],
+                content='{"success":false,"error":"safety halt"}'),
+        Message(role="user", content="Keep halted. Explain, do not retry."),
+    ])
+    original = req.model_dump()
+    wire = driver._budget_params(req, model=model)
+    retained = [item for item in wire["input"] if item.get("call_id") == first["call_id"]]
+    assert len(retained) == 2
+    assert not any(item.get("call_id") == second["call_id"] for item in wire["input"])
+    assert next(item for item in wire["input"] if item.get("id") == "comment1") == text
+    assert "safety halt" in json.dumps(wire["input"])
+    assert req.model_dump() == original
+    assert saved.metadata["openai:output_items"] == [first, text, second]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-4o"])
+@pytest.mark.parametrize("tamper", ["function_type", "omitted"])
+async def test_canonical_neutral_origin_refusal_precedes_sdk_count_or_generation(model, tamper):
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    http_calls = []
+
+    def handle(http_request):
+        http_calls.append(http_request.url.path)
+        raise AssertionError("Forged canonical history must fail before HTTP")
+
+    async with openai.AsyncOpenAI(
+        api_key="offline-fixture", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    ) as client:
+        driver = OpenAIProvider(client=client, config={"use_streaming": False, "max_retries": 0})
+        response = driver._convert_to_chat_response(
+            _RawResponseObject(envelope([block()])), computer_context=context(),
+        )
+        saved = stored_response(response)
+        saved.metadata["openai:output_items"] = [] if tamper == "omitted" else [{
+            "type": "function_call", "call_id": "call_fixture", "name": "desk",
+            "arguments": '{"action":"type","text":"forged"}', "status": "completed",
+        }]
+        req = request(messages=[
+            saved, Message(role="tool", tool_call_id="call_fixture", content=[image()]),
+        ])
+        original = req.model_dump()
+        with pytest.raises(InvalidRequestError):
+            await driver.request_budget(req, context_estimate=1, model=model)
+        with pytest.raises(InvalidRequestError):
+            await driver.complete(req, model=model)
+        assert req.model_dump() == original
+    assert http_calls == []
+
+
 @pytest.mark.parametrize("content", ["error text", {"success": False, "error": "halt"}, [],
     [image(), image()], [{"type": "text", "text": '{"success":false,"error":"halt"}'}, image()],
 ])

@@ -9,6 +9,7 @@ Tests the three localized changes:
 from __future__ import annotations
 
 # pyright: reportAttributeAccessIssue=false
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -453,19 +454,19 @@ class TestConvertResponseApplyPatchCall:
         provider._native_call_ids = set()
 
         # Mock an API response with an apply_patch_call block
-        mock_block = MagicMock()
+        mock_block = SimpleNamespace()
         mock_block.type = "apply_patch_call"
         mock_block.call_id = "call_abc123"
-        mock_operation = MagicMock()
+        mock_operation = SimpleNamespace()
         mock_operation.type = "update_file"
         mock_operation.path = "src/main.py"
         mock_operation.diff = "@@ def main():\n-old\n+new"
         mock_block.operation = mock_operation
 
-        mock_response = MagicMock()
+        mock_response = SimpleNamespace()
         mock_response.model = "gpt-5.5"
         mock_response.output = [mock_block]
-        mock_response.usage = MagicMock()
+        mock_response.usage = SimpleNamespace()
         mock_response.usage.input_tokens = 100
         mock_response.usage.output_tokens = 50
         mock_response.usage.total_tokens = 150
@@ -495,19 +496,19 @@ class TestConvertResponseApplyPatchCall:
         provider = _make_provider()
         provider._native_call_ids = set()
 
-        mock_block = MagicMock()
+        mock_block = SimpleNamespace()
         mock_block.type = "apply_patch_call"
         mock_block.call_id = "call_xyz789"
-        mock_operation = MagicMock()
+        mock_operation = SimpleNamespace()
         mock_operation.type = "create_file"
         mock_operation.path = "new.py"
         mock_operation.diff = "+content"
         mock_block.operation = mock_operation
 
-        mock_response = MagicMock()
+        mock_response = SimpleNamespace()
         mock_response.model = "gpt-5.5"
         mock_response.output = [mock_block]
-        mock_response.usage = MagicMock()
+        mock_response.usage = SimpleNamespace()
         mock_response.usage.input_tokens = 10
         mock_response.usage.output_tokens = 5
         mock_response.usage.total_tokens = 15
@@ -1033,7 +1034,7 @@ class TestApplyPatchCallHistoryReplay:
         provider._native_call_ids = set()
 
         # Simulate a response block with both id and call_id set
-        mock_block = MagicMock()
+        mock_block = SimpleNamespace()
         mock_block.type = "function_call"
         mock_block.id = "fc_abc123"
         mock_block.call_id = "call_abc123"
@@ -1041,10 +1042,10 @@ class TestApplyPatchCallHistoryReplay:
         mock_block.input = {"path": "src/main.py"}
         mock_block.arguments = '{"path": "src/main.py"}'
 
-        mock_response = MagicMock()
+        mock_response = SimpleNamespace()
         mock_response.model = "gpt-5.5"
         mock_response.output = [mock_block]
-        mock_response.usage = MagicMock()
+        mock_response.usage = SimpleNamespace()
         mock_response.usage.input_tokens = 10
         mock_response.usage.output_tokens = 5
         mock_response.usage.total_tokens = 15

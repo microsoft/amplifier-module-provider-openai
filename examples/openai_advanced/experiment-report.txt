@@ -1,0 +1,136 @@
+Advanced Responses experiments — 2026-11-06
+
+Status
+  Offline, explicit-mock prototypes. Not mounted, production-ready or enabled
+  by default. No paid API request, real hosted program, live WebSocket or
+  server-side agent was run. Existing selected models/credentials are unchanged.
+
+Run from repository root
+  python -m examples.openai_advanced.evaluate
+  python -m unittest discover -s tests/experiments -v
+  python -S -m unittest discover -s tests/experiments -v
+  ruff check examples/openai_advanced tests/experiments
+
+The first command prints finite JSON evaluation with source citations, observed
+SDK shape, deterministic fixture outcomes, comparison and rollout decisions.
+The -S check excludes site packages: SDK wire tests skip explicitly, while
+protocol tests continue. An SDK skip is not SDK qualification.
+
+1. Programmatic read-only stock/demand comparison
+   Useful stage: fetch two structured SKU snapshots and calculate a shortage.
+   The hosted JavaScript uses Promise.all and text; no Node, network, filesystem
+   or local generated-code execution is involved. Client tools remain host-owned.
+
+   programmatic.py preserves allowed_callers and output_schema in declarations,
+   copies caller into function outputs, and retains ordered program/fingerprint,
+   encrypted reasoning, function calls, function outputs and program_output.
+   A completed program_output is not a final assistant answer. Host denial,
+   malformed results, incomplete response/program and unknown client-call/send
+   outcomes stop the run with evidence. An already-started run cannot be rerun.
+
+   Deterministic compact fixture:
+     available=42, requested=51, shortage=9.
+     Raw JSON payload=79 bytes; reduced payload=78 bytes.
+     Direct parallel tools, host tool_exec aggregation and native PTC all still
+     need two host tool executions and one tool-result batch in this fixture.
+     The PTC fixture deliberately has a separate final-message continuation.
+
+   These are payload bytes and fixture/protocol boundaries, not model context
+   tokens, billed tokens, model quality or latency. Full stateless replay still
+   retains raw outputs. No demonstrated efficiency advantage in this compact
+   case; the existing host tool_exec already supplies JavaScript aggregation.
+
+   Decision: keep opt-in research only. Qualify larger structured-output tasks
+   with correctness/evidence requirements and actual host receipts before a
+   paid comparison. Do not replace host tool_exec based on these mocks.
+
+2. Multiplexed WebSocket transport experiment
+   Useful stage: run independent planner/research read-only conversations on one
+   connection without sharing their custody, budgets, provenance or workdirs.
+   multiplex.py is a JSON socket mock/reducer, not a replacement native provider.
+
+   Checks cover actual event interleaving and per-stream FIFO; stream-local
+   versus connection errors; distinct stream ownership; Stop/revocation; queued
+   admissions; connection-local response caches; and forks waiting for target
+   response.in_progress before allowing the source to advance.
+
+   Disconnect loses all cached response IDs and marks sent active work unknown;
+   queued unsent work is not sent. No automatic reconnect/replay is implemented.
+   Custody/provenance are fixture inputs, not real host grants. Workdir strings
+   are checked identities, not OS isolation. Local request limits are not
+   provider token/cost budgets; Stop cannot cancel remote effects.
+
+   Decision: keep isolated. Production native transport owns one generation.
+   Actual multi-stream use needs a host-owned admission, custody, effect-journal,
+   Stop and budget adapter rather than shared tool directories or one owner
+   applied to all streams.
+
+3. Hosted Multi-agent read-only proposal review
+   Useful stage: attribute independent proposal-review tool calls, inject each
+   result, then select only the root agent's final synthesis.
+
+   hosted_agents.py builds exact beta request candidates and reduces attributed
+   events. It retains hosted multi_agent_call, multi_agent_call_output and
+   encrypted agent_message items without executing them as application tools.
+   Function receipt keys include response ID, agent and unchanged API call ID.
+   Cross-agent wire-ID collisions fail rather than inventing wire namespaces.
+
+   response.inject uses the response.created ID and existing function outputs.
+   Since documented acknowledgements lack call_id, this small prototype submits
+   one injection at a time to avoid guessing acknowledgement correlation.
+   response.inject.created means accepted, not evidence of agent consumption.
+   response_already_completed retains returned input for continuation without
+   rerunning the tool. Disconnect/unacknowledged send remains unknown.
+
+   The final selector requires message.agent.agent_name=/root and
+   phase=final_answer; child answers/commentary are not root completion.
+   The per-call dispatcher and outbound send gate remain supplied by the host.
+
+   Official beta scope: GPT-6.1 Sol and GPT-5.6 variants, not blanket GPT-6
+   availability. Exact-model evidence must be supplied; false/unknown refuses.
+   Account/model availability remains unknown; no model list is hardcoded.
+
+   Negotiation:
+     HTTP SDK client.beta.responses.create(...,
+       betas=["responses_multi_agent=v1"])
+     WebSocket configured client.beta.responses.connect with
+       OpenAI-Beta: responses_multi_agent=v1
+     Body: multi_agent={enabled:true,max_concurrent_subagents:3}
+
+   Incompatibilities enforced: reasoning.summary, max_tool_calls and standalone
+   /responses/compact. Server-side per-agent compaction is implicit when enabled.
+   Async tools cannot be programmatic; in Multi-agent they cannot be combined
+   with parallel tool calls. This prototype only admits one read-only schema.
+
+   Local SDK inspection reports the installed version and exposed beta methods.
+   Real installed-SDK MockTransport tests check headers, body metadata and
+   output attribution without network. SDK floor 3.29 must be checked separately;
+   a simulated missing-beta test does not establish what 3.29 actually supports.
+   Missing beta seams never trigger a raw-transport or credential bypass.
+
+   Decision: do not enable by default. Keep opt-in until SDK/model/account and
+   host per-agent approval/custody/budget integration are qualified. In-memory
+   receipts do not provide restart-durable exactly-once effects.
+
+Verification ownership
+   This contribution runs local protocol and SDK mock checks only. The parent
+   manager owns integration/DTU qualification and any separately authorized
+   beneficial live API check. No environment was launched by this worker.
+   Production __init__.py, native.py, public defaults and dependencies unchanged.
+
+Observed local verification
+   Installed SDK: openai 3.33.0; httpx 0.28.1; Python 3.13.
+   75 unittest checks passed, including two real-SDK MockTransport checks.
+   With site packages disabled: 73 passed, two SDK-dependent checks skipped.
+   Ruff and git diff --check passed.
+   Independent review found five defects; all were fixed with regression tests:
+     commentary ending a turn; conflicting delta attribution; cyclic fork
+     deadlock; omitted refusal content; late historical-duplicate detection.
+   Focused independent re-review found no remaining blocker in those fixes.
+   These checks qualify isolated mock behavior, not actual model/API behavior.
+
+Official source list (fetched as Markdown, 2026-11-06)
+  https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling.md
+  https://developers.openai.com/api/docs/guides/websocket-mode.md
+  https://developers.openai.com/api/docs/guides/responses-multi-agent.md
+  https://developers.openai.com/api/docs/guides/async-tool-calling.md

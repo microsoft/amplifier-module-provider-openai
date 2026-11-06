@@ -1,6 +1,6 @@
 """Capability tests for gpt-5.5 / gpt-5.5-pro.
 
-Values verified against the live OpenAI API on 2026-04-24.
+    Values checked against official model/pricing pages on 2026-11-06.
 """
 
 from amplifier_module_provider_openai._capabilities import get_capabilities
@@ -10,14 +10,13 @@ class TestGPT55Family:
     def test_gpt_5_5(self):
         caps = get_capabilities("gpt-5.5")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
         assert caps.default_reasoning_effort is None
         assert caps.supports_vision is True
         assert caps.supports_streaming is True
-        # Pricing-derived; no public API source.
-        assert caps.long_context_pricing_threshold is None
+        assert caps.long_context_pricing_threshold == 272_000
         # gpt-5.5 default retention is "24h"; "in_memory" returns 400 from the API.
         # This flag is the single source of truth for the in_memory drop in
         # _drop_unsupported_in_memory_retention(); pin it so a future capability
@@ -27,19 +26,20 @@ class TestGPT55Family:
     def test_gpt_5_5_pro(self):
         caps = get_capabilities("gpt-5.5-pro")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
+        assert caps.long_context_pricing_threshold == 272_000
         assert caps.supports_reasoning is True
         assert caps.supports_in_memory_retention is False
 
     def test_gpt_5_5_dated_snapshot(self):
         caps = get_capabilities("gpt-5.5-2026-04-23")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
 
     def test_gpt_5_5_pro_dated_snapshot(self):
         caps = get_capabilities("gpt-5.5-pro-2026-04-23")
         assert caps.family == "gpt-5"
-        assert caps.context_window == 1_000_000
+        assert caps.context_window == 1_050_000
 
 
 class TestRegressionGPT54:

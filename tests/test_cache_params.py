@@ -227,7 +227,7 @@ def test_continuation_inherits_cache_params():
         status="incomplete",
         id="resp_incomplete",
         output=[],
-        incomplete_details=None,
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     completed_resp = DummyResponse()
 

@@ -4,7 +4,18 @@ from __future__ import annotations
 
 import base64
 import math
-import re
+
+# Automatic selection is a full-model policy, not a price comparison. This
+# policy includes Sunburst's detailed-work role, not Flare's fast-iteration role.
+# https://developers.openai.com/api/docs/guides/image-generation
+# Unknown catalog IDs and other tiers require an explicit pin.
+_AUTOMATIC_FULL_MODELS = {
+    "gpt-image-1": (1,),
+    "gpt-image-1.5": (1, 5),
+    "gpt-image-2": (2,),
+    "gpt-image-2.5-sunburst": (2, 5),
+    "gpt-image-2.6-sunburst": (2, 6),
+}
 
 
 def image_generation_info():
@@ -41,21 +52,23 @@ async def list_image_models(provider):
 
 
 def latest_image_model(rows):
-    """Prefer the latest stable GPT Image family; never opt into previews.
+    """Select the latest documented stable full model in this account's catalog.
 
-    Version numbers, not lexical ordering, select the family. The full model
-    wins over mini in the same family; an explicitly pinned mini stays pinned.
-    Only models returned by the selected account's catalog are eligible.
+    Policy includes Sunburst in the full tier alongside the unqualified aliases.
+    Flare and mini are not interchangeable with that tier, regardless of version
+    or token price. They require explicit pins, as do unknown future IDs and
+    snapshots. No catalog result is evidence of generation entitlement.
     """
-    candidates = []
-    for row in rows:
-        match = re.fullmatch(r"gpt-image-(\d+(?:\.\d+)*)(-mini)?", row["id"])
-        if match:
-            version = tuple(int(part) for part in match[1].split("."))
-            candidates.append((version, not bool(match[2]), row["id"]))
+    candidates = [
+        (_AUTOMATIC_FULL_MODELS[row["id"]], row["id"])
+        for row in rows if row["id"] in _AUTOMATIC_FULL_MODELS
+    ]
     if not candidates:
-        raise ValueError("No stable image model is available through this connection. Choose an image model explicitly.")
-    return max(candidates)[2]
+        raise ValueError(
+            "No documented stable full image model is available through this "
+            "connection. Choose an image model explicitly; auto does not switch tiers."
+        )
+    return max(candidates)[1]
 
 
 class OpenAIImageBackend:

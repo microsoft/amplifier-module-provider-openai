@@ -11,8 +11,11 @@ native = NativeResponsesProvider.wrap(driver, owner_getter=current_owner,
     lifecycle=save_private_receipt)
 ```
 
-The current native steering capability is the selected `gpt-6-astra` model at
-`https://api.openai.com/v1`. Other selected models, utility requests explicitly
+The adapter uses the final validated model, including request and SDK body
+overrides, to consult the shared exact-ID policy. Documented eligibility covers
+`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol` and `gpt-6.1-terra`
+at `https://api.openai.com/v1`. This is not account entitlement or live
+qualification of every model/parameter combination. Other models, utility requests explicitly
 marked `stream: false`, and requests without a live owner use the ordinary
 provider. Native WebSocket calls preserve the provider's request construction,
 response parsing, usage and hooks. They do not choose a model, execute tools
@@ -20,15 +23,53 @@ directly, or import a CLI, loop, or host package. Streaming SSE, background
 polling, conversation-bound requests, automatic compaction, transport overrides,
 and unrecognized input-assembly extensions are rejected before sending. A host
 must advertise these limits instead of enabling native by default.
+Pending steering, an active owner, a refused send or an unknown outcome cannot
+escape recovery by switching to ordinary transport or changing the model.
+Budgeting and native dispatch use the same pure final request plan.
 
 The injected owner supplies `context.get_messages/add_message`, `runtime.emit`,
 `config`, `_text(command)`, `pending`, `steer(wake)`, `native_job(call_id)`, and
-`start_native_job(Core ToolCall)`. The latter must retain the host's existing
-hooks and approval path. Only explicitly enabled native asynchronous delegate
-calls use it. The CLI continues to own its image budgeting and computer-result
+`start_native_job(Core ToolCall)`. The latter retains the existing explicitly
+enabled background-delegate contract and must retain host hooks and approvals.
+Additional function/custom tools require explicit host descriptors:
+
+```python
+from amplifier_module_provider_openai.native import NativeAsyncTool
+
+def native_async_tools():
+    return [
+        NativeAsyncTool(name="lookup", start=start_approved_lookup),
+    ]
+```
+
+The owner's optional synchronous `native_async_tools()` returns these exact
+records (`name`, `start`, optional `kind="function"` or `"custom"`, and
+`namespace`). `start` receives the complete original wire item, not a rewritten
+Core call. The host must establish durable custody before effects and enforce
+approval, Stop, capacity and budget at dispatch. `native_job(call_id)` exposes
+only the actual final result, with `result=None` while unfinished; a start
+acknowledgment is never a tool result. Restored uncertain jobs cannot be started
+again. Neutral computer calls are never asynchronous.
+
+The host continues to own image budgeting and computer-result
 policy through `_prepare_native_messages` and `_validate_native_items` hooks.
 Optional private `trace` and `trace_context` callbacks retain CLI diagnostics;
 public receipts never contain input/output or hidden reasoning.
+
+`wrap(..., progressive_output=True)` opts into existing Core
+`llm:stream_block_start/delta/end` hooks. Successor responses have distinct block
+identities; final response conversion does not replay text deltas. This option
+does not install a UI renderer or alter ordinary SSE behavior.
+
+Native public usage is aggregated, but pricing uses each terminal response's
+original model, service tier and cache evidence before summing costs. Two
+responses below a long-price threshold are not rerated as one large request.
+Any unpriced constituent makes the total unknown.
+
+Host adoption remains separate. The inspected Unified installer at
+`ebfe26e4730f7ed1f82352a1b8c601833dac815a` is Astra-only and its loop owner does
+not declare general async handlers. Updating this module alone does not enable
+these new optional paths there or in every Amplifier host.
 
 `steer_live(command)` accepts one identified input while a response is active.
 Acceptance is recorded once but is not application. `steering.applied` is emitted

@@ -51,9 +51,7 @@ class NativeCheckpointMixin:
         return {
             "supported": True,
             "transport": "responses_websocket",
-            "model": getattr(self, "_last_native_request", (None, {}))[1].get(
-                "model", self.default_model
-            ),
+            "model": getattr(self, "_last_native_model", self.default_model),
             "observerFailed": bool(self._observer_failure),
             "active": self.owner is not None,
             "outcome": "running"
@@ -150,6 +148,7 @@ class NativeCheckpointMixin:
                 messages = [*systems, *(m for m in messages if m.role != "system")]
             request = request.model_copy(update={"messages": messages})
             params, _, _ = self._assemble_initial_responses_params(request, **kwargs)
+            params = self._native_wire_params(params)
             if (
                 params.get("conversation")
                 or params.get("context_management")

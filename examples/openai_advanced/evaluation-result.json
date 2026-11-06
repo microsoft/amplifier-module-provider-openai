@@ -1,0 +1,176 @@
+{
+  "checks": [
+    "python -m unittest discover -s tests/experiments -v",
+    "python -m examples.openai_advanced.evaluate",
+    "ruff check examples/openai_advanced tests/experiments"
+  ],
+  "classification": "offline mock prototype evaluation, NOT production qualification",
+  "global_limitations": [
+    "No model-quality, actual latency, cost or billed-token measurements.",
+    "In-memory ledgers cannot establish restart-safe exactly-once execution.",
+    "Caller-supplied fixture evidence and custody do not confer host authority.",
+    "No provider mount/default, credentials, live socket, or host settings changed."
+  ],
+  "hosted_multi_agent": {
+    "attributed_agents": [
+      "/root/alpha_reviewer",
+      "/root/beta_reviewer"
+    ],
+    "documented_model_scope": "GPT-6.1 Sol and GPT-5.6 variants as of source retrieval",
+    "fixture": "attributed beta JSON events, no hosted agent actually ran",
+    "host_tool_calls": 2,
+    "injection_frames": [
+      {
+        "input": [
+          {
+            "call_id": "mock_call_alpha",
+            "output": "{\"estimated_weeks\":6,\"risk\":\"medium\"}",
+            "type": "function_call_output"
+          }
+        ],
+        "response_id": "resp_mock",
+        "type": "response.inject"
+      },
+      {
+        "input": [
+          {
+            "call_id": "mock_call_beta",
+            "output": "{\"estimated_weeks\":8,\"risk\":\"low\"}",
+            "type": "function_call_output"
+          }
+        ],
+        "response_id": "resp_mock",
+        "type": "response.inject"
+      }
+    ],
+    "injection_status": "accepted",
+    "mock_proposals": {
+      "alpha": {
+        "estimated_weeks": 6,
+        "risk": "medium"
+      },
+      "beta": {
+        "estimated_weeks": 8,
+        "risk": "low"
+      }
+    },
+    "negotiation": {
+      "account_verified": null,
+      "boundary": "configured_client.beta.responses.connect",
+      "extra_headers": {
+        "OpenAI-Beta": "responses_multi_agent=v1"
+      },
+      "implicit_server_compaction": true,
+      "model_evidence": "explicit mock capability fixture",
+      "submission": "not attempted"
+    },
+    "request_candidate": {
+      "input": [
+        {
+          "content": "Compare mock proposal alpha and beta.",
+          "role": "user"
+        }
+      ],
+      "model": "explicit-mock-model",
+      "multi_agent": {
+        "enabled": true,
+        "max_concurrent_subagents": 3
+      },
+      "store": false,
+      "tools": [
+        {
+          "description": "Read the explicit mock snapshot for a proposal.",
+          "name": "get_proposal",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "proposal": {
+                "enum": [
+                  "alpha",
+                  "beta"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "proposal"
+            ],
+            "type": "object"
+          },
+          "strict": true,
+          "type": "function"
+        }
+      ],
+      "type": "response.create"
+    },
+    "result_applied": null,
+    "rollout": "Do not enable by default. SDK/model/account qualification, beta negotiation, durable host approval/custody/budget receipts, and implicit per-agent compaction compatibility remain required.",
+    "root_final": "Mock root synthesis."
+  },
+  "multiplex": {
+    "create_frames": 2,
+    "fixture": "one JSON socket mock, two owned streams, interleaved frames",
+    "native_provider_modified": false,
+    "rollout": "Keep isolated. Actual native transport has a single generation owner. Production requires a host-owned per-stream admission/custody/journal adapter; this caller-supplied identity reducer is not that adapter.",
+    "socket_connections": 1,
+    "states": {
+      "planner": "completed",
+      "research": "completed"
+    }
+  },
+  "official_sources": [
+    "https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling.md",
+    "https://developers.openai.com/api/docs/guides/websocket-mode.md",
+    "https://developers.openai.com/api/docs/guides/responses-multi-agent.md",
+    "https://developers.openai.com/api/docs/guides/async-tool-calling.md"
+  ],
+  "paid_api_calls": 0,
+  "programmatic": {
+    "boundary_counts": {
+      "direct_parallel": {
+        "host_tool_executions": 2,
+        "tool_result_batches": 1
+      },
+      "host_tool_exec": {
+        "host_tool_executions": 2,
+        "tool_result_batches": 1
+      },
+      "native_programmatic": {
+        "host_tool_executions": 2,
+        "tool_result_batches": 1
+      }
+    },
+    "fixture": "explicit mock, no API requests",
+    "hosted_javascript_execution": "not evaluated; never executes locally",
+    "interpretation": "This compact case has no demonstrated context-size win. Native PTC adds hosted program continuation; existing host tool_exec already aggregates two tools. Byte counts exclude protocol envelopes. Stateless replay still retains all raw outputs; bytes are not billed tokens or proof of model-visible context size. No latency/quality claim.",
+    "mock_final": "Mock shortage: 9 units.",
+    "mock_response_count": 3,
+    "model_generation_quality": "not evaluated; all responses are fixtures",
+    "raw_tool_payload_bytes": 79,
+    "reduced_payload_bytes": 78,
+    "result": {
+      "available_units": 42,
+      "requested_units": 51,
+      "shortage_units": 9,
+      "sku": "sku_123"
+    },
+    "rollout": "Keep opt-in research only. Two compact lookups do not justify replacing existing host tool_exec. Qualify large-output tasks, evidence preservation and durable receipts before any production integration."
+  },
+  "sdk_compatibility": {
+    "account_model_availability": "unknown",
+    "beta_create_betas": true,
+    "beta_create_multi_agent": true,
+    "beta_responses": true,
+    "beta_websocket_connect": true,
+    "configured_client": "not supplied",
+    "live_api": "not called",
+    "production_host": {
+      "automatic_mount": false,
+      "durable_injection_journal": "not integrated",
+      "per_agent_approval_custody_budget_adapter": "not integrated"
+    },
+    "sdk": "3.33.0"
+  },
+  "sdk_floor_3_29": "not tested in this interpreter; rerun in qualified floor environment",
+  "sources_retrieved_local_date": "2026-11-06"
+}

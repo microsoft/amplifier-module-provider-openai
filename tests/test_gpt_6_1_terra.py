@@ -92,7 +92,7 @@ def test_capabilities_are_exact_and_default_is_unchanged():
     caps = get_capabilities(MODEL)
     assert caps.family == MODEL
     assert (caps.context_window, caps.max_input_tokens, caps.max_output_tokens) == (
-        922_000, 922_000, 128_000,
+        1_050_000, 922_000, 128_000,
     )
     assert caps.long_context_pricing_threshold == 272_000
     assert caps.default_reasoning_effort is None
@@ -124,11 +124,12 @@ def test_discovery_and_config_gate(long_context, window):
     assert all(re.fullmatch(pattern, model) is None for model in NEAR_MISSES)
 
 
-@pytest.mark.parametrize("long_context,allowance", [(False, 139_904), (True, 789_904)])
+@pytest.mark.parametrize("long_context,allowance", [(False, 267_904), (True, 917_904)])
 def test_native_input_admission_reserves_output_and_safety_budget(long_context, allowance):
     provider = _provider(enable_long_context=long_context)
     params = {"model": MODEL, "input": [], "max_output_tokens": 128_000}
-    # Reported window minus selected output cap and the existing 4,096 reserve.
+    # min(total minus output, independent input ceiling, optional price threshold)
+    # minus the existing 4,096 reserve. Output is not subtracted twice.
     provider._guard_assembled_params(params, native_input_tokens=allowance)
     with pytest.raises(errors.ContextLengthError):
         provider._guard_assembled_params(params, native_input_tokens=allowance + 1)
@@ -258,12 +259,13 @@ def test_ttl_validation_and_legacy_retention_removal(source, ttl):
 
 
 @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
-def test_older_gpt_6_ttl_rules_unchanged(model):
+def test_all_documented_gpt_6_models_accept_extended_ttl(model):
     provider = _provider(default_model=model, prompt_cache_options={"ttl": "12h"})
-    provider.client.responses.create = AsyncMock()
-    with pytest.raises(errors.InvalidRequestError, match="30m"):
-        asyncio.run(provider.complete(_request()))
-    provider.client.responses.create.assert_not_awaited()
+    provider.client.responses.create = AsyncMock(return_value=_mock_response())
+    asyncio.run(provider.complete(_request()))
+    assert provider.client.responses.create.call_args.kwargs["prompt_cache_options"] == {
+        "ttl": "12h"
+    }
 
 
 @pytest.mark.parametrize("tokens,standard", [

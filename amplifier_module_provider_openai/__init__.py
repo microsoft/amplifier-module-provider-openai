@@ -48,7 +48,12 @@ from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from ._capabilities import GPT_6_MODELS, GPT_6_SOL_LUNA_MODELS, get_capabilities
+from ._capabilities import (
+    GPT_6_MODELS,
+    LONG_CONTEXT_MODEL_PATTERN,
+    get_capabilities,
+    get_request_policy,
+)
 from ._constants import (
     BACKGROUND_POLLING_STATUSES,
     BACKGROUND_STATUS_FAILED,
@@ -63,22 +68,24 @@ from ._constants import (
     DEFAULT_TIMEOUT,
     DEFAULT_TRUNCATION,
     MAX_CONTINUATION_ATTEMPTS,
-    METADATA_INCOMPLETE_REASON,
     METADATA_REASONING_ITEMS,
-    METADATA_RESPONSE_ID,
-    METADATA_STATUS,
     METADATA_TOOL_CALL_NAMESPACES,
     METADATA_TOOL_SEARCH_ITEMS,
     NATIVE_TOOL_TYPES,
 )
-from ._cost import compute_cost
+from ._cost import compute_cost, requires_cache_usage_evidence
 from ._response_handling import (
     FunctionCallTruncationError,
-    convert_response_with_accumulated_output,
+    UnsafeContinuationError,
+    convert_response,
     describe_incomplete_function_calls,
-    extract_reasoning_text,
     merge_discarded_usage,
-    parse_function_call_block,
+    normalized_usage,
+    replay_output_items,
+    response_with_output,
+)
+from ._response_handling import (
+    field as response_field,
 )
 from ._tool_search import (
     DEFAULT_ALWAYS_LOADED,
@@ -86,8 +93,6 @@ from ._tool_search import (
     ToolSearchConfigError,
     build_additional_tools_item,
     build_namespaced_tools,
-    extract_function_call_namespaces,
-    extract_hosted_tool_search_items,
     namespace_for_member,
     normalize_namespaces,
     validate_tool_search_mode,
@@ -230,11 +235,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 # gpt-5.5-pro accepts only {medium, high, xhigh} (verified live API 2026-04-24).
 # Catching disallowed values pre-flight gives callers a clear error instead of
 # an opaque API HTTP 400.
-_GPT_5_5_PRO_ALLOWED_EFFORTS = frozenset({"medium", "high", "xhigh"})
-_GPT_6_ASTRA_ALLOWED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-_GPT_6_SOL_LUNA_ALLOWED_EFFORTS = frozenset(
-    {"none", "low", "medium", "high", "xhigh", "max"}
-)
+_GPT_5_5_PRO_ALLOWED_EFFORTS = get_request_policy("gpt-5.5-pro").allowed_efforts
 
 
 def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
@@ -271,17 +272,16 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
 def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     """Reject documented-invalid fields from a final exact GPT-6 wire payload."""
     model = params.get("model")
-    if model not in GPT_6_MODELS:
+    policy = get_request_policy(model)
+    if policy.allowed_efforts is None:
         return
 
     reasoning = params.get("reasoning")
     effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
-    allowed_efforts = (
-        _GPT_6_SOL_LUNA_ALLOWED_EFFORTS
-        if model in GPT_6_SOL_LUNA_MODELS or model == "gpt-6.1-terra"
-        else _GPT_6_ASTRA_ALLOWED_EFFORTS
-    )
-    if effort is not None and effort not in allowed_efforts:
+    allowed_efforts = policy.allowed_efforts
+    if effort is not None and (
+        not isinstance(effort, str) or effort not in allowed_efforts
+    ):
         raise kernel_errors.InvalidRequestError(
             f"Model {model!r} does not support reasoning.effort={effort!r}. "
             "Use 'low' for lightweight tasks, or omit reasoning.effort. "
@@ -291,7 +291,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     # GPT-6 Sol/Luna and GPT-6.1 Terra allow sampling fields only when an explicit
     # literal `reasoning.effort="none"` is sent. Astra and GPT-6.1 Sol never
     # allow `none`.
-    if effort != "none":
+    if model in GPT_6_MODELS and effort != "none":
         for field in ("temperature", "top_p", "top_logprobs", "logprobs"):
             if field in params and params[field] is not None:
                 raise kernel_errors.InvalidRequestError(
@@ -299,7 +299,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
                     "is active; remove it from the request or extra_request_params."
                 )
             params.pop(field, None)
-    else:
+    elif model in GPT_6_MODELS:
         # `logprobs` remains an invalid top-level Responses field even when
         # the model explicitly disables reasoning.
         if params.get("logprobs") is not None:
@@ -310,7 +310,7 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
         params.pop("logprobs", None)
 
     include = params.get("include")
-    if effort == "none" and isinstance(include, (list, tuple)):
+    if model in GPT_6_MODELS and effort == "none" and isinstance(include, (list, tuple)):
         include = [
             value for value in include if value != "reasoning.encrypted_content"
         ]
@@ -319,7 +319,8 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
         else:
             params.pop("include", None)
     if (
-        effort != "none"
+        model in GPT_6_MODELS
+        and effort != "none"
         and isinstance(include, (list, tuple))
         and "message.output_text.logprobs" in include
     ):
@@ -329,16 +330,14 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
         )
 
     options = params.get("prompt_cache_options")
-    if model == "gpt-6.1-terra" and options is not None:
+    if policy.cache_ttls and options is not None:
         _validate_prompt_cache_options(options)
-    allowed_ttls = (None, "30m", "12h") if model == "gpt-6.1-terra" else (None, "30m")
-    if isinstance(options, dict) and (
-        options.get("ttl") not in allowed_ttls
-        or (model == "gpt-6.1-terra" and "ttl" in options and options["ttl"] is None)
+    if policy.cache_ttls and isinstance(options, dict) and "ttl" in options and (
+        not isinstance(options["ttl"], str) or options["ttl"] not in policy.cache_ttls
     ):
         raise kernel_errors.InvalidRequestError(
             f"Model {model!r} supports only prompt_cache_options.ttl in "
-            f"{list(allowed_ttls[1:])}."
+            f"{sorted(policy.cache_ttls)}."
         )
 
 
@@ -382,16 +381,16 @@ def _resolve_config_reasoning_effort(value: Any, model_id: str) -> str | None:
             f"Valid values: {', '.join(sorted(_KNOWN_REASONING_EFFORTS))}. "
             f"Fix the provider config (settings.yaml / bundle config block)."
         )
-    # Per-model accepted sets, where known. gpt-5.5-pro is the only model
-    # with a verified restricted set today (live API 2026-04-24).
-    if model_id.startswith("gpt-5.5-pro") and (
-        normalized not in _GPT_5_5_PRO_ALLOWED_EFFORTS
-    ):
+    # Preserve existing mount-time behavior. All other exact-model restrictions
+    # run after request overrides select the final wire model.
+    allowed = (
+        _GPT_5_5_PRO_ALLOWED_EFFORTS
+        if model_id.startswith("gpt-5.5-pro") else None
+    )
+    if allowed is not None and normalized not in allowed:
         raise ValueError(
             f"Config 'reasoning_effort'={value!r} is not accepted by model "
-            f"{model_id!r}: gpt-5.5-pro requires one of "
-            f"{sorted(_GPT_5_5_PRO_ALLOWED_EFFORTS)} "
-            f"(verified against live API 2026-04-24)."
+            f"{model_id!r}: requires one of {sorted(allowed)}."
         )
     return normalized
 
@@ -536,10 +535,9 @@ def _validate_reasoning_context(reasoning_param: Any) -> None:
     )
 
 
-# prompt_cache_options.mode is a stable enum; ttl currently accepts only "30m" but
-# is left to the API to validate (it is the more volatile field). Verified live
-# against gpt-5.6-sol 2026-07-14. Note: prompt_cache_options COEXISTS with
-# prompt_cache_retention -- it does not replace it.
+# GPT-5.6 and later use prompt_cache_options instead of legacy retention.
+# Exact-ID TTL eligibility is in _capabilities; unknown endpoint fields remain
+# subject to authoritative API validation.
 _PROMPT_CACHE_OPTIONS_MODES = frozenset({"implicit", "explicit"})
 
 _CONTEXT_OVERFLOW_ERROR_CODES = frozenset({"context_length_exceeded"})
@@ -1118,7 +1116,9 @@ _INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
     "thinking_budget_buffer": ("removed -- see thinking_budget_tokens."),
 }
 
-_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset(_INERT_CONFIG_KEY_MESSAGES)
+_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = (
+    frozenset(_INERT_CONFIG_KEY_MESSAGES) | {"shutdown_date"}
+)
 
 # Infrastructure keys the app/kernel may place in (or alongside) a provider's
 # config block that this module does not itself read. `default_model` and
@@ -1148,14 +1148,7 @@ def _supports_tool_output_cache_breakpoints(model: str) -> bool:
     """Whether *model* supports automatic function-output cache breakpoints."""
     if not isinstance(model, str):
         return False
-    # OpenAI documents explicit function-result boundaries for GPT-5.6+.
-    # Use the curated GPT-6 family, not a second tier-specific allowlist.
-    if model in GPT_6_MODELS or model == "gpt-5.6":
-        return True
-    return any(
-        model == tier or model.startswith(f"{tier}-")
-        for tier in ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra")
-    )
+    return bool(get_request_policy(model).cache_ttls)
 
 
 def _add_tool_output_cache_breakpoints(input_items: list[Any]) -> list[Any]:
@@ -1655,20 +1648,34 @@ class OpenAIProvider:
         # This stays in-memory and is bounded to one scalar model id per model.
         self._budget_uncalibrated_warned_models: set[str] = set()
         self._budget_nontext_warned_models: set[str] = set()
+        from ._lifecycle import shutdown_date
+
+        retirement = shutdown_date(self.default_model)
+        if (
+            retirement is not None and self.name == "openai"
+            and self._has_standard_openai_endpoint()
+        ):
+            logger.warning(
+                "[PROVIDER] Explicit model pin %r has OpenAI shutdown_date=%s. "
+                "The pin is preserved; select a replacement explicitly.",
+                self.default_model, retirement,
+            )
 
     def _prepare_gpt_6_params(self, params: dict[str, Any]) -> None:
-        """Apply exact GPT-6 final-wire compatibility rules after extras merge."""
+        """Apply exact-model final-wire rules; retain this internal call seam."""
         model = params.get("model")
-        if model not in GPT_6_MODELS:
-            return
-        legacy_retention = params.pop("prompt_cache_retention", None)
+        _validate_gpt_5_5_pro_effort(model, params.get("reasoning"))
+        policy = get_request_policy(model)
+        legacy_retention = (
+            params.pop("prompt_cache_retention", None) if policy.cache_ttls else None
+        )
         if legacy_retention is not None and not self._astra_legacy_retention_warned:
             self._astra_legacy_retention_warned = True
             self._assembly_log(
                 "warning",
                 "[PROVIDER] Dropping prompt_cache_retention=%r for %s; "
                 "it is unsupported. Use prompt_cache_options.ttl instead "
-                "('30m', or '12h' for gpt-6.1-terra).",
+                "('30m' or '12h').",
                 legacy_retention,
                 model,
             )
@@ -1764,11 +1771,6 @@ class OpenAIProvider:
                 provider=self.name,
             )
         caps = get_capabilities(model)
-        advertised = (
-            caps.context_window
-            if self.enable_long_context
-            else (caps.long_context_pricing_threshold or caps.context_window)
-        )
         # Direct SDK callers may omit an output cap. Reserve the model's full
         # advertised output capability without changing their wire parameters.
         output = params.get(
@@ -1779,13 +1781,25 @@ class OpenAIProvider:
                 "OpenAI request budget requires a nonnegative integer max_output_tokens.",
                 provider=self.name,
             )
-        allowance = advertised - output - 4096
+        if caps.max_output_tokens and output > caps.max_output_tokens:
+            raise kernel_errors.ContextLengthError(
+                f"OpenAI max_output_tokens={output} exceeds the model output "
+                f"ceiling ({caps.max_output_tokens}, model={model}).",
+                provider=self.name,
+            )
+        # Total context, independent input ceiling and price threshold are
+        # different constraints. Output consumes total context, not the input
+        # ceiling or the standard-price threshold.
+        allowance = caps.context_window - output
         if caps.max_input_tokens is not None:
-            allowance = min(allowance, caps.max_input_tokens - 4096)
+            allowance = min(allowance, caps.max_input_tokens)
+        if not self.enable_long_context and caps.long_context_pricing_threshold:
+            allowance = min(allowance, caps.long_context_pricing_threshold)
+        allowance -= 4096
         if allowance <= 0:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request has no input allowance after its output reserve "
-                f"(model={model}, context={advertised}, output={output}).",
+                f"(model={model}, context={caps.context_window}, output={output}).",
                 provider=self.name,
             )
         return allowance
@@ -2061,9 +2075,13 @@ class OpenAIProvider:
             if isinstance(self.extra_request_params.get("extra_body"), dict):
                 history_tools = self.extra_request_params["extra_body"].get("tools", history_tools)
             background_mode = kwargs.get("background", False)
-            if model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
+            if (model_name in DEEP_RESEARCH_MODELS or model_name.startswith(
                 ("o3-deep-research", "o4-mini-deep-research")
+            )) and not (
+                self.name == "openai" and self._has_standard_openai_endpoint()
             ):
+                # Retired direct-OpenAI model identity must not opt users into
+                # stored background work. Compatible endpoint owners retain it.
                 background_mode = kwargs.get("background", True)
 
             params: dict[str, Any] = {
@@ -2122,7 +2140,6 @@ class OpenAIProvider:
                     )
             if reasoning is None:
                 reasoning = self.reasoning
-            _validate_gpt_5_5_pro_effort(model_name, reasoning)
             _validate_reasoning_mode(reasoning)
             _validate_reasoning_context(reasoning)
             if reasoning:
@@ -2205,12 +2222,12 @@ class OpenAIProvider:
                 "prompt_cache_retention", self.prompt_cache_retention
             ) or None
             if (
-                model_name in GPT_6_MODELS
+                get_request_policy(model_name).cache_ttls
                 and "prompt_cache_retention" not in self.config
                 and "prompt_cache_retention" not in kwargs
             ):
                 retention = None
-            if model_name not in GPT_6_MODELS:
+            if not get_request_policy(model_name).cache_ttls:
                 retention = _drop_unsupported_in_memory_retention(
                     model_name,
                     retention,
@@ -2260,6 +2277,7 @@ class OpenAIProvider:
                         model_name,
                     )
 
+            configuration_history_input = copy.deepcopy(params["input"])
             self._merge_extra_request_params(params)
             # A request-level cap is an explicit caller safety boundary. Keep
             # it authoritative over provider-wide extra params so a degraded
@@ -2283,6 +2301,13 @@ class OpenAIProvider:
                 params["max_output_tokens"] = request.max_output_tokens
             params = self._prepare_computer_images(params, request, **kwargs)
             self._prepare_gpt_6_params(params)
+            from .configuration_updates import validate_request
+
+            updates = validate_request(
+                params, messages, original_input=configuration_history_input
+            )
+            if updates and not self._uses_standard_openai_endpoint():
+                raise ValueError("configuration_update requires the documented OpenAI endpoint")
             if self._tool_output_cache_breakpoints_supported(params.get("model")) and isinstance(
                 params.get("input"), list
             ):
@@ -2607,6 +2632,8 @@ class OpenAIProvider:
             reported_context = (
                 caps.long_context_pricing_threshold or caps.context_window
             )
+        if caps.max_input_tokens is not None:
+            reported_context = min(reported_context, caps.max_input_tokens)
         provider_capabilities = [
             "streaming",
             "tools",
@@ -2669,19 +2696,9 @@ class OpenAIProvider:
                     required=False,
                     default="false",
                     requires_model=True,  # NEW -- needed for show_when to see default_model
-                    # Matches exactly the models with modelled long rates
-                    # (_LONG_RATES, _cost.py) -- gpt-5.6-sol/-terra/-luna (and
-                    # the over-included -cyber, harmless: the flag still
-                    # widens its reported window correctly). gpt-5.5 has NO
-                    # threshold at all (the flag would be a total no-op) and
-                    # gpt-5.4*/-mini/-nano have a threshold but no long rates
-                    # (cost-neutral) -- neither belongs behind this specific
-                    # ~2x-cost prompt. show_when is AND-only with one
-                    # predicate per key, so a three-way set is not
-                    # expressible; this is the single expressible predicate
-                    # that matches the models where the flag has a real cost.
+                    # Exact supported SKU sets; no speculative GPT-6 suffixes.
                     show_when={
-                        "default_model": r"matches:^(?:gpt-5\.6(?:-.*)?|gpt-6-(?:astra|sol|luna)|gpt-6\.1-(?:sol|terra))$"
+                        "default_model": LONG_CONTEXT_MODEL_PATTERN
                     },
                 ),
                 # NOTE: `safety_identifier` is intentionally NOT exposed as a
@@ -2852,6 +2869,14 @@ class OpenAIProvider:
 
         for model in models_response.data:
             model_id = model.id
+            from ._lifecycle import is_shutdown, shutdown_date
+
+            # Model discovery is not a saved pin. Exclude only known shutdowns
+            # on the direct OpenAI endpoint; preserve custom deployment catalogs.
+            direct_openai = self.name == "openai" and self._has_standard_openai_endpoint()
+            reported_shutdown = getattr(model, "shutdown_date", None)
+            if direct_openai and is_shutdown(model_id, reported=reported_shutdown):
+                continue
 
             # Check if this is a deep research model
             is_deep_research = model_id in DEEP_RESEARCH_MODELS or model_id.startswith(
@@ -2886,11 +2911,19 @@ class OpenAIProvider:
                 reported_context = (
                     caps.long_context_pricing_threshold or caps.context_window
                 )
+            if caps.max_input_tokens is not None:
+                reported_context = min(reported_context, caps.max_input_tokens)
             max_output_tokens = caps.max_output_tokens
             if is_deep_research:
                 defaults = {"max_tokens": 32768, "background": True}
             else:
                 defaults = {"max_tokens": 16384, "reasoning_effort": "none"}
+            if direct_openai:
+                retirement = shutdown_date(model_id, reported_shutdown)
+                if retirement is not None:
+                    # ModelInfo has no lifecycle field; defaults is its
+                    # extensible metadata channel. This is inert request config.
+                    defaults["shutdown_date"] = retirement
 
             models.append(
                 ModelInfo(
@@ -2917,16 +2950,10 @@ class OpenAIProvider:
             o4-mini-deep-research -> o4-mini Deep Research
         """
         # Known display name mappings
+        policy_name = get_request_policy(model_id).display_name
+        if policy_name is not None:
+            return policy_name
         display_names = {
-            "gpt-6-astra": "GPT 6 Astra",
-            "gpt-6-sol": "GPT 6 Sol",
-            "gpt-6-luna": "GPT 6 Luna",
-            "gpt-6.1-sol": "GPT 6.1 Sol",
-            "gpt-6.1-terra": "GPT 6.1 Terra",
-            "gpt-5.6": "GPT 5.6",
-            "gpt-5.6-sol": "GPT 5.6 Sol",
-            "gpt-5.6-terra": "GPT 5.6 Terra",
-            "gpt-5.6-luna": "GPT 5.6 Luna",
             "gpt-5.6-cyber": "GPT 5.6 Cyber",
             "gpt-5.5": "GPT 5.5",
             "gpt-5.5-pro": "GPT 5.5 Pro",
@@ -2991,67 +3018,7 @@ class OpenAIProvider:
         Returns:
             New input array with accumulated output included for continuation
         """
-        # Start with original input (the conversation so far)
-        continuation_input = list(original_input)
-
-        # Convert accumulated output to assistant messages for input
-        # Extract text from message blocks and reasoning summaries
-        assistant_content = []
-
-        for item in accumulated_output:
-            if hasattr(item, "type"):
-                item_type = item.type
-                if item_type == "message":
-                    # Extract text from message content
-                    content = getattr(item, "content", [])
-                    for content_item in content:
-                        if (
-                            hasattr(content_item, "type")
-                            and content_item.type == "output_text"
-                        ):
-                            text = getattr(content_item, "text", "")
-                            if text:
-                                assistant_content.append(
-                                    {"type": "output_text", "text": text}
-                                )
-                elif item_type == "reasoning":
-                    # For reasoning, we can't really include it in input as text
-                    # The reasoning trace is internal and not meant for reinsertion
-                    # Skip for now - continuation will lose reasoning context
-                    pass
-                elif item_type in {"tool_call", "function_call"}:
-                    # Tool calls - we'd need to include these but this is complex
-                    # For now, skip - incomplete with tool calls is edge case
-                    pass
-            else:
-                # Dictionary format
-                item_type = item.get("type")
-                if item_type == "message":
-                    content = item.get("content", [])
-                    for content_item in content:
-                        if content_item.get("type") == "output_text":
-                            text = content_item.get("text", "")
-                            if text:
-                                assistant_content.append(
-                                    {"type": "output_text", "text": text}
-                                )
-
-        # If we extracted any assistant content, add as a spec-compliant message item.
-        # The turn is being continued precisely because it was truncated, so it is
-        # replayed as "incomplete" -- stamping "completed" would assert the opposite
-        # of what this request is asking the model to do.
-        #
-        # occurrence_index=0: this call site emits at most one synthesized
-        # assistant message per continuation build (the just-truncated turn),
-        # so there is never a same-pass duplicate to disambiguate here.
-        if assistant_content:
-            continuation_input.append(
-                _build_assistant_message_item(
-                    assistant_content, status="incomplete", occurrence_index=0
-                )
-            )
-
-        return continuation_input
+        return [*copy.deepcopy(original_input), *replay_output_items(accumulated_output, continuation=True)]
 
     def _find_missing_tool_results(
         self, messages: list
@@ -3141,6 +3108,11 @@ class OpenAIProvider:
         if not self.supports_native_compaction():
             raise NotImplementedError("This endpoint does not advertise native Responses compaction")
         params = self._budget_params(request)
+        from .configuration_updates import validate_request
+
+        updates = validate_request(params, [m.model_dump() for m in request.messages])
+        if updates:
+            return await self._compact_configuration_updates(request, params, updates)
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
         response = await self.client.responses.compact(
@@ -3157,6 +3129,43 @@ class OpenAIProvider:
             usage = usage.model_dump()
         return {"kind": "native", "message": compacted_message(params["model"], output),
                 "usage": canonical_usage(usage), "input_tokens": input_tokens}
+
+    async def _compact_configuration_updates(self, request, params, updates):
+        """One explicit Responses trigger; never retry or strip update history."""
+        from ._response_handling import response_items
+        from .compaction import canonical_usage
+        from .configuration_updates import compacted_update_message
+
+        body = {**params, **(params.get("extra_body") or {})}
+        trigger_params = {
+            key: copy.deepcopy(body[key])
+            for key in ("model", "input", "instructions", "reasoning")
+            if key in body
+        }
+        trigger_params["input"].append({"type": "compaction_trigger"})
+        trigger_params["store"] = False
+        input_tokens = await self._guard_assembled_params_with_provider_count(params)
+        # This separate operation has no retry/fallback path: a transport error
+        # can mean submission happened. The caller must reconcile before retrying.
+        client = self.client.with_options(max_retries=0)
+        response = await client.responses.create(
+            **trigger_params, timeout=self._transport_timeout(self._request_timeout(request))
+        )
+        if getattr(response, "status", None) != "completed":
+            raise ValueError("Explicit Responses compaction did not complete")
+        output = response_items(response.output)
+        usage = getattr(response, "usage", None)
+        if hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
+        return {
+            "kind": "native",
+            "message": compacted_update_message(
+                body["model"], output, updates,
+                request_effort=(body.get("reasoning") or {}).get("effort"),
+            ),
+            "usage": canonical_usage(usage),
+            "input_tokens": input_tokens,
+        }
 
     async def complete(
         self,
@@ -3208,7 +3217,55 @@ class OpenAIProvider:
         plan_observations(original, replay)
         request = request.model_copy(deep=True)
         missing = self._find_missing_tool_results(request.messages)
+        pending = set()
+        for index, identity, _, _ in missing:
+            output = (request.messages[index].metadata or {}).get("openai:output_items")
+            if not isinstance(output, list):
+                continue
+            candidates = [
+                item for item in output if isinstance(item, dict)
+                and item.get("call_id") == identity
+                and item.get("type") in {"function_call", "custom_tool_call"}
+            ]
+            # The native owner qualifies the complete exact original item.
+            # Neither legacy content nor async/public metadata can opt out of
+            # repair or canonical pairing. Wrong-type/injected results must
+            # reach the ordinary wire guard instead of gaining an exception.
+            has_result = any(
+                message.role == "tool" and message.tool_call_id == identity
+                or any(
+                    isinstance(item, dict) and item.get("call_id") == identity
+                    and item.get("type") in {
+                        "function_call_output", "custom_tool_call_output",
+                        "apply_patch_call_output", "computer_call_output",
+                    }
+                    for item in (
+                        (message.metadata or {}).get("openai:output_items")
+                        if isinstance(
+                            (message.metadata or {}).get("openai:output_items"), list
+                        ) else []
+                    )
+                )
+                for message in request.messages
+            )
+            if (
+                len(candidates) == 1 and not has_result
+                and self._canonical_pending_async_call(candidates[0])
+            ):
+                pending.add((index, identity))
+        missing = [
+            entry for entry in missing if (entry[0], entry[1]) not in pending
+        ]
         event_data = None
+        if any(
+            "openai:output_items" in (request.messages[index].metadata or {})
+            for index, _, _, _ in missing
+        ):
+            raise kernel_errors.InvalidRequestError(
+                "Canonical response call is missing its real result; original "
+                "history is preserved and no result was synthesized.",
+                provider=self.name, retryable=False,
+            )
         if missing:
             self._assembly_log(
                 "warning",
@@ -3478,12 +3535,102 @@ class OpenAIProvider:
         # cannot be counted twice from both SSE and get_final_response().
         failed_stream_responses: list[Any] = []
         failed_stream_response_ids: set[int] = set()
+        billed_responses: list[Any] = []
+        billing_finalized = False
+        billed_usage = None
         generation_attempt = 0
+
+        def _finalize_billing(*, terminal_error=False):
+            """Account confirmed usage once, including terminal conversion errors.
+
+            Missing/unknown attempts remain unknown. Never infer their tokens or
+            cost from the request's limit. Failed stream observations are
+            de-duplicated at capture; each returned generation is a paid attempt
+            even when a test transport reuses the same response object.
+            """
+            nonlocal billing_finalized, billed_usage
+            if billing_finalized:
+                return billed_usage
+            billing_finalized = True
+            observations = [*failed_stream_responses, *billed_responses]
+            usages = [response_field(item, "usage") for item in observations]
+            if not any(usage is not None for usage in usages):
+                return None
+            billed_usage = merge_discarded_usage(normalized_usage(None), usages)
+            costs = [
+                self._compute_attempt_cost(item)
+                if response_field(item, "usage") is not None
+                and isinstance(response_field(item, "model"), str)
+                else None
+                for item in observations
+            ]
+            if costs and all(cost is not None for cost in costs):
+                total = sum(costs, Decimal(0))
+                billed_usage = billed_usage.model_copy(update={"cost_usd": total})
+                self._add_cost(total)
+            elif terminal_error:
+                # The error's total stays unknown. Retain a labelled known
+                # subtotal rather than dropping already confirmed spend. An
+                # adapter aggregate can carry a cached partial cost even when
+                # its complete cost is unknown; do not split/recount its usage.
+                known_costs = [
+                    cost if cost is not None else self._known_attempt_cost(item)
+                    for item, cost in zip(observations, costs, strict=True)
+                ]
+                if any(cost is not None for cost in known_costs):
+                    subtotal = sum((cost for cost in known_costs if cost is not None), Decimal(0))
+                    billed_usage = billed_usage.model_copy(update={"known_cost_usd": subtotal})
+                    self._add_cost(subtotal)
+            return billed_usage
+
+        def _error_billing(error):
+            if not billing_finalized:
+                # Optional transports can own multiple terminal generations
+                # before returning (or failing) at the base response seam.
+                # They supply request-owned, non-overlapping observations;
+                # the base still finalizes billing exactly once.
+                billed_responses.extend(self._error_response_observations(error))
+            usage = _finalize_billing(terminal_error=True)
+            if usage is None:
+                return {}
+            # Error evidence is not an executable response or success. It makes
+            # known spent tokens inspectable while the original error propagates.
+            error.usage = usage
+            evidence = {"usage": usage.model_dump(mode="json")}
+            if getattr(usage, "known_cost_usd", None) is not None:
+                error.known_cost_usd = usage.known_cost_usd
+                evidence["known_cost_usd"] = str(usage.known_cost_usd)
+            return evidence
 
         def _record_failed_stream_response(response: Any) -> None:
             if response is not None and id(response) not in failed_stream_response_ids:
                 failed_stream_response_ids.add(id(response))
                 failed_stream_responses.append(response)
+
+        async def _wait_for_generated_response(value: Any) -> Any:
+            """Settle one generated response without starting another attempt."""
+            try:
+                while getattr(value, "status", None) in BACKGROUND_POLLING_STATUSES:
+                    remaining = None if effective_timeout is None else max(
+                        0, effective_timeout - (time.time() - start_time)
+                    )
+                    async with asyncio.timeout(remaining):
+                        await asyncio.sleep(poll_interval)
+                        value = await self.client.responses.retrieve(
+                            value.id, timeout=self._transport_timeout(request_timeout)
+                        )
+            except (TimeoutError, openai.APIError) as error:
+                raise kernel_errors.LLMError(
+                    "Could not settle generated response; its outcome is unknown",
+                    provider=self.name, retryable=False,
+                ) from error
+            if getattr(value, "status", None) in {"failed", "cancelled"}:
+                billed_responses.append(value)
+                raise kernel_errors.LLMError(
+                    f"Generated response ended as {value.status}",
+                    provider=self.name, retryable=False,
+                )
+            return value
 
         # Per-request streaming override (does NOT mutate self.use_streaming).
         # Callers like session-namer pass metadata={"stream": False} to force
@@ -4068,11 +4215,13 @@ class OpenAIProvider:
 
                 # Check for failed/cancelled status
                 if response.status == BACKGROUND_STATUS_FAILED:
+                    billed_responses.append(response)
                     error_msg = f"Background request failed after {poll_count} polls"
                     if hasattr(response, "error") and response.error:
                         error_msg = f"{error_msg}: {response.error}"
                     raise RuntimeError(error_msg)
                 if response.status == "cancelled":
+                    billed_responses.append(response)
                     raise kernel_errors.LLMError(
                         "Background response was cancelled by the provider",
                         provider=self.name, retryable=False,
@@ -4088,7 +4237,7 @@ class OpenAIProvider:
             final_response = response
             continuation_count = 0
             truncation_retry_done = False
-            billed_responses: list[Any] = [*failed_stream_responses, response]
+            billed_responses.append(response)
             if (
                 assembly_state["neutral_computer_context"]["neutral"]
                 and getattr(final_response, "status", None) == "incomplete"
@@ -4109,6 +4258,7 @@ class OpenAIProvider:
             while (
                 hasattr(final_response, "status")
                 and final_response.status == "incomplete"
+                and response_field(response_field(final_response, "incomplete_details"), "reason") == "max_output_tokens"
                 and kwargs.get("auto_continue", self.auto_continue)
                 and continuation_count < MAX_CONTINUATION_ATTEMPTS
             ):
@@ -4171,6 +4321,7 @@ class OpenAIProvider:
                             self._create_response(params, timeout=request_timeout),
                             timeout=effective_timeout,
                         )
+                        final_response = await _wait_for_generated_response(final_response)
                         self._record_budget_calibration(params, final_response)
                         billed_responses.append(final_response)
                         elapsed_ms += int((time.time() - retry_start) * 1000)
@@ -4234,26 +4385,22 @@ class OpenAIProvider:
                 # Build continuation params using input-based pattern.
                 # params["input"] is the full converted history; the provider
                 # is always stateless.
-                continuation_input = self._build_continuation_input(
-                    params["input"], accumulated_output
-                )
+                original_input = response_field(params.get("extra_body"), "input", params["input"])
+                if not isinstance(original_input, list):
+                    raise UnsafeContinuationError(
+                        "Cannot losslessly auto-continue an opaque non-list input override"
+                    )
+                continuation_input = self._build_continuation_input(original_input, accumulated_output)
 
-                continue_params = {
-                    "model": params["model"],
-                    "input": continuation_input,
-                }
-
-                # Inherit important params if they were set
-                if "instructions" in params:
-                    continue_params["instructions"] = params["instructions"]
-                if "max_output_tokens" in params:
-                    continue_params["max_output_tokens"] = params["max_output_tokens"]
-                if "temperature" in params:
-                    continue_params["temperature"] = params["temperature"]
-                if "reasoning" in params:
-                    continue_params["reasoning"] = params["reasoning"]
-                if "include" in params:
-                    continue_params["include"] = params["include"]
+                # Reuse the final validated request, including future SDK body
+                # fields and transport controls. Only input changes; do not
+                # re-merge overrides which could replace the accumulated input.
+                continue_params = copy.deepcopy(params)
+                continue_params["input"] = continuation_input
+                if isinstance(continue_params.get("extra_body"), dict) and "input" in continue_params["extra_body"]:
+                    # The SDK overlays extra_body after named fields. Reuse the
+                    # effective final input, not a stale pre-override history.
+                    continue_params["extra_body"]["input"] = copy.deepcopy(continuation_input)
                 if "tools" in params:
                     binding = assembly_state["neutral_computer_context"]["binding"]
                     continue_params["tools"] = [
@@ -4262,33 +4409,6 @@ class OpenAIProvider:
                         else copy.deepcopy(tool)
                         for tool in params["tools"]
                     ]
-                    continue_params["tool_choice"] = params.get("tool_choice", "auto")
-                    continue_params["parallel_tool_calls"] = params.get(
-                        "parallel_tool_calls", True
-                    )
-                # The provider is stateless: context is carried forward
-                # explicitly in the rebuilt input array.
-                if "store" in params:
-                    continue_params["store"] = params["store"]
-                if "prompt_cache_key" in params:
-                    continue_params["prompt_cache_key"] = params["prompt_cache_key"]
-                if "prompt_cache_retention" in params:
-                    continue_params["prompt_cache_retention"] = params[
-                        "prompt_cache_retention"
-                    ]
-                if "safety_identifier" in params:
-                    continue_params["safety_identifier"] = params["safety_identifier"]
-                if "prompt_cache_options" in params:
-                    continue_params["prompt_cache_options"] = params[
-                        "prompt_cache_options"
-                    ]
-                if "text" in params:
-                    continue_params["text"] = params["text"]
-
-                # extra_request_params applies to EVERY request this provider
-                # issues, not just the first. Merged last here too, for the
-                # same reason and with the same owner-beware semantics.
-                self._merge_extra_request_params(continue_params)
                 if assembly_state["neutral_computer_context"]["neutral"]:
                     from .neutral_computer import compile_request, replay_calls
 
@@ -4324,6 +4444,7 @@ class OpenAIProvider:
                         self._create_response(continue_params, timeout=request_timeout),
                         timeout=effective_timeout,
                     )
+                    final_response = await _wait_for_generated_response(final_response)
                     self._record_budget_calibration(continue_params, final_response)
                     billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
@@ -4334,13 +4455,15 @@ class OpenAIProvider:
                         accumulated_output.extend(final_response.output)
 
                 except Exception as e:
-                    if isinstance(e, kernel_errors.ContextLengthError):
+                    if isinstance(e, kernel_errors.LLMError) and not e.retryable:
                         raise
-                    logger.error(
-                        f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
-                        f"Returning partial response from {continuation_count} continuation(s)"
-                    )
-                    break  # Return what we have so far
+                    # A lost continuation can have generated hosted effects.
+                    # Do not turn an unknown outcome into partial success or
+                    # replay the initial request through the retry policy.
+                    raise kernel_errors.LLMError(
+                        f"Continuation {continuation_count} failed; its outcome is unknown: {e}",
+                        provider=self.name, retryable=False,
+                    ) from e
 
             # Log completion summary
             if continuation_count > 0:
@@ -4355,26 +4478,22 @@ class OpenAIProvider:
 
             # Convert to ChatResponse FIRST (before emitting llm:response)
             # so event usage fields come from the canonical ChatResponse
-            if continuation_count > 0 and assembly_state["neutral_computer_context"]["neutral"]:
-                view = copy.copy(response)
-                view.output = accumulated_output
-                chat_response = self._convert_to_chat_response(
-                    view, computer_context=assembly_state["neutral_computer_context"]
-                )
+            chat_response = self._convert_to_chat_response(
+                response_with_output(response, accumulated_output) if continuation_count > 0 else response,
+                computer_context=assembly_state["neutral_computer_context"],
+            )
+            if continuation_count > 0:
                 chat_response.metadata = {
                     **(chat_response.metadata or {}),
                     "openai:continuation_count": continuation_count,
                 }
-            elif continuation_count > 0:
-                # Use new helper for accumulated output
-                chat_response = convert_response_with_accumulated_output(
-                    response, accumulated_output, continuation_count, OpenAIChatResponse
-                )
-            else:
-                # Use existing conversion for normal (non-continued) responses
-                chat_response = self._convert_to_chat_response(
-                    response, computer_context=assembly_state["neutral_computer_context"]
-                )
+
+            from .configuration_updates import REQUEST_KEY, request_configuration
+
+            chat_response.metadata = {
+                **(chat_response.metadata or {}),
+                REQUEST_KEY: request_configuration(params),
+            }
 
             # Publish only after HTTP success and validated response conversion.
             # Counts never commit these staged, request-local observations.
@@ -4390,28 +4509,9 @@ class OpenAIProvider:
             # continuations and truncation retries whose output was discarded.
             # Merge raw vendor usage through the same normalization used by
             # the final response so cache writes remain counted exactly once.
-            preceding_usages = [
-                getattr(billed_response, "usage", None)
-                for billed_response in billed_responses[:-1]
-            ]
-            if preceding_usages and chat_response.usage is not None:
-                chat_response.usage = merge_discarded_usage(
-                    chat_response.usage, preceding_usages
-                )
-            if chat_response.usage is not None:
-                attempt_costs: list[Decimal | None] = []
-                for billed_response in billed_responses:
-                    attempt_costs.append(self._compute_attempt_cost(billed_response))
-                if attempt_costs and all(cost is not None for cost in attempt_costs):
-                    total_cost = sum(attempt_costs, Decimal(0))
-                    chat_response.usage = chat_response.usage.model_copy(
-                        update={"cost_usd": total_cost}
-                    )
-                    self._add_cost(total_cost)
-                else:
-                    chat_response.usage = chat_response.usage.model_copy(
-                        update={"cost_usd": None}
-                    )
+            accounted_usage = _finalize_billing()
+            if accounted_usage is not None:
+                chat_response.usage = accounted_usage
 
             # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4460,7 +4560,11 @@ class OpenAIProvider:
 
             return chat_response
 
+        except asyncio.CancelledError as e:
+            _error_billing(e)
+            raise
         except kernel_errors.LLMError as e:
+            error_billing = _error_billing(e)
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
@@ -4475,6 +4579,7 @@ class OpenAIProvider:
                         "error": error_msg,
                         "provider": self.name,
                         "model": params["model"],
+                        **error_billing,
                         **({"error_code": e.code, "response_details": e.response_details}
                            if getattr(e, "code", None) == "computer_use_response_invalid"
                            and isinstance(getattr(e, "response_details", None), dict) else {}),
@@ -4483,6 +4588,7 @@ class OpenAIProvider:
             raise
 
         except Exception as e:
+            error_billing = _error_billing(e)
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
@@ -4498,6 +4604,7 @@ class OpenAIProvider:
                         "error": error_msg,
                         "provider": self.name,
                         "model": params["model"],
+                        **error_billing,
                     },
                 )
             # Re-raise with meaningful message if original was empty
@@ -4560,6 +4667,13 @@ class OpenAIProvider:
 
         return info
 
+    def _canonical_pending_async_call(self, item: dict[str, Any]) -> bool:
+        """Only an owning native adapter can qualify a retained pending call.
+
+        Ordinary history, async flags and public metadata grant no exception.
+        """
+        return False
+
     def _convert_messages(
         self,
         messages: list[dict[str, Any]],
@@ -4586,6 +4700,7 @@ class OpenAIProvider:
         """
         from .compaction import canonical_window
         from .computer_history import project_failed_computer_history
+        from .configuration_updates import compaction_restatement, message_item
         from .neutral_computer import CALLS, KEY, plan_observations, replay_calls
 
         original_replay = replay_calls(messages)
@@ -4630,9 +4745,10 @@ class OpenAIProvider:
                     ] if isinstance(b, dict)
                 }
                 metadata[CALLS] = {k: v for k, v in metadata[CALLS].items() if k in ids}
-        replay_calls(messages)
+        current_replay = replay_calls(messages)
         openai_messages = []
         canonical_item_ids = set()
+        canonical_response_item_ids = set()
         i = 0
         model_name = model or self.default_model
 
@@ -4676,6 +4792,11 @@ class OpenAIProvider:
 
         while i < len(messages):
             msg = messages[i]
+            update = message_item(msg)
+            if update is not None:
+                openai_messages.append(update)
+                i += 1
+                continue
             window = canonical_window(msg, model_name)
             if window is not None:
                 # Standalone compact output is already canonical. Preserve the
@@ -4683,6 +4804,54 @@ class OpenAIProvider:
                 # items before/after encrypted state; do not repair inside it.
                 openai_messages.extend(window)
                 canonical_item_ids.update(id(item) for item in window)
+                restatement = compaction_restatement(msg)
+                if restatement is not None:
+                    openai_messages.append(restatement)
+                i += 1
+                continue
+            if "openai:output_items" in (msg.get("metadata") or {}):
+                from ._response_handling import replay_output_items
+
+                if msg.get("role") != "assistant":
+                    raise ValueError("Canonical response output requires an assistant message")
+                output = []
+                for item in replay_output_items(msg["metadata"]["openai:output_items"]):
+                    if item.get("type") == "reasoning" and i <= _reasoning_cutoff:
+                        # Apply the same configured request-view policy as
+                        # metadata-less legacy turns; never edit saved items.
+                        continue
+                    identity = item.get("call_id")
+                    if item.get("type") == "computer_call" and identity in original_replay:
+                        # The failure projector can remove a validated neutral
+                        # call/result pair in this derived view after a new user
+                        # message. Do not resurrect it from output metadata.
+                        if identity not in current_replay:
+                            continue
+                        record = current_replay[identity]
+                        if (
+                            item.get("actions") != record["vendor_actions"]
+                            or item.get("pending_safety_checks")
+                        ):
+                            raise kernel_errors.InvalidRequestError(
+                                "Canonical neutral computer item disagrees with its binding "
+                                "or contains pending safety requirements",
+                                provider=self.name, retryable=False,
+                            )
+                        # Do not mark a neutral alias as legacy native. Its real
+                        # result needs neutral validation, reference retention
+                        # and final model/endpoint fallback in compile_request.
+                        self._native_call_ids.discard(identity)
+                        self._native_call_types.pop(identity, None)
+                        output.append(item)
+                        continue
+                    if item.get("type") in {"computer_call", "apply_patch_call"}:
+                        self._native_call_ids.add(identity)
+                        if item["type"] == "computer_call":
+                            self._native_call_types[identity] = "computer"
+                    output.append(item)
+                openai_messages.extend(output)
+                canonical_item_ids.update(id(item) for item in output)
+                canonical_response_item_ids.update(id(item) for item in output)
                 i += 1
                 continue
             role = msg.get("role")
@@ -4707,7 +4876,24 @@ class OpenAIProvider:
                         # must be checked before the generic native-call branch
                         # below, since computer call_ids are also present in
                         # _native_call_ids but need a different result shape.
-                        if self._native_call_types.get(tool_call_id) == "computer":
+                        if tool_call_id in current_replay:
+                            # The neutral compiler validates the actual screenshot
+                            # and retains accompanying reference text. A legacy
+                            # native image-only envelope would discard it or fail.
+                            rich_output = (
+                                _convert_function_tool_output_content(tool_content, model_name)
+                                if isinstance(tool_content, list) else None
+                            )
+                            openai_messages.append({
+                                "type": "function_call_output",
+                                "call_id": tool_call_id,
+                                "output": (
+                                    rich_output if rich_output is not None
+                                    else tool_content if isinstance(tool_content, str)
+                                    else json.dumps(tool_content)
+                                ),
+                            })
+                        elif self._native_call_types.get(tool_call_id) == "computer":
                             try:
                                 image_url = _extract_computer_screenshot_data_url(tool_content)
                             except ValueError as exc:
@@ -5300,6 +5486,48 @@ class OpenAIProvider:
                 self._assembly_log("warning", f"Unknown message role: {role}")
                 i += 1
 
+        # Canonical response calls require real matching results, including
+        # after a failed-computer request projection. Never let authoritative
+        # metadata resurrect a call whose result was replaced by reference text.
+        # Standalone compact windows stay opaque and are deliberately exempt.
+        response_output_types = {
+            "function_call": "function_call_output",
+            "tool_call": "function_call_output",
+            "custom_tool_call": "custom_tool_call_output",
+            "apply_patch_call": "apply_patch_call_output",
+            "computer_call": "computer_call_output",
+        }
+        for index, item in enumerate(openai_messages):
+            expected = response_output_types.get(item.get("type"))
+            if id(item) not in canonical_response_item_ids or expected is None:
+                continue
+            identity = item.get("call_id")
+            if item.get("type") == "computer_call" and identity in current_replay:
+                # This intermediate is consumed by compile_request before count
+                # or dispatch, never sent as a native result on its own.
+                expected = "function_call_output"
+            results = [
+                (result_index, result)
+                for result_index, result in enumerate(openai_messages)
+                if result.get("call_id") == identity and result.get("type") == expected
+            ]
+            any_results = any(
+                result.get("call_id") == identity
+                and result.get("type") in response_output_types.values()
+                for result in openai_messages
+            )
+            if identity and not any_results and self._canonical_pending_async_call(item):
+                continue
+            if (
+                not identity or len(results) != 1 or results[0][0] <= index
+            ):
+                raise kernel_errors.InvalidRequestError(
+                    "Canonical response call has no unique following real result; "
+                    "original history is preserved, no result was synthesized and "
+                    "no failed computer call was resurrected.",
+                    provider=self.name, retryable=False,
+                )
+
         # P4 wire-path invariant: every function_call item replayed into the
         # input MUST have a paired output by call_id, or the API rejects the
         # whole request (400 "No tool output found for function call
@@ -5392,6 +5620,16 @@ class OpenAIProvider:
                 # Keep a clean function declaration until final overrides and
                 # endpoint/model selection have been resolved by the compiler.
                 openai_tools.append(ordinary(tool))
+                continue
+            if response_field(tool, "type") == "custom":
+                # Custom tools have raw-text/grammar input, not JSON-schema
+                # function input. Keep their actual declaration and never
+                # silently convert them into a different callable contract.
+                declaration = tool if isinstance(tool, dict) else tool.model_dump()
+                openai_tools.append(copy.deepcopy({
+                    key: value for key, value in declaration.items()
+                    if key in {"type", "name", "description", "format"} and value is not None
+                }))
                 continue
             # Check if this is a native OpenAI tool (dict with recognized type)
             if isinstance(tool, dict):
@@ -5558,6 +5796,30 @@ class OpenAIProvider:
         )
         return block, extra_item
 
+    def _error_response_observations(self, error: BaseException) -> tuple[Any, ...]:
+        """Return additional request-owned response evidence on transport failure.
+
+        The default HTTP path has no hidden generations. Adapters may return
+        confirmed terminal responses plus usage-less sentinels for unresolved
+        successors. Observations must belong to the current request and must
+        not duplicate responses already returned to base completion. This hook
+        neither dispatches work nor records costs; endpoint pricing still uses
+        ``_compute_attempt_cost`` and finalization remains base-owned.
+        """
+        return ()
+
+    def _known_attempt_cost(self, response: Any) -> Decimal | None:
+        """Return a cached known subtotal when an adapter's total is unknown.
+
+        Used only for terminal error accounting after ``_compute_attempt_cost``
+        returns None. The default has no partial price evidence. An override
+        must return a non-overlapping confirmed subtotal for this exact response,
+        never reprice components, dispatch work or invoke the cost accumulator.
+        Returning zero means an evidenced zero; None means no known subtotal.
+        This value never becomes the complete ``Usage.cost_usd``.
+        """
+        return None
+
     def _compute_attempt_cost(self, response: Any) -> Decimal | None:
         """Return one response's token cost without mutating provider state.
 
@@ -5570,10 +5832,17 @@ class OpenAIProvider:
         if usage_obj is None:
             return None
         input_details = getattr(usage_obj, "input_tokens_details", None)
-        if getattr(response, "model", "") == "gpt-6.1-terra" and any(
-            type(getattr(input_details, key, None)) is not int
-            or getattr(input_details, key) < 0
-            for key in ("cached_tokens", "cache_write_tokens")
+        if requires_cache_usage_evidence(getattr(response, "model", "")) and (
+            any(
+                type(getattr(input_details, key, None)) is not int
+                or getattr(input_details, key) < 0
+                for key in ("cached_tokens", "cache_write_tokens")
+            )
+            or any(
+                type(getattr(usage_obj, key, None)) is not int
+                or getattr(usage_obj, key) < 0
+                for key in ("input_tokens", "output_tokens")
+            )
         ):
             # Missing evidence is not an explicit zero: fresh input, cache
             # reads, and the two write lifetimes have different prices.
@@ -5599,484 +5868,21 @@ class OpenAIProvider:
     def _convert_to_chat_response(
         self, response: Any, *, computer_context: dict[str, Any] | None = None
     ) -> ChatResponse:
-        """Convert OpenAI response to ChatResponse format.
-
-        Args:
-            response: OpenAI API response
-
-        Returns:
-            ChatResponse with content blocks
-        """
-        from amplifier_core.message_models import (
-            TextBlock,
-            ThinkingBlock,
-            ToolCall,
-            ToolCallBlock,
-            Usage,
+        """Instance seam for Azure/native adapters; conversion has one owner."""
+        chat_response = convert_response(
+            response, OpenAIChatResponse,
+            native_call_ids=self._native_call_ids,
+            native_call_types=self._native_call_types,
+            computer_context=computer_context,
         )
-
-        from .neutral_computer import CALLS, KEY, response_calls
-
-        # Validate the entire native batch before returning any executable call.
-        # A safety requirement is not an acknowledgement or a tool argument.
-        neutral_calls = (
-            response_calls(
-                response.output, computer_context,
-                getattr(response, "model", None), getattr(response, "status", None),
+        if response_field(response, "usage") is not None:
+            # Pricing overrides historically receive attribute-based SDK objects.
+            # Keep that seam even for the canonical wire-dict conversion path.
+            cost = self._compute_attempt_cost(
+                _RawResponseObject(response) if isinstance(response, dict) else response
             )
-            if computer_context is not None else {}
-        )
-
-        content_blocks = []
-        tool_calls = []
-        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
-        text_accumulator: list[str] = []
-        reasoning_item_ids: list[str] = []  # Track reasoning IDs for metadata
-
-        # Parse output blocks
-        for block in response.output:
-            # Handle both SDK objects and dictionaries
-            if hasattr(block, "type"):
-                block_type = block.type
-
-                if block_type == "message":
-                    # Extract text from message content
-                    block_content = getattr(block, "content", [])
-                    if isinstance(block_content, list):
-                        for content_item in block_content:
-                            if (
-                                hasattr(content_item, "type")
-                                and content_item.type == "output_text"
-                            ):
-                                text = getattr(content_item, "text", "")
-                                content_blocks.append(TextBlock(text=text))
-                                text_accumulator.append(text)
-                                event_blocks.append(
-                                    TextContent(
-                                        text=text,
-                                        raw=getattr(content_item, "raw", None),
-                                    )
-                                )
-                    elif isinstance(block_content, str):
-                        content_blocks.append(TextBlock(text=block_content))
-                        text_accumulator.append(block_content)
-                        event_blocks.append(TextContent(text=block_content))
-
-                elif block_type == "reasoning":
-                    # Extract reasoning ID and encrypted content for state preservation
-                    reasoning_id = getattr(block, "id", None)
-                    encrypted_content = getattr(block, "encrypted_content", None)
-
-                    # Track reasoning item ID for metadata (backward compat)
-                    if reasoning_id:
-                        reasoning_item_ids.append(reasoning_id)
-
-                    # Extract reasoning summary if available
-                    reasoning_summary = getattr(block, "summary", None) or getattr(
-                        block, "text", None
-                    )
-
-                    # Use helper to extract reasoning text
-                    reasoning_text = extract_reasoning_text(reasoning_summary)
-
-                    # Fallback to original logic if helper didn't find text
-                    if reasoning_text is None and isinstance(reasoning_summary, list):
-                        # Extract text from list of summary objects (dict or Pydantic models)
-                        texts = []
-                        for item in reasoning_summary:
-                            if isinstance(item, dict):
-                                texts.append(item.get("text", ""))
-                            elif hasattr(item, "text"):
-                                texts.append(getattr(item, "text", ""))
-                            elif isinstance(item, str):
-                                texts.append(item)
-                        reasoning_text = "\n".join(filter(None, texts))
-                    elif isinstance(reasoning_summary, str):
-                        reasoning_text = reasoning_summary
-                    elif isinstance(reasoning_summary, dict):
-                        reasoning_text = reasoning_summary.get(
-                            "text", str(reasoning_summary)
-                        )
-                    elif hasattr(reasoning_summary, "text"):
-                        reasoning_text = getattr(
-                            reasoning_summary, "text", str(reasoning_summary)
-                        )
-
-                    # Create thinking block if there's reasoning text OR encrypted state to preserve
-                    if reasoning_text or encrypted_content:
-                        # Named dict, NOT a positional list. amplifier_foundation's
-                        # sanitize_for_json drops None from lists (serialization.py:54-61),
-                        # which silently collapsed [None, "rs_abc"] -> ["rs_abc"] and made
-                        # every block captured without ciphertext permanently unreplayable
-                        # after resume. A dict survives the same key-dropping without
-                        # losing what each surviving value MEANS. See
-                        # _decode_reasoning_state for the back-compat reader.
-                        thinking_block = ThinkingBlock(
-                            thinking=reasoning_text
-                            or "",  # May be empty when only encrypted_content exists
-                            signature=None,
-                            visibility="internal",
-                            content=[
-                                {
-                                    "encrypted_content": encrypted_content,
-                                    "id": reasoning_id,
-                                    "summary": reasoning_text or None,
-                                }
-                            ],
-                        )
-                        logger.info(
-                            f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
-                            f"has_encrypted={encrypted_content is not None}, "
-                            f"enc_len={len(encrypted_content) if encrypted_content else 0}"
-                        )
-                        content_blocks.append(thinking_block)
-                        event_blocks.append(ThinkingContent(text=reasoning_text or ""))
-                        # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
-
-                elif block_type in {"tool_call", "function_call"}:
-                    # P4: call_id-keyed; raises FunctionCallTruncationError
-                    # on incomplete calls; completed-but-unparseable arguments
-                    # coerce to {} loudly (survivable model failure).
-                    tool_id, tool_name, tool_input = parse_function_call_block(block)
-                    content_blocks.append(
-                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
-                    )
-                    tool_calls.append(
-                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
-                    )
-
-                elif block_type == "apply_patch_call":
-                    call_id = getattr(block, "call_id", "")
-                    operation = block.operation
-                    args = {
-                        "type": getattr(operation, "type", ""),
-                        "path": getattr(operation, "path", ""),
-                        "diff": getattr(operation, "diff", ""),
-                    }
-                    content_blocks.append(
-                        ToolCallBlock(id=call_id, name="apply_patch", input=args)
-                    )
-                    tool_calls.append(
-                        ToolCall(id=call_id, name="apply_patch", arguments=args)
-                    )
-                    # Track for round-trip output format
-                    self._native_call_ids.add(call_id)
-
-                elif block_type == "computer_call":
-                    call_id = getattr(block, "call_id", "")
-                    record = neutral_calls.get(call_id)
-                    args = record["canonical"] if record else {"actions": _extract_computer_actions(block)}
-                    alias = record["alias"] if record else "computer"
-                    content_blocks.append(
-                        ToolCallBlock(id=call_id, name=alias, input=args, **({"metadata": {KEY: record}} if record else {}))
-                    )
-                    tool_calls.append(
-                        ToolCall(id=call_id, name=alias, arguments=args, **({"metadata": {KEY: record}} if record else {}))
-                    )
-                    # Track for round-trip output format (computer_call_output,
-                    # not apply_patch_call_output -- see _native_call_types).
-                    if record is None:
-                        self._native_call_ids.add(call_id)
-                        self._native_call_types[call_id] = "computer"
-
-            else:
-                # Dictionary format
-                block_type = block.get("type")
-
-                if block_type == "message":
-                    block_content = block.get("content", [])
-                    if isinstance(block_content, list):
-                        for content_item in block_content:
-                            if content_item.get("type") == "output_text":
-                                text = content_item.get("text", "")
-                                content_blocks.append(TextBlock(text=text))
-                                text_accumulator.append(text)
-                                event_blocks.append(
-                                    TextContent(text=text, raw=content_item)
-                                )
-                    elif isinstance(block_content, str):
-                        content_blocks.append(TextBlock(text=block_content))
-                        text_accumulator.append(block_content)
-                        event_blocks.append(TextContent(text=block_content, raw=block))
-
-                elif block_type == "reasoning":
-                    # Extract reasoning ID and encrypted content for state preservation
-                    reasoning_id = block.get("id")
-                    encrypted_content = block.get("encrypted_content")
-
-                    # Track reasoning item ID for metadata (backward compat)
-                    if reasoning_id:
-                        reasoning_item_ids.append(reasoning_id)
-
-                    # Extract reasoning summary if available
-                    reasoning_summary = block.get("summary") or block.get("text")
-
-                    # Use helper to extract reasoning text
-                    reasoning_text = extract_reasoning_text(reasoning_summary)
-
-                    # Fallback to original logic if helper didn't find text
-                    if reasoning_text is None and isinstance(reasoning_summary, list):
-                        # Extract text from list of summary objects (dict or Pydantic models)
-                        texts = []
-                        for item in reasoning_summary:
-                            if isinstance(item, dict):
-                                texts.append(item.get("text", ""))
-                            elif hasattr(item, "text"):
-                                texts.append(getattr(item, "text", ""))
-                            elif isinstance(item, str):
-                                texts.append(item)
-                        reasoning_text = "\n".join(filter(None, texts))
-                    elif isinstance(reasoning_summary, str):
-                        reasoning_text = reasoning_summary
-                    elif isinstance(reasoning_summary, dict):
-                        reasoning_text = reasoning_summary.get(
-                            "text", str(reasoning_summary)
-                        )
-                    elif hasattr(reasoning_summary, "text"):
-                        reasoning_text = getattr(
-                            reasoning_summary, "text", str(reasoning_summary)
-                        )
-
-                    # Create thinking block if there's reasoning text OR encrypted state to preserve
-                    if reasoning_text or encrypted_content:
-                        # Named dict, NOT a positional list. amplifier_foundation's
-                        # sanitize_for_json drops None from lists (serialization.py:54-61),
-                        # which silently collapsed [None, "rs_abc"] -> ["rs_abc"] and made
-                        # every block captured without ciphertext permanently unreplayable
-                        # after resume. A dict survives the same key-dropping without
-                        # losing what each surviving value MEANS. See
-                        # _decode_reasoning_state for the back-compat reader.
-                        thinking_block = ThinkingBlock(
-                            thinking=reasoning_text
-                            or "",  # May be empty when only encrypted_content exists
-                            signature=None,
-                            visibility="internal",
-                            content=[
-                                {
-                                    "encrypted_content": encrypted_content,
-                                    "id": reasoning_id,
-                                    "summary": reasoning_text or None,
-                                }
-                            ],
-                        )
-                        logger.info(
-                            f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
-                            f"has_encrypted={encrypted_content is not None}, "
-                            f"enc_len={len(encrypted_content) if encrypted_content else 0}"
-                        )
-                        content_blocks.append(thinking_block)
-                        event_blocks.append(ThinkingContent(text=reasoning_text or ""))
-                        # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
-
-                elif block_type in {"tool_call", "function_call"}:
-                    # P4: call_id-keyed; raises FunctionCallTruncationError
-                    # on incomplete calls; completed-but-unparseable arguments
-                    # coerce to {} loudly (survivable model failure).
-                    tool_id, tool_name, tool_input = parse_function_call_block(block)
-                    content_blocks.append(
-                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
-                    )
-                    tool_calls.append(
-                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
-                    )
-                    event_blocks.append(
-                        ToolCallContent(
-                            id=tool_id, name=tool_name, arguments=tool_input, raw=block
-                        )
-                    )
-
-                elif block_type == "apply_patch_call":
-                    call_id = block.get("call_id", "")
-                    operation = block.get("operation", {})
-                    args = {
-                        "type": operation.get("type", ""),
-                        "path": operation.get("path", ""),
-                        "diff": operation.get("diff", ""),
-                    }
-                    content_blocks.append(
-                        ToolCallBlock(id=call_id, name="apply_patch", input=args)
-                    )
-                    tool_calls.append(
-                        ToolCall(id=call_id, name="apply_patch", arguments=args)
-                    )
-                    self._native_call_ids.add(call_id)
-
-                elif block_type == "computer_call":
-                    call_id = block.get("call_id", "")
-                    record = neutral_calls.get(call_id)
-                    args = record["canonical"] if record else {"actions": _extract_computer_actions(block)}
-                    alias = record["alias"] if record else "computer"
-                    content_blocks.append(
-                        ToolCallBlock(id=call_id, name=alias, input=args, **({"metadata": {KEY: record}} if record else {}))
-                    )
-                    tool_calls.append(
-                        ToolCall(id=call_id, name=alias, arguments=args, **({"metadata": {KEY: record}} if record else {}))
-                    )
-                    if record is None:
-                        self._native_call_ids.add(call_id)
-                        self._native_call_types[call_id] = "computer"
-
-        # Extract usage counts.
-        #
-        # OpenAI's usage.input_tokens (Responses API) is the RAW vendor gross
-        # total: fresh + cache_read + cache_write ALL COMBINED (cache_write is
-        # a SUBSET of it -- see the `fresh_input = prompt_tokens - cached -
-        # cache_write` derivation in _cost.py, confirmed against live
-        # gpt-5.6-sol usage). This differs from Anthropic, where cache_write
-        # (cache_creation) is a genuinely DISJOINT bucket reported on top of
-        # input_tokens.
-        #
-        # The kernel Usage contract (amplifier_core CONTRACTS.md) normalizes
-        # input_tokens to "gross total: fresh + cache_read combined,
-        # cache_write NOT included" -- every consumer (e.g. the streaming-UI
-        # display) computes `total_input = input_tokens + cache_write_tokens`
-        # assuming that shape. Emitting OpenAI's raw total unmodified (already
-        # containing cache_write) makes that formula double-count the write
-        # tokens (measured: 18,053 displayed vs. a true 9,028 gross input).
-        #
-        # `_raw_input_tokens` is kept SEPARATELY from the normalized
-        # `usage_counts["input"]` because compute_cost() below needs the raw
-        # vendor gross (its own `prompt_tokens` param already subtracts
-        # cached/cache_write internally) -- normalizing input_tokens here must
-        # not also perturb the cost computation.
-        usage_obj = response.usage if hasattr(response, "usage") else None
-        usage_counts = {"input": 0, "output": 0, "total": 0}
-        _raw_input_tokens = 0
-        if usage_obj:
-            if hasattr(usage_obj, "input_tokens"):
-                _raw_input_tokens = usage_obj.input_tokens
-            if hasattr(usage_obj, "output_tokens"):
-                usage_counts["output"] = usage_obj.output_tokens
-
-        # Phase 2: Extract reasoning_tokens from output_tokens_details
-        reasoning_tokens = None
-        if usage_obj and hasattr(usage_obj, "output_tokens_details"):
-            details = usage_obj.output_tokens_details
-            if details and hasattr(details, "reasoning_tokens"):
-                reasoning_tokens = details.reasoning_tokens
-
-        # Extract cache_read_tokens (and, for GPT-5.6, cache_write_tokens) from
-        # input_tokens_details. Field verified live on gpt-5.6-sol (2026-07-14):
-        # usage.input_tokens_details.{cached_tokens, cache_write_tokens}.
-        cache_read_tokens = None
-        cache_write_tokens = None
-        if usage_obj and hasattr(usage_obj, "input_tokens_details"):
-            details = usage_obj.input_tokens_details
-            if details and hasattr(details, "cached_tokens"):
-                cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
-            if details and hasattr(details, "cache_write_tokens"):
-                cache_write_tokens = details.cache_write_tokens  # GPT-5.6+; 0 valid
-
-        # Normalize: cache_write is a SUBSET of the raw OpenAI total, so
-        # remove it to get the "fresh + cache_read" gross the kernel contract
-        # expects. max(0, ...) guards against a malformed/unexpected API
-        # payload where cache_write_tokens would otherwise exceed input_tokens.
-        usage_counts["input"] = max(0, _raw_input_tokens - (cache_write_tokens or 0))
-        usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
-
-        usage = Usage(
-            input_tokens=usage_counts["input"],
-            output_tokens=usage_counts["output"],
-            total_tokens=usage_counts["total"],
-            reasoning_tokens=reasoning_tokens,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=cache_write_tokens,
-        )
-
-        # Price the original response, not the normalized public Usage above.
-        # The pricing hook consumes gross input and subtracts cache subsets once;
-        # completion aggregates each billed attempt through the same hook.
-        if usage_obj:
-            cost = self._compute_attempt_cost(response)
             if cost is not None:
-                usage = usage.model_copy(update={"cost_usd": cost})
-
-        combined_text = "\n\n".join(text_accumulator).strip()
-
-        # Per OpenAI docs: "response.output_text is the safest way to retrieve the final answer"
-        # Extract it directly from the response if available
-        raw_output_text = getattr(response, "output_text", None)
-
-        # Build metadata with provider-specific state
-        metadata = {}
-        if neutral_calls:
-            metadata[CALLS] = copy.deepcopy(neutral_calls)
-
-        # Response ID -- captured for correlating a stored transcript turn to
-        # an OpenAI response (support/debug). Never read back into a later
-        # request: the provider is stateless-only.
-        if hasattr(response, "id"):
-            metadata[METADATA_RESPONSE_ID] = response.id
-
-        # Status (completed/incomplete)
-        if hasattr(response, "status"):
-            metadata[METADATA_STATUS] = response.status
-
-            # If incomplete, record the reason
-            if response.status == "incomplete":
-                incomplete_details = getattr(response, "incomplete_details", None)
-                if incomplete_details:
-                    if isinstance(incomplete_details, dict):
-                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get(
-                            "reason"
-                        )
-                    elif hasattr(incomplete_details, "reason"):
-                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.reason
-
-        # Reasoning item IDs (for explicit passing if needed)
-        if reasoning_item_ids:
-            metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
-
-        # BREAK 3 -- hosted tool-search items. See
-        # _tool_search.extract_hosted_tool_search_items and the twin capture in
-        # _response_handling.convert_response_with_accumulated_output.
-        _output_items = list(getattr(response, "output", None) or [])
-        tool_search_items = extract_hosted_tool_search_items(_output_items)
-        if tool_search_items:
-            metadata[METADATA_TOOL_SEARCH_ITEMS] = tool_search_items
-        # BREAK 6 -- the namespace a function_call was issued from. Required on
-        # the round trip; see extract_function_call_namespaces.
-        call_namespaces = extract_function_call_namespaces(_output_items)
-        if call_namespaces:
-            metadata[METADATA_TOOL_CALL_NAMESPACES] = call_namespaces
-
-        # DEBUG: Log what we're returning
-        logger.info(
-            f"[PROVIDER] Returning ChatResponse with {len(content_blocks)} content blocks"
-        )
-        for i, block in enumerate(content_blocks):
-            block_type = block.type if hasattr(block, "type") else "unknown"
-            has_content = hasattr(block, "content") and block.content is not None
-            logger.info(
-                f"[PROVIDER]   Block {i}: type={block_type}, has_content_field={has_content}"
-            )
-
-        chat_response = OpenAIChatResponse(
-            content=content_blocks,
-            tool_calls=tool_calls if tool_calls else None,
-            usage=usage,
-            finish_reason=(
-                "length"
-                if getattr(response, "status", None) == "incomplete"
-                else getattr(response, "finish_reason", None)
-            ),
-            content_blocks=event_blocks if event_blocks else None,
-            text=combined_text or None,
-            output_text=raw_output_text,  # Per OpenAI docs: safest way to get final answer
-            metadata=metadata if metadata else None,
-        )
-
-        # Shared conversion also serves the unchanged optional native adapter.
-        # Request-local observations are returned only after response validation,
-        # never committed to the mounted provider or emitted by a count.
-        if (computer_context and computer_context.get("observations")
-                and getattr(response, "status", None) == "completed"):
-            from .neutral_computer import IMAGES
-
-            chat_response.metadata = {
-                **(chat_response.metadata or {}),
-                IMAGES: copy.deepcopy(computer_context["observations"]),
-            }
+                chat_response.usage = chat_response.usage.model_copy(update={"cost_usd": cost})
         return chat_response
 
     async def close(self) -> None:

@@ -8,19 +8,91 @@ model identifier.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 __all__ = [
     "GPT_6_MODELS",
     "GPT_6_SOL_LUNA_MODELS",
     "ModelCapabilities",
+    "RequestPolicy",
     "get_capabilities",
+    "get_request_policy",
 ]
 
 GPT_6_MODELS = frozenset(
     {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"}
 )
 GPT_6_SOL_LUNA_MODELS = frozenset({"gpt-6-sol", "gpt-6-luna"})
+GPT_5_6_MODELS = frozenset(
+    {"gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+)
+
+
+@dataclass(frozen=True)
+class RequestPolicy:
+    """Documented exact-ID eligibility, never host or live qualification.
+
+    Each feature still needs its own request-combination, SDK, endpoint,
+    entitlement and host checks. Unknown efforts are not an allow-all promise.
+    Empty cache_ttls means this registry does not establish the new cache API.
+    Sources (checked 2026-11-06): /api/docs/models/<id>.md and guides/
+    {prompt-caching,reasoning,steering,async-tool-calling}.md at developers.openai.com.
+    """
+
+    allowed_efforts: frozenset[str] | None = None
+    cache_ttls: frozenset[str] = frozenset()
+    supports_configuration_update: bool = False
+    supports_steering: bool = False
+    supports_async_tools: bool = False
+    display_name: str | None = None
+
+
+_MODERN_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
+_CACHE_TTLS = frozenset({"30m", "12h"})
+_REQUEST_POLICIES = {
+    **{
+        model: RequestPolicy(
+            allowed_efforts=(
+                _MODERN_EFFORTS - {"none"}
+                if model in {"gpt-6-astra", "gpt-6.1-sol"}
+                else _MODERN_EFFORTS
+            ),
+            cache_ttls=_CACHE_TTLS,
+            supports_configuration_update=True,
+            supports_steering=True,
+            supports_async_tools=True,
+            display_name="GPT " + model.removeprefix("gpt-").replace("-", " ").title(),
+        )
+        for model in GPT_6_MODELS
+    },
+    **{
+        model: RequestPolicy(
+            allowed_efforts=_MODERN_EFFORTS, cache_ttls=_CACHE_TTLS,
+            display_name="GPT " + model.removeprefix("gpt-").replace("-", " ").title(),
+        )
+        for model in GPT_5_6_MODELS
+    },
+    "gpt-5.5-pro": RequestPolicy(
+        allowed_efforts=frozenset({"medium", "high", "xhigh"})
+    ),
+    "gpt-5.2-pro": RequestPolicy(
+        allowed_efforts=frozenset({"medium", "high", "xhigh"})
+    ),
+    **{
+        model: RequestPolicy(
+            allowed_efforts=frozenset({"none", "low", "medium", "high", "xhigh"})
+        )
+        for model in ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2")
+    },
+}
+
+
+def get_request_policy(model_id: str) -> RequestPolicy:
+    """Look up documented IDs only; no prefix or invented-snapshot expansion."""
+    return (
+        _REQUEST_POLICIES.get(model_id, RequestPolicy())
+        if isinstance(model_id, str) else RequestPolicy()
+    )
 
 _GPT5_TAGS: tuple[str, ...] = (
     "tools",
@@ -223,56 +295,84 @@ def _parse_gpt5_version(model_id: str) -> tuple[int, int]:
     return (major, minor)
 
 
-def _detect_version(model_id: str, family: str) -> tuple[int, int]:
-    """Extract ``(major, minor)`` version from a model ID.
+_MODERN_CAPABILITIES = ModelCapabilities(
+    family="gpt-5",
+    context_window=1_050_000,
+    max_input_tokens=922_000,
+    supports_reasoning=True,
+    capability_tags=_GPT5_TAGS,
+    long_context_pricing_threshold=272_000,
+    supports_in_memory_retention=False,
+    supports_native_computer_use=True,
+)
 
-    Uses *family* to short-circuit parsing for non-GPT families.
-    For GPT families, delegates to ``_parse_gpt5_version``.
+# Model facts are distinct from request-feature eligibility and lifecycle.
+# Exact GPT-6 IDs have no documented dated snapshots. Legacy GPT-5 snapshot
+# parsing below remains a compatibility path, not qualification for new features.
+_EXACT_CAPABILITIES = {
+    **{
+        model: replace(_MODERN_CAPABILITIES, family=model)
+        for model in GPT_6_MODELS
+    },
+    **{model: _MODERN_CAPABILITIES for model in GPT_5_6_MODELS},
+    "gpt-5.4": replace(
+        _MODERN_CAPABILITIES, max_input_tokens=None,
+        supports_in_memory_retention=True,
+    ),
+    "gpt-5.4-pro": replace(
+        _MODERN_CAPABILITIES, max_input_tokens=None,
+        supports_in_memory_retention=True,
+    ),
+    "gpt-5.5": replace(_MODERN_CAPABILITIES, max_input_tokens=None),
+    "gpt-5.5-pro": replace(
+        _MODERN_CAPABILITIES, max_input_tokens=None,
+    ),
+    "gpt-5.4-mini": replace(
+        _MODERN_CAPABILITIES,
+        context_window=400_000,
+        max_input_tokens=272_000,
+        long_context_pricing_threshold=None,
+        supports_in_memory_retention=True,
+    ),
+    "gpt-5.2": replace(
+        _MODERN_CAPABILITIES,
+        context_window=400_000,
+        max_input_tokens=None,
+        long_context_pricing_threshold=None,
+        supports_in_memory_retention=True,
+        supports_native_computer_use=False,
+    ),
+    "gpt-5.2-pro": replace(
+        _MODERN_CAPABILITIES,
+        context_window=400_000,
+        max_input_tokens=None,
+        long_context_pricing_threshold=None,
+        supports_in_memory_retention=True,
+        supports_native_computer_use=False,
+    ),
+}
 
-    Examples::
-
-        _detect_version("gpt-5.4", "gpt-5")       -> (5, 4)
-        _detect_version("gpt-5.4-pro", "gpt-5")   -> (5, 4)
-        _detect_version("gpt-5.3-codex", "gpt-5") -> (5, 3)
-        _detect_version("gpt-5-mini", "gpt-5-mini") -> (5, 0)
-        _detect_version("o3", "o-series")          -> (0, 0)
-
-    Returns ``(0, 0)`` for non-GPT families or when parsing fails.
-    """
-    if not family.startswith("gpt-"):
-        return (0, 0)
-    return _parse_gpt5_version(model_id)
+# ConfigField supports one regex predicate, so derive it from the same facts.
+LONG_CONTEXT_MODEL_PATTERN = "matches:^(?:" + "|".join(
+    re.escape(model) for model, caps in sorted(_EXACT_CAPABILITIES.items())
+    if caps.long_context_pricing_threshold is not None
+) + ")$"
 
 
 def get_capabilities(model_id: str) -> ModelCapabilities:
     """Return capabilities for *model_id*.
 
-    Version-gated logic for the gpt-5 family:
-    - 5.4+ (or unknown sub-version): 1.05M context, reasoning, no explicit effort, 272K pricing threshold
-    - 5.3: 400K context, reasoning, no explicit effort
-    - 5.2 and below: 200K context, reasoning, implicit effort
+    Exact model facts take precedence. Legacy family defaults remain below for
+    compatible deployment aliases and historical readers, not new qualification.
     """
-    # GPT-6 plus GPT-6.1 Sol/Terra is an exact model set. The public model
-    # pages list no dated snapshots, so do not extend these values to guessed IDs.
-    # `context_window` is Amplifier's safe input/compaction budget, not the
-    # native total window (1,050,000 tokens).
-    if model_id in GPT_6_MODELS:
-        return ModelCapabilities(
-            family=model_id,
-            context_window=922_000,
-            max_output_tokens=128_000,
-            supports_reasoning=True,
-            # Omit effort so each model applies its own documented default.
-            default_reasoning_effort=None,
-            supports_vision=True,
-            supports_streaming=True,
-            capability_tags=_GPT5_TAGS,
-            long_context_pricing_threshold=272_000,
-            supports_in_memory_retention=False,
-            supports_native_apply_patch=True,
-            supports_native_computer_use=True,
-            max_input_tokens=922_000,
+    exact = _EXACT_CAPABILITIES.get(model_id)
+    if exact is None and model_id.startswith("gpt-5"):
+        # Retain historical dated-snapshot capability readers for GPT-5 only.
+        exact = _EXACT_CAPABILITIES.get(
+            re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model_id)
         )
+    if exact is not None:
+        return exact
 
     family = _detect_family(model_id)
 
@@ -352,12 +452,8 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
         # made no difference once minor >= 1).
         supports_computer_use = minor >= 4 and "-nano" not in model_id
 
-        # gpt-5.5 — verified against live API 2026-04-24.
-        # 1M context, ~4x input / 3x output pricing vs 5.4. Reasoning blocks,
-        # rs_* IDs, and encrypted_content carry the same shape as 5.4.
-        # long_context_pricing_threshold is left None: the public pricing page
-        # is not API-derivable, and 5.5's threshold (if any) differs from
-        # 5.4's 272K given the price step. Callers see the full 1M context.
+        # Unlisted legacy aliases retain their historical fallback. Documented
+        # IDs and dated GPT-5 readers resolved through the exact facts above.
         if minor == 5:
             return ModelCapabilities(
                 family="gpt-5",
@@ -374,27 +470,8 @@ def get_capabilities(model_id: str) -> ModelCapabilities:
                 supports_native_computer_use=supports_computer_use,
             )
 
-        # gpt-5.6 (Sol / Terra / Luna) -- GA 2026-07-09.
-        #
-        # context_window=900_000 is EMPIRICALLY MEASURED, not the marketing number.
-        # OpenAI advertises ~1.05M, but a live binary-search probe of gpt-5.6-sol
-        # (2026-07-14) found the real hard ceiling is ~908K-928K: a 907,812-token
-        # input succeeds, 928,125 returns HTTP 400 context_length_exceeded. The
-        # nominal 1.05M is NOT deliverable -- reporting it caused real
-        # context_length_exceeded crashes on long sessions. 900_000 sits safely
-        # below the measured success point (headroom for output tokens). All three
-        # tiers share this ceiling (they differ in price/latency, see _cost.py).
-        #
-        # in_memory retention is REJECTED by the API ("compatible only with 24h
-        # extended prompt caching"), so supports_in_memory_retention=False routes
-        # callers to 24h via the existing _drop_unsupported_in_memory_retention gate.
-        #
-        # long_context_pricing_threshold=272_000 (mirrors gpt-5.4): gpt-5.6 has a
-        # documented short/long-context price split (~2x) at this boundary. get_info()
-        # reports the THRESHOLD as the default context_window, so unpinned sessions
-        # compact against the standard-priced 272K window and don't silently incur 2x
-        # billing. Callers who need the full measured 900K opt in via
-        # enable_long_context=True (accepting the ~2x price) -- identical to gpt-5.4.
+        # Preserve the historical conservative fallback for undocumented
+        # GPT-5.6 suffixes without assigning new cache/steering eligibility.
         if minor == 6:
             return ModelCapabilities(
                 family="gpt-5",

@@ -22,6 +22,7 @@ def _provider(**config: object) -> OpenAIProvider:
         api_key="[REDACTED:SECRET]",
         config={
             "default_model": "gpt-6-sol",
+            "base_url": "https://offline.invalid/v1",
             "max_retries": 0,
             "use_streaming": False,
             "reasoning_summary": "auto",
@@ -53,11 +54,17 @@ def _response(
                 content=[SimpleNamespace(type="output_text", text="Hi")],
             )
         ],
-        incomplete_details=None,
+        incomplete_details=(
+            SimpleNamespace(reason="max_output_tokens") if status == "incomplete" else None
+        ),
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            input_tokens_details=SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
+            input_tokens_details=SimpleNamespace(
+                cached_tokens=0,
+                cache_write_tokens=0,
+                cache_write_tokens_details={"ttl_30m_tokens": 0, "ttl_12h_tokens": 0},
+            ),
         ),
     )
 
@@ -67,7 +74,7 @@ def test_sol_luna_have_exact_documented_capabilities(model: str) -> None:
     caps = get_capabilities(model)
 
     assert caps.family == model
-    assert caps.context_window == 922_000
+    assert caps.context_window == 1_050_000
     assert caps.max_input_tokens == 922_000
     assert caps.max_output_tokens == 128_000
     assert caps.default_reasoning_effort is None
@@ -202,7 +209,7 @@ def test_sol_luna_reject_minimal_from_every_final_parameter_source(
 @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
 @pytest.mark.parametrize(
     ("ttl", "valid"),
-    [("30m", True), ("24h", False)],
+    [("30m", True), ("12h", True), ("24h", False)],
 )
 def test_sol_luna_final_extra_cache_ttl_is_validated(model: str, ttl: str, valid: bool) -> None:
     provider = _provider(
@@ -214,7 +221,7 @@ def test_sol_luna_final_extra_cache_ttl_is_validated(model: str, ttl: str, valid
     if valid:
         asyncio.run(provider.complete(_request()))
         assert provider.client.responses.create.call_args.kwargs["prompt_cache_options"] == {
-            "ttl": "30m"
+            "ttl": ttl
         }
     else:
         with pytest.raises(kernel_errors.InvalidRequestError, match="30m"):
@@ -365,6 +372,7 @@ def test_sol_mixed_cache_tokens_are_billed_once_and_unknown_costs_stay_unknown()
         completion_tokens=100,
         cached_tokens=200,
         cache_write_tokens=300,
+        cache_write_tokens_details={"ttl_30m_tokens": 300, "ttl_12h_tokens": 0},
         service_tier="default",
     ) == Decimal("0.00279")
     assert compute_cost("gpt-6-sol", prompt_tokens=1, service_tier=None) is None
@@ -378,7 +386,11 @@ def test_compute_attempt_cost_uses_raw_responses_cache_usage() -> None:
     response.usage = SimpleNamespace(
         input_tokens=1_000,
         output_tokens=100,
-        input_tokens_details=SimpleNamespace(cached_tokens=200, cache_write_tokens=300),
+        input_tokens_details=SimpleNamespace(
+            cached_tokens=200,
+            cache_write_tokens=300,
+            cache_write_tokens_details={"ttl_30m_tokens": 300, "ttl_12h_tokens": 0},
+        ),
     )
 
     converted = provider._convert_to_chat_response(response)
@@ -457,6 +469,7 @@ def test_subclass_cost_seam_controls_conversion_and_single_aggregation() -> None
         add_cost=reported_costs.append,
         config={
             "default_model": "gpt-6-sol",
+            "base_url": "https://offline.invalid/v1",
             "max_retries": 0,
             "use_streaming": False,
         },
@@ -473,6 +486,6 @@ def test_subclass_cost_seam_controls_conversion_and_single_aggregation() -> None
 
     assert result.usage.cost_usd == Decimal(14)
     assert reported_costs == [Decimal(14)]
-    # Direct base conversion and every billed continuation attempt use the same
-    # override; session accumulation occurs only after the attempts complete.
-    assert provider.cost_calls == 3
+    # Standalone conversion, canonical continued conversion, and both actual
+    # attempts use the pure hook. Only aggregation invokes the accumulator.
+    assert provider.cost_calls == 4

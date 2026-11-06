@@ -140,11 +140,21 @@ this provider default does not alter their tier policy.
 - `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna` - GPT-6 exact model set. Each reports a 272,000-token input budget by default, or 922,000 with long context enabled (within its 1,050,000-token native total window), and supports a 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` tools. Sol and Luna have an API default of `medium` reasoning and also accept literal request-level `reasoning = { effort = "none" }`; Astra does not. No bare GPT-6, unversioned Terra, or dated GPT-6 IDs are inferred.
 - `gpt-6.1-sol` - Exact GPT-6.1 Sol model. It has the same reported 272,000-token standard input budget (922,000 with long context enabled), 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` support. It accepts `low`, `medium`, `high`, `xhigh`, and `max` reasoning effort. The configured `reasoning_effort = "none"` remains an omission sentinel, but literal API `reasoning.effort = "none"` and `minimal` are invalid. No snapshots or unlisted sibling GPT-6.1 IDs are inferred.
 - `gpt-6.1-terra` - Exact GPT-6.1 Terra model: text/image input, text output, streaming, function calling, structured outputs, native `apply_patch`, `computer`, and tool search. It shares the 272,000-token standard input budget (922,000 opt-in), 1,050,000-token native window, and 128,000-token output limit. Reasoning defaults to `medium`; literal API `none`, `low`, `medium`, `high`, `xhigh`, and `max` are supported, not `minimal`. It can control the optional Responses image-generation operation; this is not direct raster output from chat.
-- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers (flagship / balanced / cost-efficient); alias `gpt-5.6` → `gpt-5.6-sol`. Adds `reasoning.effort="max"`, `reasoning.mode="pro"`, and `prompt_cache_options`. Note: gpt-5.6 bills cache-write tokens at 1.25× input (automatic on prompts >1024 tokens) and rejects `in_memory` retention (auto-dropped to 24h).
+- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` - GPT-5.6 tiers; alias `gpt-5.6` → Sol. Supports `reasoning.effort="max"`, `reasoning.mode="pro"` and `prompt_cache_options.ttl` of `30m` or `12h`. Legacy retention is removed. Cache-write estimates require the response's lifetime-resolved usage, not the requested TTL.
 - `gpt-5.5` - Prior-generation GPT-5 model
 - `gpt-5.4` - Balanced GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5: 400,000-token total context, 272,000-token maximum input, and 128,000-token maximum output. Preflight retains its 4,096-token safety reserve; reducing the output cap does not raise the input ceiling.
 - `gpt-5-nano` - Smallest GPT-5 variant
+
+Capabilities, request eligibility and lifecycle are separate data. Exact model
+policies share family defaults without inferring future GPT-6 IDs. For the public
+OpenAI endpoint, discovery hides documented or API-reported shutdowns and carries
+a valid `shutdown_date` as inert model metadata. Explicit pins are preserved and
+warned about, not silently replaced. Deprecated models still available before
+their shutdown date remain discoverable. Azure deployment aliases and custom
+gateway catalogs do not inherit public-OpenAI retirement policy.
+See [OpenAI API deprecations](https://developers.openai.com/api/docs/deprecations.md)
+and the retained [model-policy evidence](docs/evidence/model-policy-2026-11-06.txt).
 
 ## Configuration
 
@@ -161,7 +171,7 @@ config = {
     default_model = "gpt-6.1-sol",
     reasoning_effort = "low",              # none|minimal|low|medium|high|xhigh|max
     max_output_tokens = null,              # null = the model's capability max
-    prompt_cache_retention = "24h",        # "24h" | "in_memory" | null
+    prompt_cache_options = { ttl = "30m" }, # exact GPT-5.6/GPT-6 models: "30m" | "12h"
     # ...see the settings-key reference table for every key
 }
 ```
@@ -192,8 +202,8 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `timeout` | (client) | Optional model request timeout seconds; unset/null waits for completion or cancellation. Connection setup remains bounded. | — | |
 | `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
 | `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
-| `prompt_cache_retention` | `prompt_cache_retention` | `"24h"` \| `"in_memory"` \| `null`. GPT-6/GPT-6.1 remove this legacy field and warn once; use `prompt_cache_options.ttl`. gpt-5.5/5.6 reject `in_memory` (auto-dropped to 24h). **Settings-only now.** | `"24h"` stabilizes cache lifetime where supported. | |
-| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); GPT-6 and GPT-6.1 Sol accept only `ttl: "30m"`; GPT-6.1 Terra also accepts `"12h"`. | Terra's 12h writes cost more than 30m writes. `explicit` w/ no breakpoints would disable caching (~10×). | |
+| `prompt_cache_retention` | `prompt_cache_retention` | Legacy `"24h"` \| `"in_memory"` \| `null`. Exact GPT-5.6/GPT-6 models remove it and warn once; use `prompt_cache_options.ttl`. Other models retain their established retention behavior. | Endpoint/model dependent. | |
+| `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); exact GPT-5.6/GPT-6 models accept `ttl: "30m"` or `"12h"`. | 12h writes cost more than 30m writes; missing billing evidence is not an assumed lifetime. | |
 | `reasoning_context` | `reasoning.context` | `auto`\|`current_turn`\|`all_turns`. First-class key; composes with `reasoning_effort` (the legacy `reasoning` dict does not). | `current_turn` trims rendered reasoning on long loops. | |
 | `safety_identifier` | `safety_identifier` | Per-end-user abuse-tracking signal. **kwargs-only in practice**; settable via config for tests. | — | |
 | `text_verbosity` | `text.verbosity` | GPT-5.6 response-length control: `low`\|`medium`\|`high`. **Settings-only now** (ConfigField removed). | — | |
@@ -454,8 +464,8 @@ The provider exposes OpenAI's prompt-caching hint parameters. Defaults:
 supported), `prompt_cache_key` unset, `truncation = null` (the field is
 omitted so the cached prefix is never silently rewritten on overflow).
 
-For GPT-6, the legacy retention field is always omitted; use
-`prompt_cache_options.ttl: "30m"` instead (`"12h"` is also supported for GPT-6.1 Terra).
+For exact GPT-5.6/GPT-6 models, the legacy retention field is omitted; use
+`prompt_cache_options.ttl: "30m"` or `"12h"` instead.
 
 See also: [OpenAI Cookbook — Prompt Caching 201](https://cookbook.openai.com/examples/prompt_caching_201).
 
@@ -477,14 +487,13 @@ OpenAI's July 2025 guidance.
 | Value | Meaning |
 | --- | --- |
 | `"24h"` | Extended GPU-local KV storage. Provider default. |
-| `"in_memory"` | 5–10 min in-process cache. Rejected by gpt-5.5/5.6 (auto-dropped to `"24h"` with a warning). |
+| `"in_memory"` | Legacy in-process cache hint. GPT-5.5 replaces it with `"24h"`; exact GPT-5.6/GPT-6 models remove legacy retention and use `prompt_cache_options`. |
 | `null` | Field omitted; OpenAI picks the per-model default. |
 
 ### `prompt_cache_options` — tool-result boundaries alongside implicit caching
 
-For the curated GPT-6 models (`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
-`gpt-6.1-sol`), `gpt-5.6`, and the GPT-5.6 Sol/Luna/Terra tiers and their
-hyphenated variants, the provider adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
+For the five exact GPT-6 IDs, `gpt-5.6`, and the exact GPT-5.6 Sol/Luna/Terra
+tiers, the provider adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
 result. A string output becomes an `input_text` block with identical text;
 structured outputs receive the marker on their last string-valued `input_text`
 block. Existing markers and non-text blocks are preserved. Instructions, roles,
@@ -640,21 +649,18 @@ it does not map to an API parameter.
 - On **gpt-5.6, the exact GPT-6 set, and exact GPT-6.1 Sol/Terra**, exceeding it re-rates the **ENTIRE request** — input, output,
   cached, and cache-write tokens — at long rates. **Whole-request, not
   marginal-on-the-overage.**
-- **Which models actually have the tier:** `gpt-5.6-sol` / `-terra` / `-luna`,
-  `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna`, and `gpt-6.1-sol` / `gpt-6.1-terra` have modelled long rates. `gpt-5.4` and variants carry a
-  272K threshold but have **no long rates modelled**, so the flag only changes
-  the *reported* window for them. **`gpt-5.5` has no threshold at all** — the
-  flag is a no-op there.
+- **Models with modeled long rates:** exact GPT-5.4 and Pro, GPT-5.5 and Pro,
+  GPT-5.6 tiers/alias, and the five exact GPT-6 IDs. GPT-5.4 Mini instead has a
+  400K total window and independent 272K input ceiling; it does not inherit the
+  flagship's 1.05M context or long-price policy.
 - **What the flag does:** with it off (default), `get_info`/`list_models`
   report the 272K threshold as the context window, so unpinned sessions compact
-  against the standard-priced window. With it on, they report the full measured
-  input budget (900,000 for 5.6, empirically measured; 922,000 for GPT-6 and
-  GPT-6.1 Sol/Terra, reserving 128,000 output tokens from the 1,050,000-token total
-  window).
+  against the standard-priced window. With it on, they report the safe input
+  budget rather than the native total window: 922,000 for exact GPT-5.6/GPT-6
+  models. Model limits and preflight allowances are not live large-input qualification.
 
-The `enable_long_context` ConfigField is gated (`show_when`) to gpt-5.6-family
-models, exact GPT-6 IDs, and exact GPT-6.1 Sol/Terra, where the flag carries a cost
-consequence.
+The `enable_long_context` ConfigField is derived from the same exact-model
+threshold facts used by preflight, including GPT-5.4/5.5 and Pro.
 
 ## GPT-6 Astra, Sol, Luna, and GPT-6.1 Sol/Terra
 
@@ -677,10 +683,10 @@ Active/default reasoning rejects
 `include: ["message.output_text.logprobs"]` after `extra_request_params` has
 performed its final merge. Top-level Responses `logprobs` is always rejected.
 
-The provider supports `prompt_cache_options.ttl: "30m"` for these models.
-GPT-6.1 Terra also supports `"12h"`; other TTLs are rejected before dispatch.
-The legacy `prompt_cache_retention` field is removed from every GPT-6 and
-GPT-6.1 Sol/Terra wire payload, including continuation calls. The existing explicit-cache-mode safety
+The provider supports `prompt_cache_options.ttl: "30m"` or `"12h"` for the exact
+GPT-5.6/GPT-6 IDs; other TTLs are rejected before dispatch.
+The legacy `prompt_cache_retention` field is removed from their wire payloads,
+including continuation calls. The existing explicit-cache-mode safety
 guard remains: requests without eligible tool results may have no breakpoint,
 so session-wide explicit mode is dropped rather than disabling caching.
 All curated GPT-6 models receive the tool-result boundaries described above,
@@ -691,9 +697,12 @@ alongside their existing implicit caching behavior.
 The native total context window is 1,050,000 tokens and maximum output is
 128,000 tokens. The reported context window is the safe input and
 compaction budget: 272,000 by default to avoid long-context pricing, or
-922,000 with `enable_long_context: true`. The request preflight additionally
-reserves the selected output cap and 4,096 safety tokens from that reported
-budget, so the amount admitted in one request can be lower. The billing
+922,000 with `enable_long_context: true`. Request preflight computes
+`min(total_context - output_reserve, max_input, standard_price_input_cap)`
+and subtracts 4,096 safety tokens. The price cap applies only with long context
+disabled. Output is not subtracted from the independent input or pricing ceiling
+again. With a 128,000 output cap, actual allowances are **267,904 standard /
+917,904 long**. The billing
 boundary remains strict: exactly 272,000 input tokens uses short pricing;
 272,001 re-rates the whole request.
 
@@ -713,7 +722,7 @@ Terra Standard rates, USD per million tokens:
 | ≤272,000 | $1 | $0.05 | $1.25 | $2.50 | $5 |
 | >272,000 | $2 | $0.10 | $2.50 | $5 | $7.50 |
 
-Terra cache writes use the response's
+Modern cache writes use the response's
 `input_tokens_details.cache_write_tokens_details.{ttl_30m_tokens,ttl_12h_tokens}`.
 The non-overlapping buckets must sum to `cache_write_tokens`. Mixed lifetimes
 are priced separately per attempt; missing aggregate cache counts or inconsistent lifetime evidence
@@ -727,22 +736,54 @@ Reasoning tokens are already included in output tokens; cache reads and writes
 are each subtracted once from gross input. These are token-only estimates:
 hosted-tool fees and regional-processing uplifts are excluded.
 
-The Responses API supports more GPT-6 features than the ordinary HTTP adapter
-orchestrates. This Sol/Luna/GPT-6.1 Sol/Terra support does not extend the optional
-native adapter's Astra-only WebSocket/steering path: Sol, Luna, and GPT-6.1 Sol/Terra
-use ordinary Responses transport.
-Async tool-call orchestration, multi-agent orchestration, and compaction
-orchestration are not added by this update.
+The optional native adapter now checks the final assembled model against the
+shared exact-ID policy. Its host must still opt in, own execution and implement
+the lifecycle contract. Ordinary mounting remains HTTP Responses. A host with an
+Astra-only installer does not gain Terra steering merely by updating this module.
+See [native transport](docs/native-responses.md).
 
-Two inherited limitations also apply to Terra. Input preflight subtracts the
-requested output cap and a 4,096-token safety reserve from the reported budget,
-even though the GPT-6 budget already reserves output. With a 128,000-token output
-cap, actual input allowances are 139,904 tokens (standard) or 789,904 (long).
-The advertised 922,000-token input ceiling is not an end-to-end qualification.
-Automatic output-budget continuation synthesizes a text continuation rather than
-losslessly replaying reasoning, assistant phase, and tool items. Workflows that
-need exact replay should set `auto_continue: false` and manage continuation in
-the host. These existing behaviors are not changed by Terra model registration.
+Automatic output-limit continuation preserves ordered eligible canonical output,
+including reasoning and assistant phase, instead of reconstructing text. It
+refuses outstanding client tool calls rather than fabricating results or dropping
+them. Only `incomplete_details.reason="max_output_tokens"` permits continuation;
+content filtering and unspecified incompletion do not trigger another generation.
+Hosts needing a strict one-generation boundary should use `auto_continue: false`.
+Neither the 922K input ceiling nor optional feature eligibility is a live
+large-input or every-host qualification.
+
+### Explicit effort changes and advanced experiments
+
+Hosts can persist an operator-requested reasoning change without rewriting the
+original request-level effort:
+
+```python
+from amplifier_core import Message
+from amplifier_module_provider_openai.configuration_updates import (
+    configuration_update_from_response,
+)
+
+# Persist response.metadata with its assistant message first.
+# Append this carrier before the next user message; keep the original request effort.
+update = Message(**configuration_update_from_response(response, "high"))
+```
+
+The provider records the actual final-wire baseline, including original omission
+(`None`), under `openai:request_configuration`. This is not the API's echoed effort
+or an autonomous reasoning policy. Version 1 accepts effort changes only in
+standard single-agent mode. Model changes, prefix rewrites, automatic truncation
+and automatic compaction are refused. With update history, `compact_context`
+uses one explicit Responses `compaction_trigger`, preserves the opaque result and
+restates the last explicit effort. It does not fall back to standalone compact or
+retry an unknown submission. Original messages remain unchanged. Host selection
+and persistence adoption are separate from this provider interface.
+
+The [advanced Responses experiments](examples/openai_advanced/experiment-report.txt)
+are **unmounted opt-in examples**, not production provider modes. They exercise
+programmatic tools, two-stream multiplexing and hosted Multi-agent with explicit
+mock transports. Run `python -m examples.openai_advanced.evaluate` to reproduce
+their bounded comparison. The compact aggregation case does not demonstrate a
+useful efficiency gain over the existing host programmatic tool. No live
+quality, latency, cost or account-availability claim follows from those fixtures.
 
 Terra sources: [model](https://developers.openai.com/api/docs/models/gpt-6.1-terra.md),
 [latest-model guide](https://developers.openai.com/api/docs/guides/latest-model.md?model=gpt-6-astra),
@@ -838,7 +879,7 @@ Neutral replay uses JSON-safe `openai:computer_calls` response/message metadata
 and `openai:computer_use` block metadata. Both copies must agree with the canonical
 call and original vendor actions. Duplicate identities cannot authorize another
 execution, including after historical failure projection. Count, complete,
-stream, text-only continuation, and the optional native adapter use the same
+stream, safe output-limit continuation, and the optional native adapter use the same
 binding/projection. Incomplete tool batches are not internally replayed.
 
 Successful native observations are retained once in returned
@@ -1052,13 +1093,19 @@ The provider populates `ChatResponse.metadata` with OpenAI-specific state:
 | `openai:incomplete_reason` | `str` | `"max_output_tokens"` or `"content_filter"`. |
 | `openai:reasoning_items` | `list[str]` | Reasoning item ids (`rs_*`) for state preservation. |
 | `openai:continuation_count` | `int` | Number of auto-continuations performed (if > 0). |
+| `openai:output_items` | `list[dict]` | Ordered canonical output, including original IDs, phase, namespaces and opaque reasoning. Preserve it with the assistant message; real matching client tool results remain required. |
+| `openai:request_configuration` | `dict` | Narrow final-wire model/effort baseline for explicit configuration updates; `request_effort: null` means omitted. |
 | `openai:tool_search_items` | `list[dict]` | Hosted `tool_search_call` / `tool_search_output` items, replayed verbatim into `input` on the next request. Dropping them makes every discovered tool cease to exist for the model **and** breaks the cache forward. |
 
 All keys use the `openai:` prefix to prevent collisions with other providers.
 
 ### Graceful Error Recovery
 
-If tool results are missing from conversation history (context-management bugs,
+Canonical `openai:output_items` history requires a unique following real result
+for each client tool call. Missing or mismatched results fail before dispatch;
+the provider does not fabricate evidence or resurrect a failed computer action.
+
+For older history without canonical output metadata, if tool results are missing (context-management bugs,
 parsing errors, state corruption), the provider detects the unpaired tool calls
 and injects synthetic `[SYSTEM ERROR: Tool result missing]` results so the API
 accepts the request and the session continues, rather than crashing.
@@ -1074,7 +1121,7 @@ outputs).
 ## Dependencies
 
 - `amplifier-core>=1.0.0`
-- `openai>=1.0.0`
+- `openai>=3.29.0`
 
 ## Contributing
 

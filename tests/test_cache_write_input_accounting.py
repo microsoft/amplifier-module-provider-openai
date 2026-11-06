@@ -98,6 +98,9 @@ class _MeasuredUsageResponse:
             input_tokens_details=SimpleNamespace(
                 cached_tokens=_CACHE_READ_TOKENS,
                 cache_write_tokens=_CACHE_WRITE_TOKENS,
+                cache_write_tokens_details={
+                    "ttl_30m_tokens": _CACHE_WRITE_TOKENS, "ttl_12h_tokens": 0,
+                },
             ),
         )
         self.status = "completed"
@@ -337,6 +340,9 @@ def _cold_response():
             input_tokens_details=SimpleNamespace(
                 cached_tokens=0,  # COLD: nothing served from cache
                 cache_write_tokens=_COLD_CACHE_WRITE,  # large real write
+                cache_write_tokens_details={
+                    "ttl_30m_tokens": _COLD_CACHE_WRITE, "ttl_12h_tokens": 0,
+                },
             ),
         ),
         status="completed",
