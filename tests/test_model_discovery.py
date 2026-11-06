@@ -137,7 +137,12 @@ async def test_discovery_preserves_absent_account_binding_after_environment_chan
     ) as client:
         assert client.organization is None
         assert client.project is None
-        headers_before = dict(client.default_headers)
+        # Absent fields use fresh Omit sentinel instances on each property read.
+        # Compare actual string header values, not sentinel object identities.
+        headers_before = {
+            name: value for name, value in client.default_headers.items()
+            if isinstance(value, str)
+        }
         provider = OpenAIProvider(
             client=client, config={"max_retries": 0, "base_url": ENDPOINT},
         )
@@ -162,7 +167,10 @@ async def test_discovery_preserves_absent_account_binding_after_environment_chan
         assert client.project is None
         assert client.api_key == "fixture-discovery-key"
         assert str(client.base_url) == ENDPOINT
-        assert client.default_headers == headers_before
+        assert {
+            name: value for name, value in client.default_headers.items()
+            if isinstance(value, str)
+        } == headers_before
         assert client.max_retries == 2
         assert not http.is_closed
     assert http.is_closed
