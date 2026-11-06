@@ -35,6 +35,7 @@ from .native_checkpoint import NativeCheckpointMixin, digest
 
 NATIVE_REQUEST = contextvars.ContextVar("openai_native_request", default=None)
 NATIVE_BUDGET = contextvars.ContextVar("openai_native_budget", default=None)
+NATIVE_BILLING = contextvars.ContextVar("openai_native_billing", default=None)
 _NOT_SENT_RECEIPT_TIMEOUT = 1.0  # Per cooperative sink; never a model deadline.
 
 
@@ -85,6 +86,8 @@ class NativeResponse(_RawResponseObject):
             sum(costs, Decimal(0)) if costs and all(c is not None for c in costs)
             else None
         )
+        known = [cost for cost in costs if cost is not None]
+        self.native_known_terminal_cost = sum(known, Decimal(0)) if known else None
 
 
 def key(message):
@@ -129,6 +132,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         provider._steer_preparing = False
         provider._native_send_refused = False
         provider.owner_getter = owner_getter
+        provider._native_root = provider
+        provider._native_lineage_owner = None
         provider.trace = trace or (lambda *args: None)
         provider.trace_context = trace_context or (lambda *args: None)
         provider._request_messages = []
@@ -146,6 +151,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         provider.seen = Counter()
         provider.last_context = Counter()
         provider.async_calls = {}
+        provider._native_observed_async_calls = {}
+        provider._native_async_call_owners = {}
         provider.delivered_results = set()
         provider.pending_parent = False
         provider.full_messages = []
@@ -159,6 +166,90 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         if isinstance(response, NativeResponse):
             return response.native_terminal_cost
         return self._terminal_cost(response)
+
+    def _known_attempt_cost(self, response):
+        if isinstance(response, NativeResponse):
+            return response.native_known_terminal_cost
+        return None
+
+    def _error_response_observations(self, error):
+        """Return this generation's confirmed terminals, never inferred spend."""
+        ledger = NATIVE_BILLING.get()
+        if (
+            ledger is None or ledger["provider"] is not self
+            or ledger["owner"] is not self.owner or ledger["consumed"]
+            or ledger["returned"]
+        ):
+            return ()
+        ledger["consumed"] = True
+        observations = list(ledger["observations"].values())
+        if ledger["unresolved"]:
+            # The failing/disconnected successor may have incurred unknown spend.
+            # Keep confirmed tokens/subtotal, not a false known total.
+            observations.append(NativeResponse({}, [], []))
+        return tuple(observations)
+
+    def _record_native_terminal_billing(self, terminal, cost):
+        ledger = NATIVE_BILLING.get()
+        if ledger is not None and ledger["provider"] is self and ledger["owner"] is self.owner:
+            identity = terminal.get("id")
+            if identity not in ledger["observations"]:
+                ledger["observations"][identity] = NativeResponse(
+                    copy.deepcopy(terminal), [terminal], [cost],
+                )
+
+    def _canonical_pending_async_call(self, item):
+        """Private owner/job qualification; public async metadata grants nothing."""
+        root = getattr(self, "_native_probe_root", self._native_root)
+        active = NATIVE_REQUEST.get()
+        if not (
+            active is not None and getattr(active, "_native_root", None) is root
+            or getattr(self, "_native_probe_owner", None) is not None
+        ):
+            return False
+        owner = getattr(self, "_native_probe_owner", None) or root.owner
+        if owner is None or root.owner_getter() is not owner:
+            return False
+        identity = item.get("call_id")
+        if (
+            item.get("type") not in {"function_call", "custom_tool_call"}
+            or item.get("async") is not True or not isinstance(identity, str)
+            or item.get("status", "completed") != "completed"
+        ):
+            return False
+        original = root._native_observed_async_calls.get(identity)
+        if original is not None and root._native_async_call_owners.get(identity) is not owner:
+            return False
+        job = owner.native_job(identity)
+        if job is None or job.get("restored") and not job.get("recovered"):
+            return False
+        if original is None:
+            # A restored provider needs exact original call provenance from the
+            # durable host, not a transcript claiming its own qualification.
+            retained = getattr(owner, "native_async_call", None)
+            original = (
+                retained(identity)
+                if job.get("restored") is True and job.get("recovered") is True
+                and callable(retained) else None
+            )
+        if original != item:
+            return False
+        kind = "function" if item["type"] == "function_call" else "custom"
+        getter = getattr(owner, "native_async_tools", None)
+        declarations = getter() if callable(getter) else ()
+        if isinstance(declarations, (tuple, list)) and any(
+            isinstance(d, NativeAsyncTool) and callable(d.start)
+            and (d.kind, d.namespace, d.name) == (kind, item.get("namespace"), item.get("name"))
+            and d.name != "computer"
+            for d in declarations
+        ):
+            return True
+        return (
+            kind == "function" and not item.get("namespace")
+            and item.get("name") == "delegate"
+            and owner.config.get("background_delegate") is True
+            and callable(getattr(owner, "start_native_job", None))
+        )
 
     def _native_eligible(self, params):
         # Documented eligibility, not a family prefix or live account assertion.
@@ -283,6 +374,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         # Retain the original identity BEFORE awaiting the host. Unknown dispatch
         # remains unknown, not permission to start again on another provider turn.
         self.async_calls[call_id] = copy.deepcopy(item)
+        self._native_observed_async_calls[call_id] = copy.deepcopy(item)
+        self._native_async_call_owners[call_id] = self.owner
         getattr(self, "_native_current_async_calls", set()).add(call_id)
         await start(copy.deepcopy(item))
 
@@ -657,6 +750,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
     def _native_probe(self, request, options):
         planner = copy.copy(self)
         planner._native_planning = True
+        planner._native_probe_root = self
+        planner._native_probe_owner = self.owner_getter()
         planner.async_calls = copy.deepcopy(self.async_calls)
         for message in request.messages:
             for call in (message.metadata or {}).get("converge_native_async_calls", []):
@@ -674,6 +769,15 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         if self.owner is not None or self._native_busy:
             raise LLMError(
                 "Native provider already owns a generation",
+                provider=self.name, retryable=False,
+            )
+        if (
+            self._native_lineage_owner is not None
+            and owner is not self._native_lineage_owner
+            and (self.previous_response_id or self.async_calls or self._native_requires_recovery())
+        ):
+            raise LLMError(
+                "Native history belongs to a different owner; explicit recovery is required",
                 provider=self.name, retryable=False,
             )
         try:
@@ -719,6 +823,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 provider=self.name, retryable=False,
             )
         self.owner = owner
+        self._native_lineage_owner = owner
         self._native_initial_plan = plan
         self._native_config_digest = self._native_admission_digest()
         previous_model = getattr(self, "_last_native_model", None)
@@ -742,6 +847,10 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             if m.role in {"developer", "user", "assistant", "tool"}
         ]
         token = NATIVE_REQUEST.set(self)
+        billing_token = NATIVE_BILLING.set({
+            "provider": self, "owner": owner, "observations": {},
+            "consumed": False, "unresolved": False, "returned": False,
+        })
         request = request.model_copy(
             update={"metadata": {**(request.metadata or {}), "stream": False}}
         )
@@ -783,6 +892,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             self._retain_legacy_failed_context(self._request_messages, exc)
             raise
         finally:
+            NATIVE_BILLING.reset(billing_token)
             NATIVE_REQUEST.reset(token)
             self.owner = None
             self.response_id = None
@@ -1324,7 +1434,13 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 )
             self._native_request_attempted = True
             self._computer_function_lineage = function_computer
-            return await self._native_response(params, timeout=timeout)
+            response = await self._native_response(params, timeout=timeout)
+            ledger = NATIVE_BILLING.get()
+            if ledger is not None and ledger["provider"] is self:
+                # Shared completion now owns this returned aggregate, including
+                # later conversion errors. Do not also return its components.
+                ledger["returned"] = True
+            return response
         except asyncio.CancelledError:
             if delta_started and not self.request_uncertain:
                 self._native_send_refused = True
@@ -1485,6 +1601,9 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             input_items=len(payload.get("input", [])),
             async_tools=sorted(".".join(filter(None, identity[1:])) for identity in async_handlers),
         )
+        ledger = NATIVE_BILLING.get()
+        if ledger is not None and ledger["provider"] is self:
+            ledger["unresolved"] = True
         output, output_ids, totals, terminal = [], set(), {}, None
         output_bytes = 0
         event_count = 0
@@ -1615,6 +1734,12 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                         self._terminal_cost(_RawResponseObject(copy.deepcopy(terminal)))
                         if known_usage else None
                     )
+                    self._record_native_terminal_billing(terminal, costs[-1])
+                    if ledger is not None and ledger["provider"] is self:
+                        # A received terminal settles this generation even if
+                        # local parsing later fails. Accepted/pending steering
+                        # can still have an unobserved successor.
+                        ledger["unresolved"] = bool(self.inflight or self.awaiting_successor)
                     terminals.append(copy.deepcopy(terminal))
                     self.previous_response_id = terminal["id"]
                     self.response_id = None
@@ -1649,6 +1774,20 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     if not self.inflight and not self.awaiting_successor:
                         break
                 elif kind in {"response.failed", "error"}:
+                    failed = event.get("response")
+                    if isinstance(failed, dict) and failed.get("id"):
+                        usage = failed.get("usage")
+                        known_usage = isinstance(usage, dict) and all(
+                            type(usage.get(k)) is int and usage[k] >= 0
+                            for k in ("input_tokens", "output_tokens")
+                        )
+                        cost = (
+                            self._terminal_cost(_RawResponseObject(copy.deepcopy(failed)))
+                            if known_usage else None
+                        )
+                        self._record_native_terminal_billing(failed, cost)
+                        if ledger is not None and ledger["provider"] is self:
+                            ledger["unresolved"] = False
                     # Deliberately non-retryable: a job may already have run.
                     code = (
                         event.get("error")
@@ -1661,6 +1800,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                         + str(code)
                     )
         terminal = {**terminal, "output": output, "usage": totals}
+        if ledger is not None and ledger["provider"] is self:
+            ledger["unresolved"] = False
         await self._emit(
             "native.completed",
             response_id=terminal["id"],

@@ -653,3 +653,347 @@ async def test_async_wait_order_never_crosses_original_call_after_earlier_sync_p
         < position("function_call_output", "async-later")
         < position("function_call_output", "wait")
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["function", "custom"])
+async def test_canonical_pending_async_survives_next_public_native_request(kind):
+    p, owner = public_provider()
+    start = AsyncMock()
+    owner.native_async_tools = lambda: [NativeAsyncTool("lookup", start, kind=kind)]
+    owner.native_job = lambda identity: {"result": None}
+    item = async_call("job1", kind=kind)
+    terminal = billed("r1", tokens=100)
+    terminal["response"]["output"] = [item]
+    p.socket.feed(created("r1"), {"type": "response.output_item.done", "item": item}, terminal)
+    req = request()
+    response = await p.complete(req, tools=[{"type": kind, "name": "lookup"}])
+    persisted = Message(role="assistant", content=response.content, metadata=response.metadata)
+    next_request = ChatRequest(messages=[
+        *req.messages, persisted, Message(role="user", content="continue independently"),
+    ], max_output_tokens=32)
+    owner.messages = [m.model_dump() for m in next_request.messages]
+    p.socket.feed(created("r2"), billed("r2", tokens=100))
+    result = await p.complete(next_request, tools=[{"type": kind, "name": "lookup"}])
+    assert result is not None
+    start.assert_awaited_once()
+    assert len(p.socket.sent) == 2
+    assert p.socket.sent[-1]["previous_response_id"] == "r1"
+    assert not any(x.get("call_id") == "job1" for x in p.socket.sent[-1]["input"])
+    assert "job1" not in p.delivered_results
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["failed", "disconnect", "cancelled"])
+async def test_confirmed_parent_billing_survives_native_successor_failure_once(failure):
+    p, _ = public_provider()
+    costs, hooks = [], AsyncMock()
+    p._add_cost = costs.append
+    p.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=hooks))
+    p.socket.feed(created("parent"))
+    task = asyncio.create_task(p.complete(request()))
+    await wait_created(p)
+    await p.steer_live(SimpleNamespace(id="direction", text="update"))
+    parent = billed("parent", tokens=100)
+    parent["type"] = "response.incomplete"
+    parent["response"].update(status="incomplete", incomplete_details={"reason": "steered"})
+    ending = (
+        {"type": "response.failed", "response": {"id": "next", "error": {"code": "failure"}}}
+        if failure == "failed" else
+        ConnectionError("offline disconnect") if failure == "disconnect" else
+        asyncio.CancelledError()
+    )
+    socket = p.socket
+    socket.feed(
+        {"type": "response.steer.accepted", "steer": {"id": "steer"}},
+        parent, created("next"), ending,
+    )
+    with pytest.raises((LLMError, asyncio.CancelledError)) as caught:
+        await task
+    usage = getattr(caught.value, "usage", None)
+    assert usage is not None
+    assert usage.input_tokens == 100
+    assert usage.cost_usd is None
+    assert usage.known_cost_usd == Decimal("0.001")
+    assert costs == [Decimal("0.001")]
+    assert p.request_uncertain and socket.closed
+    assert len(socket.sent) == 2  # create + steer, never another generation
+    with pytest.raises(LLMError, match="uncertain"):
+        await p._renew_idle_connection()
+    assert costs == [Decimal("0.001")]
+    if failure != "cancelled":
+        error_events = [
+            c.args[1] for c in hooks.await_args_list
+            if c.args[0] == "llm:response" and c.args[1].get("status") == "error"
+        ]
+        assert len(error_events) == 1
+        assert error_events[0]["known_cost_usd"] == "0.001"
+
+
+async def pending_canonical_history(p, owner):
+    start = AsyncMock()
+    owner.native_async_tools = lambda: [NativeAsyncTool("lookup", start)]
+    owner.native_job = lambda identity: {"result": None}
+    item = async_call("pending")
+    end = billed("first", tokens=100)
+    end["response"]["output"] = [item]
+    p.socket.feed(created("first"), {"type": "response.output_item.done", "item": item}, end)
+    req = request()
+    result = await p.complete(req, tools=[{"type": "function", "name": "lookup"}])
+    messages = [
+        *req.messages,
+        Message(role="assistant", content=result.content, metadata=result.metadata),
+        Message(role="user", content="independent next turn"),
+    ]
+    return ChatRequest(messages=messages, max_output_tokens=32), start, item
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", [
+    "metadata_only", "arguments", "missing_job", "restored_unknown",
+    "missing_handler", "other_owner", "wrong_result", "duplicate_result", "ordinary",
+])
+async def test_pending_exception_never_trusts_public_metadata_or_invalid_results(mutation):
+    p, owner = public_provider()
+    req, start, item = await pending_canonical_history(p, owner)
+    if mutation == "metadata_only":
+        p._native_observed_async_calls.clear()
+    elif mutation == "arguments":
+        req.messages[1].metadata["openai:output_items"][0]["arguments"] = '{"tampered":true}'
+    elif mutation == "missing_job":
+        owner.native_job = lambda identity: None
+    elif mutation == "restored_unknown":
+        owner.native_job = lambda identity: {"restored": True, "recovered": False, "result": None}
+    elif mutation == "missing_handler":
+        owner.native_async_tools = list
+    elif mutation == "other_owner":
+        p.owner_getter = lambda: None
+    elif mutation in {"wrong_result", "duplicate_result"}:
+        if mutation == "wrong_result":
+            req.messages[1].metadata["openai:output_items"].append({
+                "type": "custom_tool_call_output", "call_id": item["call_id"], "output": "wrong kind",
+            })
+        else:
+            req.messages += [
+                Message(role="tool", tool_call_id=item["call_id"], content="one"),
+                Message(role="tool", tool_call_id=item["call_id"], content="two"),
+            ]
+    elif mutation == "ordinary":
+        req.model = "gpt-5.6"
+    owner.messages = [m.model_dump() for m in req.messages]
+    before = copy.deepcopy(owner.messages)
+    with pytest.raises(LLMError):
+        await p.complete(req, tools=[{"type": "function", "name": "lookup"}])
+    assert len(p.socket.sent) == 1
+    assert owner.messages == before
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_durable_recovered_original_call_can_qualify_but_never_restart():
+    p, owner = public_provider()
+    req, start, item = await pending_canonical_history(p, owner)
+    p._native_observed_async_calls.clear()
+    owner.native_job = lambda identity: {"restored": True, "recovered": True, "result": None}
+    owner.native_async_call = lambda identity: copy.deepcopy(item)
+    owner.messages = [m.model_dump() for m in req.messages]
+    p.socket.feed(created("second"), billed("second", tokens=100))
+    await p.complete(req, tools=[{"type": "function", "name": "lookup"}])
+    start.assert_awaited_once()
+    assert len(p.socket.sent) == 2 and "pending" not in p.delivered_results
+
+
+@pytest.mark.asyncio
+async def test_ready_pending_canonical_result_delivered_on_original_id_once():
+    p, owner = public_provider()
+    req, start, item = await pending_canonical_history(p, owner)
+    owner.native_job = lambda identity: {"result": "REAL FINAL OUTPUT"}
+    owner.messages = [m.model_dump() for m in req.messages]
+    p.socket.feed(created("second"), billed("second", tokens=100))
+    await p.complete(req, tools=[{"type": "function", "name": "lookup"}])
+    outputs = [
+        value for value in p.socket.sent[-1]["input"]
+        if value.get("type") == "function_call_output" and value.get("call_id") == item["call_id"]
+    ]
+    assert len(outputs) == 1
+    assert "REAL FINAL OUTPUT" in str(outputs[0]["output"])
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_returned_native_response_conversion_failure_is_not_double_billed():
+    p, _ = public_provider()
+    costs = []
+    p._add_cost = costs.append
+    p._convert_to_chat_response = lambda *args, **kwargs: (_ for _ in ()).throw(
+        LLMError("conversion rejected", provider=p.name, retryable=False)
+    )
+    p.socket.feed(created("one"), billed("one", tokens=100))
+    with pytest.raises(LLMError) as caught:
+        await p.complete(request())
+    assert costs == [Decimal("0.001")]
+    assert caught.value.usage.input_tokens == 100
+    assert caught.value.usage.cost_usd == Decimal("0.001")
+
+
+@pytest.mark.asyncio
+async def test_terminal_missing_cache_evidence_keeps_only_known_subtotal_on_failure():
+    p, _ = public_provider()
+    costs = []
+    p._add_cost = costs.append
+    p.socket.feed(created("parent"))
+    task = asyncio.create_task(p.complete(request()))
+    await wait_created(p)
+    await p.steer_live(SimpleNamespace(id="direction", text="update"))
+    parent = billed("parent", tokens=100)
+    parent["type"] = "response.incomplete"
+    parent["response"].update(status="incomplete", incomplete_details={"reason": "steered"})
+    successor = billed("next", model="gpt-6.1-terra", tokens=100)
+    successor["type"] = "response.failed"
+    successor["response"]["usage"]["input_tokens_details"].pop("cache_write_tokens")
+    p.socket.feed(
+        {"type": "response.steer.accepted", "steer": {"id": "steer"}},
+        parent, created("next"), successor,
+    )
+    with pytest.raises(LLMError) as caught:
+        await task
+    assert caught.value.usage.input_tokens == 200
+    assert caught.value.usage.cost_usd is None
+    assert caught.value.usage.known_cost_usd == Decimal("0.001")
+    assert costs == [Decimal("0.001")]
+
+
+@pytest.mark.asyncio
+async def test_successful_native_billing_does_not_consume_error_components():
+    p, _ = public_provider()
+    costs = []
+    p._add_cost = costs.append
+    p._error_response_observations = lambda error: (_ for _ in ()).throw(
+        AssertionError("successful aggregate must not use the error hook")
+    )
+    p.socket.feed(created("one"), billed("one", tokens=100))
+    result = await p.complete(request())
+    assert costs == [Decimal("0.001")]
+    assert result.usage.cost_usd == Decimal("0.001")
+
+
+@pytest.mark.asyncio
+async def test_failed_successor_uses_endpoint_pricing_hook_once_for_parent():
+    p, _ = public_provider()
+    observed, costs = [], []
+    def price(raw):
+        observed.append((raw.id, raw.model, raw.service_tier))
+        return Decimal("7.5")
+    p._terminal_cost = price
+    p._add_cost = costs.append
+    p.socket.feed(created("parent"))
+    task = asyncio.create_task(p.complete(request()))
+    await wait_created(p)
+    await p.steer_live(SimpleNamespace(id="direction", text="update"))
+    parent = billed("parent", model="gpt-6-sol", tier="priority", tokens=100)
+    parent["type"] = "response.incomplete"
+    parent["response"].update(status="incomplete", incomplete_details={"reason": "steered"})
+    p.socket.feed(
+        {"type": "response.steer.accepted", "steer": {"id": "steer"}},
+        parent, created("next"), ConnectionError("lost successor"),
+    )
+    with pytest.raises(LLMError) as caught:
+        await task
+    assert observed == [("parent", "gpt-6-sol", "priority")]
+    assert costs == [Decimal("7.5")]
+    assert caught.value.usage.cost_usd is None
+    assert caught.value.usage.known_cost_usd == Decimal("7.5")
+
+
+@pytest.mark.asyncio
+async def test_pending_canonical_call_rejects_different_nonnull_owner():
+    from tests.test_native_transport import Owner
+
+    p, owner = public_provider()
+    req, start, _ = await pending_canonical_history(p, owner)
+    other = Owner()
+    other.native_job = lambda identity: {"result": "OTHER OWNER RESULT"}
+    other.native_async_tools = owner.native_async_tools
+    p.owner_getter = lambda: other
+    with pytest.raises(LLMError, match="different owner"):
+        await p.complete(req, tools=[{"type": "function", "name": "lookup"}])
+    assert len(p.socket.sent) == 1 and not p.delivered_results
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job", [
+    {"result": None},
+    {"restored": True, "result": None},
+    {"recovered": True, "result": None},
+    {"restored": True, "recovered": False, "result": None},
+])
+async def test_retained_original_requires_restored_and_recovered_job(job):
+    p, owner = public_provider()
+    req, start, item = await pending_canonical_history(p, owner)
+    p._native_observed_async_calls.clear()
+    owner.native_async_call = lambda identity: copy.deepcopy(item)
+    owner.native_job = lambda identity: copy.deepcopy(job)
+    with pytest.raises(LLMError):
+        await p.complete(req, tools=[{"type": "function", "name": "lookup"}])
+    assert len(p.socket.sent) == 1 and not p.delivered_results
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_kind", ["failed", "incomplete", "post_terminal_processing"])
+async def test_fully_priced_terminal_error_retains_known_total_without_successor(terminal_kind):
+    p, _ = public_provider()
+    costs = []
+    p._add_cost = costs.append
+    terminal = billed("one", tokens=100)
+    if terminal_kind == "failed":
+        terminal["type"] = "response.failed"
+        terminal["response"]["status"] = "failed"
+    elif terminal_kind == "incomplete":
+        terminal["type"] = "response.incomplete"
+        terminal["response"].update(status="incomplete", incomplete_details={"reason": "max_output_tokens"})
+    else:
+        terminal["response"]["output"] = [42]  # evidence precedes local output parser failure
+    p.socket.feed(created("one"), terminal)
+    with pytest.raises(LLMError) as caught:
+        await p.complete(request())
+    assert caught.value.usage.input_tokens == 100
+    assert caught.value.usage.cost_usd == Decimal("0.001")
+    assert getattr(caught.value.usage, "known_cost_usd", None) is None
+    assert costs == [Decimal("0.001")]
+
+
+@pytest.mark.asyncio
+async def test_mixed_native_aggregate_conversion_failure_retains_known_subtotal():
+    p, _ = public_provider()
+    costs, prices = [], []
+    pricing = p._terminal_cost
+    def price(raw):
+        prices.append(raw.id)
+        return pricing(raw)
+    p._terminal_cost = price
+    p._add_cost = costs.append
+    p._convert_to_chat_response = lambda *args, **kwargs: (_ for _ in ()).throw(
+        LLMError("conversion refused", provider=p.name, retryable=False)
+    )
+    p.socket.feed(created("parent"))
+    task = asyncio.create_task(p.complete(request()))
+    await wait_created(p)
+    await p.steer_live(SimpleNamespace(id="direction", text="update"))
+    parent = billed("parent", tokens=100)
+    parent["type"] = "response.incomplete"
+    parent["response"].update(status="incomplete", incomplete_details={"reason": "steered"})
+    successor = billed("next", model="gpt-6.1-terra", tokens=100)
+    successor["response"]["usage"]["input_tokens_details"].pop("cache_write_tokens")
+    p.socket.feed(
+        {"type": "response.steer.accepted", "steer": {"id": "steer"}},
+        parent, created("next"), successor,
+    )
+    with pytest.raises(LLMError) as caught:
+        await task
+    assert caught.value.usage.input_tokens == 200
+    assert caught.value.usage.cost_usd is None
+    assert caught.value.usage.known_cost_usd == Decimal("0.001")
+    assert costs == [Decimal("0.001")]
+    assert prices == ["parent", "next"]
