@@ -2,6 +2,7 @@
 
 import asyncio
 
+import httpx
 from openai import AsyncOpenAI
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -28,6 +29,32 @@ async def main():
     finally:
         await transport.aclose()
     assert transport.is_closed
+
+    requests = []
+
+    def catalog(request):
+        requests.append(request)
+        assert request.method == "GET"
+        assert str(request.url) == "https://installed.example.invalid/v1/models"
+        return httpx.Response(200, json={
+            "object": "list",
+            "data": [{"id": "installed-api-id", "object": "model",
+                      "created": 1, "owned_by": "fixture"}],
+        })
+
+    async with AsyncOpenAI(
+        api_key="synthetic-runtime-smoke",
+        base_url="https://installed.example.invalid/v1/",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(catalog)),
+        max_retries=0,
+    ) as client:
+        provider = OpenAIProvider(client=client)
+        assert await provider.discover_models() == {
+            "version": 1,
+            "source": "provider-api",
+            "models": [{"id": "installed-api-id", "display_name": "installed-api-id"}],
+        }
+    assert len(requests) == 1
 
 
 if __name__ == "__main__":

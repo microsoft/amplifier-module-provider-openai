@@ -2732,6 +2732,159 @@ class OpenAIProvider:
 
         return await list_image_models(self)
 
+    async def _request_model_catalog(
+        self, request: Callable[[], Awaitable[Any]], *, operation: str = "list_models"
+    ) -> Any:
+        """Share catalog error translation, not listing/filtering/retry policy."""
+        try:
+            return await request()
+        except openai.RateLimitError as e:
+            body = getattr(e, "body", None)
+            error_msg = json.dumps(body) if body is not None else str(e)
+            raise kernel_errors.RateLimitError(
+                error_msg,
+                provider=self.name,
+                status_code=429,
+                retryable=True,
+            ) from e
+        except openai.AuthenticationError as e:
+            body = getattr(e, "body", None)
+            error_msg = json.dumps(body) if body is not None else str(e)
+            raise kernel_errors.AuthenticationError(
+                error_msg,
+                provider=self.name,
+                status_code=getattr(e, "status_code", 401),
+            ) from e
+        except openai.APIStatusError as e:
+            status = getattr(e, "status_code", 500)
+            body = getattr(e, "body", None)
+            error_msg = json.dumps(body) if body is not None else str(e)
+            if status == 403:
+                if self._is_cloudflare_challenge(e):
+                    logger.warning(
+                        "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+                        "with HTML body) on %s(). Treating as "
+                        "transient%s.",
+                        operation,
+                        " -- will retry" if operation == "list_models" else "",
+                    )
+                    raise kernel_errors.ProviderUnavailableError(
+                        "Cloudflare bot challenge (transient 403 with HTML "
+                        "body). This typically resolves on retry.",
+                        provider=self.name,
+                        status_code=403,
+                        retryable=True,
+                    ) from e
+                raise kernel_errors.AccessDeniedError(
+                    error_msg,
+                    provider=self.name,
+                    status_code=403,
+                ) from e
+            if status == 404:
+                raise kernel_errors.NotFoundError(
+                    error_msg,
+                    provider=self.name,
+                    status_code=404,
+                ) from e
+            if status >= 500:
+                raise kernel_errors.ProviderUnavailableError(
+                    error_msg,
+                    provider=self.name,
+                    status_code=status,
+                    retryable=True,
+                ) from e
+            raise kernel_errors.LLMError(
+                error_msg,
+                provider=self.name,
+                status_code=status,
+                retryable=False,
+            ) from e
+        except (openai.APIConnectionError, openai.APITimeoutError) as e:
+            # Transport-level failures (DNS, connection reset, timeout) are
+            # genuinely transient.
+            raise kernel_errors.LLMError(
+                str(e) or f"{type(e).__name__}: (no message)",
+                provider=self.name,
+                retryable=True,
+            ) from e
+        except kernel_errors.LLMError:
+            raise  # Already translated, don't double-wrap
+
+    async def discover_models(self) -> dict[str, Any]:
+        """Return a fresh, strict API inventory, independent of model selection.
+
+        This optional surface does not use list_models' curated family/date
+        filters or capability guesses. The catalog does not establish inference
+        compatibility or entitlement. No cache, defaults, aliases or fallback.
+        """
+        if self._client is None and self._api_key is None:
+            raise kernel_errors.AuthenticationError(
+                "api_key or client must be provided for model discovery",
+                provider=self.name,
+            )
+        try:
+            # Retain the bound endpoint, account and authentication. Do not
+            # mutate the inference client's retry settings or close its transport.
+            client = self.client.with_options(max_retries=0)
+            models: list[dict[str, str]] = []
+            cursors: set[str] = set()
+            query: dict[str, str] = {}
+            while True:
+                response = await self._request_model_catalog(
+                    lambda query=query: client.models.with_raw_response.list(
+                        extra_query=query
+                    ),
+                    operation="discover_models",
+                )
+                # SDK models are constructed permissively. Inspect the original
+                # JSON so missing data or coerced IDs cannot masquerade as success.
+                page = response.http_response.json()
+                if (
+                    not isinstance(page, dict)
+                    or page.get("object") != "list"
+                    or not isinstance(page.get("data"), list)
+                ):
+                    raise ValueError("Expected a model list with a data array")
+                for row in page["data"]:
+                    model_id = row.get("id") if isinstance(row, dict) else None
+                    if (
+                        not isinstance(model_id, str)
+                        or not model_id.strip()
+                        or model_id != model_id.strip()
+                    ):
+                        raise ValueError("Expected a nonblank exact model ID")
+                    models.append({"id": model_id, "display_name": model_id})
+
+                # OpenAI's standard /models response is not paginated (AsyncPage).
+                # Compatible endpoints may explicitly use has_more/last_id. Do
+                # not silently truncate those pages or follow remote next URLs.
+                has_more = page.get("has_more", False)
+                if not isinstance(has_more, bool):
+                    raise TypeError("Expected boolean has_more")
+                if not has_more:
+                    break
+                cursor = page.get("last_id")
+                if cursor is None and page["data"]:
+                    cursor = page["data"][-1]["id"]
+                if (
+                    not isinstance(cursor, str)
+                    or not cursor.strip()
+                    or cursor != cursor.strip()
+                    or cursor in cursors
+                ):
+                    raise ValueError("Missing or repeated model catalog cursor")
+                cursors.add(cursor)
+                query = {"after": cursor}
+            return {"version": 1, "source": "provider-api", "models": models}
+        except kernel_errors.LLMError:
+            raise
+        except (openai.APIError, ValueError, TypeError, AttributeError) as e:
+            raise kernel_errors.LLMError(
+                "Invalid model discovery response or client",
+                provider=self.name,
+                retryable=False,
+            ) from e
+
     async def list_models(self) -> list[ModelInfo]:
         """
         List available OpenAI models.
@@ -2746,77 +2899,7 @@ class OpenAIProvider:
         """
 
         async def _do_list_models():
-            try:
-                return await self.client.models.list()
-            except openai.RateLimitError as e:
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
-                raise kernel_errors.RateLimitError(
-                    error_msg,
-                    provider=self.name,
-                    status_code=429,
-                    retryable=True,
-                ) from e
-            except openai.AuthenticationError as e:
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
-                raise kernel_errors.AuthenticationError(
-                    error_msg,
-                    provider=self.name,
-                    status_code=getattr(e, "status_code", 401),
-                ) from e
-            except openai.APIStatusError as e:
-                status = getattr(e, "status_code", 500)
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
-                if status == 403:
-                    if self._is_cloudflare_challenge(e):
-                        logger.warning(
-                            "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-                            "with HTML body) on list_models(). Treating as "
-                            "transient -- will retry."
-                        )
-                        raise kernel_errors.ProviderUnavailableError(
-                            "Cloudflare bot challenge (transient 403 with HTML "
-                            "body). This typically resolves on retry.",
-                            provider=self.name,
-                            status_code=403,
-                            retryable=True,
-                        ) from e
-                    raise kernel_errors.AccessDeniedError(
-                        error_msg,
-                        provider=self.name,
-                        status_code=403,
-                    ) from e
-                if status == 404:
-                    raise kernel_errors.NotFoundError(
-                        error_msg,
-                        provider=self.name,
-                        status_code=404,
-                    ) from e
-                if status >= 500:
-                    raise kernel_errors.ProviderUnavailableError(
-                        error_msg,
-                        provider=self.name,
-                        status_code=status,
-                        retryable=True,
-                    ) from e
-                raise kernel_errors.LLMError(
-                    error_msg,
-                    provider=self.name,
-                    status_code=status,
-                    retryable=False,
-                ) from e
-            except (openai.APIConnectionError, openai.APITimeoutError) as e:
-                # Transport-level failures (DNS, connection reset, timeout) are
-                # genuinely transient.
-                raise kernel_errors.LLMError(
-                    str(e) or f"{type(e).__name__}: (no message)",
-                    provider=self.name,
-                    retryable=True,
-                ) from e
-            except kernel_errors.LLMError:
-                raise  # Already translated, don't double-wrap
+            return await self._request_model_catalog(lambda: self.client.models.list())
 
         async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
             """Callback invoked before each retry sleep."""

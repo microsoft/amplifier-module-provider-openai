@@ -145,6 +145,30 @@ this provider default does not alter their tier policy.
 - `gpt-5-mini` - Smaller, faster GPT-5: 400,000-token total context, 272,000-token maximum input, and 128,000-token maximum output. Preflight retains its 4,096-token safety reserve; reducing the output cap does not raise the input ceiling.
 - `gpt-5-nano` - Smallest GPT-5 variant
 
+### Optional strict model discovery
+
+`await provider.discover_models()` returns
+`{"version": 1, "source": "provider-api", "models": [...]}` from a fresh
+Models API request on the provider's existing endpoint, credential and account.
+Each row contains the exact API `id` and that same ID as `display_name`.
+An empty API catalog is a successful `models: []`; no configured default,
+inferred alias, cached result, capability estimate or replacement model is added.
+
+Discovery returns the full catalog, including older families, dated snapshots,
+fine-tuned and non-chat models. Catalog presence does not establish Responses
+compatibility or inference entitlement. Model selection, reasoning effort,
+priority and `hide_dated_models` do not filter or alter discovery.
+The standard OpenAI catalog is unpaginated; compatible endpoints that explicitly
+return `has_more` use `last_id` (or the last returned ID) as the next `after`
+cursor. Every page is validated; a failed page or malformed/cyclic cursor fails
+the operation rather than returning a partial catalog.
+
+Discovery makes only catalog GET requests, with SDK retries disabled, and raises
+typed kernel errors for authentication, transport/API and malformed-response
+failures. It does not treat failures as empty or unsupported discovery. Existing
+`list_models()` retains its curated family/date filters, metadata, ordering and
+shared retry/error behavior; ordinary inference is unchanged.
+
 ## Configuration
 
 The wizard collects four fields (`api_key`, `base_url`, `reasoning_effort`,
