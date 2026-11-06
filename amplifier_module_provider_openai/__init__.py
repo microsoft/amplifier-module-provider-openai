@@ -63,10 +63,7 @@ from ._constants import (
     DEFAULT_TIMEOUT,
     DEFAULT_TRUNCATION,
     MAX_CONTINUATION_ATTEMPTS,
-    METADATA_INCOMPLETE_REASON,
     METADATA_REASONING_ITEMS,
-    METADATA_RESPONSE_ID,
-    METADATA_STATUS,
     METADATA_TOOL_CALL_NAMESPACES,
     METADATA_TOOL_SEARCH_ITEMS,
     NATIVE_TOOL_TYPES,
@@ -74,11 +71,12 @@ from ._constants import (
 from ._cost import compute_cost
 from ._response_handling import (
     FunctionCallTruncationError,
-    convert_response_with_accumulated_output,
+    convert_response,
     describe_incomplete_function_calls,
-    extract_reasoning_text,
+    field as response_field,
     merge_discarded_usage,
-    parse_function_call_block,
+    replay_output_items,
+    response_with_output,
 )
 from ._tool_search import (
     DEFAULT_ALWAYS_LOADED,
@@ -86,8 +84,6 @@ from ._tool_search import (
     ToolSearchConfigError,
     build_additional_tools_item,
     build_namespaced_tools,
-    extract_function_call_namespaces,
-    extract_hosted_tool_search_items,
     namespace_for_member,
     normalize_namespaces,
     validate_tool_search_mode,
@@ -2991,67 +2987,7 @@ class OpenAIProvider:
         Returns:
             New input array with accumulated output included for continuation
         """
-        # Start with original input (the conversation so far)
-        continuation_input = list(original_input)
-
-        # Convert accumulated output to assistant messages for input
-        # Extract text from message blocks and reasoning summaries
-        assistant_content = []
-
-        for item in accumulated_output:
-            if hasattr(item, "type"):
-                item_type = item.type
-                if item_type == "message":
-                    # Extract text from message content
-                    content = getattr(item, "content", [])
-                    for content_item in content:
-                        if (
-                            hasattr(content_item, "type")
-                            and content_item.type == "output_text"
-                        ):
-                            text = getattr(content_item, "text", "")
-                            if text:
-                                assistant_content.append(
-                                    {"type": "output_text", "text": text}
-                                )
-                elif item_type == "reasoning":
-                    # For reasoning, we can't really include it in input as text
-                    # The reasoning trace is internal and not meant for reinsertion
-                    # Skip for now - continuation will lose reasoning context
-                    pass
-                elif item_type in {"tool_call", "function_call"}:
-                    # Tool calls - we'd need to include these but this is complex
-                    # For now, skip - incomplete with tool calls is edge case
-                    pass
-            else:
-                # Dictionary format
-                item_type = item.get("type")
-                if item_type == "message":
-                    content = item.get("content", [])
-                    for content_item in content:
-                        if content_item.get("type") == "output_text":
-                            text = content_item.get("text", "")
-                            if text:
-                                assistant_content.append(
-                                    {"type": "output_text", "text": text}
-                                )
-
-        # If we extracted any assistant content, add as a spec-compliant message item.
-        # The turn is being continued precisely because it was truncated, so it is
-        # replayed as "incomplete" -- stamping "completed" would assert the opposite
-        # of what this request is asking the model to do.
-        #
-        # occurrence_index=0: this call site emits at most one synthesized
-        # assistant message per continuation build (the just-truncated turn),
-        # so there is never a same-pass duplicate to disambiguate here.
-        if assistant_content:
-            continuation_input.append(
-                _build_assistant_message_item(
-                    assistant_content, status="incomplete", occurrence_index=0
-                )
-            )
-
-        return continuation_input
+        return [*copy.deepcopy(original_input), *replay_output_items(accumulated_output, continuation=True)]
 
     def _find_missing_tool_results(
         self, messages: list
@@ -4109,6 +4045,7 @@ class OpenAIProvider:
             while (
                 hasattr(final_response, "status")
                 and final_response.status == "incomplete"
+                and response_field(response_field(final_response, "incomplete_details"), "reason") == "max_output_tokens"
                 and kwargs.get("auto_continue", self.auto_continue)
                 and continuation_count < MAX_CONTINUATION_ATTEMPTS
             ):
@@ -4238,22 +4175,11 @@ class OpenAIProvider:
                     params["input"], accumulated_output
                 )
 
-                continue_params = {
-                    "model": params["model"],
-                    "input": continuation_input,
-                }
-
-                # Inherit important params if they were set
-                if "instructions" in params:
-                    continue_params["instructions"] = params["instructions"]
-                if "max_output_tokens" in params:
-                    continue_params["max_output_tokens"] = params["max_output_tokens"]
-                if "temperature" in params:
-                    continue_params["temperature"] = params["temperature"]
-                if "reasoning" in params:
-                    continue_params["reasoning"] = params["reasoning"]
-                if "include" in params:
-                    continue_params["include"] = params["include"]
+                # Reuse the final validated request, including future SDK body
+                # fields and transport controls. Only input changes; do not
+                # re-merge overrides which could replace the accumulated input.
+                continue_params = copy.deepcopy(params)
+                continue_params["input"] = continuation_input
                 if "tools" in params:
                     binding = assembly_state["neutral_computer_context"]["binding"]
                     continue_params["tools"] = [
@@ -4262,33 +4188,6 @@ class OpenAIProvider:
                         else copy.deepcopy(tool)
                         for tool in params["tools"]
                     ]
-                    continue_params["tool_choice"] = params.get("tool_choice", "auto")
-                    continue_params["parallel_tool_calls"] = params.get(
-                        "parallel_tool_calls", True
-                    )
-                # The provider is stateless: context is carried forward
-                # explicitly in the rebuilt input array.
-                if "store" in params:
-                    continue_params["store"] = params["store"]
-                if "prompt_cache_key" in params:
-                    continue_params["prompt_cache_key"] = params["prompt_cache_key"]
-                if "prompt_cache_retention" in params:
-                    continue_params["prompt_cache_retention"] = params[
-                        "prompt_cache_retention"
-                    ]
-                if "safety_identifier" in params:
-                    continue_params["safety_identifier"] = params["safety_identifier"]
-                if "prompt_cache_options" in params:
-                    continue_params["prompt_cache_options"] = params[
-                        "prompt_cache_options"
-                    ]
-                if "text" in params:
-                    continue_params["text"] = params["text"]
-
-                # extra_request_params applies to EVERY request this provider
-                # issues, not just the first. Merged last here too, for the
-                # same reason and with the same owner-beware semantics.
-                self._merge_extra_request_params(continue_params)
                 if assembly_state["neutral_computer_context"]["neutral"]:
                     from .neutral_computer import compile_request, replay_calls
 
@@ -4324,6 +4223,23 @@ class OpenAIProvider:
                         self._create_response(continue_params, timeout=request_timeout),
                         timeout=effective_timeout,
                     )
+                    # Background applies to every generation, not only the
+                    # first one. Poll this same response; never regenerate.
+                    while getattr(final_response, "status", None) in BACKGROUND_POLLING_STATUSES:
+                        remaining = None if effective_timeout is None else max(
+                            0, effective_timeout - (time.time() - start_time)
+                        )
+                        async with asyncio.timeout(remaining):
+                            await asyncio.sleep(poll_interval)
+                            final_response = await self.client.responses.retrieve(
+                                final_response.id,
+                                timeout=self._transport_timeout(request_timeout),
+                            )
+                    if getattr(final_response, "status", None) in {"failed", "cancelled"}:
+                        raise kernel_errors.LLMError(
+                            f"Continuation response ended as {final_response.status}",
+                            provider=self.name, retryable=False,
+                        )
                     self._record_budget_calibration(continue_params, final_response)
                     billed_responses.append(final_response)
                     continue_elapsed = int((time.time() - continue_start) * 1000)
@@ -4336,11 +4252,13 @@ class OpenAIProvider:
                 except Exception as e:
                     if isinstance(e, kernel_errors.ContextLengthError):
                         raise
-                    logger.error(
-                        f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
-                        f"Returning partial response from {continuation_count} continuation(s)"
-                    )
-                    break  # Return what we have so far
+                    # A lost continuation can have generated hosted effects.
+                    # Do not turn an unknown outcome into partial success or
+                    # replay the initial request through the retry policy.
+                    raise kernel_errors.LLMError(
+                        f"Continuation {continuation_count} failed; its outcome is unknown: {e}",
+                        provider=self.name, retryable=False,
+                    ) from e
 
             # Log completion summary
             if continuation_count > 0:
@@ -4355,26 +4273,15 @@ class OpenAIProvider:
 
             # Convert to ChatResponse FIRST (before emitting llm:response)
             # so event usage fields come from the canonical ChatResponse
-            if continuation_count > 0 and assembly_state["neutral_computer_context"]["neutral"]:
-                view = copy.copy(response)
-                view.output = accumulated_output
-                chat_response = self._convert_to_chat_response(
-                    view, computer_context=assembly_state["neutral_computer_context"]
-                )
+            chat_response = self._convert_to_chat_response(
+                response_with_output(response, accumulated_output),
+                computer_context=assembly_state["neutral_computer_context"],
+            )
+            if continuation_count > 0:
                 chat_response.metadata = {
                     **(chat_response.metadata or {}),
                     "openai:continuation_count": continuation_count,
                 }
-            elif continuation_count > 0:
-                # Use new helper for accumulated output
-                chat_response = convert_response_with_accumulated_output(
-                    response, accumulated_output, continuation_count, OpenAIChatResponse
-                )
-            else:
-                # Use existing conversion for normal (non-continued) responses
-                chat_response = self._convert_to_chat_response(
-                    response, computer_context=assembly_state["neutral_computer_context"]
-                )
 
             # Publish only after HTTP success and validated response conversion.
             # Counts never commit these staged, request-local observations.
@@ -5599,484 +5506,21 @@ class OpenAIProvider:
     def _convert_to_chat_response(
         self, response: Any, *, computer_context: dict[str, Any] | None = None
     ) -> ChatResponse:
-        """Convert OpenAI response to ChatResponse format.
-
-        Args:
-            response: OpenAI API response
-
-        Returns:
-            ChatResponse with content blocks
-        """
-        from amplifier_core.message_models import (
-            TextBlock,
-            ThinkingBlock,
-            ToolCall,
-            ToolCallBlock,
-            Usage,
+        """Instance seam for Azure/native adapters; conversion has one owner."""
+        chat_response = convert_response(
+            response, OpenAIChatResponse,
+            native_call_ids=self._native_call_ids,
+            native_call_types=self._native_call_types,
+            computer_context=computer_context,
         )
-
-        from .neutral_computer import CALLS, KEY, response_calls
-
-        # Validate the entire native batch before returning any executable call.
-        # A safety requirement is not an acknowledgement or a tool argument.
-        neutral_calls = (
-            response_calls(
-                response.output, computer_context,
-                getattr(response, "model", None), getattr(response, "status", None),
+        if response_field(response, "usage") is not None:
+            # Pricing overrides historically receive attribute-based SDK objects.
+            # Keep that seam even for the canonical wire-dict conversion path.
+            cost = self._compute_attempt_cost(
+                _RawResponseObject(response) if isinstance(response, dict) else response
             )
-            if computer_context is not None else {}
-        )
-
-        content_blocks = []
-        tool_calls = []
-        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
-        text_accumulator: list[str] = []
-        reasoning_item_ids: list[str] = []  # Track reasoning IDs for metadata
-
-        # Parse output blocks
-        for block in response.output:
-            # Handle both SDK objects and dictionaries
-            if hasattr(block, "type"):
-                block_type = block.type
-
-                if block_type == "message":
-                    # Extract text from message content
-                    block_content = getattr(block, "content", [])
-                    if isinstance(block_content, list):
-                        for content_item in block_content:
-                            if (
-                                hasattr(content_item, "type")
-                                and content_item.type == "output_text"
-                            ):
-                                text = getattr(content_item, "text", "")
-                                content_blocks.append(TextBlock(text=text))
-                                text_accumulator.append(text)
-                                event_blocks.append(
-                                    TextContent(
-                                        text=text,
-                                        raw=getattr(content_item, "raw", None),
-                                    )
-                                )
-                    elif isinstance(block_content, str):
-                        content_blocks.append(TextBlock(text=block_content))
-                        text_accumulator.append(block_content)
-                        event_blocks.append(TextContent(text=block_content))
-
-                elif block_type == "reasoning":
-                    # Extract reasoning ID and encrypted content for state preservation
-                    reasoning_id = getattr(block, "id", None)
-                    encrypted_content = getattr(block, "encrypted_content", None)
-
-                    # Track reasoning item ID for metadata (backward compat)
-                    if reasoning_id:
-                        reasoning_item_ids.append(reasoning_id)
-
-                    # Extract reasoning summary if available
-                    reasoning_summary = getattr(block, "summary", None) or getattr(
-                        block, "text", None
-                    )
-
-                    # Use helper to extract reasoning text
-                    reasoning_text = extract_reasoning_text(reasoning_summary)
-
-                    # Fallback to original logic if helper didn't find text
-                    if reasoning_text is None and isinstance(reasoning_summary, list):
-                        # Extract text from list of summary objects (dict or Pydantic models)
-                        texts = []
-                        for item in reasoning_summary:
-                            if isinstance(item, dict):
-                                texts.append(item.get("text", ""))
-                            elif hasattr(item, "text"):
-                                texts.append(getattr(item, "text", ""))
-                            elif isinstance(item, str):
-                                texts.append(item)
-                        reasoning_text = "\n".join(filter(None, texts))
-                    elif isinstance(reasoning_summary, str):
-                        reasoning_text = reasoning_summary
-                    elif isinstance(reasoning_summary, dict):
-                        reasoning_text = reasoning_summary.get(
-                            "text", str(reasoning_summary)
-                        )
-                    elif hasattr(reasoning_summary, "text"):
-                        reasoning_text = getattr(
-                            reasoning_summary, "text", str(reasoning_summary)
-                        )
-
-                    # Create thinking block if there's reasoning text OR encrypted state to preserve
-                    if reasoning_text or encrypted_content:
-                        # Named dict, NOT a positional list. amplifier_foundation's
-                        # sanitize_for_json drops None from lists (serialization.py:54-61),
-                        # which silently collapsed [None, "rs_abc"] -> ["rs_abc"] and made
-                        # every block captured without ciphertext permanently unreplayable
-                        # after resume. A dict survives the same key-dropping without
-                        # losing what each surviving value MEANS. See
-                        # _decode_reasoning_state for the back-compat reader.
-                        thinking_block = ThinkingBlock(
-                            thinking=reasoning_text
-                            or "",  # May be empty when only encrypted_content exists
-                            signature=None,
-                            visibility="internal",
-                            content=[
-                                {
-                                    "encrypted_content": encrypted_content,
-                                    "id": reasoning_id,
-                                    "summary": reasoning_text or None,
-                                }
-                            ],
-                        )
-                        logger.info(
-                            f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
-                            f"has_encrypted={encrypted_content is not None}, "
-                            f"enc_len={len(encrypted_content) if encrypted_content else 0}"
-                        )
-                        content_blocks.append(thinking_block)
-                        event_blocks.append(ThinkingContent(text=reasoning_text or ""))
-                        # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
-
-                elif block_type in {"tool_call", "function_call"}:
-                    # P4: call_id-keyed; raises FunctionCallTruncationError
-                    # on incomplete calls; completed-but-unparseable arguments
-                    # coerce to {} loudly (survivable model failure).
-                    tool_id, tool_name, tool_input = parse_function_call_block(block)
-                    content_blocks.append(
-                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
-                    )
-                    tool_calls.append(
-                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
-                    )
-
-                elif block_type == "apply_patch_call":
-                    call_id = getattr(block, "call_id", "")
-                    operation = block.operation
-                    args = {
-                        "type": getattr(operation, "type", ""),
-                        "path": getattr(operation, "path", ""),
-                        "diff": getattr(operation, "diff", ""),
-                    }
-                    content_blocks.append(
-                        ToolCallBlock(id=call_id, name="apply_patch", input=args)
-                    )
-                    tool_calls.append(
-                        ToolCall(id=call_id, name="apply_patch", arguments=args)
-                    )
-                    # Track for round-trip output format
-                    self._native_call_ids.add(call_id)
-
-                elif block_type == "computer_call":
-                    call_id = getattr(block, "call_id", "")
-                    record = neutral_calls.get(call_id)
-                    args = record["canonical"] if record else {"actions": _extract_computer_actions(block)}
-                    alias = record["alias"] if record else "computer"
-                    content_blocks.append(
-                        ToolCallBlock(id=call_id, name=alias, input=args, **({"metadata": {KEY: record}} if record else {}))
-                    )
-                    tool_calls.append(
-                        ToolCall(id=call_id, name=alias, arguments=args, **({"metadata": {KEY: record}} if record else {}))
-                    )
-                    # Track for round-trip output format (computer_call_output,
-                    # not apply_patch_call_output -- see _native_call_types).
-                    if record is None:
-                        self._native_call_ids.add(call_id)
-                        self._native_call_types[call_id] = "computer"
-
-            else:
-                # Dictionary format
-                block_type = block.get("type")
-
-                if block_type == "message":
-                    block_content = block.get("content", [])
-                    if isinstance(block_content, list):
-                        for content_item in block_content:
-                            if content_item.get("type") == "output_text":
-                                text = content_item.get("text", "")
-                                content_blocks.append(TextBlock(text=text))
-                                text_accumulator.append(text)
-                                event_blocks.append(
-                                    TextContent(text=text, raw=content_item)
-                                )
-                    elif isinstance(block_content, str):
-                        content_blocks.append(TextBlock(text=block_content))
-                        text_accumulator.append(block_content)
-                        event_blocks.append(TextContent(text=block_content, raw=block))
-
-                elif block_type == "reasoning":
-                    # Extract reasoning ID and encrypted content for state preservation
-                    reasoning_id = block.get("id")
-                    encrypted_content = block.get("encrypted_content")
-
-                    # Track reasoning item ID for metadata (backward compat)
-                    if reasoning_id:
-                        reasoning_item_ids.append(reasoning_id)
-
-                    # Extract reasoning summary if available
-                    reasoning_summary = block.get("summary") or block.get("text")
-
-                    # Use helper to extract reasoning text
-                    reasoning_text = extract_reasoning_text(reasoning_summary)
-
-                    # Fallback to original logic if helper didn't find text
-                    if reasoning_text is None and isinstance(reasoning_summary, list):
-                        # Extract text from list of summary objects (dict or Pydantic models)
-                        texts = []
-                        for item in reasoning_summary:
-                            if isinstance(item, dict):
-                                texts.append(item.get("text", ""))
-                            elif hasattr(item, "text"):
-                                texts.append(getattr(item, "text", ""))
-                            elif isinstance(item, str):
-                                texts.append(item)
-                        reasoning_text = "\n".join(filter(None, texts))
-                    elif isinstance(reasoning_summary, str):
-                        reasoning_text = reasoning_summary
-                    elif isinstance(reasoning_summary, dict):
-                        reasoning_text = reasoning_summary.get(
-                            "text", str(reasoning_summary)
-                        )
-                    elif hasattr(reasoning_summary, "text"):
-                        reasoning_text = getattr(
-                            reasoning_summary, "text", str(reasoning_summary)
-                        )
-
-                    # Create thinking block if there's reasoning text OR encrypted state to preserve
-                    if reasoning_text or encrypted_content:
-                        # Named dict, NOT a positional list. amplifier_foundation's
-                        # sanitize_for_json drops None from lists (serialization.py:54-61),
-                        # which silently collapsed [None, "rs_abc"] -> ["rs_abc"] and made
-                        # every block captured without ciphertext permanently unreplayable
-                        # after resume. A dict survives the same key-dropping without
-                        # losing what each surviving value MEANS. See
-                        # _decode_reasoning_state for the back-compat reader.
-                        thinking_block = ThinkingBlock(
-                            thinking=reasoning_text
-                            or "",  # May be empty when only encrypted_content exists
-                            signature=None,
-                            visibility="internal",
-                            content=[
-                                {
-                                    "encrypted_content": encrypted_content,
-                                    "id": reasoning_id,
-                                    "summary": reasoning_text or None,
-                                }
-                            ],
-                        )
-                        logger.info(
-                            f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
-                            f"has_encrypted={encrypted_content is not None}, "
-                            f"enc_len={len(encrypted_content) if encrypted_content else 0}"
-                        )
-                        content_blocks.append(thinking_block)
-                        event_blocks.append(ThinkingContent(text=reasoning_text or ""))
-                        # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
-
-                elif block_type in {"tool_call", "function_call"}:
-                    # P4: call_id-keyed; raises FunctionCallTruncationError
-                    # on incomplete calls; completed-but-unparseable arguments
-                    # coerce to {} loudly (survivable model failure).
-                    tool_id, tool_name, tool_input = parse_function_call_block(block)
-                    content_blocks.append(
-                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
-                    )
-                    tool_calls.append(
-                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
-                    )
-                    event_blocks.append(
-                        ToolCallContent(
-                            id=tool_id, name=tool_name, arguments=tool_input, raw=block
-                        )
-                    )
-
-                elif block_type == "apply_patch_call":
-                    call_id = block.get("call_id", "")
-                    operation = block.get("operation", {})
-                    args = {
-                        "type": operation.get("type", ""),
-                        "path": operation.get("path", ""),
-                        "diff": operation.get("diff", ""),
-                    }
-                    content_blocks.append(
-                        ToolCallBlock(id=call_id, name="apply_patch", input=args)
-                    )
-                    tool_calls.append(
-                        ToolCall(id=call_id, name="apply_patch", arguments=args)
-                    )
-                    self._native_call_ids.add(call_id)
-
-                elif block_type == "computer_call":
-                    call_id = block.get("call_id", "")
-                    record = neutral_calls.get(call_id)
-                    args = record["canonical"] if record else {"actions": _extract_computer_actions(block)}
-                    alias = record["alias"] if record else "computer"
-                    content_blocks.append(
-                        ToolCallBlock(id=call_id, name=alias, input=args, **({"metadata": {KEY: record}} if record else {}))
-                    )
-                    tool_calls.append(
-                        ToolCall(id=call_id, name=alias, arguments=args, **({"metadata": {KEY: record}} if record else {}))
-                    )
-                    if record is None:
-                        self._native_call_ids.add(call_id)
-                        self._native_call_types[call_id] = "computer"
-
-        # Extract usage counts.
-        #
-        # OpenAI's usage.input_tokens (Responses API) is the RAW vendor gross
-        # total: fresh + cache_read + cache_write ALL COMBINED (cache_write is
-        # a SUBSET of it -- see the `fresh_input = prompt_tokens - cached -
-        # cache_write` derivation in _cost.py, confirmed against live
-        # gpt-5.6-sol usage). This differs from Anthropic, where cache_write
-        # (cache_creation) is a genuinely DISJOINT bucket reported on top of
-        # input_tokens.
-        #
-        # The kernel Usage contract (amplifier_core CONTRACTS.md) normalizes
-        # input_tokens to "gross total: fresh + cache_read combined,
-        # cache_write NOT included" -- every consumer (e.g. the streaming-UI
-        # display) computes `total_input = input_tokens + cache_write_tokens`
-        # assuming that shape. Emitting OpenAI's raw total unmodified (already
-        # containing cache_write) makes that formula double-count the write
-        # tokens (measured: 18,053 displayed vs. a true 9,028 gross input).
-        #
-        # `_raw_input_tokens` is kept SEPARATELY from the normalized
-        # `usage_counts["input"]` because compute_cost() below needs the raw
-        # vendor gross (its own `prompt_tokens` param already subtracts
-        # cached/cache_write internally) -- normalizing input_tokens here must
-        # not also perturb the cost computation.
-        usage_obj = response.usage if hasattr(response, "usage") else None
-        usage_counts = {"input": 0, "output": 0, "total": 0}
-        _raw_input_tokens = 0
-        if usage_obj:
-            if hasattr(usage_obj, "input_tokens"):
-                _raw_input_tokens = usage_obj.input_tokens
-            if hasattr(usage_obj, "output_tokens"):
-                usage_counts["output"] = usage_obj.output_tokens
-
-        # Phase 2: Extract reasoning_tokens from output_tokens_details
-        reasoning_tokens = None
-        if usage_obj and hasattr(usage_obj, "output_tokens_details"):
-            details = usage_obj.output_tokens_details
-            if details and hasattr(details, "reasoning_tokens"):
-                reasoning_tokens = details.reasoning_tokens
-
-        # Extract cache_read_tokens (and, for GPT-5.6, cache_write_tokens) from
-        # input_tokens_details. Field verified live on gpt-5.6-sol (2026-07-14):
-        # usage.input_tokens_details.{cached_tokens, cache_write_tokens}.
-        cache_read_tokens = None
-        cache_write_tokens = None
-        if usage_obj and hasattr(usage_obj, "input_tokens_details"):
-            details = usage_obj.input_tokens_details
-            if details and hasattr(details, "cached_tokens"):
-                cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
-            if details and hasattr(details, "cache_write_tokens"):
-                cache_write_tokens = details.cache_write_tokens  # GPT-5.6+; 0 valid
-
-        # Normalize: cache_write is a SUBSET of the raw OpenAI total, so
-        # remove it to get the "fresh + cache_read" gross the kernel contract
-        # expects. max(0, ...) guards against a malformed/unexpected API
-        # payload where cache_write_tokens would otherwise exceed input_tokens.
-        usage_counts["input"] = max(0, _raw_input_tokens - (cache_write_tokens or 0))
-        usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
-
-        usage = Usage(
-            input_tokens=usage_counts["input"],
-            output_tokens=usage_counts["output"],
-            total_tokens=usage_counts["total"],
-            reasoning_tokens=reasoning_tokens,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=cache_write_tokens,
-        )
-
-        # Price the original response, not the normalized public Usage above.
-        # The pricing hook consumes gross input and subtracts cache subsets once;
-        # completion aggregates each billed attempt through the same hook.
-        if usage_obj:
-            cost = self._compute_attempt_cost(response)
             if cost is not None:
-                usage = usage.model_copy(update={"cost_usd": cost})
-
-        combined_text = "\n\n".join(text_accumulator).strip()
-
-        # Per OpenAI docs: "response.output_text is the safest way to retrieve the final answer"
-        # Extract it directly from the response if available
-        raw_output_text = getattr(response, "output_text", None)
-
-        # Build metadata with provider-specific state
-        metadata = {}
-        if neutral_calls:
-            metadata[CALLS] = copy.deepcopy(neutral_calls)
-
-        # Response ID -- captured for correlating a stored transcript turn to
-        # an OpenAI response (support/debug). Never read back into a later
-        # request: the provider is stateless-only.
-        if hasattr(response, "id"):
-            metadata[METADATA_RESPONSE_ID] = response.id
-
-        # Status (completed/incomplete)
-        if hasattr(response, "status"):
-            metadata[METADATA_STATUS] = response.status
-
-            # If incomplete, record the reason
-            if response.status == "incomplete":
-                incomplete_details = getattr(response, "incomplete_details", None)
-                if incomplete_details:
-                    if isinstance(incomplete_details, dict):
-                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get(
-                            "reason"
-                        )
-                    elif hasattr(incomplete_details, "reason"):
-                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.reason
-
-        # Reasoning item IDs (for explicit passing if needed)
-        if reasoning_item_ids:
-            metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
-
-        # BREAK 3 -- hosted tool-search items. See
-        # _tool_search.extract_hosted_tool_search_items and the twin capture in
-        # _response_handling.convert_response_with_accumulated_output.
-        _output_items = list(getattr(response, "output", None) or [])
-        tool_search_items = extract_hosted_tool_search_items(_output_items)
-        if tool_search_items:
-            metadata[METADATA_TOOL_SEARCH_ITEMS] = tool_search_items
-        # BREAK 6 -- the namespace a function_call was issued from. Required on
-        # the round trip; see extract_function_call_namespaces.
-        call_namespaces = extract_function_call_namespaces(_output_items)
-        if call_namespaces:
-            metadata[METADATA_TOOL_CALL_NAMESPACES] = call_namespaces
-
-        # DEBUG: Log what we're returning
-        logger.info(
-            f"[PROVIDER] Returning ChatResponse with {len(content_blocks)} content blocks"
-        )
-        for i, block in enumerate(content_blocks):
-            block_type = block.type if hasattr(block, "type") else "unknown"
-            has_content = hasattr(block, "content") and block.content is not None
-            logger.info(
-                f"[PROVIDER]   Block {i}: type={block_type}, has_content_field={has_content}"
-            )
-
-        chat_response = OpenAIChatResponse(
-            content=content_blocks,
-            tool_calls=tool_calls if tool_calls else None,
-            usage=usage,
-            finish_reason=(
-                "length"
-                if getattr(response, "status", None) == "incomplete"
-                else getattr(response, "finish_reason", None)
-            ),
-            content_blocks=event_blocks if event_blocks else None,
-            text=combined_text or None,
-            output_text=raw_output_text,  # Per OpenAI docs: safest way to get final answer
-            metadata=metadata if metadata else None,
-        )
-
-        # Shared conversion also serves the unchanged optional native adapter.
-        # Request-local observations are returned only after response validation,
-        # never committed to the mounted provider or emitted by a count.
-        if (computer_context and computer_context.get("observations")
-                and getattr(response, "status", None) == "completed"):
-            from .neutral_computer import IMAGES
-
-            chat_response.metadata = {
-                **(chat_response.metadata or {}),
-                IMAGES: copy.deepcopy(computer_context["observations"]),
-            }
+                chat_response.usage = chat_response.usage.model_copy(update={"cost_usd": cost})
         return chat_response
 
     async def close(self) -> None:
