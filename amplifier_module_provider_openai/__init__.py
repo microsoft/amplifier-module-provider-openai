@@ -3568,12 +3568,19 @@ class OpenAIProvider:
                 total = sum(costs, Decimal(0))
                 billed_usage = billed_usage.model_copy(update={"cost_usd": total})
                 self._add_cost(total)
-            elif terminal_error and any(cost is not None for cost in costs):
+            elif terminal_error:
                 # The error's total stays unknown. Retain a labelled known
-                # subtotal rather than dropping already confirmed spend.
-                subtotal = sum((cost for cost in costs if cost is not None), Decimal(0))
-                billed_usage = billed_usage.model_copy(update={"known_cost_usd": subtotal})
-                self._add_cost(subtotal)
+                # subtotal rather than dropping already confirmed spend. An
+                # adapter aggregate can carry a cached partial cost even when
+                # its complete cost is unknown; do not split/recount its usage.
+                known_costs = [
+                    cost if cost is not None else self._known_attempt_cost(item)
+                    for item, cost in zip(observations, costs, strict=True)
+                ]
+                if any(cost is not None for cost in known_costs):
+                    subtotal = sum((cost for cost in known_costs if cost is not None), Decimal(0))
+                    billed_usage = billed_usage.model_copy(update={"known_cost_usd": subtotal})
+                    self._add_cost(subtotal)
             return billed_usage
 
         def _error_billing(error):
@@ -5800,6 +5807,18 @@ class OpenAIProvider:
         ``_compute_attempt_cost`` and finalization remains base-owned.
         """
         return ()
+
+    def _known_attempt_cost(self, response: Any) -> Decimal | None:
+        """Return a cached known subtotal when an adapter's total is unknown.
+
+        Used only for terminal error accounting after ``_compute_attempt_cost``
+        returns None. The default has no partial price evidence. An override
+        must return a non-overlapping confirmed subtotal for this exact response,
+        never reprice components, dispatch work or invoke the cost accumulator.
+        Returning zero means an evidenced zero; None means no known subtotal.
+        This value never becomes the complete ``Usage.cost_usd``.
+        """
+        return None
 
     def _compute_attempt_cost(self, response: Any) -> Decimal | None:
         """Return one response's token cost without mutating provider state.

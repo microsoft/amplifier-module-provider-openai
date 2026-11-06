@@ -307,6 +307,92 @@ async def test_adapter_error_observation_hook_is_not_called_after_success_billin
         await provider.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subtotal", [Decimal("0.001"), Decimal(0), None])
+async def test_returned_aggregate_conversion_error_retains_cached_partial_cost_once(
+    subtotal,
+):
+    class AggregateEndpoint(EndpointProvider):
+        known_calls = 0
+        observation_calls = 0
+
+        def _compute_attempt_cost(self, response):
+            self.priced.append(response.id)
+            # One confirmed successor has unknown pricing.
+
+        def _known_attempt_cost(self, response):
+            self.known_calls += 1
+            return subtotal
+
+        def _error_response_observations(self, error):
+            self.observation_calls += 1
+            return ()  # the base already owns the aggregate, not its components
+
+    provider = AggregateEndpoint()
+    hooks = SimpleNamespace(emit=AsyncMock())
+    provider.coordinator = SimpleNamespace(hooks=hooks)
+    aggregate = Response.model_validate(payload([{**PATCH, "status": "in_progress"}]))
+    provider.client.responses.create = AsyncMock(return_value=aggregate)
+    try:
+        with pytest.raises(UnsafeContinuationError) as caught:
+            await provider.complete(
+                ChatRequest(messages=[Message(role="user", content="go")])
+            )
+        assert provider.known_calls == provider.observation_calls == 1
+        assert provider.priced == ["resp_0"]  # never reprice component responses
+        assert caught.value.usage.input_tokens == 95
+        assert caught.value.usage.output_tokens == 10
+        assert caught.value.usage.cost_usd is None
+        assert provider.costs == ([subtotal] if subtotal is not None else [])
+        assert getattr(caught.value, "known_cost_usd", None) == subtotal
+        errors = [
+            call.args[1]
+            for call in hooks.emit.call_args_list
+            if call.args[0] == "llm:response" and call.args[1].get("status") == "error"
+        ]
+        assert len(errors) == 1
+        assert errors[0]["usage"]["cost_usd"] is None
+        assert errors[0].get("known_cost_usd") == (
+            str(subtotal) if subtotal is not None else None
+        )
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conversion_failure", [False, True])
+async def test_known_subtotal_hook_never_replaces_known_total_or_runs_on_success(
+    conversion_failure,
+):
+    class AggregateEndpoint(EndpointProvider):
+        def _known_attempt_cost(self, response):
+            raise AssertionError(
+                "known full cost or successful completion cannot use partial-price hook"
+            )
+
+    provider = AggregateEndpoint()
+    items = [{**PATCH, "status": "in_progress"}] if conversion_failure else [text()]
+    provider.client.responses.create = AsyncMock(
+        return_value=Response.model_validate(payload(items))
+    )
+    try:
+        if conversion_failure:
+            with pytest.raises(UnsafeContinuationError) as caught:
+                await provider.complete(
+                    ChatRequest(messages=[Message(role="user", content="go")])
+                )
+            assert caught.value.usage.cost_usd == Decimal("0.125")
+            assert not hasattr(caught.value, "known_cost_usd")
+        else:
+            result = await provider.complete(
+                ChatRequest(messages=[Message(role="user", content="go")])
+            )
+            assert result.usage.cost_usd == Decimal("0.125")
+        assert provider.costs == [Decimal("0.125")]
+    finally:
+        await provider.close()
+
+
 @pytest.mark.parametrize("as_spec", [False, True])
 def test_custom_tool_declaration_keeps_raw_input_contract_and_grammar(as_spec):
     from amplifier_core.message_models import ToolSpec
