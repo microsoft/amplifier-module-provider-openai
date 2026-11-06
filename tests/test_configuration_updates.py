@@ -139,6 +139,7 @@ def test_restart_low_high_low_preserves_positions_and_original_request_prefix():
         ({"reasoning": {"effort": "high"}}, "original request-level effort"),
         ({"multi_agent": {"enabled": True, "max_concurrent_subagents": 3}}, "single-agent"),
         ({"multi_agent": None}, "single-agent"),
+        ({"multi_agent": {"enabled": 0}}, "single-agent"),
     ],
 )
 def test_final_extra_body_overrides_cannot_bypass_history_validation(extra, match):
@@ -254,11 +255,39 @@ def test_canonical_host_call_requires_unique_real_result(results):
 def test_canonical_host_call_with_real_result_replays_once():
     output = [{"type": "function_call", "call_id": "call1", "id": "fc1",
                "name": "read", "arguments": "{}", "status": "completed"}]
-    wire = provider()._budget_params(ChatRequest(messages=[
+    messages = [
         Message(role="assistant", content="", metadata={"openai:output_items": output}),
         Message(role="tool", tool_call_id="call1", content="real result"),
-    ]))["input"]
+    ]
+    wire = provider()._convert_messages([m.model_dump() for m in messages])
     assert wire == [*output, {"type": "function_call_output", "call_id": "call1", "output": "real result"}]
+
+
+def test_canonical_computer_metadata_cannot_resurrect_failed_projected_call():
+    from amplifier_core.llm_errors import InvalidRequestError
+
+    messages = [
+        {"role": "user", "content": "Inspect"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Checking"},
+                {"type": "tool_call", "id": "call1", "name": "computer",
+                 "input": {"actions": [{"type": "screenshot"}]}},
+            ],
+            "metadata": {"openai:output_items": [
+                {"type": "computer_call", "call_id": "call1", "id": "cc1",
+                 "actions": [{"type": "screenshot"}], "status": "completed"},
+            ]},
+        },
+        {"role": "tool", "tool_call_id": "call1",
+         "content": '{"success":false,"error":{"code":"safety_halt"}}'},
+        {"role": "user", "content": "Keep halted. Explain."},
+    ]
+    before = copy.deepcopy(messages)
+    with pytest.raises(InvalidRequestError, match="no failed computer call was resurrected"):
+        provider()._convert_messages(messages)
+    assert messages == before
 
 
 def test_message_level_repair_cannot_fabricate_canonical_call_result():

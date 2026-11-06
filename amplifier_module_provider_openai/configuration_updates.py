@@ -186,8 +186,14 @@ def validate_request(
     # options cannot silently inherit a single-agent eligibility claim.
     if set(reasoning) - {"mode", "effort", "context", "summary", "generate_summary"}:
         raise ValueError("configuration_update does not support reasoning extensions")
-    if "multi_agent" in body and body["multi_agent"] != {"enabled": False}:
-        raise ValueError("configuration_update requires single-agent mode")
+    if "multi_agent" in body:
+        multi_agent = body["multi_agent"]
+        if (
+            not isinstance(multi_agent, dict)
+            or set(multi_agent) != {"enabled"}
+            or multi_agent["enabled"] is not False
+        ):
+            raise ValueError("configuration_update requires single-agent mode")
     if reasoning.get("effort") is not None:
         _validate_model_effort(model, reasoning["effort"])
     if body.get("truncation") not in (None, "disabled"):
