@@ -464,8 +464,8 @@ The provider exposes OpenAI's prompt-caching hint parameters. Defaults:
 supported), `prompt_cache_key` unset, `truncation = null` (the field is
 omitted so the cached prefix is never silently rewritten on overflow).
 
-For GPT-6, the legacy retention field is always omitted; use
-`prompt_cache_options.ttl: "30m"` instead (`"12h"` is also supported for GPT-6.1 Terra).
+For exact GPT-5.6/GPT-6 models, the legacy retention field is omitted; use
+`prompt_cache_options.ttl: "30m"` or `"12h"` instead.
 
 See also: [OpenAI Cookbook — Prompt Caching 201](https://cookbook.openai.com/examples/prompt_caching_201).
 
@@ -487,14 +487,13 @@ OpenAI's July 2025 guidance.
 | Value | Meaning |
 | --- | --- |
 | `"24h"` | Extended GPU-local KV storage. Provider default. |
-| `"in_memory"` | 5–10 min in-process cache. Rejected by gpt-5.5/5.6 (auto-dropped to `"24h"` with a warning). |
+| `"in_memory"` | Legacy in-process cache hint. GPT-5.5 replaces it with `"24h"`; exact GPT-5.6/GPT-6 models remove legacy retention and use `prompt_cache_options`. |
 | `null` | Field omitted; OpenAI picks the per-model default. |
 
 ### `prompt_cache_options` — tool-result boundaries alongside implicit caching
 
-For the curated GPT-6 models (`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
-`gpt-6.1-sol`), `gpt-5.6`, and the GPT-5.6 Sol/Luna/Terra tiers and their
-hyphenated variants, the provider adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
+For the five exact GPT-6 IDs, `gpt-5.6`, and the exact GPT-5.6 Sol/Luna/Terra
+tiers, the provider adds `prompt_cache_breakpoint: {mode: explicit}` to each eligible function
 result. A string output becomes an `input_text` block with identical text;
 structured outputs receive the marker on their last string-valued `input_text`
 block. Existing markers and non-text blocks are preserved. Instructions, roles,
@@ -880,7 +879,7 @@ Neutral replay uses JSON-safe `openai:computer_calls` response/message metadata
 and `openai:computer_use` block metadata. Both copies must agree with the canonical
 call and original vendor actions. Duplicate identities cannot authorize another
 execution, including after historical failure projection. Count, complete,
-stream, text-only continuation, and the optional native adapter use the same
+stream, safe output-limit continuation, and the optional native adapter use the same
 binding/projection. Incomplete tool batches are not internally replayed.
 
 Successful native observations are retained once in returned
