@@ -400,7 +400,7 @@ _LONG_RATES["gpt-5.6"] = _LONG_RATES["gpt-5.6-sol"]
 
 
 def _find_rates(
-    model: str, table: dict[str, dict[str, Decimal]] | None = None
+    model: object, table: dict[str, dict[str, Decimal]] | None = None
 ) -> dict[str, Decimal] | None:
     """Look up pricing rates, falling back from snapshot id to family alias.
 
@@ -417,8 +417,12 @@ def _find_rates(
         table: rate table to search. Defaults to _RATES (short-context). Pass
             _LONG_RATES to resolve long-context rates for the same model.
 
-    Returns None (not a fabricated $0.00) when neither resolves.
+    Returns None (not a fabricated $0.00) when neither resolves, including
+    missing or malformed vendor model evidence. Billing can run while handling
+    an invalid response; it must not mask that original error.
     """
+    if not isinstance(model, str) or not model:
+        return None
     if table is None:
         table = _RATES
     rates = table.get(model)
@@ -434,7 +438,7 @@ def _find_rates(
     return table.get(m.group("base"))
 
 
-def requires_cache_usage_evidence(model: str) -> bool:
+def requires_cache_usage_evidence(model: object) -> bool:
     """Pricing-reader requirement, including retained historical snapshots.
 
     This is deliberately distinct from exact-ID request-feature eligibility.
@@ -444,7 +448,7 @@ def requires_cache_usage_evidence(model: str) -> bool:
 
 
 def compute_cost(
-    model: str,
+    model: object,
     *,
     prompt_tokens: int = 0,
     completion_tokens: int = 0,

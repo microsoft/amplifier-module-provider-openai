@@ -261,3 +261,25 @@ def test_historical_readers_and_legacy_tiers_are_preserved():
 def test_undocumented_ids_never_get_inferred_prices(model):
     assert compute_cost(model) is None
     assert compute_cost(model, prompt_tokens=1_000_000) is None
+
+
+@pytest.mark.parametrize("model", [
+    None, "", False, True, 0, 55, 1.5, b"gpt-5.5", [], ["gpt-5.5"],
+    {}, {"model": "gpt-5.5"},
+])
+def test_malformed_vendor_model_is_unknown_even_with_explicit_zero_usage(model):
+    from amplifier_module_provider_openai._cost import (
+        _find_rates,
+        requires_cache_usage_evidence,
+    )
+
+    assert _find_rates(model) is None
+    assert _find_rates(model, _LONG_RATES) is None
+    assert requires_cache_usage_evidence(model) is False
+    assert compute_cost(model) is None
+    assert compute_cost(model, prompt_tokens=100, completion_tokens=10) is None
+
+
+def test_known_zero_usage_remains_distinct_from_missing_model():
+    assert compute_cost("gpt-5.5") == Decimal(0)
+    assert compute_cost(None) is None
