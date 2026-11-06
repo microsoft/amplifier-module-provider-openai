@@ -2836,7 +2836,13 @@ class OpenAIProvider:
                     lambda query=query: client.get(
                         "/models",
                         cast_to=httpx.Response,
-                        options={"max_retries": 0, "params": query},
+                        options={
+                            "max_retries": 0,
+                            "params": query,
+                            # Match the generated Models API; generic requests
+                            # otherwise also allow admin-key authentication.
+                            "security": {"bearer_auth": True},
+                        },
                     ),
                     operation="discover_models",
                 )

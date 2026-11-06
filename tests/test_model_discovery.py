@@ -177,6 +177,52 @@ async def test_discovery_preserves_absent_account_binding_after_environment_chan
 
 
 @pytest.mark.asyncio
+async def test_discovery_rejects_admin_only_credentials_before_transport(monkeypatch):
+    for name in (
+        "OPENAI_API_KEY", "OPENAI_ADMIN_KEY", "OPENAI_CUSTOM_HEADERS",
+        "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    requests = []
+
+    def transport(request):
+        requests.append(request)
+        # A valid response makes an unauthorized admin fallback observable as
+        # success, rather than a transport exception that discovery could wrap.
+        return httpx.Response(200, json=catalog("admin-fallback-must-not-be-used"))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False)
+    async with AsyncOpenAI(
+        api_key="",
+        admin_api_key="fixture-admin",
+        base_url=ENDPOINT,
+        http_client=http,
+        max_retries=2,
+    ) as client:
+        provider = OpenAIProvider(
+            client=client, config={"max_retries": 0, "base_url": ENDPOINT},
+        )
+        # The generated /models operation allows bearer_auth only. Generic
+        # client.get defaults also allow admin_api_key_auth in SDK 3.29.
+        with pytest.raises(TypeError, match="Could not resolve authentication method"):
+            await client.models.list()
+        assert requests == []
+
+        with pytest.raises(kernel_errors.LLMError) as raised:
+            await provider.discover_models()
+        assert raised.value.provider == "openai"
+        assert raised.value.retryable is False
+        assert requests == []  # Refuse locally, not after sending the admin key.
+        assert provider.client is client
+        assert client.api_key == ""
+        assert client.admin_api_key == "fixture-admin"
+        assert client.max_retries == 2
+        assert not http.is_closed
+    assert http.is_closed
+
+
+@pytest.mark.asyncio
 async def test_successful_empty_catalog_is_not_a_default_or_error():
     async with sdk_provider(
         lambda _: httpx.Response(200, json=catalog()),
