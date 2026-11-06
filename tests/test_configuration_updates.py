@@ -385,6 +385,26 @@ def test_message_level_repair_cannot_fabricate_canonical_call_result():
     assert request.model_dump() == before
 
 
+def test_message_repair_respects_only_exact_private_pending_call_qualification():
+    item = {"type": "function_call", "call_id": "async1", "id": "fc1",
+            "name": "read", "arguments": "{}", "status": "completed", "async": True}
+
+    class PendingProvider(OpenAIProvider):
+        def _canonical_pending_async_call(self, candidate):
+            return candidate == item
+
+    request = ChatRequest(messages=[Message(
+        role="assistant",
+        content=[{"type": "tool_call", "id": "async1", "name": "read", "input": {}}],
+        metadata={"openai:output_items": [item]},
+    )])
+    original = request.model_dump()
+    planned, event = PendingProvider(api_key="offline")._plan_tool_repairs(request)
+    assert planned.model_dump() == original
+    assert event is None
+    assert request.model_dump() == original
+
+
 def test_final_input_override_cannot_move_update_with_identical_sequence():
     p = provider()
     request = request_with_update()

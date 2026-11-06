@@ -3217,6 +3217,45 @@ class OpenAIProvider:
         plan_observations(original, replay)
         request = request.model_copy(deep=True)
         missing = self._find_missing_tool_results(request.messages)
+        pending = set()
+        for index, identity, _, _ in missing:
+            output = (request.messages[index].metadata or {}).get("openai:output_items")
+            if not isinstance(output, list):
+                continue
+            candidates = [
+                item for item in output if isinstance(item, dict)
+                and item.get("call_id") == identity
+                and item.get("type") in {"function_call", "custom_tool_call"}
+            ]
+            # The native owner qualifies the complete exact original item.
+            # Neither legacy content nor async/public metadata can opt out of
+            # repair or canonical pairing. Wrong-type/injected results must
+            # reach the ordinary wire guard instead of gaining an exception.
+            has_result = any(
+                message.role == "tool" and message.tool_call_id == identity
+                or any(
+                    isinstance(item, dict) and item.get("call_id") == identity
+                    and item.get("type") in {
+                        "function_call_output", "custom_tool_call_output",
+                        "apply_patch_call_output", "computer_call_output",
+                    }
+                    for item in (
+                        (message.metadata or {}).get("openai:output_items")
+                        if isinstance(
+                            (message.metadata or {}).get("openai:output_items"), list
+                        ) else []
+                    )
+                )
+                for message in request.messages
+            )
+            if (
+                len(candidates) == 1 and not has_result
+                and self._canonical_pending_async_call(candidates[0])
+            ):
+                pending.add((index, identity))
+        missing = [
+            entry for entry in missing if (entry[0], entry[1]) not in pending
+        ]
         event_data = None
         if any(
             "openai:output_items" in (request.messages[index].metadata or {})
