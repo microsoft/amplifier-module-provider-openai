@@ -4816,11 +4816,15 @@ class OpenAIProvider:
                     openai_messages.append(restatement)
                 i += 1
                 continue
-            if "openai:output_items" in (msg.get("metadata") or {}):
+            # Replay output only for assistant messages. Consumers can derive
+            # another role/content view while retaining response metadata;
+            # that metadata must not replace their supplied input.
+            if (
+                msg.get("role") == "assistant"
+                and "openai:output_items" in (msg.get("metadata") or {})
+            ):
                 from ._response_handling import replay_output_items
 
-                if msg.get("role") != "assistant":
-                    raise ValueError("Canonical response output requires an assistant message")
                 output = []
                 for item in replay_output_items(msg["metadata"]["openai:output_items"]):
                     if item.get("type") == "reasoning" and i <= _reasoning_cutoff:
