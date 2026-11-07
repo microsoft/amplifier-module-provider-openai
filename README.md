@@ -752,6 +752,12 @@ Both capture and replay remove `parsed_arguments` from function calls and `parse
 from output-text blocks. This also makes previously saved parsed output resumable
 without rewriting transcripts. Tool arguments, opaque fields and explicit API
 nulls remain intact; counting and generation use the same normalized input.
+`openai:output_items` replays output only on assistant messages. If a host derives
+a different role/content view while retaining that metadata, the provider uses
+the supplied role and content through its ordinary conversion path. Metadata
+does not turn user input or tool results into assistant output. Hosts that want
+native reasoning, phase and item identities replayed must retain the assistant
+role; validation of those items and their real tool results remains unchanged.
 Hosts needing a strict one-generation boundary should use `auto_continue: false`.
 Neither the 922K input ceiling nor optional feature eligibility is a live
 large-input or every-host qualification.
