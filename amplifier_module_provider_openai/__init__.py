@@ -4946,6 +4946,11 @@ class OpenAIProvider:
                         self._native_call_ids.add(identity)
                         if item["type"] == "computer_call":
                             self._native_call_types[identity] = "computer"
+                    elif item.get("type") in {"function_call", "tool_call"}:
+                        # Historical calls retain their captured protocol even
+                        # after tools change or legacy inference tracked the ID.
+                        self._native_call_ids.discard(identity)
+                        self._native_call_types.pop(identity, None)
                     output.append(item)
                 openai_messages.extend(output)
                 canonical_item_ids.update(id(item) for item in output)
