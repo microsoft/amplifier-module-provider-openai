@@ -1,12 +1,16 @@
 """Canonical output parity and lossless, fail-closed continuation contracts."""
 
 import copy
+import json
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from amplifier_core import ChatRequest, Message, llm_errors
+from openai import AsyncOpenAI, omit
+from openai.lib._parsing._responses import parse_response
 from openai.types.responses import Response
 
 from amplifier_module_provider_openai import OpenAIChatResponse, OpenAIProvider
@@ -127,6 +131,148 @@ def test_sdk_omits_only_unset_defaults_preserves_explicit_nulls_and_unknown_fiel
     assert response_items(sdk.output) == [item]
     explicit = Response.model_validate(payload([text(phase=None)]))
     assert response_items(explicit.output)[0]["phase"] is None
+
+
+def parsed_response(*, parse_arguments=True):
+    """The stream finalizer adds these local fields even without structured text."""
+    return parse_response(
+        text_format=omit,
+        input_tools=[
+            {
+                "type": "function",
+                "name": "read",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+            }
+        ]
+        if parse_arguments
+        else [],
+        response=Response.model_validate(payload([text(), FUNCTION])),
+    )
+
+
+@pytest.mark.parametrize("parse_arguments", [False, True])
+@pytest.mark.parametrize("as_sdk", [False, True])
+def test_parsed_stream_output_and_saved_history_exclude_sdk_only_fields(
+    as_sdk, parse_arguments
+):
+    response = parsed_response(parse_arguments=parse_arguments)
+    saved = response.model_dump(mode="json", exclude_unset=True)["output"]
+    assert saved[0]["content"][0]["parsed"] is None
+    assert "parsed_arguments" in saved[1]
+    before = copy.deepcopy(saved)
+    output = response.output if as_sdk else saved
+    assert response_items(output) == [text(), FUNCTION]
+    assert replay_output_items(output) == [text(), FUNCTION]
+    assert saved == before  # Old transcripts are normalized in memory, not rewritten.
+    provider = OpenAIProvider(api_key="offline")
+    reply = provider._convert_to_chat_response(response if as_sdk else payload(saved))
+    assert reply.metadata["openai:output_items"] == [text(), FUNCTION]
+    assert reply.tool_calls[0].arguments == {"path": "a"}
+
+
+def test_sdk_field_removal_does_not_rewrite_tool_arguments_or_opaque_payloads():
+    item = {
+        **FUNCTION,
+        "parsed_arguments": None,
+        "arguments": '{"parsed_arguments":1,"parsed":2}',
+        "future": {"parsed_arguments": "keep", "parsed": "keep"},
+    }
+    unknown = {"type": "future_item", "parsed": "keep", "parsed_arguments": "keep"}
+    message = text()
+    message["content"].append({"type": "future_content", "parsed": "keep"})
+    expected = copy.deepcopy(item)
+    del expected["parsed_arguments"]
+    assert replay_output_items([item, unknown, message]) == [expected, unknown, message]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_saved_parsed_output_has_same_clean_wire_in_count_and_generation(
+    streaming,
+):
+    # Exercise the actual SDK HTTP serialization: fake clients miss SDK-added fields.
+    observed = []
+
+    def receive(request):
+        body = json.loads(request.content)
+        observed.append((request.url.path, body))
+        for item in body["input"]:
+            assert "parsed_arguments" not in item
+            for part in (
+                item.get("content", []) if isinstance(item.get("content"), list) else []
+            ):
+                assert "parsed" not in part
+        if request.url.path.endswith("/input_tokens"):
+            return httpx.Response(200, json={"input_tokens": 100})
+        response = payload([text(1)], index=1)
+        if streaming:
+            events = [
+                {
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": payload([], index=1, status="in_progress"),
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": response,
+                },
+            ]
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text="".join(
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                    for event in events
+                ),
+            )
+        return httpx.Response(200, json=response)
+
+    async with AsyncOpenAI(
+        api_key="offline",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(receive)),
+        max_retries=0,
+    ) as client:
+        provider = OpenAIProvider(
+            api_key="offline",
+            client=client,
+            config={
+                "default_model": "gpt-6.1-sol",
+                "use_streaming": streaming,
+                "max_retries": 0,
+            },
+        )
+        saved = parsed_response().model_dump(mode="json", exclude_unset=True)["output"]
+        request = ChatRequest(
+            messages=[
+                Message(role="user", content="Read a"),
+                Message(
+                    role="assistant",
+                    content="",
+                    metadata={"openai:output_items": saved},
+                ),
+                Message(
+                    role="tool", tool_call_id="call_function", content="contents of a"
+                ),
+                Message(role="user", content="Continue"),
+            ]
+        )
+        before = request.model_dump()
+        await provider.request_budget(request, context_estimate=100)
+        reply = await provider.complete(request)
+        assert reply.metadata["openai:output_items"] == [text(1)]
+        assert request.model_dump() == before
+    counts = [body for path, body in observed if path.endswith("/input_tokens")]
+    creates = [body for path, body in observed if path.endswith("/responses")]
+    assert len(counts) == 2 and len(creates) == 1
+    assert counts[0]["input"] == counts[1]["input"] == creates[0]["input"]
+    assert FUNCTION in creates[0]["input"]
 
 
 def test_continuation_preserves_order_phase_ids_ciphertext_and_opaque_items_without_mutation():

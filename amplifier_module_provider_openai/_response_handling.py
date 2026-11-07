@@ -68,8 +68,9 @@ def _wire_value(value: Any) -> Any:
 def response_items(output: list[Any]) -> list[dict[str, Any]]:
     """Own ordered output, including opaque fields, IDs, namespaces and phase.
 
-    SDKs add optional output defaults which older endpoints may not accept as
-    input. Only unset defaults are excluded; explicit wire nulls are retained.
+    SDKs add unset defaults and local parsing annotations which are not API
+    input fields. Exclude those while retaining explicit wire nulls. Normalize
+    saved dicts too, so histories captured by older versions remain resumable.
     """
     items = [_wire_value(item) for item in output]
     if any(
@@ -79,6 +80,15 @@ def response_items(output: list[Any]) -> list[dict[str, Any]]:
         raise kernel_errors.LLMError(
             "Response output contains a non-item value", retryable=False
         )
+    for item in items:
+        if item["type"] == "function_call":
+            item.pop("parsed_arguments", None)
+        elif item["type"] == "message":
+            for part in item.get("content", []) or []:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    part.pop("parsed", None)
+    # Do not recursively strip these names: tool arguments and opaque fields
+    # may legitimately use them. All changes above affect our owned copy only.
     return items
 
 
