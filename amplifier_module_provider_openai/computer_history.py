@@ -54,13 +54,25 @@ def project_failed_computer_history(
     from .neutral_computer import neutral_screenshot, replay_calls
     neutral = replay_calls(messages)
     native.update(neutral)
+    ordinary = set()
     for message in messages:
         if message.get("role") == "assistant":
+            # Saved protocol identity outranks a tool-name/argument heuristic.
+            # The current roster may no longer contain an old ordinary tool.
+            output = (message.get("metadata") or {}).get("openai:output_items")
+            if isinstance(output, list):
+                ordinary.update(
+                    item.get("call_id")
+                    for item in output
+                    if isinstance(item, dict)
+                    and item.get("type") in {"function_call", "tool_call"}
+                )
             native.update(
                 call.get("id") or call.get("tool_call_id")
                 for call in _calls(message)
                 if _native(call) and (call.get("name") or call.get("tool")) not in ordinary_names
             )
+    native.difference_update(ordinary - neutral.keys())
     last_user = max(
         (
             i

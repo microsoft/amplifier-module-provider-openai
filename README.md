@@ -946,6 +946,11 @@ including SDK `extra_body`, are finalized. Intent and provider-local diagnostics
 never go into the SDK payload. Ordinary tools named `computer` or `screenshot`
 without intent remain ordinary functions.
 
+Saved assistant output retains the original call type when the available tools
+change. An ordinary `function_call` named `computer` keeps its actual function
+result even after that tool is removed; its name and arguments do not turn it
+into a native computer call. Missing results still reject the request.
+
 The evidenced native subset is screenshot, mouse movement, left/right/middle
 click, double-click, typing, and supported single-key chords. Coordinates remain
 screenshot pixels. A native call becomes one ordered canonical batch:
