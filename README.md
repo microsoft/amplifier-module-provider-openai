@@ -747,6 +747,11 @@ including reasoning and assistant phase, instead of reconstructing text. It
 refuses outstanding client tool calls rather than fabricating results or dropping
 them. Only `incomplete_details.reason="max_output_tokens"` permits continuation;
 content filtering and unspecified incompletion do not trigger another generation.
+Canonical history retains API output fields, not SDK-local parsing annotations.
+Both capture and replay remove `parsed_arguments` from function calls and `parsed`
+from output-text blocks. This also makes previously saved parsed output resumable
+without rewriting transcripts. Tool arguments, opaque fields and explicit API
+nulls remain intact; counting and generation use the same normalized input.
 Hosts needing a strict one-generation boundary should use `auto_continue: false`.
 Neither the 922K input ceiling nor optional feature eligibility is a live
 large-input or every-host qualification.
