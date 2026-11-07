@@ -8,7 +8,7 @@ Covers:
   (e) None != Decimal('0')
   (f) Result type is always Decimal, never float
   (g) Cache-only (fresh_input=0)
-  (h) Models returning None until rates added
+  (h) Documented legacy pricing
   (i) gpt-5.5 pricing
   (j) gpt-5.5-pro: no cache discount
 """
@@ -24,9 +24,9 @@ from amplifier_module_provider_openai._cost import _RATES, _find_rates, compute_
 # (a) Known model: gpt-5.4 input cost
 # ---------------------------------------------------------------------------
 def test_known_model_input_cost():
-    """gpt-5.4: 1M input (no cache) → $2.50."""
+    """gpt-5.4: 1M input crosses 272K and uses the $5 long-context rate."""
     result = compute_cost("gpt-5.4", prompt_tokens=1_000_000)
-    assert result == Decimal("2.50"), f"Expected Decimal('2.50'), got {result!r}"
+    assert result == Decimal("5.00"), f"Expected Decimal('5.00'), got {result!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -42,14 +42,14 @@ def test_known_model_output_cost():
 # (c) REQUIRED: Cached request does NOT double-charge
 # ---------------------------------------------------------------------------
 def test_cached_request_does_not_double_charge():
-    """gpt-5.4: 1M prompt_tokens, 1M cached_tokens → $0.25 (cache_read only).
+    """gpt-5.4: 1M prompt_tokens, 1M cached_tokens → $0.50 (long cache_read only).
 
     fresh_input = 1M - 1M = 0
-    cost = 0 × $2.50/M + 0 × $15.00/M + 1M × $0.25/M = $0.25
+    cost = 0 × $5.00/M + 0 × $22.50/M + 1M × $0.50/M = $0.50
     """
     result = compute_cost("gpt-5.4", prompt_tokens=1_000_000, cached_tokens=1_000_000)
-    assert result == Decimal("0.25"), (
-        f"Expected Decimal('0.25') (cache_read only, no double-charge), got {result!r}"
+    assert result == Decimal("0.50"), (
+        f"Expected Decimal('0.50') (cache_read only, no double-charge), got {result!r}"
     )
 
 
@@ -88,36 +88,37 @@ def test_result_type_is_decimal():
 def test_cache_only_no_fresh_input():
     """When prompt_tokens == cached_tokens, fresh cost is 0, only cache_read cost."""
     result = compute_cost("gpt-5.5", prompt_tokens=500_000, cached_tokens=500_000)
-    expected = Decimal(500000) * Decimal("0.50") / Decimal(1000000)
-    assert result == expected
+    assert result == Decimal("0.50")
 
 
 # ---------------------------------------------------------------------------
-# (h) Models returning None (not yet priced)
+# (h) Documented prices replace the stale "not yet priced" TODO.
+# https://developers.openai.com/api/docs/pricing.md (2026-11-06)
+# https://developers.openai.com/api/docs/models/gpt-5.1-codex.md
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "model",
+    "model,expected",
     [
-        "gpt-5.3-codex",
-        "gpt-5.2",
-        "gpt-5.2-pro",
-        "gpt-5.1",
-        "gpt-5.1-codex",
-        "gpt-5-mini",
+        ("gpt-5.3-codex", "1.75"),
+        ("gpt-5.2", "1.75"),
+        ("gpt-5.2-pro", "21.00"),
+        ("gpt-5.1", "1.25"),
+        ("gpt-5.1-codex", "1.25"),
+        ("gpt-5-mini", "0.25"),
     ],
 )
-def test_unpriced_models_return_none(model):
-    """Models listed as 'return None until rates are added' must return None."""
+def test_previously_unpriced_models_use_documented_rates(model, expected):
+    """Current source prices are known; this does not assert model availability."""
     result = compute_cost(model, prompt_tokens=1_000_000)
-    assert result is None, f"Expected None for unpriced model {model!r}, got {result!r}"
+    assert result == Decimal(expected)
 
 
 # ---------------------------------------------------------------------------
 # (i) gpt-5.5 pricing: $5/$30/$0.50
 # ---------------------------------------------------------------------------
 def test_gpt_55_pricing():
-    """gpt-5.5: 1M fresh input → $5.00, 1M output → $30.00, 1M cached → $0.50."""
-    assert compute_cost("gpt-5.5", prompt_tokens=1_000_000) == Decimal("5.00")
+    """1M input uses long pricing; output alone and cached-only legacy calls do not."""
+    assert compute_cost("gpt-5.5", prompt_tokens=1_000_000) == Decimal("10.00")
     assert compute_cost("gpt-5.5", completion_tokens=1_000_000) == Decimal("30.00")
     assert compute_cost("gpt-5.5", cached_tokens=1_000_000) == Decimal("0.50")
 
@@ -220,7 +221,7 @@ def test_dated_snapshot_resolves_via_fallback(
 ):
     """Dated snapshots (what the API echoes back) resolve to the family alias rates."""
     assert _find_rates(snapshot) is not None, f"{snapshot} should resolve via fallback"
-    assert compute_cost(snapshot, prompt_tokens=1_000_000) == expected_input
+    assert compute_cost(snapshot, prompt_tokens=200_000) == expected_input / 5
     assert compute_cost(snapshot, completion_tokens=1_000_000) == expected_output
     assert compute_cost(snapshot, cached_tokens=1_000_000) == expected_cache
 
@@ -257,8 +258,8 @@ def test_exact_match_wins_over_family_fallback():
     _RATES["gpt-5.5-2099-01-01"] = sentinel
     try:
         assert _find_rates("gpt-5.5-2099-01-01") is sentinel
-        assert compute_cost("gpt-5.5-2099-01-01", prompt_tokens=1_000_000) == Decimal(
-            "999.00"
+        assert compute_cost("gpt-5.5-2099-01-01", prompt_tokens=1_000) == Decimal(
+            "0.999"
         )
     finally:
         del _RATES["gpt-5.5-2099-01-01"]
@@ -290,7 +291,7 @@ def test_dated_snapshot_matches_alias_pricing(
     snapshot, input_cost, output_cost, cache_cost
 ):
     """Dated snapshot IDs (what the API echoes back) must resolve to the same rates as alias."""
-    assert compute_cost(snapshot, prompt_tokens=1_000_000) == input_cost, (
+    assert compute_cost(snapshot, prompt_tokens=200_000) == input_cost / 5, (
         f"{snapshot} input"
     )
     assert compute_cost(snapshot, completion_tokens=1_000_000) == output_cost, (
@@ -356,11 +357,14 @@ def test_gpt_56_family_rates(
 
     # --- short context: input at/below the 272K threshold keeps the standard rate ---
     assert compute_cost(model, prompt_tokens=200_000) == Decimal(200_000) * inp / _M
-    # output / cache-read carry 0 prompt tokens -> below threshold -> short rate.
+    # Output alone keeps short pricing; cached tokens must be a subset of input.
     assert compute_cost(model, completion_tokens=1_000_000) == out
-    assert compute_cost(model, cached_tokens=1_000_000) == cread
+    assert compute_cost(model, prompt_tokens=200_000, cached_tokens=200_000) == cread / 5
     assert (
-        compute_cost(model, prompt_tokens=200_000, cache_write_tokens=200_000)
+        compute_cost(
+            model, prompt_tokens=200_000, cache_write_tokens=200_000,
+            cache_write_tokens_details={"ttl_30m_tokens": 200_000, "ttl_12h_tokens": 0},
+        )
         == Decimal(200_000) * cwrite / _M
     )
 
@@ -378,7 +382,10 @@ def test_gpt_56_family_rates(
     )
     # 1M all cache-write input (>272K) -> long cache-write rate.
     assert (
-        compute_cost(model, prompt_tokens=1_000_000, cache_write_tokens=1_000_000)
+        compute_cost(
+            model, prompt_tokens=1_000_000, cache_write_tokens=1_000_000,
+            cache_write_tokens_details={"ttl_30m_tokens": 1_000_000, "ttl_12h_tokens": 0},
+        )
         == l_cwrite
     )
 
@@ -398,6 +405,7 @@ def test_gpt_56_no_triple_charge_mixed_turn():
         completion_tokens=100,
         cached_tokens=200,
         cache_write_tokens=300,
+        cache_write_tokens_details={"ttl_30m_tokens": 300, "ttl_12h_tokens": 0},
     )
     assert result == Decimal("0.00558"), f"got {result!r}"
 
@@ -409,8 +417,8 @@ def test_gpt_56_golden_from_real_usage():
     (see projects/gpt-5-6-support/ground-truth/usage-real.json). The API supplied
     the usage/token evidence; expected costs below are computed at current rates.
 
-    WRITE call: input=2655, cache_write=2652, cached=0, output=5
-        fresh=3 @4 + 2652 @5 + 5 @20 = 0.000012 + 0.013260 + 0.000100 = 0.013372
+    WRITE call: input=2655, cache_write=2652, cached=0, output=5.
+        Historical capture has no lifetime evidence: cost is now unknown.
     READ  call: input=2655, cache_write=0, cached=2652, output=5
         fresh=3 @4 + 2652 @0.40 + 5 @20 = 0.000012 + 0.0010608 + 0.000100 = 0.0011728
     """
@@ -428,15 +436,8 @@ def test_gpt_56_golden_from_real_usage():
         cached_tokens=2652,
         cache_write_tokens=0,
     )
-    assert write == Decimal("0.013372"), f"WRITE got {write!r}"
+    assert write is None
     assert read == Decimal("0.0011728"), f"READ got {read!r}"
-    # The write turn MUST cost more than billing those tokens as plain input --
-    # this is the 1.25x premium, and guards against silent regression to $4 input.
-    plain_input = compute_cost(
-        "gpt-5.6-sol", prompt_tokens=2655, completion_tokens=5, cached_tokens=0
-    )
-    assert write is not None and plain_input is not None
-    assert write > plain_input
 
 
 def test_gpt_56_alias_snapshot_resolves():
@@ -453,18 +454,13 @@ def test_gpt_56_alias_snapshot_resolves():
     )
 
 
-def test_long_context_rerate_requires_both_gates():
-    """Long-context re-rating fires only when the model has BOTH a threshold AND
-    modelled long rates. The two gates are independent:
+def test_gpt_54_and_55_use_documented_long_context_rates():
+    """Current pricing documents both thresholds and both long-context rates.
 
-    - gpt-5.4: has a 272K threshold but NO _LONG_RATES entry -> never re-rates,
-      keeps its single short rate even at 1M input.
-    - gpt-5.5: threshold is None -> never re-rates regardless of input size.
+    https://developers.openai.com/api/docs/pricing.md (2026-11-06).
     """
-    # gpt-5.4 short input $2.50/M applies even at 1M input (no long rates modelled).
-    assert compute_cost("gpt-5.4", prompt_tokens=1_000_000) == Decimal("2.50")
-    # gpt-5.5 short input $5.00/M applies even at 1M input (threshold is None).
-    assert compute_cost("gpt-5.5", prompt_tokens=1_000_000) == Decimal("5.00")
+    assert compute_cost("gpt-5.4", prompt_tokens=1_000_000) == Decimal("5.00")
+    assert compute_cost("gpt-5.5", prompt_tokens=1_000_000) == Decimal("10.00")
 
 
 def test_cache_write_ignored_for_models_without_write_rate():
@@ -479,21 +475,17 @@ def test_cache_write_ignored_for_models_without_write_rate():
 # ---------------------------------------------------------------------------
 # (r) Golden: exact measured numbers from the cache-write input-accounting
 # defect investigation (see test_cache_write_input_accounting.py). This is
-# the INDEPENDENT verification that compute_cost() itself was, and remains,
-# correct -- the input-accounting bug lived only in how the provider mapped
+# a historical raw-count fixture. The input-accounting bug lived in how the provider mapped
 # raw usage fields onto the public Usage.input_tokens contract, NOT in cost
 # math. compute_cost() must always be fed the RAW vendor total (prompt_tokens
 # = fresh + cache_read + cache_write combined), never the normalized
 # Usage.input_tokens value.
 # ---------------------------------------------------------------------------
-def test_golden_measured_turn_gross_9028_cache_write_9025():
+def test_historical_measured_write_without_lifetime_is_unknown():
     """gpt-5.6-sol, short context: input=9028 (raw), cache_write=9025,
-    cached=0, output=7. Token counts are from a live capture; expected cost uses
-    current rates.
+    cached=0, output=7. Token counts are from a live capture without lifetime data.
 
-    fresh = 9028 - 0 - 9025 = 3
-    cost  = 3 @ $4.00/M + 9025 @ $5.00/M + 7 @ $20.00/M
-          = 0.000012 + 0.045125 + 0.00014 = 0.045277
+    Do not manufacture 30m evidence for this old write capture.
     """
     result = compute_cost(
         "gpt-5.6-sol",
@@ -502,4 +494,4 @@ def test_golden_measured_turn_gross_9028_cache_write_9025():
         cached_tokens=0,
         cache_write_tokens=9_025,
     )
-    assert result == Decimal("0.045277"), f"got {result!r}"
+    assert result is None

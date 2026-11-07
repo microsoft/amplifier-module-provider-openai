@@ -16,6 +16,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from urllib.parse import urlparse
 
 import websockets
@@ -29,10 +30,12 @@ from . import (
     _add_tool_output_cache_breakpoints,
     _RawResponseObject,
 )
-from .native_checkpoint import NativeCheckpointMixin
+from ._capabilities import get_request_policy
+from .native_checkpoint import NativeCheckpointMixin, digest
 
 NATIVE_REQUEST = contextvars.ContextVar("openai_native_request", default=None)
 NATIVE_BUDGET = contextvars.ContextVar("openai_native_budget", default=None)
+NATIVE_BILLING = contextvars.ContextVar("openai_native_billing", default=None)
 _NOT_SENT_RECEIPT_TIMEOUT = 1.0  # Per cooperative sink; never a model deadline.
 
 
@@ -54,6 +57,39 @@ class NativeSendAdmission:
     admit: Callable[[NativeOutboundEnvelope], bool] = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class NativeAsyncTool:
+    """Host-qualified handler for one exact wire tool, not an approval bypass.
+
+    An optional synchronous ``owner.native_async_tools()`` returns these records.
+    ``start`` receives a deep copy of the complete function/custom call item,
+    including the original call_id, namespace and arguments/input. The host MUST
+    persist custody before effects and enforce approvals, Stop and budgets at
+    each dispatch. It exposes only the real final output via native_job(call_id)
+    (result=None while running). A returned start acknowledgment is never output.
+    Restored uncertain jobs must not be started again.
+    """
+
+    name: str
+    start: Callable = field(repr=False)
+    kind: str = "function"
+    namespace: str | None = None
+
+
+class NativeResponse(_RawResponseObject):
+    """Aggregate public usage with immutable per-terminal pricing evidence."""
+
+    def __init__(self, data, terminals, costs):
+        super().__init__(data)
+        self.native_terminals = tuple(copy.deepcopy(terminals))
+        self.native_terminal_cost = (
+            sum(costs, Decimal(0)) if costs and all(c is not None for c in costs)
+            else None
+        )
+        known = [cost for cost in costs if cost is not None]
+        self.native_known_terminal_cost = sum(known, Decimal(0)) if known else None
+
+
 def key(message):
     return json.dumps(message, sort_keys=True, default=str)
 
@@ -72,7 +108,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
     @classmethod
     def wrap(
         cls, original, *, owner_getter, trace=None, trace_context=None, lifecycle=None,
-        prepare_send=None,
+        prepare_send=None, progressive_output=False,
     ):
         if "complete" in original.__dict__:
             raise ValueError(
@@ -86,9 +122,18 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         provider._close_failure = None
         provider.lifecycle = lifecycle
         provider.prepare_send = prepare_send
+        if type(progressive_output) is not bool:
+            raise ValueError("progressive_output must be boolean")
+        provider.progressive_output = progressive_output
+        # Preserve instance/endpoint pricing overrides. Not all endpoint drivers
+        # implement this seam yet; absence of such an override is not qualification.
+        provider._terminal_cost = original._compute_attempt_cost
+        provider.__dict__.pop("_compute_attempt_cost", None)
         provider._steer_preparing = False
         provider._native_send_refused = False
         provider.owner_getter = owner_getter
+        provider._native_root = provider
+        provider._native_lineage_owner = None
         provider.trace = trace or (lambda *args: None)
         provider.trace_context = trace_context or (lambda *args: None)
         provider._request_messages = []
@@ -106,6 +151,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         provider.seen = Counter()
         provider.last_context = Counter()
         provider.async_calls = {}
+        provider._native_observed_async_calls = {}
+        provider._native_async_call_owners = {}
         provider.delivered_results = set()
         provider.pending_parent = False
         provider.full_messages = []
@@ -114,6 +161,275 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         provider.socket_opened_at = None
         provider.request_uncertain = False
         return provider
+
+    def _compute_attempt_cost(self, response):
+        if isinstance(response, NativeResponse):
+            return response.native_terminal_cost
+        return self._terminal_cost(response)
+
+    def _known_attempt_cost(self, response):
+        if isinstance(response, NativeResponse):
+            return response.native_known_terminal_cost
+        return None
+
+    def _error_response_observations(self, error):
+        """Return this generation's confirmed terminals, never inferred spend."""
+        ledger = NATIVE_BILLING.get()
+        if (
+            ledger is None or ledger["provider"] is not self
+            or ledger["owner"] is not self.owner or ledger["consumed"]
+            or ledger["returned"]
+        ):
+            return ()
+        ledger["consumed"] = True
+        observations = list(ledger["observations"].values())
+        if ledger["unresolved"]:
+            # The failing/disconnected successor may have incurred unknown spend.
+            # Keep confirmed tokens/subtotal, not a false known total.
+            observations.append(NativeResponse({}, [], []))
+        return tuple(observations)
+
+    def _record_native_terminal_billing(self, terminal, cost):
+        ledger = NATIVE_BILLING.get()
+        if ledger is not None and ledger["provider"] is self and ledger["owner"] is self.owner:
+            identity = terminal.get("id")
+            if identity not in ledger["observations"]:
+                ledger["observations"][identity] = NativeResponse(
+                    copy.deepcopy(terminal), [terminal], [cost],
+                )
+
+    def _canonical_pending_async_call(self, item):
+        """Private owner/job qualification; public async metadata grants nothing."""
+        root = getattr(self, "_native_probe_root", self._native_root)
+        active = NATIVE_REQUEST.get()
+        if not (
+            active is not None and getattr(active, "_native_root", None) is root
+            or getattr(self, "_native_probe_owner", None) is not None
+        ):
+            return False
+        owner = getattr(self, "_native_probe_owner", None) or root.owner
+        if owner is None or root.owner_getter() is not owner:
+            return False
+        identity = item.get("call_id")
+        if (
+            item.get("type") not in {"function_call", "custom_tool_call"}
+            or item.get("async") is not True or not isinstance(identity, str)
+            or item.get("status", "completed") != "completed"
+        ):
+            return False
+        original = root._native_observed_async_calls.get(identity)
+        if original is not None and root._native_async_call_owners.get(identity) is not owner:
+            return False
+        job = owner.native_job(identity)
+        if job is None or job.get("restored") and not job.get("recovered"):
+            return False
+        if original is None:
+            # A restored provider needs exact original call provenance from the
+            # durable host, not a transcript claiming its own qualification.
+            retained = getattr(owner, "native_async_call", None)
+            original = (
+                retained(identity)
+                if job.get("restored") is True and job.get("recovered") is True
+                and callable(retained) else None
+            )
+        if original != item:
+            return False
+        kind = "function" if item["type"] == "function_call" else "custom"
+        getter = getattr(owner, "native_async_tools", None)
+        declarations = getter() if callable(getter) else ()
+        if isinstance(declarations, (tuple, list)) and any(
+            isinstance(d, NativeAsyncTool) and callable(d.start)
+            and (d.kind, d.namespace, d.name) == (kind, item.get("namespace"), item.get("name"))
+            and d.name != "computer"
+            for d in declarations
+        ):
+            return True
+        return (
+            kind == "function" and not item.get("namespace")
+            and item.get("name") == "delegate"
+            and owner.config.get("background_delegate") is True
+            and callable(getattr(owner, "start_native_job", None))
+        )
+
+    def _native_eligible(self, params):
+        # Documented eligibility, not a family prefix or live account assertion.
+        body = params.get("extra_body") or {}
+        model = body.get("model", params.get("model"))
+        return isinstance(model, str) and get_request_policy(model).supports_steering
+
+    def _native_requires_recovery(self):
+        return bool(
+            self.owner or self._native_busy or self.pending_parent or self.inflight
+            or self.awaiting_successor or self.request_uncertain
+            or self._native_send_refused
+        )
+
+    def _native_admission_digest(self):
+        return digest({
+            "config": self.config, "extra_request_params": self.extra_request_params,
+            "default_model": self.default_model,
+        })
+
+    def _native_job(self, identity):
+        snapshot = getattr(self, "_native_job_snapshot", None)
+        return snapshot.get(identity) if snapshot is not None else self.owner.native_job(identity)
+
+    @staticmethod
+    def _native_wire_params(params):
+        """Expand the SDK's final JSON overlay before native count/admission."""
+        params = copy.deepcopy(params)
+        body = params.pop("extra_body", {})
+        if not isinstance(body, dict):
+            raise TypeError("Native extra_body must be an object")
+        params.update(body)
+        return params
+
+    def _async_tools(self, payload, neutral_aliases):
+        """Mark only exact qualified wire declarations; strip unqualified async."""
+        getter = getattr(self.owner, "native_async_tools", None)
+        declarations = getter() if callable(getter) else ()
+        if not isinstance(declarations, (tuple, list)) or len(declarations) > 1024:
+            raise ValueError("Invalid native async handler declaration")
+        if declarations and not callable(getattr(self.owner, "native_job", None)):
+            raise ValueError("Native async handlers require host job reconciliation")
+        handlers = {}
+        for declaration in declarations:
+            if (
+                not isinstance(declaration, NativeAsyncTool)
+                or declaration.kind not in {"function", "custom"}
+                or not isinstance(declaration.name, str) or not declaration.name
+                or not callable(declaration.start)
+                or declaration.namespace is not None
+                and (not isinstance(declaration.namespace, str) or not declaration.namespace)
+            ):
+                raise ValueError("Invalid native async handler declaration")
+            identity = declaration.kind, declaration.namespace, declaration.name
+            if identity in handlers or declaration.name in neutral_aliases | {"computer"}:
+                raise ValueError("Invalid or duplicate native async handler")
+            handlers[identity] = declaration.start
+        legacy = getattr(self.owner, "start_native_job", None)
+        if self.owner.config.get("background_delegate") and callable(legacy):
+            async def start_delegate(item):
+                await legacy(ToolCall(
+                    id=item["call_id"], name=item["name"],
+                    arguments=json.loads(item["arguments"]),
+                ))
+            handlers.setdefault(("function", None, "delegate"), start_delegate)
+        selected = {}
+        # Public completion always supplies its validated model. Preserve legacy
+        # direct internal calls that omit it; unknown explicit models get none.
+        model = payload.get("model", self.default_model)
+        eligible = isinstance(model, str) and get_request_policy(model).supports_async_tools
+
+        def mark(tools, namespace=None):
+            for tool in tools:
+                if tool.get("type") == "namespace":
+                    mark(tool.get("tools", []), tool.get("name"))
+                elif tool.get("type") in {"function", "custom"}:
+                    identity = tool["type"], namespace, tool.get("name")
+                    tool.pop("async", None)
+                    if (
+                        eligible and identity in handlers
+                        and tool.get("name") not in neutral_aliases | {"computer"}
+                    ):
+                        tool["async"] = True
+                        selected[identity] = handlers[identity]
+        mark(payload.get("tools", []))
+        if (
+            selected and (payload.get("multi_agent") or {}).get("enabled")
+            and payload.get("parallel_tool_calls", True) is not False
+        ):
+            raise ValueError("Native async tools cannot combine multi-agent parallel calls")
+        return selected
+
+    async def _start_async_call(self, item, handlers, neutral_aliases):
+        if item.get("name") in neutral_aliases | {"computer"}:
+            from .neutral_computer import refuse
+            refuse(
+                "neutral computer calls cannot enter asynchronous delegation",
+                "computer_use_response_invalid",
+            )
+        kind = {"function_call": "function", "custom_tool_call": "custom"}.get(item.get("type"))
+        identity = kind, item.get("namespace"), item.get("name")
+        start = handlers.get(identity)
+        call_id = item.get("call_id")
+        if (
+            start is None or not isinstance(call_id, str) or not call_id
+            or item.get("status", "completed") != "completed"
+        ):
+            raise ValueError("Unexpected or incomplete native async tool")
+        if kind == "function":
+            arguments = json.loads(item["arguments"])
+            if not isinstance(arguments, dict):
+                raise ValueError("Native async function arguments must be an object")
+        elif not isinstance(item.get("input"), str):
+            raise ValueError("Native async custom input must be text")
+        previous = self.async_calls.get(call_id)
+        if previous is not None:
+            if previous != item:
+                raise ValueError("Native async call identity changed")
+            return  # A duplicate complete event never repeats an external effect.
+        if len(self.async_calls) >= 1024:
+            raise RuntimeError("Native asynchronous call bound exceeded")
+        # Retain the original identity BEFORE awaiting the host. Unknown dispatch
+        # remains unknown, not permission to start again on another provider turn.
+        self.async_calls[call_id] = copy.deepcopy(item)
+        self._native_observed_async_calls[call_id] = copy.deepcopy(item)
+        self._native_async_call_owners[call_id] = self.owner
+        getattr(self, "_native_current_async_calls", set()).add(call_id)
+        await start(copy.deepcopy(item))
+
+    async def _progress(self, event, state):
+        hooks = getattr(getattr(self, "coordinator", None), "hooks", None)
+        if not self.progressive_output or hooks is None:
+            return
+        kind = event.get("type")
+        if kind not in {
+            "response.output_item.added", "response.output_item.done",
+            "response.output_text.delta", "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        }:
+            return
+        index = event.get("output_index")
+        if type(index) is not int or index < 0 or not self.response_id:
+            return
+        # Successor output_index starts at zero again. Keep globally distinct
+        # blocks in the same request, and provider sequence identity for dedupe.
+        identity = self.response_id, event.get("sequence_number")
+        if identity[1] is not None:
+            if identity in state["seen"]:
+                return
+            state["seen"].add(identity)
+        block = self.response_id, index
+        if block not in state["blocks"]:
+            state["blocks"][block] = len(state["blocks"])
+        public_index = state["blocks"][block]
+        item_type = (event.get("item") or {}).get("type")
+        block_type = {
+            "message": "text", "reasoning": "thinking",
+            "function_call": "tool_use", "custom_tool_call": "tool_use",
+        }.get(item_type, "thinking" if "reasoning" in kind else "text")
+        data = {
+            "request_id": state["request_id"], "block_index": public_index,
+            "block_type": state["types"].get(block, block_type),
+            "native_response_id": self.response_id,
+        }
+        if kind == "response.output_item.added":
+            if block in state["types"]:
+                return
+            state["types"][block] = block_type
+            if (event.get("item") or {}).get("name"):
+                data["name"] = event["item"]["name"]
+            await hooks.emit("llm:stream_block_start", data)
+        elif kind == "response.output_item.done":
+            if block in state["ended"]:
+                return
+            state["ended"].add(block)
+            await hooks.emit("llm:stream_block_end", data)
+        elif isinstance(event.get("delta"), str) and event["delta"]:
+            data.update(sequence=state["sequence"].get(block, 0), text=event["delta"])
+            state["sequence"][block] = data["sequence"] + 1
+            await hooks.emit("llm:stream_block_delta", data)
 
     async def _emit(self, kind, **data):
         if self.lifecycle is not None:
@@ -356,16 +672,21 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             kwargs.get("request_options"),
             {k: v for k, v in kwargs.items() if k != "request_options"},
         )
+        # Use the same pure final assembler as dispatch, never a parallel model
+        # precedence implementation. This view neither counts nor commits state.
+        plan = self._native_probe(request, options)
+        params = plan[0]
+        params = self._native_wire_params(params)
         canonical = None
-        if (
+        eligible = (
             owner is not None
-            and self._checkpoint
-            and options.get("model", self.default_model) == "gpt-6-astra"
+            and self._native_eligible(params)
             and options.get("extended_thinking") is not False
             and (request.metadata or {}).get("stream") is not False
-        ):
+        )
+        if eligible and self._checkpoint:
             canonical = await owner.context.get_messages()
-        token = NATIVE_BUDGET.set((self, canonical) if canonical is not None else None)
+        token = NATIVE_BUDGET.set((self, canonical, plan) if eligible else None)
         try:
             result = super().request_budget(request, **kwargs)
             return await result if inspect.isawaitable(result) else result
@@ -373,9 +694,24 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             NATIVE_BUDGET.reset(token)
 
     def _assemble_initial_responses_params(self, request, **kwargs):
-        params, state, logs = super()._assemble_initial_responses_params(
-            request, **kwargs
-        )
+        planned = getattr(self, "_native_initial_plan", None)
+        budget = NATIVE_BUDGET.get()
+        if NATIVE_REQUEST.get() is self and planned is not None:
+            params, state, logs = copy.deepcopy(planned)
+            self._native_initial_plan = None
+        elif budget is not None and budget[0] is self and len(budget) > 2:
+            params, state, logs = copy.deepcopy(budget[2])
+        else:
+            params, state, logs = super()._assemble_initial_responses_params(
+                request, **kwargs
+            )
+        if NATIVE_REQUEST.get() is self or budget is not None and budget[0] is self:
+            params = self._native_wire_params(params)
+            # The base validates ordinary API options before any SDK overlay.
+            # Native dispatch/count must validate the final overlaid model too.
+            validator = copy.copy(self)
+            validator._assembly_log_records = []
+            validator._prepare_gpt_6_params(params)
         if NATIVE_REQUEST.get() is self:
             # Refuse a validated rewrite while state is still request-local,
             # before shared COMPLETE commits fresh call maps or repair receipts.
@@ -398,8 +734,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             state = {**state, "native_full_params": copy.deepcopy(params)}
             params = self._plan_checkpoint(params, self.full_messages)
         else:
-            budget = NATIVE_BUDGET.get()
-            if budget is not None and budget[0] is self:
+            if budget is not None and budget[0] is self and budget[1] is not None:
                 params = self._plan_checkpoint(params, budget[1])
         # Checkpoint planning can supply additional native wire history. Apply
         # the same compatibility contract to the final counted/dispatched view.
@@ -412,33 +747,110 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             self._native_full_params = state.get("native_full_params")
             self._native_computer_context = state["neutral_computer_context"]
 
+    def _native_probe(self, request, options):
+        planner = copy.copy(self)
+        planner._native_planning = True
+        planner._native_probe_root = self
+        planner._native_probe_owner = self.owner_getter()
+        planner.async_calls = copy.deepcopy(self.async_calls)
+        for message in request.messages:
+            for call in (message.metadata or {}).get("converge_native_async_calls", []):
+                planner.async_calls.setdefault(call["call_id"], copy.deepcopy(call))
+        return super(NativeResponsesProvider, planner)._assemble_initial_responses_params(
+            request, **options
+        )
+
     async def complete(self, request, **kwargs):
         kwargs = self._merge_request_options(
             kwargs.pop("request_options", None), kwargs
         )
         owner = self.owner_getter()
+        # Active/uncertain ownership must be checked BEFORE any fallback.
+        if self.owner is not None or self._native_busy:
+            raise LLMError(
+                "Native provider already owns a generation",
+                provider=self.name, retryable=False,
+            )
+        if (
+            self._native_lineage_owner is not None
+            and owner is not self._native_lineage_owner
+            and (self.previous_response_id or self.async_calls or self._native_requires_recovery())
+        ):
+            raise LLMError(
+                "Native history belongs to a different owner; explicit recovery is required",
+                provider=self.name, retryable=False,
+            )
+        try:
+            plan = self._native_probe(request, kwargs)
+        except InvalidRequestError as exc:
+            if (
+                owner is not None and kwargs.get("extended_thinking") is not False
+                and (request.metadata or {}).get("stream") is not False
+                and self._native_eligible(self._native_wire_params({
+                    "model": kwargs.get("model") or request.model or self.default_model,
+                    **self.extra_request_params,
+                }))
+            ):
+                # This is observation of the same complete-only legacy failure,
+                # not dispatch, repair or relaxed computer provenance validation.
+                token = NATIVE_REQUEST.set(self)
+                try:
+                    self._retain_legacy_failed_context(
+                        [m.model_dump() for m in request.messages], exc,
+                    )
+                finally:
+                    NATIVE_REQUEST.reset(token)
+            raise
         if (
             owner is None
             or (request.metadata or {}).get("stream") is False
             or kwargs.get("extended_thinking") is False
-            or kwargs.get("model", self.default_model) != "gpt-6-astra"
+            or not self._native_eligible(plan[0])
         ):
+            if self._native_requires_recovery():
+                raise LLMError(
+                    "Native state cannot fall back to ordinary transport; explicit recovery is required",
+                    provider=self.name, retryable=False,
+                )
             token = NATIVE_REQUEST.set(None)
             try:
                 return await super().complete(request, **kwargs)
             finally:
                 NATIVE_REQUEST.reset(token)
-        if self.owner is not None or self._native_busy:
-            raise RuntimeError("Native provider already owns a generation")
+        if plan[1]["repairs"]:
+            raise LLMError(
+                "Native tool results are missing; explicit recovery is required",
+                provider=self.name, retryable=False,
+            )
         self.owner = owner
+        self._native_lineage_owner = owner
+        self._native_initial_plan = plan
+        self._native_config_digest = self._native_admission_digest()
+        previous_model = getattr(self, "_last_native_model", None)
+        planned_model = (plan[0].get("extra_body") or {}).get("model", plan[0].get("model"))
+        self._native_wire_model = planned_model
+        if previous_model is not None and previous_model != planned_model:
+            if self.pending_parent or self.inflight or self.awaiting_successor:
+                self.owner = None
+                raise LLMError(
+                    "Pending steering cannot change model; explicit recovery is required",
+                    provider=self.name, retryable=False,
+                )
+            self._discard_checkpoint("model_changed")
+            self.epoch = str(uuid.uuid4())
         self._native_full_params = None
         self._native_request_attempted = False
+        self._native_current_async_calls = set()
         self._request_messages = [
             m.model_dump()
             for m in request.messages
             if m.role in {"developer", "user", "assistant", "tool"}
         ]
         token = NATIVE_REQUEST.set(self)
+        billing_token = NATIVE_BILLING.set({
+            "provider": self, "owner": owner, "observations": {},
+            "consumed": False, "unresolved": False, "returned": False,
+        })
         request = request.model_copy(
             update={"metadata": {**(request.metadata or {}), "stream": False}}
         )
@@ -458,15 +870,20 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     self.async_calls.setdefault(call["call_id"], call)
             response = await super().complete(request, **kwargs)
             self._last_native_request = (request, copy.deepcopy(kwargs))
+            self._last_native_model = self._native_wire_model
             calls = [
-                self.async_calls[call.id]
-                for call in response.tool_calls or []
-                if call.id in self.async_calls
+                copy.deepcopy(self.async_calls[identity])
+                for identity in dict.fromkeys([
+                    *(call.id for call in response.tool_calls or []),
+                    *sorted(self._native_current_async_calls),
+                ])
+                if identity in self.async_calls
             ]
             response.metadata = {
                 **(response.metadata or {}),
                 "converge_live_epoch": self.epoch,
                 "converge_native_async_calls": calls,
+                "native_progressive_output": self.progressive_output,
             }
             return response
         except InvalidRequestError as exc:
@@ -475,16 +892,22 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             self._retain_legacy_failed_context(self._request_messages, exc)
             raise
         finally:
+            NATIVE_BILLING.reset(billing_token)
             NATIVE_REQUEST.reset(token)
             self.owner = None
             self.response_id = None
             self._native_computer_context = {}
             self.__dict__.pop("_staged_computer_images", None)
             self.full_messages = []
+            self._native_initial_plan = None
 
     def _find_missing_tool_results(self, messages):
         missing = super()._find_missing_tool_results(messages)
-        if NATIVE_REQUEST.get() is self:
+        if getattr(self, "_native_planning", False):
+            # The probe must preserve ordinary repair behavior until eligibility
+            # is known, while genuine native async calls intentionally stay open.
+            return [entry for entry in missing if entry[1] not in self.async_calls]
+        if NATIVE_REQUEST.get() is self or getattr(self, "_native_planning", False):
             # Native async calls are intentionally unpaired while running.
             remaining = [entry for entry in missing if entry[1] not in self.async_calls]
             if remaining:
@@ -608,17 +1031,19 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             # A result-only delta cannot rediscover its original call. Response
             # assembly owns publication of the complete plan's new records once.
             self._staged_computer_images = newly_observed
-        outstanding = {
-            identity
-            for identity in self.async_calls
-            if (job := self.owner.native_job(identity)) is not None
-            and (not job.get("restored") or job.get("recovered"))
-            and identity not in self.delivered_results
-        }
         results = {
             m.get("tool_call_id"): m.get("content")
             for m in [*messages, *self.full_messages]
             if m.get("role") == "tool"
+        }
+        outstanding = {
+            identity
+            for identity in self.async_calls
+            if identity not in self.delivered_results and (
+                (job := self._native_job(identity)) is not None
+                and (not job.get("restored") or job.get("recovered"))
+                or job is None and results.get(identity) is not None
+            )
         }
 
         def append_call(target, identity):
@@ -626,12 +1051,20 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 target.append(copy.deepcopy(self.async_calls[identity]))
             elif identity in self.delivered_results:
                 return
-            job = self.owner.native_job(identity)
-            result = job.get("result") if job is not None else results.get(identity)
+            job = self._native_job(identity)
+            result = (
+                job.get("result")
+                if job is not None and (not job.get("restored") or job.get("recovered"))
+                else results.get(identity) if job is None else None
+            )
             if result is not None:
                 target.append(
                     {
-                        "type": "function_call_output",
+                        "type": (
+                            "custom_tool_call_output"
+                            if self.async_calls[identity].get("type") == "custom_tool_call"
+                            else "function_call_output"
+                        ),
                         "call_id": identity,
                         "output": result,
                     }
@@ -648,8 +1081,10 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             if identity in self.async_calls and item.get("type") in {
                 "function_call",
                 "function_call_output",
+                "custom_tool_call",
+                "custom_tool_call_output",
             }:
-                if item["type"] == "function_call" and identity not in visible:
+                if item["type"] in {"function_call", "custom_tool_call"} and identity not in visible:
                     append_call(reconciled, identity)
                     visible.add(identity)
             else:
@@ -664,6 +1099,32 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     reconciled if self.previous_response_id else pending_history,
                     identity,
                 )
+        # A synchronous host wait returns status only. Deliver any ready async
+        # outputs on ORIGINAL call IDs before status on another call, never
+        # synthesizing completion or interpreting task handles in the provider.
+        for ready in list(reconciled):
+            identity = ready.get("call_id")
+            if (
+                ready.get("type") not in {"function_call_output", "custom_tool_call_output"}
+                or identity not in self.async_calls
+            ):
+                continue
+            output_index = reconciled.index(ready)
+            original_index = next((
+                i for i, item in enumerate(reconciled)
+                if item.get("type") in {"function_call", "custom_tool_call"}
+                and item.get("call_id") == identity
+            ), -1)
+            # A fresh full window may have older synchronous pairs. Never move
+            # a deferred output before its own original call to pass those pairs.
+            first_sync = next((
+                i for i in range(original_index + 1, output_index)
+                if reconciled[i].get("type") in {"function_call_output", "custom_tool_call_output"}
+                and reconciled[i].get("call_id") not in self.async_calls
+            ), None)
+            if first_sync is not None:
+                reconciled.pop(output_index)
+                reconciled.insert(first_sync, ready)
         return self._validate_native_items(pending_history + reconciled)
 
     async def _connect(self):
@@ -836,6 +1297,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             return await super()._create_response(
                 params, native_input_tokens=native_input_tokens, timeout=timeout
             )
+        delta_started = False
         try:
             if getattr(self, "_native_request_attempted", False):
                 raise LLMError(
@@ -895,6 +1357,22 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 self.previous_response_id = None
                 self.seen.clear()
                 self.epoch = str(uuid.uuid4())
+            delta_started = True
+            self._native_job_snapshot = {
+                identity: copy.deepcopy(self.owner.native_job(identity))
+                for identity in self.async_calls
+            }
+            if self.async_calls and self._checkpoint:
+                if self.pending_parent:
+                    raise LLMError(
+                        "Pending steering cannot replace a checkpoint with async history; explicit recovery is required",
+                        provider=self.name, retryable=False,
+                    )
+                # Applying an opaque checkpoint to the unreconciled full plan
+                # can erase ready outputs after they were marked delivered.
+                # Conservatively rebuild one full reconciled window instead.
+                self._discard_checkpoint("async_reconciliation")
+                self.epoch = str(uuid.uuid4())
             params = {
                 **params, "input": self._convert_messages(
                     self._request_messages, ordinary_computer_names=ordinary_names
@@ -921,22 +1399,59 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     and self._computer_function_lineage
                 ),
             )
+            # A ready deferred result can enlarge the input AFTER initial
+            # preflight. Count an isolated full-window reconciliation, not just
+            # the server-cache delta and never reuse the earlier smaller count.
+            count_params = params
+            if self.async_calls:
+                counter = copy.copy(self)
+                counter.previous_response_id = None
+                counter.last_context = Counter()
+                counter.seen = Counter()
+                counter.delivered_results = set()
+                counter._native_call_ids = set(self._native_call_ids)
+                counter._native_call_types = dict(self._native_call_types)
+                count_token = NATIVE_REQUEST.set(counter)
+                try:
+                    count_input = counter._convert_messages(
+                        self._request_messages, ordinary_computer_names=ordinary_names,
+                    )
+                finally:
+                    NATIVE_REQUEST.reset(count_token)
+                count_input = self._compile_neutral_input(full_params, count_input)
+                if self._tool_output_cache_breakpoints_supported(params.get("model")):
+                    count_input = _add_tool_output_cache_breakpoints(count_input)
+                count_params = self._plan_checkpoint(
+                    {**full_params, "input": count_input}, self.full_messages,
+                )
+                # Any difference invalidates the original measurement.
+                native_input_tokens = None
             if native_input_tokens is None:
-                await self._guard_assembled_params_with_provider_count(params)
+                await self._guard_assembled_params_with_provider_count(count_params)
             else:
                 self._guard_assembled_params(
                     params, native_input_tokens=native_input_tokens
                 )
             self._native_request_attempted = True
             self._computer_function_lineage = function_computer
-            return await self._native_response(params, timeout=timeout)
+            response = await self._native_response(params, timeout=timeout)
+            ledger = NATIVE_BILLING.get()
+            if ledger is not None and ledger["provider"] is self:
+                # Shared completion now owns this returned aggregate, including
+                # later conversion errors. Do not also return its components.
+                ledger["returned"] = True
+            return response
         except asyncio.CancelledError:
+            if delta_started and not self.request_uncertain:
+                self._native_send_refused = True
             await self._uncertain("cancelled")
             raise
         except Exception as exc:
             # The conventional driver's generic exception handler retries.
             # Native calls may already have dispatched jobs, so explicitly use
             # the kernel's non-retryable contract even for transport failures.
+            if delta_started and not self.request_uncertain:
+                self._native_send_refused = True
             await self._uncertain(type(exc).__name__)
             if isinstance(exc, LLMError) and not self.request_uncertain:
                 raise
@@ -947,6 +1462,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 provider=self.name,
                 retryable=False,
             ) from exc
+        finally:
+            self.__dict__.pop("_native_job_snapshot", None)
 
     def _compile_neutral_input(self, full_params, items):
         """Compile full and delta request views with the same explicit binding."""
@@ -999,6 +1516,17 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 )
         extra_body = payload.pop("extra_body", {})
         payload.update(extra_body)
+        if (
+            NATIVE_REQUEST.get() is self and hasattr(self, "_native_config_digest")
+            and (
+                not self._native_eligible(payload)
+                or self._native_admission_digest() != self._native_config_digest
+            )
+        ):
+            raise self._send_refused()
+        if "type" in payload or "stream_id" in payload:
+            raise ValueError("Native request cannot override its control envelope")
+        self._native_wire_model = payload.get("model")
         if payload.get("conversation") or payload.get("context_management"):
             raise ValueError(
                 "Native steering cannot combine conversation state or automatic compaction"
@@ -1023,25 +1551,11 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     raise ValueError(
                         "Pending native steering continuation is missing a required input"
                     )
-        async_names = set()
         neutral_aliases = set(
             getattr(self, "_native_computer_context", {}).get("declarations", {})
         )
 
-        def mark(tools):
-            for tool in tools:
-                if tool.get("type") == "namespace":
-                    mark(tool.get("tools", []))
-                elif (
-                    self.owner.config.get("background_delegate")
-                    and tool.get("type") == "function"
-                    and tool.get("name") == "delegate"
-                    and tool.get("name") not in neutral_aliases
-                ):
-                    tool["async"] = True
-                    async_names.add("delegate")
-
-        mark(payload.get("tools", []))
+        async_handlers = self._async_tools(payload, neutral_aliases)
         self.trace_context(payload)
         self.trace("native.send", {"type": "response.create", **payload})
         if self.prepare_send is None:
@@ -1060,6 +1574,11 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 admission = await self._prepare_send_admission("response.create")
                 receipt["attempt_id"] = admission.attempt_id
                 if self.owner is not owner or self.socket is not socket:
+                    raise self._send_refused()
+                if (
+                    NATIVE_REQUEST.get() is self and hasattr(self, "_native_config_digest")
+                    and self._native_admission_digest() != self._native_config_digest
+                ):
                     raise self._send_refused()
                 wire = self._admit_send({"type": "response.create", **payload}, admission)
             except BaseException as exc:
@@ -1080,11 +1599,19 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             "native.request",
             continuation=bool(self.previous_response_id),
             input_items=len(payload.get("input", [])),
-            async_tools=sorted(async_names),
+            async_tools=sorted(".".join(filter(None, identity[1:])) for identity in async_handlers),
         )
+        ledger = NATIVE_BILLING.get()
+        if ledger is not None and ledger["provider"] is self:
+            ledger["unresolved"] = True
         output, output_ids, totals, terminal = [], set(), {}, None
         output_bytes = 0
         event_count = 0
+        terminals, costs, terminal_ids = [], [], set()
+        progress = {
+            "request_id": str(uuid.uuid4()), "blocks": {}, "types": {},
+            "sequence": {}, "seen": set(), "ended": set(),
+        }
         resumed_steer = self.pending_steer if self.pending_parent else None
         self.pending_parent = False
         self.pending_steer = None
@@ -1096,6 +1623,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 event = json.loads(await self.socket.recv())
                 self.trace("native.receive", event)
                 kind = event.get("type")
+                await self._progress(event, progress)
                 if kind == "response.created":
                     terminal = None
                     self.response_id = event["response"]["id"]
@@ -1119,30 +1647,8 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     )
                 elif kind == "response.output_item.done":
                     item = event["item"]
-                    if item.get("type") == "function_call" and item.get("async"):
-                        if item.get("name") in neutral_aliases:
-                            from .neutral_computer import refuse
-
-                            refuse(
-                                "neutral computer calls cannot enter asynchronous delegation",
-                                "computer_use_response_invalid",
-                            )
-                        if item.get("name") not in async_names:
-                            raise RuntimeError("Unexpected native async tool")
-                        call_id = item["call_id"]
-                        if call_id not in self.async_calls:
-                            if len(self.async_calls) >= 1024:
-                                raise RuntimeError(
-                                    "Native asynchronous call bound exceeded"
-                                )
-                            self.async_calls[call_id] = item
-                            await self.owner.start_native_job(
-                                ToolCall(
-                                    id=call_id,
-                                    name=item["name"],
-                                    arguments=json.loads(item["arguments"]),
-                                )
-                            )
+                    if item.get("type") in {"function_call", "custom_tool_call"} and item.get("async"):
+                        await self._start_async_call(item, async_handlers, neutral_aliases)
                 elif kind == "response.steer.accepted":
                     if not self.inflight or self.inflight["accepted"]:
                         raise RuntimeError(
@@ -1212,6 +1718,29 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                         break
                 elif kind in {"response.completed", "response.incomplete"}:
                     terminal = event["response"]
+                    identity = terminal["id"]
+                    if identity in terminal_ids:
+                        raise RuntimeError("Duplicate native terminal response")
+                    terminal_ids.add(identity)
+                    # Price each original terminal at its ACTUAL model/tier/cache
+                    # breakdown, before a long-context threshold can be crossed
+                    # by combining unrelated responses. Missing usage is unknown.
+                    usage = terminal.get("usage")
+                    known_usage = isinstance(usage, dict) and all(
+                        type(usage.get(k)) is int and usage[k] >= 0
+                        for k in ("input_tokens", "output_tokens")
+                    )
+                    costs.append(
+                        self._terminal_cost(_RawResponseObject(copy.deepcopy(terminal)))
+                        if known_usage else None
+                    )
+                    self._record_native_terminal_billing(terminal, costs[-1])
+                    if ledger is not None and ledger["provider"] is self:
+                        # A received terminal settles this generation even if
+                        # local parsing later fails. Accepted/pending steering
+                        # can still have an unobserved successor.
+                        ledger["unresolved"] = bool(self.inflight or self.awaiting_successor)
+                    terminals.append(copy.deepcopy(terminal))
                     self.previous_response_id = terminal["id"]
                     self.response_id = None
                     if self.owner.config.get("latest_response_only"):
@@ -1245,6 +1774,20 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     if not self.inflight and not self.awaiting_successor:
                         break
                 elif kind in {"response.failed", "error"}:
+                    failed = event.get("response")
+                    if isinstance(failed, dict) and failed.get("id"):
+                        usage = failed.get("usage")
+                        known_usage = isinstance(usage, dict) and all(
+                            type(usage.get(k)) is int and usage[k] >= 0
+                            for k in ("input_tokens", "output_tokens")
+                        )
+                        cost = (
+                            self._terminal_cost(_RawResponseObject(copy.deepcopy(failed)))
+                            if known_usage else None
+                        )
+                        self._record_native_terminal_billing(failed, cost)
+                        if ledger is not None and ledger["provider"] is self:
+                            ledger["unresolved"] = False
                     # Deliberately non-retryable: a job may already have run.
                     code = (
                         event.get("error")
@@ -1257,13 +1800,15 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                         + str(code)
                     )
         terminal = {**terminal, "output": output, "usage": totals}
+        if ledger is not None and ledger["provider"] is self:
+            ledger["unresolved"] = False
         await self._emit(
             "native.completed",
             response_id=terminal["id"],
             pending_steering=self.pending_parent,
         )
         self.request_uncertain = False
-        return _RawResponseObject(terminal)
+        return NativeResponse(terminal, terminals, costs)
 
     async def close_live(self):
         if self.request_uncertain or self.pending_parent:

@@ -4,13 +4,14 @@ Verifies that:
 1. For a model with a pricing threshold (gpt-5.4), default config reports the
    threshold (cost-safe 272K).
 2. enable_long_context=True reports the full 1,050K for gpt-5.4.
-3. Models without a pricing threshold are unaffected by the flag.
+3. Models without a pricing threshold are unaffected by the flag, but reporting
+   still respects their independent maximum input limit.
 4. list_models() obeys the same reporting logic.
 5. get_info() includes the enable_long_context ConfigField.
 6. enable_long_context defaults to False when not in config.
 
-Note: gpt-5.6-sol (the current DEFAULT_MODEL) has no modelled pricing threshold,
-so the threshold-vs-full behavior is exercised via an explicit `default_model="gpt-5.4"`.
+The threshold-vs-full behavior is exercised via explicit `default_model="gpt-5.4"`.
+For gpt-5-mini, the safe reported input limit is 272K, not its 400K total context.
 """
 
 import asyncio
@@ -32,7 +33,7 @@ def _make_list_models_provider(**config_overrides) -> OpenAIProvider:
     """Create a provider wired to return specific model IDs from list_models()."""
     config = {"max_retries": 0, "model_filters": {}, **config_overrides}
     provider = OpenAIProvider(api_key="test-key", config=config)
-    provider._fetch_model_ids = AsyncMock(return_value=["gpt-5.4"])
+    provider._fetch_model_catalog = AsyncMock(return_value={"gpt-5.4": None})
     return provider
 
 
@@ -77,17 +78,17 @@ class TestGetInfoContextWindowReporting:
 
     def test_no_threshold_model_unaffected_by_flag(self):
         """Model without pricing threshold → flag doesn't change reported context_window."""
-        # gpt-5-mini has no long_context_pricing_threshold → always reports caps.context_window
+        # No pricing threshold, but the independent 272K input ceiling still applies.
         provider = _make_provider(enable_long_context=True, default_model="gpt-5-mini")
         info = provider.get_info()
-        assert info.defaults["context_window"] == 400_000
+        assert info.defaults["context_window"] == 272_000
         assert info.defaults["max_output_tokens"] == 128_000
 
     def test_no_threshold_model_default_flag(self):
-        """Model without pricing threshold, default flag → reports caps.context_window."""
+        """Default reporting also respects the independent maximum input limit."""
         provider = _make_provider(default_model="gpt-5-mini")
         info = provider.get_info()
-        assert info.defaults["context_window"] == 400_000
+        assert info.defaults["context_window"] == 272_000
         assert info.defaults["max_output_tokens"] == 128_000
 
 
@@ -100,13 +101,15 @@ class TestListModelsContextWindowReporting:
     """list_models() must report context_window based on the flag."""
 
     def test_gpt_5_mini_limits_match_public_info(self):
-        """Discovery and get_info must expose the same published mini limits."""
+        """Discovery reports safe mini input limits, not total context capacity."""
         provider = _make_list_models_provider(default_model="gpt-5-mini")
-        provider._fetch_model_ids.return_value = ["gpt-5-mini", "gpt-5-mini-2025-08-07"]
+        provider._fetch_model_catalog.return_value = dict.fromkeys(
+            ["gpt-5-mini", "gpt-5-mini-2025-08-07"]
+        )
         models = asyncio.run(provider.list_models())
         assert {m.id for m in models} == {"gpt-5-mini", "gpt-5-mini-2025-08-07"}
         for model in models:
-            assert model.context_window == 400_000
+            assert model.context_window == 272_000
             assert model.max_output_tokens == 128_000
 
     def test_list_models_default_272k(self):

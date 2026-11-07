@@ -13,12 +13,13 @@ class ModelFilters:
     include: tuple[str, ...] = ("*",)
     exclude: tuple[str, ...] = ()
     hide_dated: bool = False
+    hide_shutdown: bool = False
 
     @classmethod
     def parse(cls, value: Mapping[str, object]) -> "ModelFilters":
         if not isinstance(value, Mapping):
             raise TypeError("model filters must be a mapping")
-        if set(value) - {"include", "exclude", "hide_dated"}:
+        if set(value) - {"include", "exclude", "hide_dated", "hide_shutdown"}:
             raise ValueError("unknown model filter key")
 
         def patterns(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -33,7 +34,13 @@ class ModelFilters:
         hide_dated = value.get("hide_dated", False)
         if not isinstance(hide_dated, bool):
             raise TypeError("model filters hide_dated must be a boolean")
-        return cls(patterns("include", ("*",)), patterns("exclude", ()), hide_dated)
+        hide_shutdown = value.get("hide_shutdown", False)
+        if not isinstance(hide_shutdown, bool):
+            raise TypeError("model filters hide_shutdown must be a boolean")
+        return cls(
+            patterns("include", ("*",)), patterns("exclude", ()),
+            hide_dated, hide_shutdown,
+        )
 
     def select(self, ids: list[str]) -> list[str]:
         selected = {
@@ -58,6 +65,7 @@ class ModelFilters:
             "include": list(self.include),
             "exclude": list(self.exclude),
             "hide_dated": self.hide_dated,
+            "hide_shutdown": self.hide_shutdown,
         }
 
 
@@ -83,6 +91,11 @@ def selector_schema() -> dict:
                 "type": "boolean",
                 "default": False,
                 "description": "Hide YYYY-MM-DD suffixes only when the selected undated alias exists.",
+            },
+            "hide_shutdown": {
+                "type": "boolean",
+                "default": False,
+                "description": "Hide known shutdowns on direct OpenAI only; gateways and deployments are unaffected.",
             },
         },
     }

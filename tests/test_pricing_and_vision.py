@@ -13,7 +13,7 @@ from amplifier_module_provider_openai import OpenAIProvider
 ])
 async def test_explicit_listing_preserves_known_vision_capabilities(model, vision):
     provider = OpenAIProvider(api_key="test-key")
-    provider._fetch_model_ids = AsyncMock(return_value=[model])
+    provider._fetch_model_catalog = AsyncMock(return_value={model: None})
     assert await provider.list_models() == []
     rows = await provider.list_models(filters={})
     assert len(rows) == 1

@@ -97,7 +97,7 @@ class TestAssistantMessageHelper:
 
 
 class TestBuildContinuationInput:
-    """_build_continuation_input must emit assistant items in Form 2+."""
+    """Continuation preserves the actual typed output, never synthesizes a turn."""
 
     def _provider(self) -> OpenAIProvider:
         return OpenAIProvider(api_key="test-key")
@@ -110,7 +110,11 @@ class TestBuildContinuationInput:
         accumulated_output = [
             {
                 "type": "message",
-                "content": [{"type": "output_text", "text": "Once upon a time..."}],
+                "id": "msg_original",
+                "role": "assistant",
+                "status": "incomplete",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Once upon a time...", "annotations": []}],
             }
         ]
         result = provider._build_continuation_input(original_input, accumulated_output)
@@ -122,6 +126,9 @@ class TestBuildContinuationInput:
         # reported as incomplete -- "completed" would contradict the request.
         assert msg["status"] == "incomplete"
         assert msg["id"].startswith("msg_")
+        assert msg == accumulated_output[0]
+        assert msg["id"] == "msg_original"
+        assert msg["phase"] == "final_answer"
         assert msg["content"][0] == {
             "type": "output_text",
             "text": "Once upon a time...",

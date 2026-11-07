@@ -23,6 +23,7 @@ def _provider(**config: object) -> OpenAIProvider:
         api_key="[REDACTED:SECRET]",
         config={
             "default_model": "gpt-6-astra",
+            "base_url": "https://offline.invalid/v1",
             "max_retries": 0,
             "use_streaming": False,
             **config,
@@ -52,11 +53,15 @@ def _response(
                 content=[SimpleNamespace(type="output_text", text="Hi")],
             )
         ],
-        incomplete_details=None,
+        incomplete_details={"reason": "max_output_tokens"} if status == "incomplete" else None,
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            input_tokens_details=SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
+            input_tokens_details=SimpleNamespace(
+                cached_tokens=0,
+                cache_write_tokens=0,
+                cache_write_tokens_details={"ttl_30m_tokens": 0, "ttl_12h_tokens": 0},
+            ),
         ),
     )
 
@@ -115,7 +120,8 @@ class TestCapabilities:
         caps = get_capabilities("gpt-6-astra")
 
         assert caps.family == "gpt-6-astra"
-        assert caps.context_window == 922_000
+        assert caps.context_window == 1_050_000
+        assert caps.max_input_tokens == 922_000
         assert caps.max_output_tokens == 128_000
         assert caps.supports_reasoning is True
         assert caps.default_reasoning_effort is None
@@ -134,7 +140,7 @@ class TestCapabilities:
 
     def test_list_models_uses_friendly_name_and_reported_limits(self) -> None:
         provider = _provider(hide_dated_models=False)
-        provider._fetch_model_ids = AsyncMock(return_value=["gpt-6-astra"])
+        provider._fetch_model_catalog = AsyncMock(return_value={"gpt-6-astra": None})
 
         models = asyncio.run(provider.list_models())
 
@@ -342,12 +348,13 @@ def test_astra_drops_legacy_retention_reintroduced_by_final_extra_merge() -> Non
     assert "prompt_cache_retention" not in provider.client.responses.create.call_args.kwargs
 
 
-def test_astra_accepts_only_documented_cache_ttl() -> None:
-    provider = _provider(prompt_cache_options={"ttl": "30m"})
+@pytest.mark.parametrize("ttl", ["30m", "12h"])
+def test_astra_accepts_only_documented_cache_ttl(ttl: str) -> None:
+    provider = _provider(prompt_cache_options={"ttl": ttl})
     provider.client.responses.create = AsyncMock(return_value=_response())
     asyncio.run(provider.complete(_request()))
     assert provider.client.responses.create.call_args.kwargs["prompt_cache_options"] == {
-        "ttl": "30m"
+        "ttl": ttl
     }
 
     invalid = _provider(prompt_cache_options={"ttl": "24h"})
@@ -375,7 +382,7 @@ def test_astra_null_logprobs_is_omitted() -> None:
     assert "logprobs" not in provider.client.responses.create.call_args.kwargs
 
 
-def test_astra_continuation_validates_final_extra_params_before_second_sdk_call() -> None:
+def test_astra_continuation_reuses_validated_snapshot_not_mutated_global_params() -> None:
     provider = _provider(extra_request_params={"seed": 1})
     call_count = 0
 
@@ -388,13 +395,14 @@ def test_astra_continuation_validates_final_extra_params_before_second_sdk_call(
         return _response()
 
     provider.client.responses.create = AsyncMock(side_effect=create)
-    with pytest.raises(kernel_errors.InvalidRequestError):
-        asyncio.run(provider.complete(_request()))
+    asyncio.run(provider.complete(_request()))
+    assert provider.client.responses.create.await_count == 2
+    continued = provider.client.responses.create.call_args.kwargs
+    assert continued["seed"] == 1
+    assert "top_p" not in continued
 
-    assert provider.client.responses.create.await_count == 1
 
-
-def test_astra_continuation_rejects_logprobs_after_final_extra_merge() -> None:
+def test_astra_continuation_does_not_admit_new_logprobs_from_mutated_global_params() -> None:
     provider = _provider(extra_request_params={"seed": 1})
     call_count = 0
 
@@ -407,10 +415,11 @@ def test_astra_continuation_rejects_logprobs_after_final_extra_merge() -> None:
         return _response()
 
     provider.client.responses.create = AsyncMock(side_effect=create)
-    with pytest.raises(kernel_errors.InvalidRequestError, match="logprobs"):
-        asyncio.run(provider.complete(_request()))
-
-    assert provider.client.responses.create.await_count == 1
+    asyncio.run(provider.complete(_request()))
+    assert provider.client.responses.create.await_count == 2
+    continued = provider.client.responses.create.call_args.kwargs
+    assert continued["seed"] == 1
+    assert "logprobs" not in continued
 
 
 @pytest.mark.parametrize(
@@ -637,6 +646,7 @@ def test_astra_cached_write_mix_and_reasoning_tokens_are_not_double_charged() ->
         prompt_tokens=100_000,
         cached_tokens=10_000,
         cache_write_tokens=20_000,
+        cache_write_tokens_details={"ttl_30m_tokens": 20_000, "ttl_12h_tokens": 0},
         completion_tokens=20_000,
         service_tier="default",
     ) == Decimal("1.96")

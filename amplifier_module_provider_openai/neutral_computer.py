@@ -299,6 +299,21 @@ def compile_request(params: dict[str, Any], source_tools: list[Any], endpoint: A
         refuse("native override removed the explicit alias binding")
     if by_alias and binding is None and native_required(result.get("tool_choice")):
         refuse("native-required request has no supported alias binding", "computer_use_native_unavailable")
+    # Canonical native output metadata retains the full original item. Only a
+    # validated neutral binding permits ordinary fallback; unbound native
+    # history is not translated by name or shape. Results are already carried
+    # as ordinary outputs with all original images and reference text intact.
+    if binding is None:
+        for index, item in enumerate(result.get("input", [])):
+            record = replay.get(item.get("call_id"))
+            if item.get("type") != "computer_call" or record is None:
+                continue
+            if item.get("actions") != record["vendor_actions"] or item.get("pending_safety_checks"):
+                refuse("canonical native history disagrees with saved provenance")
+            result["input"][index] = {
+                "type": "function_call", "call_id": item["call_id"],
+                "name": record["alias"], "arguments": json.dumps(record["canonical"]),
+            }
     def function_names(tools):
         for tool in tools:
             if tool.get("type") == "function":
@@ -747,6 +762,37 @@ def replay_calls(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             identities = [block[key] for key in ("id", "tool_call_id", "call_id") if key in block]
             if any(isinstance(value, str) and value in found and owners[value] != index for value in identities):
                 refuse("duplicate computer call across historical turns")
+    # Canonical output is another persisted representation of the same bound
+    # calls, not permission to replace them. Validate IDs before inspecting the
+    # claimed item type: a forged function/message item must not evade native
+    # provenance checks, and an empty list must not drop an outstanding call.
+    for index, message in enumerate(messages):
+        metadata = _metadata(message)
+        if "openai:output_items" not in metadata:
+            continue  # Older metadata-less turns retain their legacy reader.
+        expected = [identity for identity in found if owners[identity] == index]
+        output = metadata["openai:output_items"]
+        if not isinstance(output, list) or any(not isinstance(item, dict) for item in output):
+            refuse("malformed canonical computer output")
+        seen = []
+        for item in output:
+            identity = item.get("call_id")
+            if not isinstance(identity, str) or identity not in found:
+                continue
+            if owners[identity] != index or identity in seen or item.get("type") != "computer_call":
+                refuse("canonical computer identity has a conflicting owner, type or duplicate")
+            record = found[identity]
+            actual = response_calls(
+                [item],
+                {"neutral": True, "binding": record["binding"],
+                 "declarations": {record["alias"]: record["binding"]}, "ordinary_names": []},
+                record["binding"]["model"], "completed",
+            )
+            if not json_agrees(actual.get(identity), record):
+                refuse("canonical computer output disagrees with its saved binding")
+            seen.append(identity)
+        if seen != expected:
+            refuse("canonical computer output omitted or reordered a bound call")
     return found
 
 

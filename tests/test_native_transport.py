@@ -109,7 +109,7 @@ async def wait_created(provider):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("effective_model", ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "unrecognized-model"])
+@pytest.mark.parametrize("effective_model", ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"])
 @pytest.mark.parametrize("standard_endpoint", [True, False])
 async def test_complete_preserves_final_model_cache_policy_and_fresh_observation(effective_model, standard_endpoint):
     p, owner = make()

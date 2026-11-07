@@ -191,6 +191,7 @@ async def test_concurrent_overrides_snapshot_before_await_never_mutate_shared_st
 @pytest.mark.parametrize("filters", [
     False, "all", [], {"include": "*"}, {"include": [None]}, {"include": [""]},
     {"exclude": [1]}, {"hide_dated": "false"}, {"hide_dated": None}, {"typo": True},
+    {"hide_shutdown": "false"}, {"hide_shutdown": None},
 ])
 async def test_invalid_filters_fail_before_io_and_config_fails_at_construction(filters):
     with pytest.raises((ValueError, TypeError)):
@@ -211,7 +212,9 @@ def test_optional_selector_advertisement_no_parallel_discovery_surface():
     assert info["version"] == 1 and info["filters_keyword"] == "filters"
     assert info["source"] == "provider-api"
     assert info["unfiltered"] == {} and info["override"] == "replace"
-    assert info["default_filters"] == {"include": ["gpt-6*"], "exclude": [], "hide_dated": True}
+    assert info["default_filters"] == {
+        "include": ["gpt-6*"], "exclude": [], "hide_dated": True, "hide_shutdown": True,
+    }
     assert p._client is None
 
 

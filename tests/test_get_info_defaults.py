@@ -5,9 +5,14 @@ Verifies that:
 2. get_info() uses self.default_model instead of a hardcoded model string.
 3. The long_context_pricing_threshold vs enable_long_context interaction still
    produces a cost-safe default when a model HAS a threshold (gpt-5.4).
-   gpt-5.5 has no published threshold, so it reports its full 1M context
-   regardless of the flag.
+   gpt-5.5 and gpt-5.5-pro also have a documented threshold.
 """
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._capabilities import get_capabilities
@@ -95,3 +100,39 @@ class TestGPT54CostSafeBehaviorRegression:
         info = provider.get_info()
         assert info.defaults["context_window"] == 1_050_000
         assert info.defaults["model"] == "gpt-5.4"
+
+
+@pytest.mark.parametrize("model,standard,long", [
+    ("gpt-6-astra", 272_000, 922_000),
+    ("gpt-6-sol", 272_000, 922_000),
+    ("gpt-6-luna", 272_000, 922_000),
+    ("gpt-6.1-sol", 272_000, 922_000),
+    ("gpt-6.1-terra", 272_000, 922_000),
+    ("gpt-5.6", 272_000, 922_000),
+    ("gpt-5.6-sol", 272_000, 922_000),
+    ("gpt-5.6-terra", 272_000, 922_000),
+    ("gpt-5.6-luna", 272_000, 922_000),
+    ("gpt-5.5", 272_000, 1_050_000),
+    ("gpt-5.5-pro", 272_000, 1_050_000),
+    ("gpt-5.4-mini", 272_000, 272_000),
+    ("gpt-5.2", 400_000, 400_000),
+    ("gpt-5.2-pro", 400_000, 400_000),
+])
+@pytest.mark.parametrize("enable_long_context", [False, True])
+def test_info_and_discovery_report_safe_input_not_total_or_reserved_budget(
+    model, standard, long, enable_long_context
+):
+    provider = _make_provider(
+        default_model=model,
+        enable_long_context=enable_long_context,
+        base_url="https://offline.invalid/v1",
+    )
+    provider.client.models.list = AsyncMock(
+        return_value=SimpleNamespace(data=[SimpleNamespace(id=model)])
+    )
+    expected = long if enable_long_context else standard
+    assert provider.get_info().defaults["context_window"] == expected
+    models = asyncio.run(provider.list_models())
+    assert len(models) == 1
+    assert models[0].context_window == expected
+    assert models[0].max_output_tokens == 128_000

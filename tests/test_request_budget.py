@@ -160,6 +160,137 @@ def test_models_without_an_input_ceiling_keep_existing_output_reserve_policy():
     assert provider._budget_input_limit(params) == 400_000 - 1_000 - 4_096
 
 
+@pytest.mark.parametrize("model", [
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra",
+    "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+])
+@pytest.mark.parametrize("long_context,allowance", [(False, 267_904), (True, 917_904)])
+@pytest.mark.parametrize("output", [1_000, 128_000])
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_modern_native_preflight_and_dispatch_agree_at_independent_input_boundary(
+    model, long_context, allowance, output, delta, streaming
+):
+    # 1.05M total - 128K max output = 922K independent input. Reducing output
+    # cannot increase input, and standard pricing caps input (not input+output).
+    measured = allowance + delta
+    provider, counter = _native_provider(
+        default_model=model,
+        enable_long_context=long_context,
+        use_streaming=streaming,
+        input_tokens=measured,
+    )
+    request = _request(output=output)
+    decision = asyncio.run(provider.request_budget(request, context_estimate=measured))
+    assert decision["input_limit_tokens"] == allowance
+    assert decision["max_output_tokens"] == output
+    assert decision["estimated_input_tokens"] == measured
+    response = _response(measured)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    provider.client.responses.stream.return_value = _StreamContext(response)
+    if delta > 0:
+        with pytest.raises(kernel_errors.ContextLengthError, match="native input allowance"):
+            asyncio.run(provider.complete(request))
+        provider.client.responses.create.assert_not_called()
+        provider.client.responses.stream.assert_not_called()
+    else:
+        asyncio.run(provider.complete(request))
+        sdk = provider.client.responses.stream if streaming else provider.client.responses.create
+        assert sdk.call_count == 1
+        assert sdk.call_args.kwargs["model"] == model
+        assert sdk.call_args.kwargs["max_output_tokens"] == output
+        assert counter.call_args.kwargs == _count_projection(_wire_params(sdk.call_args.kwargs))
+    assert counter.await_count == 2
+
+
+@pytest.mark.parametrize("model,long_context,output,expected", [
+    # No independent ceiling on 5.5: total-output constrains opted-in input.
+    ("gpt-5.5", False, 128_000, 267_904),
+    ("gpt-5.5", False, 1_000, 267_904),
+    ("gpt-5.5", True, 128_000, 917_904),
+    ("gpt-5.5", True, 1_000, 1_044_904),
+    # Pro also has the documented 272K Standard/long price threshold.
+    ("gpt-5.5-pro", False, 128_000, 267_904),
+    ("gpt-5.5-pro", False, 1_000, 267_904),
+    ("gpt-5.5-pro", True, 1_000, 1_044_904),
+    # Mini's independent 272K input ceiling applies even with long context.
+    ("gpt-5.4-mini", False, 128_000, 267_904),
+    ("gpt-5.4-mini", False, 1_000, 267_904),
+    ("gpt-5.4-mini", True, 1_000, 267_904),
+    # 5.2 has a 400K total, no separate input ceiling, and no long threshold.
+    ("gpt-5.2", False, 128_000, 267_904),
+    ("gpt-5.2", True, 1_000, 394_904),
+    ("gpt-5.2-pro", False, 1_000, 394_904),
+    ("gpt-5.2-pro", True, 128_000, 267_904),
+])
+def test_total_input_and_price_constraints_have_independent_numerical_oracles(
+    model, long_context, output, expected
+):
+    provider, _ = _native_provider(default_model=model, enable_long_context=long_context)
+    decision = asyncio.run(provider.request_budget(_request(output=output), context_estimate=1))
+    assert decision["input_limit_tokens"] == expected
+    params = {"model": model, "input": [], "max_output_tokens": output}
+    provider._guard_assembled_params(params, native_input_tokens=expected)
+    with pytest.raises(kernel_errors.ContextLengthError, match="native input allowance"):
+        provider._guard_assembled_params(params, native_input_tokens=expected + 1)
+
+
+@pytest.mark.parametrize("configured,final,long_context,expected", [
+    ("gpt-5.4-mini", "gpt-6.1-sol", True, 917_904),
+    ("gpt-6.1-sol", "gpt-5.4-mini", True, 267_904),
+    ("gpt-6.1-sol", "gpt-5.5-pro", False, 267_904),
+    ("gpt-5.5-pro", "gpt-6.1-terra", False, 267_904),
+])
+def test_final_extra_model_selects_budget_for_preflight_count_and_dispatch(
+    configured, final, long_context, expected
+):
+    provider, counter = _native_provider(
+        default_model=configured,
+        enable_long_context=long_context,
+        extra_request_params={"model": final},
+        input_tokens=expected,
+    )
+    request = _request(output=128_000)
+    decision = asyncio.run(
+        provider.request_budget(request, context_estimate=expected, model="gpt-5.2")
+    )
+    assert decision["input_limit_tokens"] == expected
+    assert counter.call_args.kwargs["model"] == final
+    response = _response(expected)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    asyncio.run(provider.complete(request, model="gpt-5.2"))
+    assert provider.client.responses.create.call_args.kwargs["model"] == final
+    assert counter.await_count == 2
+
+
+@pytest.mark.parametrize("source", ["request", "kwargs", "extras", "direct"])
+def test_output_above_model_ceiling_is_rejected_before_generation(source):
+    config, kwargs = {}, {}
+    request = _request()
+    if source == "request":
+        request = _request(output=128_001)
+    elif source == "kwargs":
+        kwargs["max_tokens"] = 128_001
+    elif source == "extras":
+        config["extra_request_params"] = {"max_output_tokens": 128_001}
+    provider, _counter = _native_provider(
+        default_model="gpt-6.1-terra", enable_long_context=True, **config
+    )
+    if source == "direct":
+        params = {"model": "gpt-6.1-terra", "input": [], "max_output_tokens": 128_001}
+        with pytest.raises(kernel_errors.ContextLengthError, match="model output ceiling"):
+            asyncio.run(provider._create_response(params))
+    else:
+        with pytest.raises(kernel_errors.ContextLengthError, match="model output ceiling"):
+            asyncio.run(provider.request_budget(request, context_estimate=1, **kwargs))
+        with pytest.raises(kernel_errors.ContextLengthError, match="model output ceiling"):
+            asyncio.run(provider.complete(request, **kwargs))
+    provider.client.responses.create.assert_not_called()
+    provider.client.responses.stream.assert_not_called()
+
+
 def test_native_count_returns_official_measurement_for_the_finalized_projection():
     provider, counter = _native_provider(default_model="gpt-5-mini")
     request = ChatRequest(
@@ -604,7 +735,7 @@ def test_negative_output_reserve_cannot_enlarge_the_input_allowance():
 def test_omitted_direct_output_cap_reserves_model_maximum_without_mutation():
     provider = _provider(default_model="gpt-5.6-terra", enable_long_context=True)
     params = {"model": "gpt-5.6-terra", "input": []}
-    assert provider._budget_input_limit(params) == 900_000 - 128_000 - 4_096
+    assert provider._budget_input_limit(params) == 917_904
     assert "max_output_tokens" not in params
 
 
@@ -906,6 +1037,7 @@ def test_continuation_rechecks_and_calibrates_its_exact_final_params():
     incomplete = _response(10, status="incomplete")
     incomplete.id = "resp_incomplete"
     incomplete.output = []
+    incomplete.incomplete_details = SimpleNamespace(reason="max_output_tokens")
     completed = _response(20)
     completed.output = []
     provider.client.responses.create = AsyncMock(side_effect=[incomplete, completed])
@@ -927,6 +1059,7 @@ def test_over_budget_continuation_raises_without_a_second_sdk_dispatch():
     incomplete = _response(10, status="incomplete")
     incomplete.id = "resp_incomplete"
     incomplete.output = []
+    incomplete.incomplete_details = SimpleNamespace(reason="max_output_tokens")
     provider.client.responses.create = AsyncMock(return_value=incomplete)
     guard_calls = 0
 
@@ -1023,7 +1156,7 @@ def test_typed_images_without_native_count_dispatch_unchanged_without_calibratio
     assert "non-text input" in caplog.text
 
 
-@pytest.mark.parametrize("input_tokens", [10, 900_000])
+@pytest.mark.parametrize("input_tokens", [10, 900_000, 917_904, 917_905])
 def test_typed_images_native_count_remains_authoritative(input_tokens):
     provider, counter = _native_provider(
         default_model="gpt-5.6-terra",
@@ -1035,7 +1168,7 @@ def test_typed_images_native_count_remains_authoritative(input_tokens):
     params = provider._budget_params(request)
     decision = asyncio.run(provider.request_budget(request, context_estimate=12_000))
     assert decision["measurement"]["input_tokens"] == input_tokens
-    assert decision["input_limit_tokens"] == 767_904
+    assert decision["input_limit_tokens"] == 917_904
     assert counter.call_args.kwargs == _count_projection(params)
     response = _response(input_tokens)
     response.output = []

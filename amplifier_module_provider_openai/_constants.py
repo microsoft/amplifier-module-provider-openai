@@ -33,7 +33,6 @@ METADATA_TOOL_CALL_NAMESPACES = "openai:tool_call_namespaces"
 DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
-DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
 DEFAULT_TIMEOUT = None  # Wait for completion unless the caller selects a deadline.
 # `None` (omit the field) is the cache-friendly default. OpenAI's
 # `truncation="auto"` silently drops oldest messages when context fills,
@@ -44,11 +43,8 @@ DEFAULT_TIMEOUT = None  # Wait for completion unless the caller selects a deadli
 # `config={"truncation": "auto"}`.
 DEFAULT_TRUNCATION: str | None = None
 
-# Default prompt-cache retention. OpenAI's per-model server-side default
-# is "in_memory" (5–10 min) for gpt-5.4 and below, "24h" for gpt-5.5+.
-# Forcing "24h" everywhere stabilizes cache lifetime across the curated
-# model list. Models that reject "in_memory" are gated by
-# `ModelCapabilities.supports_in_memory_retention`.
+# Legacy-model cache preference. GPT-5.6 and later use their own ttl API;
+# the final-model request policy removes this field for those exact IDs.
 DEFAULT_PROMPT_CACHE_RETENTION: str | None = "24h"
 
 # Maximum number of continuation attempts for incomplete responses
@@ -97,9 +93,7 @@ DEEP_RESEARCH_MODELS = frozenset({"o3-deep-research", "o4-mini-deep-research"})
 BACKGROUND_STATUS_QUEUED = "queued"
 BACKGROUND_STATUS_IN_PROGRESS = "in_progress"
 BACKGROUND_STATUS_SEARCHING = "searching"
-BACKGROUND_STATUS_COMPLETED = "completed"
 BACKGROUND_STATUS_FAILED = "failed"
-BACKGROUND_STATUS_CANCELLED = "cancelled"
 
 # Non-terminal statuses that require continued polling
 BACKGROUND_POLLING_STATUSES = frozenset(

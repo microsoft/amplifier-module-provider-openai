@@ -1,10 +1,12 @@
 """Phase-2 tests: gpt-5.6 reasoning.mode ("pro") and prompt_cache_options.
 
-Shapes verified live against gpt-5.6-sol on 2026-07-14:
+Historical shape probes against gpt-5.6-sol on 2026-07-14:
 - reasoning.mode in {"standard", "pro"} ("pro" = extended internal reasoning).
-- prompt_cache_options {"mode": "implicit"|"explicit", "ttl": "30m"}, which
-  COEXISTS with prompt_cache_retention (both are echoed together -- it is NOT a
-  replacement/deprecation of prompt_cache_retention).
+
+Current accepted cache policy: exact GPT-5.6 and GPT-6 IDs use
+prompt_cache_options {"mode": "implicit"|"explicit", "ttl": "30m"|"12h"}.
+Legacy prompt_cache_retention is omitted. Preview and snapshot suffixes do not
+qualify for these new features merely by sharing a model prefix.
 
 Also covers the D2 guardrail (spec section 2.4): a live probe on 2026-08-28
 confirmed that `prompt_cache_options.mode == "explicit"` with zero
@@ -75,12 +77,12 @@ def _captured_params(provider: OpenAIProvider) -> Any:
 
 
 @pytest.mark.parametrize("model,marked", [
-    ("gpt-5.6-luna", True), ("gpt-5.6-terra-preview", True),
+    ("gpt-5.6-luna", True), ("gpt-5.6-terra-preview", False),
     ("gpt-6-astra", True), ("gpt-6-astra-preview", False),
     ("unrecognized-model", False), ("gpt-5.5", False),
-    ("gpt-5.6-sol", True), ("gpt-5.6-sol-2026-07-09", True),
+    ("gpt-5.6-sol", True), ("gpt-5.6-sol-2026-07-09", False),
     ("gpt-5.6", True), ("gpt-6-sol", True), ("gpt-6-luna", True),
-    ("gpt-6.1-sol", True),
+    ("gpt-5.6-terra", True), ("gpt-6.1-sol", True), ("gpt-6.1-terra", True),
 ])
 def test_effective_model_and_caller_input_cache_contract(model, marked):
     """Final normalization applies to overrides but never mutates their objects."""
@@ -144,7 +146,10 @@ def test_automatic_boundaries_follow_actual_endpoint_on_initial_and_continued_ca
     supplied = [{"type": "function_call_output", "call_id": "c", "output": "result"}]
     provider = _make_provider(default_model="gpt-6.1-sol", extra_request_params={"input": supplied})
     provider.client.base_url = endpoint
-    incomplete = SimpleNamespace(status="incomplete", id="incomplete", output=[], incomplete_details=None)
+    incomplete = SimpleNamespace(
+        status="incomplete", id="incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+    )
     provider.client.responses.create = AsyncMock(side_effect=[incomplete, DummyResponse()])
     asyncio.run(provider.complete(_simple_request()))
     calls = provider.client.responses.create.call_args_list
@@ -154,7 +159,10 @@ def test_automatic_boundaries_follow_actual_endpoint_on_initial_and_continued_ca
     assert supplied[0]["output"] == "result"
 
 
-@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
+@pytest.mark.parametrize("model", [
+    "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra",
+])
 def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged(model):
     supplied = [{"type": "function_call_output", "call_id": str(i), "output": f"result-{i}"}
                 for i in range(7)]
@@ -162,7 +170,8 @@ def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged(model
         default_model=model, extra_request_params={"input": supplied},
     )
     incomplete = SimpleNamespace(
-        status="incomplete", id="incomplete", output=[], incomplete_details=None,
+        status="incomplete", id="incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     provider.client.responses.create = AsyncMock(side_effect=[incomplete, DummyResponse()])
     asyncio.run(provider.complete(_simple_request()))
@@ -173,10 +182,7 @@ def test_cache_boundaries_reach_every_continuation_with_defaults_unchanged(model
             {"mode": "explicit"}
         ] * 7
         assert call.kwargs.get("prompt_cache_options") is None
-        if model.startswith("gpt-6"):
-            assert "prompt_cache_retention" not in call.kwargs
-        else:
-            assert call.kwargs["prompt_cache_retention"] == provider.prompt_cache_retention
+        assert "prompt_cache_retention" not in call.kwargs
     assert all(isinstance(item["output"], str) for item in supplied)
 
 
@@ -248,7 +254,9 @@ def test_validate_reasoning_mode_rejects(bad):
         {"mode": "implicit"},
         {"mode": "explicit"},
         {"ttl": "30m"},
+        {"ttl": "12h"},
         {"mode": "explicit", "ttl": "30m"},
+        {"mode": "implicit", "ttl": "12h"},
         {},
     ],
 )
@@ -288,22 +296,24 @@ def test_reasoning_mode_absent_when_not_set():
 
 
 # ---------------------------------------------------------------------------
-# prompt_cache_options passthrough + coexistence with retention
+# prompt_cache_options passthrough without legacy retention
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_cache_options_forwarded_from_config():
-    """implicit mode (unaffected by the D2 mount-time gate) passes through
-    verbatim, coexisting with prompt_cache_retention."""
+@pytest.mark.parametrize("model", [
+    "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+])
+@pytest.mark.parametrize("ttl", ["30m", "12h"])
+def test_prompt_cache_options_forwarded_from_config(model, ttl):
+    """Implicit mode and either supported TTL survive without legacy retention."""
     provider = _make_provider(
-        default_model="gpt-5.6-sol", prompt_cache_options={"mode": "implicit"}
+        default_model=model, prompt_cache_options={"mode": "implicit", "ttl": ttl}
     )
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     asyncio.run(provider.complete(_simple_request()))
     params = _captured_params(provider)
-    assert params["prompt_cache_options"] == {"mode": "implicit"}
-    # Coexistence: the default "24h" retention is still sent alongside it.
-    assert params["prompt_cache_retention"] == "24h"
+    assert params["prompt_cache_options"] == {"mode": "implicit", "ttl": ttl}
+    assert "prompt_cache_retention" not in params
 
 
 def test_prompt_cache_options_omitted_when_none():
@@ -326,7 +336,8 @@ def test_prompt_cache_options_kwarg_overrides_config():
     assert _captured_params(provider)["prompt_cache_options"] == {"mode": "explicit"}
 
 
-def test_prompt_cache_options_forwarded_on_continuation():
+@pytest.mark.parametrize("ttl", ["30m", "12h"])
+def test_prompt_cache_options_forwarded_on_continuation(ttl):
     """prompt_cache_options must survive an incomplete->continuation sequence.
 
     Mirrors test_cache_params.test_continuation_inherits_cache_params: if the
@@ -337,19 +348,23 @@ def test_prompt_cache_options_forwarded_on_continuation():
     """
     provider = _make_provider(default_model="gpt-5.6-sol")
     incomplete_resp = SimpleNamespace(
-        status="incomplete", id="resp_incomplete", output=[], incomplete_details=None
+        status="incomplete", id="resp_incomplete", output=[],
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
     provider.client.responses.create = AsyncMock(
         side_effect=[incomplete_resp, DummyResponse()]
     )
     asyncio.run(
-        provider.complete(_simple_request(), prompt_cache_options={"mode": "explicit"})
+        provider.complete(
+            _simple_request(), prompt_cache_options={"mode": "explicit", "ttl": ttl}
+        )
     )
 
     calls = provider.client.responses.create.call_args_list
     assert len(calls) == 2
     for call in calls:
-        assert call.kwargs.get("prompt_cache_options") == {"mode": "explicit"}
+        assert call.kwargs.get("prompt_cache_options") == {"mode": "explicit", "ttl": ttl}
+        assert "prompt_cache_retention" not in call.kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +491,8 @@ def test_explicit_mode_kwarg_override_bypasses_mount_validation(caplog):
 def test_curated_gpt6_models_share_the_documented_cache_contract():
     """Adding a supported tier must not silently omit its cache policy."""
     from amplifier_module_provider_openai import _supports_tool_output_cache_breakpoints
-    from amplifier_module_provider_openai._capabilities import GPT_6_MODELS
 
-    assert all(_supports_tool_output_cache_breakpoints(model) for model in GPT_6_MODELS)
+    for model in (
+        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra",
+    ):
+        assert _supports_tool_output_cache_breakpoints(model), model

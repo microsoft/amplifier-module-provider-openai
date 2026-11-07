@@ -26,7 +26,7 @@ def _make_provider(**config_overrides) -> OpenAIProvider:
 def _make_list_models_provider(*model_ids: str) -> OpenAIProvider:
     """Create a provider wired to return specific model IDs from list_models()."""
     provider = _make_provider(model_filters={})
-    provider._fetch_model_ids = AsyncMock(return_value=list(model_ids))
+    provider._fetch_model_catalog = AsyncMock(return_value=dict.fromkeys(model_ids))
     return provider
 
 

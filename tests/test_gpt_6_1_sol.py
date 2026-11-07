@@ -63,13 +63,16 @@ def _response(
                 content=[SimpleNamespace(type="output_text", text="Hi")],
             )
         ],
-        incomplete_details=None,
+        incomplete_details=(
+            SimpleNamespace(reason="max_output_tokens") if status == "incomplete" else None
+        ),
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             input_tokens_details=SimpleNamespace(
                 cached_tokens=0,
                 cache_write_tokens=0,
+                cache_write_tokens_details={"ttl_30m_tokens": 0, "ttl_12h_tokens": 0},
             ),
         ),
     )
@@ -79,7 +82,7 @@ def test_exact_gpt_6_1_sol_capabilities_and_exact_id_boundary() -> None:
     caps = get_capabilities(MODEL)
 
     assert caps.family == MODEL
-    assert caps.context_window == 922_000
+    assert caps.context_window == 1_050_000
     assert caps.max_input_tokens == 922_000
     assert caps.max_output_tokens == 128_000
     assert caps.long_context_pricing_threshold == 272_000
@@ -90,7 +93,7 @@ def test_exact_gpt_6_1_sol_capabilities_and_exact_id_boundary() -> None:
     assert caps.supports_native_computer_use is True
     for unrecognized in (
         "gpt-6.1",
-        "gpt-6.1-terra",
+        "gpt-6.1-cyber",
         "gpt-6.1-luna",
         "gpt-6.1-sol-2099-01-01",
     ):
@@ -180,10 +183,11 @@ def test_existing_gpt_6_sol_luna_literal_none_remains_legal(model: str) -> None:
     }
 
 
-def test_gpt_6_1_sol_caching_uses_only_30m_and_omits_legacy_retention() -> None:
+@pytest.mark.parametrize("ttl", ["30m", "12h"])
+def test_gpt_6_1_sol_caching_uses_documented_ttls_and_omits_legacy_retention(ttl) -> None:
     provider = _provider(
         prompt_cache_retention="24h",
-        prompt_cache_options={"ttl": "30m"},
+        prompt_cache_options={"ttl": ttl},
     )
     provider.client.responses.create = AsyncMock(return_value=_response())
 
@@ -191,7 +195,7 @@ def test_gpt_6_1_sol_caching_uses_only_30m_and_omits_legacy_retention() -> None:
 
     params = provider.client.responses.create.call_args.kwargs
     assert "prompt_cache_retention" not in params
-    assert params["prompt_cache_options"] == {"ttl": "30m"}
+    assert params["prompt_cache_options"] == {"ttl": ttl}
 
     invalid = _provider(prompt_cache_options={"ttl": "24h"})
     invalid.client.responses.create = AsyncMock(return_value=_response())
@@ -202,9 +206,9 @@ def test_gpt_6_1_sol_caching_uses_only_30m_and_omits_legacy_retention() -> None:
 
 def test_gpt_6_1_sol_discovery_has_display_name_and_opt_in_long_context() -> None:
     default = _provider(hide_dated_models=False)
-    default._fetch_model_ids = AsyncMock(return_value=[
+    default._fetch_model_catalog = AsyncMock(return_value=dict.fromkeys([
         MODEL, "gpt-6.1-sol-2099-01-01", "gpt-6.1-new-tier",
-    ])
+    ]))
 
     models = asyncio.run(default.list_models())
 
@@ -229,6 +233,7 @@ def test_gpt_6_1_sol_cost_uses_independent_short_and_long_cache_oracles() -> Non
         prompt_tokens=272_000,
         cached_tokens=100_000,
         cache_write_tokens=50_000,
+        cache_write_tokens_details={"ttl_30m_tokens": 50_000, "ttl_12h_tokens": 0},
         completion_tokens=20_000,
     ) == Decimal("0.579")
     assert compute_cost(
@@ -236,6 +241,7 @@ def test_gpt_6_1_sol_cost_uses_independent_short_and_long_cache_oracles() -> Non
         prompt_tokens=272_001,
         cached_tokens=100_000,
         cache_write_tokens=50_000,
+        cache_write_tokens_details={"ttl_30m_tokens": 50_000, "ttl_12h_tokens": 0},
         completion_tokens=20_000,
     ) == Decimal("1.058004")
 

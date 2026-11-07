@@ -19,5 +19,5 @@ class TestOpenaiProviderBehavior(ProviderBehaviorTests):
     @pytest.mark.asyncio
     async def test_list_models_returns_list(self, provider_module):
         """Exercise the Core no-argument contract with offline catalog IDs."""
-        provider_module._fetch_model_ids = AsyncMock(return_value=["gpt-6.1-sol"])
+        provider_module._fetch_model_catalog = AsyncMock(return_value={"gpt-6.1-sol": None})
         await super().test_list_models_returns_list(provider_module)
