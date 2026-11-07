@@ -54,6 +54,9 @@ from ._capabilities import (
     get_capabilities,
     get_request_policy,
 )
+from ._capabilities import (
+    GPT_6_SOL_LUNA_MODELS as GPT_6_SOL_LUNA_MODELS,
+)
 from ._constants import (
     BACKGROUND_POLLING_STATUSES,
     BACKGROUND_STATUS_FAILED,
@@ -236,6 +239,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 # Catching disallowed values pre-flight gives callers a clear error instead of
 # an opaque API HTTP 400.
 _GPT_5_5_PRO_ALLOWED_EFFORTS = get_request_policy("gpt-5.5-pro").allowed_efforts
+# Existing consumers import these names to validate their reasoning selectors.
+# Keep their values sourced from the canonical policy instead of another table.
+_GPT_6_ASTRA_ALLOWED_EFFORTS = get_request_policy("gpt-6-astra").allowed_efforts
+_GPT_6_SOL_LUNA_ALLOWED_EFFORTS = get_request_policy("gpt-6-sol").allowed_efforts
 
 
 def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
