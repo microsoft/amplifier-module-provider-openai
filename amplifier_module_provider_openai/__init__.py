@@ -53,6 +53,7 @@ from ._capabilities import (
     GPT_6_MODELS,
     LONG_CONTEXT_MODEL_PATTERN,
     get_capabilities,
+    get_known_context_window,
     get_request_policy,
 )
 from ._capabilities import (
@@ -2043,7 +2044,17 @@ class OpenAIProvider:
         }
         if measurement is not None:
             decision["measurement"] = measurement
+        decision.update(self._budget_window_metadata(params))
         return decision
+
+    def _budget_window_metadata(self, params: dict[str, Any]) -> dict[str, int]:
+        """Report exact-model facts, never reconstruct a window from allowances."""
+        # This fact is independent of counting support. The native transport
+        # wrapper also owns OpenAI model IDs, but uses the legacy budget branch.
+        if self.name != "openai" or not self._has_standard_openai_endpoint():
+            return {}
+        window = get_known_context_window(params["model"])
+        return {"context_window_tokens": window} if window is not None else {}
 
     def _assemble_initial_responses_params_stateful(
         self, request: ChatRequest, *, restore_state: bool, **kwargs: Any
@@ -2480,6 +2491,7 @@ class OpenAIProvider:
             # reservation before asking a context manager to omit more input.
             "max_output_tokens": int(params["max_output_tokens"]),
             "context_token_budget": max(0, int(target)),
+            **self._budget_window_metadata(params),
         }
 
     def _guard_assembled_params(
