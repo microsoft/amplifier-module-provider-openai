@@ -129,6 +129,84 @@ async def test_custom_actual_endpoint_overrides_standard_config_and_omits_window
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("body,wire_model,window", [
+    ({"model": "gpt-5.2"}, "gpt-5.2", None),
+    ({"model": "unknown-deployment"}, "unknown-deployment", None),
+    ({"model": None}, None, None),
+    ({"model": 42}, 42, None),
+    ({"model": "gpt-6-astra"}, "gpt-6-astra", 1_050_000),
+    ({"metadata": {"fixture": "overlay"}}, "gpt-6-astra", 1_050_000),
+])
+async def test_sdk_overlay_window_matches_wire_identity_or_is_omitted(body, wire_model, window):
+    wires = []
+
+    def receive(request):
+        assert request.method == "POST" and request.url.path == "/v1/responses"
+        wires.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "id": "resp_offline", "object": "response", "created_at": 0,
+            "status": "completed", "model": "offline-fixture", "output": [],
+        })
+
+    async with AsyncOpenAI(
+        api_key="offline-overlay", max_retries=0, base_url="https://api.openai.com/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(receive), trust_env=False),
+    ) as client:
+        p = OpenAIProvider(client=client, config={"extra_request_params": {"extra_body": body}})
+        request = ChatRequest(messages=[Message(role="user", content="hello")], model="gpt-6-astra",
+                              max_output_tokens=1_000)
+        params = p._budget_params(request)
+        before = copy.deepcopy(params)
+        # Direct native counting already refuses this unsupported SDK envelope.
+        assert await p.request_budget(request, context_estimate=20) is None
+        client.responses.input_tokens.count = None
+        result = p.request_budget(request, context_estimate=20)
+        assert result.get("context_window_tokens") == window
+        assert p._budget_decision(params, context_estimate=20, estimated_input_tokens=42).get(
+            "context_window_tokens"
+        ) == window
+        with patch.object(p, "_budget_window_metadata", return_value={}):
+            prior = p.request_budget(request, context_estimate=20)
+        assert {k: v for k, v in result.items() if k != "context_window_tokens"} == prior
+        assert result["input_limit_tokens"] == 267_904  # Existing pre-overlay fitting is unchanged.
+        assert result["max_output_tokens"] == 1_000
+        assert wires == []  # Metadata/preflight adds no IO.
+        # Exercise the real SDK overlay, not a hand-written JSON merge.
+        await client.responses.create(**{**params, "stream": False})
+        assert len(wires) == 1 and wires[0]["model"] == wire_model
+        assert "context_window_tokens" not in wires[0]
+        assert params == before and p.config["extra_request_params"]["extra_body"] == body
+
+
+@pytest.mark.parametrize("body", [None, [], "unsupported"])
+def test_sdk_overlay_non_object_has_no_window_evidence(body):
+    p = OpenAIProvider(api_key="unused")
+    assert p._budget_window_metadata({"model": "gpt-6-astra", "extra_body": body}) == {}
+    assert p._client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_present,window", [(False, None), (True, 1_050_000)])
+async def test_native_sdk_overlay_folded_and_fallback_window(owner_present, window):
+    from types import SimpleNamespace
+
+    from amplifier_module_provider_openai.native import NativeResponsesProvider
+
+    async with provider_fixture(native=True, extra_request_params={"extra_body": {"model": "gpt-6-astra"}}) as (p, calls):
+        owner = SimpleNamespace() if owner_present else None
+        wrapper = NativeResponsesProvider.wrap(p, owner_getter=lambda: owner)
+        request = ChatRequest(messages=[Message(role="user", content="hello")], model="gpt-5.2",
+                              max_output_tokens=1_000)
+        result = await wrapper.request_budget(request, context_estimate=20)
+        assert result.get("context_window_tokens") == window
+        assert result["input_limit_tokens"] == (267_904 if owner_present else 394_904)
+        with patch.object(wrapper, "_budget_window_metadata", return_value={}):
+            prior = await wrapper.request_budget(request, context_estimate=20)
+        assert {k: v for k, v in result.items() if k != "context_window_tokens"} == prior
+        assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_non_openai_subclass_cannot_inherit_public_model_window_claim():
     class DeploymentProvider(OpenAIProvider):
         name = "deployment"

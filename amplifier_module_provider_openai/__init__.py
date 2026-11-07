@@ -2053,6 +2053,14 @@ class OpenAIProvider:
         # wrapper also owns OpenAI model IDs, but uses the legacy budget branch.
         if self.name != "openai" or not self._has_standard_openai_endpoint():
             return {}
+        # The SDK applies extra_body after named fields. Do not attach a window
+        # to a pre-overlay budget identity that the final wire can replace.
+        body = params.get("extra_body", {})
+        if not isinstance(body, dict) or (
+            "model" in body
+            and (not isinstance(body["model"], str) or body["model"] != params["model"])
+        ):
+            return {}
         window = get_known_context_window(params["model"])
         return {"context_window_tokens": window} if window is not None else {}
 

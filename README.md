@@ -1114,6 +1114,14 @@ unknown, never zero or a default-model substitution. A `None` budget remains
 `None`, and counting failures still raise. No count, catalog or generation call
 is added to obtain this metadata.
 
+For an unfolded SDK `extra_body`, evidence is also omitted if its `model`
+differs from the assembled model, is not a string, or the overlay is not an
+object. An object with no `model`, or the same exact model string, does not
+suppress evidence. Native paths that already fold the overlay into their budget
+parameters report the known window of that folded model; fallback paths with an
+unfolded conflicting overlay omit it. This metadata check does not alter the
+existing fitting identity, overlay precedence, wire payload, or error behavior.
+
 The return remains an extensible dictionary; no Core protocol change or new
 dependency is required. Consumers may ignore the field. Consumers displaying it
 must associate the decision with the exact request/options through their existing
