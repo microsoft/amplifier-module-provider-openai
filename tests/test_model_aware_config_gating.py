@@ -412,6 +412,7 @@ class TestUnknownConfigKeySweep:
             "raw": False,
             "timeout": 600.0,
             "filtered": True,
+            "model_filters": {"include": ["gpt-6*"], "hide_dated": True},
             "prompt_cache_key": "",
             "prompt_cache_retention": None,
             "prompt_cache_options": None,
@@ -562,8 +563,8 @@ class TestExtraKnownConfigKeysExtensionPoint:
 
 
 def test_known_config_keys_has_no_accidental_overlap_gaps():
-    """Sanity check on the KNOWN_KEYS bookkeeping itself: the three
-    constituent sets (consumed / recognized-inert / infrastructure) are
+    """Sanity check on the KNOWN_KEYS bookkeeping itself: the four
+    constituent sets (consumed / recognized-inert / deprecated / infrastructure) are
     non-overlapping, so the audit trail in the module stays legible."""
     from amplifier_module_provider_openai import (
         _CONSUMED_CONFIG_KEYS,
@@ -583,7 +584,7 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
         | _DEPRECATED_ALIAS_CONFIG_KEYS
         | _INFRASTRUCTURE_CONFIG_KEYS
     )
-    # 34 keys: the 28 the config-surface-V2 survey counted (32 - 5 removed
+    # 35 keys: the 28 the config-surface-V2 survey counted (32 - 5 removed
     # [enable_state, enable_reasoning_context, enable_response_chaining,
     # thinking_budget_tokens, thinking_budget_buffer] + 1 added
     # [extra_request_params]), + 1 added by the reasoning.context gate fix
@@ -593,12 +594,39 @@ def test_known_config_keys_has_no_accidental_overlap_gaps():
     # key holding the whole {mode, namespaces, always_loaded} mapping, so
     # the surface grows by one entry, not three), + 1 optional Images API
     # backend configuration object (image_generation), and 1 optional decision
-    # backend configuration object (decisions). Audited against every
+    # backend configuration object (decisions), + 1 provider-local listing
+    # selector object (model_filters; not a Responses API wire parameter).
+    # Audited against every
     # `self.config.get(...)` call site in the constructor and request path.
-    assert len(_CONSUMED_CONFIG_KEYS) == 34
+    assert len(_CONSUMED_CONFIG_KEYS) == 35
     assert "auto_continue" in _CONSUMED_CONFIG_KEYS
     assert "image_generation" in _CONSUMED_CONFIG_KEYS
     assert "decisions" in _CONSUMED_CONFIG_KEYS
+    assert "model_filters" in _CONSUMED_CONFIG_KEYS
+
+
+def test_model_filters_are_consumed_locally_without_changing_chat_wire(caplog):
+    """Listing policy is recognized but cannot select or constrain inference."""
+    caplog.set_level(logging.WARNING, logger="amplifier_module_provider_openai")
+    selector = {"include": [], "exclude": ["gpt-*"], "hide_dated": True, "hide_shutdown": True}
+    provider = _make_provider(default_model="gpt-5.4", model_filters=selector)
+    provider._fetch_model_catalog = AsyncMock(return_value=dict.fromkeys(["gpt-5.4", "gpt-6-sol"]))
+    provider.client.responses.create = AsyncMock(return_value=_DummyResponse())
+
+    assert provider.get_model_list_info()["default_filters"] == selector
+    assert asyncio.run(provider.list_models()) == []
+    asyncio.run(provider.complete(_simple_request()))
+
+    params = _captured_params(provider)
+    assert params["model"] == "gpt-5.4"
+    assert "model_filters" not in params
+    assert "exclude" not in params
+    assert "hide_dated" not in params
+    assert "hide_shutdown" not in params
+    # Responses has an unrelated include parameter; it must not receive the
+    # listing selector's empty include list.
+    assert params.get("include") != selector["include"]
+    assert not any(_UNKNOWN_KEY_MARKER in r.message for r in caplog.records)
 
 
 def test_image_backend_configuration_is_consumed_without_changing_chat_wire(caplog):

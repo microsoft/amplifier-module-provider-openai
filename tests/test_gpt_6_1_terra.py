@@ -110,13 +110,16 @@ def test_capabilities_are_exact_and_default_is_unchanged():
 @pytest.mark.parametrize("long_context,window", [(False, 272_000), (True, 922_000)])
 def test_discovery_and_config_gate(long_context, window):
     provider = _provider(enable_long_context=long_context, hide_dated_models=False)
-    provider.client.models.list = AsyncMock(return_value=SimpleNamespace(
-        data=[SimpleNamespace(id=model) for model in [MODEL, *NEAR_MISSES]]
-    ))
+    provider._fetch_model_catalog = AsyncMock(return_value=dict.fromkeys([MODEL, *NEAR_MISSES]))
     models = asyncio.run(provider.list_models())
-    assert [(m.id, m.display_name, m.context_window, m.max_output_tokens) for m in models] == [
+    assert [(m.id, m.display_name, m.context_window, m.max_output_tokens)
+            for m in models if m.id == MODEL] == [
         (MODEL, "GPT 6.1 Terra", window, 128_000)
     ]
+    # Endpoint presence is independent of known capability eligibility.
+    assert {m.id for m in models} == {MODEL, *NEAR_MISSES}
+    assert all(m.context_window == 0 and m.capabilities == []
+               for m in models if m.id != MODEL)
     assert provider.get_info().defaults["context_window"] == window
     field = next(f for f in provider.get_info().config_fields if f.id == "enable_long_context")
     pattern = field.show_when["default_model"].removeprefix("matches:")

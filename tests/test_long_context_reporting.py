@@ -15,7 +15,6 @@ For gpt-5-mini, the safe reported input limit is 272K, not its 400K total contex
 """
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from amplifier_module_provider_openai import OpenAIProvider
@@ -30,20 +29,11 @@ def _make_provider(**config_overrides) -> OpenAIProvider:
     return OpenAIProvider(api_key="test-key", config=config)
 
 
-def _fake_models_response(model_ids: list[str]):
-    """Create a fake OpenAI models.list() response."""
-    data = [SimpleNamespace(id=mid) for mid in model_ids]
-    return SimpleNamespace(data=data)
-
-
 def _make_list_models_provider(**config_overrides) -> OpenAIProvider:
     """Create a provider wired to return specific model IDs from list_models()."""
-    config = {"max_retries": 0, "filtered": False, **config_overrides}
+    config = {"max_retries": 0, "model_filters": {}, **config_overrides}
     provider = OpenAIProvider(api_key="test-key", config=config)
-    provider._client = AsyncMock()
-    provider._client.models.list = AsyncMock(
-        return_value=_fake_models_response(["gpt-5.4"])
-    )
+    provider._fetch_model_catalog = AsyncMock(return_value={"gpt-5.4": None})
     return provider
 
 
@@ -113,7 +103,7 @@ class TestListModelsContextWindowReporting:
     def test_gpt_5_mini_limits_match_public_info(self):
         """Discovery reports safe mini input limits, not total context capacity."""
         provider = _make_list_models_provider(default_model="gpt-5-mini")
-        provider._client.models.list.return_value = _fake_models_response(
+        provider._fetch_model_catalog.return_value = dict.fromkeys(
             ["gpt-5-mini", "gpt-5-mini-2025-08-07"]
         )
         models = asyncio.run(provider.list_models())

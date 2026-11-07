@@ -206,22 +206,18 @@ def test_gpt_6_1_sol_caching_uses_documented_ttls_and_omits_legacy_retention(ttl
 
 def test_gpt_6_1_sol_discovery_has_display_name_and_opt_in_long_context() -> None:
     default = _provider(hide_dated_models=False)
-    default._client = AsyncMock()
-    default._client.models.list = AsyncMock(
-        return_value=SimpleNamespace(
-            data=[
-                SimpleNamespace(id=MODEL),
-                SimpleNamespace(id="gpt-6.1-sol-2099-01-01"),
-                SimpleNamespace(id="gpt-6.1-luna"),
-            ]
-        )
-    )
+    default._fetch_model_catalog = AsyncMock(return_value=dict.fromkeys([
+        MODEL, "gpt-6.1-sol-2099-01-01", "gpt-6.1-new-tier",
+    ]))
 
     models = asyncio.run(default.list_models())
 
     assert [
-        (model.id, model.display_name, model.context_window) for model in models
+        (model.id, model.display_name, model.context_window) for model in models if model.id == MODEL
     ] == [(MODEL, "GPT 6.1 Sol", 272_000)]
+    unknown = [model for model in models if model.id != MODEL]
+    assert {model.id for model in unknown} == {"gpt-6.1-sol-2099-01-01", "gpt-6.1-new-tier"}
+    assert all(model.context_window == 0 and model.defaults == {} for model in unknown)
     assert default.get_info().defaults["context_window"] == 272_000
     assert (
         _provider(enable_long_context=True).get_info().defaults["context_window"]

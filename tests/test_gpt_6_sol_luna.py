@@ -288,27 +288,42 @@ def test_sol_luna_implicit_retention_is_omitted_without_warning(model: str, capl
     ]
 
 
-def test_sol_luna_discovery_has_exact_models_and_default_long_context_budget() -> None:
+def test_sol_luna_listing_keeps_known_metadata_without_guessing_future_ids() -> None:
     provider = _provider(hide_dated_models=False)
-    provider._client = AsyncMock()
-    provider._client.models.list = AsyncMock(
-        return_value=SimpleNamespace(
-            data=[
-                SimpleNamespace(id="gpt-6-sol"),
-                SimpleNamespace(id="gpt-6-luna"),
-                SimpleNamespace(id="gpt-6-terra"),
-                SimpleNamespace(id="gpt-6-sol-2099-01-01"),
-            ]
-        )
-    )
+    provider._fetch_model_catalog = AsyncMock(return_value=dict.fromkeys([
+        "gpt-6-sol", "gpt-6-luna", "gpt-6-new-tier", "gpt-6-sol-2099-01-01",
+    ]))
 
     models = asyncio.run(provider.list_models())
 
-    assert [(model.id, model.display_name) for model in models] == [
+    known = [model for model in models if model.id in {"gpt-6-sol", "gpt-6-luna"}]
+    assert [(model.id, model.display_name) for model in known] == [
         ("gpt-6-luna", "GPT 6 Luna"),
         ("gpt-6-sol", "GPT 6 Sol"),
     ]
-    assert all(model.context_window == 272_000 for model in models)
+    assert all(model.context_window == 272_000 for model in known)
+    unknown = [model for model in models if model not in known]
+    assert {model.id for model in unknown} == {"gpt-6-new-tier", "gpt-6-sol-2099-01-01"}
+    assert all(model.context_window == 0 and model.defaults == {} for model in unknown)
+
+
+@pytest.mark.parametrize("model", ["gpt-5.4", "o3-mini"])
+@pytest.mark.parametrize("per_call", [False, True])
+def test_listing_filters_do_not_change_explicit_legacy_inference(model, per_call) -> None:
+    provider = _provider(
+        default_model="gpt-6-sol" if per_call else model,
+        model_filters={"include": []},
+    )
+    provider._fetch_model_catalog = AsyncMock(return_value=dict.fromkeys([model, "gpt-6-sol"]))
+    provider.client.responses.create = AsyncMock(return_value=_response(model=model))
+
+    assert asyncio.run(provider.list_models()) == []
+    assert {row.id for row in asyncio.run(provider.list_models(filters={}))} == {
+        model, "gpt-6-sol",
+    }
+    asyncio.run(provider.complete(_request(), **({"model": model} if per_call else {})))
+    assert provider.client.responses.create.call_args.kwargs["model"] == model
+    assert provider.get_model_list_info()["default_filters"]["include"] == []
 
 
 @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
@@ -325,9 +340,7 @@ def test_sol_luna_per_call_model_override_uses_exact_context_budget(
     asyncio.run(provider.complete(_request(), model=model))
 
     assert provider.client.responses.create.call_args.kwargs["model"] == model
-    provider.client.models.list = AsyncMock(
-        return_value=SimpleNamespace(data=[SimpleNamespace(id=model)])
-    )
+    provider._fetch_model_catalog = AsyncMock(return_value={model: None})
     models = asyncio.run(provider.list_models())
     assert models[0].context_window == expected_context
 

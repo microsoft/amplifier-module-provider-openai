@@ -146,9 +146,83 @@ this provider default does not alter their tier policy.
 - `gpt-5-mini` - Smaller, faster GPT-5: 400,000-token total context, 272,000-token maximum input, and 128,000-token maximum output. Preflight retains its 4,096-token safety reserve; reducing the output cap does not raise the input ceiling.
 - `gpt-5-nano` - Smallest GPT-5 variant
 
+### Model listing and optional filters
+
+`await provider.list_models()` remains async and returns `list[ModelInfo]`.
+It is the single canonical implementation; the earlier PR141 proposal for a
+separate public `discover_models()` interface is deliberately removed.
+The default view now shows endpoint-returned **`gpt-6*`** IDs, including future
+variants and previews, not a fixed known-model allowlist. GPT-5, o-series and
+deep-research models remain usable through explicit inference selection but are
+not in the default listing. No default, alias or synthetic model is added.
+
+```python
+await provider.list_models()                 # Frozen provider/config defaults
+await provider.list_models(filters=None)     # Same as no argument
+await provider.list_models(filters={})       # Truly all IDs, including snapshots/non-chat
+await provider.list_models(filters={
+    "include": ["gpt-6*", "gpt-5*"],
+    "exclude": ["*-preview"],
+    "hide_dated": True,
+    "hide_shutdown": True,
+})
+```
+
+An explicit selector **replaces**, rather than merges with, provider defaults.
+Its omitted keys mean `include: ["*"]`, `exclude: []`, `hide_dated: false`,
+`hide_shutdown: false`. Thus `{}` includes even known shutdowns returned by the API.
+Patterns use case-insensitive, OS-independent Python `fnmatch` glob semantics
+(`*`, `?`, `[seq]`, `[!seq]`); exact endpoint ID bytes are preserved.
+Any include match qualifies; any exclude match wins; `include: []` matches none.
+Invalid selectors raise `ValueError` or `TypeError` before I/O. `hide_dated` suppresses a terminal
+`-YYYY-MM-DD` snapshot only when its exact corresponding undated alias is also
+selected. A snapshot without that alias remains visible. Preview labels in IDs
+remain visible in display names; preview status is not guessed for opaque IDs.
+
+The settings-only `model_filters` mapping has the same replacement semantics;
+`model_filters: {}` makes the configured view unfiltered. When absent/null,
+defaults are `include: ["gpt-6*"]`, `exclude: []`, `hide_shutdown: true`,
+and the legacy date preference.
+`hide_dated_models` (default true) still controls dates only; deprecated `filtered`
+is its alias, with `hide_dated_models` winning when both are set. Neither false
+value means all families. The date policy is deliberately corrected to retain
+unaliased snapshots. A non-null `model_filters` replaces both legacy date keys.
+Config is snapshotted at construction; each call snapshots its selector before
+I/O. Changing caller mappings, capability readback or legacy attributes cannot
+mutate another call's filtering. Reconstruct the provider to change defaults.
+
+Optional local `get_model_list_info()` returns version `1`, `source: "provider-api"`, `filters_keyword`,
+`filters_schema`, effective `default_filters`, `unfiltered: {}`, and
+`override: "replace"`. Consumers must inspect support before passing keywords;
+this is **not** a Core protocol change or a promise about legacy/other providers.
+`source` advertises fresh strict API-backed listing, not current account access;
+listing failures still raise rather than becoming successful static results.
+No Foundation dependency or shared transport keyword assumption is introduced.
+
+Listing fetches one complete Models API response per attempt on the original
+bound SDK client, preserving endpoint, credential, organization/project (including
+absence), headers and caller transport ownership. The generated SDK's bearer-only
+security policy is preserved. OpenAI documents no native name filter or pagination:
+no `extra_query` filters/cursors are invented. A compatible response declaring
+`has_more: true` fails rather than returning a partial catalog.
+Provider retry/backoff remains in effect, with SDK retries disabled per request;
+the bound client's settings are not mutated. Authentication, API/transport and
+malformed-response failures raise typed errors with sanitized public diagnostics.
+Cancellation propagates. Empty success remains `[]`; there is no static/cache fallback.
+
+Known models retain existing metadata and display-name ordering. Unrecognized
+endpoint IDs have `context_window: 0`, `max_output_tokens: 0`, `capabilities: []`
+and `defaults: {}` (apart from a known inert `shutdown_date`): zero means
+**unknown**, not a usable inference limit. They do
+not inherit guessed capability/price tables from an alias. Catalog presence is
+not proof of Responses compatibility or inference entitlement. Inference defaults,
+explicit pins, credential ownership and capability/price tables are unchanged.
+
 Capabilities, request eligibility and lifecycle are separate data. Exact model
 policies share family defaults without inferring future GPT-6 IDs. For the public
-OpenAI endpoint, discovery hides documented or API-reported shutdowns and carries
+OpenAI endpoint, `hide_shutdown: true` hides documented or API-reported shutdowns.
+This is enabled in the provider default view, not in explicit selectors unless
+requested. Lifecycle filtering runs before dated-alias suppression. Listing carries
 a valid `shutdown_date` as inert model metadata. Explicit pins are preserved and
 warned about, not silently replaced. Deprecated models still available before
 their shutdown date remain discoverable. Azure deployment aliases and custom
@@ -200,7 +274,8 @@ counterpart. `Wizard?` marks the four keys the app-cli wizard prompts for.
 | `truncation` | `truncation` | `null` (default) omits the field; API errors on overflow. `"auto"` drops oldest messages (busts cache). | `"auto"` lowers cache hit rate. | |
 | `raw` | **Amplifier-only** | When `true`, includes the full (redacted) request payload in `llm:request` events. | — | |
 | `timeout` | (client) | Optional model request timeout seconds; unset/null waits for completion or cancellation. Connection setup remains bounded. | — | |
-| `hide_dated_models` | **Amplifier-only** | Hides dated snapshot ids (`gpt-5.6-2026-07-09`) from `list_models`. | — | |
+| `hide_dated_models` | **Amplifier-only** | Date-only preference (default true); hides a snapshot only if its selected exact undated alias exists. Deprecated `filtered` is an alias. Ignored when `model_filters` is supplied. | — | |
+| `model_filters` | **Amplifier-only** | Settings-only listing selector: `include`, `exclude`, `hide_dated`, `hide_shutdown`. Replaces defaults; `{}` is truly unfiltered. Does not affect inference. See [Model listing](#model-listing-and-optional-filters). | — | |
 | `prompt_cache_key` | `prompt_cache_key` | Stable cache-routing identifier. **Settings-only** (no ConfigField). | Improves cache hit rate. | |
 | `prompt_cache_retention` | `prompt_cache_retention` | Legacy `"24h"` \| `"in_memory"` \| `null`. Exact GPT-5.6/GPT-6 models remove it and warn once; use `prompt_cache_options.ttl`. Other models retain their established retention behavior. | Endpoint/model dependent. | |
 | `prompt_cache_options` | `prompt_cache_options` | `{mode, ttl}`. **`mode: "explicit"` is dropped at mount** (see [Prompt caching](#prompt-caching)); exact GPT-5.6/GPT-6 models accept `ttl: "30m"` or `"12h"`. | 12h writes cost more than 30m writes; missing billing evidence is not an assumed lifetime. | |

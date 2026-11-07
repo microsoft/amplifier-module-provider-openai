@@ -140,10 +140,7 @@ class TestCapabilities:
 
     def test_list_models_uses_friendly_name_and_reported_limits(self) -> None:
         provider = _provider(hide_dated_models=False)
-        provider._client = AsyncMock()
-        provider._client.models.list = AsyncMock(
-            return_value=SimpleNamespace(data=[SimpleNamespace(id="gpt-6-astra")])
-        )
+        provider._fetch_model_catalog = AsyncMock(return_value={"gpt-6-astra": None})
 
         models = asyncio.run(provider.list_models())
 
