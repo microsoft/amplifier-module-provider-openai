@@ -8,11 +8,9 @@ Verifies that:
    gpt-5.5 and gpt-5.5-pro also have a documented threshold.
 """
 
-import asyncio
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
-
+import httpx
 import pytest
+from openai import AsyncOpenAI
 
 from amplifier_module_provider_openai import OpenAIProvider
 from amplifier_module_provider_openai._capabilities import get_capabilities
@@ -119,20 +117,52 @@ class TestGPT54CostSafeBehaviorRegression:
     ("gpt-5.2-pro", 400_000, 400_000),
 ])
 @pytest.mark.parametrize("enable_long_context", [False, True])
-def test_info_and_discovery_report_safe_input_not_total_or_reserved_budget(
+@pytest.mark.asyncio
+async def test_info_and_discovery_report_safe_input_not_total_or_reserved_budget(
     model, standard, long, enable_long_context
 ):
-    provider = _make_provider(
-        default_model=model,
-        enable_long_context=enable_long_context,
+    requests = []
+
+    def catalog(request):
+        requests.append(request)
+        assert request.method == "GET"
+        assert str(request.url) == "https://offline.invalid/v1/models"
+        assert request.headers["authorization"] == "Bearer test-key"
+        assert not request.content
+        return httpx.Response(200, json={
+            "object": "list",
+            "data": [{"id": model, "object": "model", "created": 0, "owned_by": "fixture"}],
+        })
+
+    async with AsyncOpenAI(
+        api_key="test-key",
         base_url="https://offline.invalid/v1",
-    )
-    provider.client.models.list = AsyncMock(
-        return_value=SimpleNamespace(data=[SimpleNamespace(id=model)])
-    )
-    expected = long if enable_long_context else standard
-    assert provider.get_info().defaults["context_window"] == expected
-    models = asyncio.run(provider.list_models())
-    assert len(models) == 1
-    assert models[0].context_window == expected
-    assert models[0].max_output_tokens == 128_000
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(catalog), trust_env=False,
+        ),
+        max_retries=0,
+    ) as client:
+        provider = OpenAIProvider(client=client, config={
+            "max_retries": 0,
+            "default_model": model,
+            "enable_long_context": enable_long_context,
+        })
+        expected = long if enable_long_context else standard
+        assert provider.get_info().defaults["context_window"] == expected
+
+        # This oracle covers all model metadata, not only recommended defaults.
+        # Exercise the real bound SDK path; mocking models.list misses it.
+        models = await provider.list_models(filters={})
+        assert len(models) == 1
+        assert models[0].id == model
+        assert models[0].context_window == expected
+        assert models[0].max_output_tokens == 128_000
+
+        # Metadata availability does not widen the approved no-argument view.
+        default_models = await provider.list_models()
+        assert [row.id for row in default_models] == (
+            [model] if model.startswith("gpt-6") else []
+        )
+        assert provider.client is client
+        assert provider.default_model == model
+        assert len(requests) == 2
