@@ -1096,6 +1096,43 @@ usage remains in actual usage accounting but never calibrates the text byte
 estimate. Data URLs or image-shaped JSON inside ordinary text, tool arguments,
 or tool schemas remain subject to the text guard.
 
+### Exact-model window evidence in request budgets
+
+Both counted and legacy `request_budget` decisions may add
+`context_window_tokens`: a positive integer containing the effective wire model's
+documented **full context window**. It comes from the same exact-ID capability
+registry used by request fitting, after normal model selection and final request
+overrides. It is not the mounted default model's `get_info()` value, an inferred
+family value, an input allowance, an output reservation, a safety margin, a
+pricing threshold, or the context manager's compaction target.
+
+For example, a selected `gpt-6-astra` reports `1_050_000`, independently of a
+standard/long input allowance of `267_904`/`917_904`. Changing the request's
+output reservation or `enable_long_context` does not change that model fact.
+The existing budget fields and fitting policy are unchanged.
+
+This optional evidence is emitted only for an OpenAI provider (including its
+native transport wrapper) on its effective standard OpenAI endpoint and a model with an exact registry entry
+(including documented aliases such as `gpt-5.6`). Unknown IDs, historical
+snapshot/family guesses, custom endpoints and non-OpenAI providers omit it; absence is
+unknown, never zero or a default-model substitution. A `None` budget remains
+`None`, and counting failures still raise. No count, catalog or generation call
+is added to obtain this metadata.
+
+For an unfolded SDK `extra_body`, evidence is also omitted if its `model`
+differs from the assembled model, is not a string, or the overlay is not an
+object. An object with no `model`, or the same exact model string, does not
+suppress evidence. Native paths that already fold the overlay into their budget
+parameters report the known window of that folded model; fallback paths with an
+unfolded conflicting overlay omit it. This metadata check does not alter the
+existing fitting identity, overlay precedence, wire payload, or error behavior.
+
+The return remains an extensible dictionary; no Core protocol change or new
+dependency is required. Consumers may ignore the field. Consumers displaying it
+must associate the decision with the exact request/options through their existing
+budget-attribution boundary. This field does not prove that association, add
+permission to execute, or guarantee live account entitlement.
+
 ### Native Responses input counts
 
 For a direct `OpenAIProvider` on the effective standard

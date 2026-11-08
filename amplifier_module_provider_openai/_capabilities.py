@@ -359,6 +359,16 @@ LONG_CONTEXT_MODEL_PATTERN = "matches:^(?:" + "|".join(
 ) + ")$"
 
 
+def get_known_context_window(model_id: str) -> int | None:
+    """Return the full window only for an exact documented capability entry.
+
+    Unlike get_capabilities, this evidence lookup does not expand snapshots or
+    infer family defaults for deployment aliases and unknown model suffixes.
+    """
+    caps = _EXACT_CAPABILITIES.get(model_id)
+    return caps.context_window if caps is not None else None
+
+
 def get_capabilities(model_id: str) -> ModelCapabilities:
     """Return capabilities for *model_id*.
 
