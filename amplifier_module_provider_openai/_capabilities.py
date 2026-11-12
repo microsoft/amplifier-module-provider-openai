@@ -310,6 +310,13 @@ _MODERN_CAPABILITIES = ModelCapabilities(
 # Exact GPT-6 IDs have no documented dated snapshots. Legacy GPT-5 snapshot
 # parsing below remains a compatibility path, not qualification for new features.
 _EXACT_CAPABILITIES = {
+    "chat-latest": ModelCapabilities(
+        family="chat-latest",
+        context_window=400_000,
+        max_input_tokens=272_000,
+        max_output_tokens=128_000,
+        capability_tags=("tools", "streaming", "json_mode", "vision"),
+    ),
     **{
         model: replace(_MODERN_CAPABILITIES, family=model)
         for model in GPT_6_MODELS

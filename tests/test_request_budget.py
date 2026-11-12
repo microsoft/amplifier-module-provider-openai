@@ -154,6 +154,103 @@ def test_gpt_5_mini_reduced_output_cannot_exceed_documented_input_ceiling():
     assert counter.await_count == 2  # preflight plus the independent dispatch guard
 
 
+@pytest.mark.parametrize("output", [None, 128_000, 1_000])
+@pytest.mark.parametrize("measured", [267_904, 267_905])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("long_context", [False, True])
+def test_chat_latest_input_boundary(output, measured, streaming, long_context):
+    provider, counter = _native_provider(
+        default_model="chat-latest", input_tokens=measured,
+        use_streaming=streaming, enable_long_context=long_context,
+    )
+    request = _request(output=output)
+    decision = asyncio.run(provider.request_budget(request, context_estimate=measured))
+    assert decision["context_window_tokens"] == 400_000
+    assert decision["max_output_tokens"] == (128_000 if output is None else output)
+    assert decision["input_limit_tokens"] == 267_904
+    response = _response(measured)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    provider.client.responses.stream.return_value = _StreamContext(response)
+    if measured > 267_904:
+        assert 0 < decision["context_token_budget"] < measured
+        with pytest.raises(kernel_errors.ContextLengthError, match="native input allowance"):
+            asyncio.run(provider.complete(request))
+        provider.client.responses.create.assert_not_called()
+        provider.client.responses.stream.assert_not_called()
+    else:
+        assert decision["context_token_budget"] == measured
+        asyncio.run(provider.complete(request))
+        sdk = provider.client.responses.stream if streaming else provider.client.responses.create
+        assert sdk.call_count == 1
+        assert sdk.call_args.kwargs["model"] == "chat-latest"
+        assert sdk.call_args.kwargs["max_output_tokens"] == decision["max_output_tokens"]
+        assert counter.call_args.kwargs == _count_projection(_wire_params(sdk.call_args.kwargs))
+    assert counter.await_count == 2
+
+
+@pytest.mark.parametrize("selection", ["request", "kwargs", "extras"])
+def test_chat_latest_final_selection_preserves_default_and_request(selection):
+    config, kwargs = {}, {}
+    request = _request(output=1_000)
+    if selection == "request":
+        request.model = "chat-latest"
+    elif selection == "kwargs":
+        kwargs["model"] = "chat-latest"
+    else:
+        config["extra_request_params"] = {"model": "chat-latest"}
+    provider, counter = _native_provider(input_tokens=267_904, **config)
+    original = request.model_dump()
+    decision = asyncio.run(provider.request_budget(request, context_estimate=267_904, **kwargs))
+    assert decision["input_limit_tokens"] == 267_904
+    response = _response(267_904)
+    response.output = []
+    provider.client.responses.create.return_value = response
+    asyncio.run(provider.complete(request, **kwargs))
+    wire = _wire_params(provider.client.responses.create.call_args.kwargs)
+    assert wire["model"] == "chat-latest"
+    assert "reasoning" not in wire
+    if selection != "extras":
+        assert wire["prompt_cache_retention"] == "24h"
+    assert counter.call_args.kwargs == _count_projection(wire)
+    assert counter.await_count == 2
+    assert request.model_dump() == original
+    assert provider.default_model == "gpt-6.1-sol"
+
+
+def test_chat_latest_output_ceiling_and_failed_count_never_dispatch():
+    provider, counter = _native_provider(default_model="chat-latest")
+    request = _request(output=128_001)
+    with pytest.raises(kernel_errors.ContextLengthError, match="model output ceiling"):
+        asyncio.run(provider.request_budget(request, context_estimate=1))
+    with pytest.raises(kernel_errors.ContextLengthError, match="model output ceiling"):
+        asyncio.run(provider.complete(request))
+    assert counter.await_count == 2  # Existing contract counts before admission.
+    counter.reset_mock()
+    counter.side_effect = RuntimeError("synthetic count failure")
+    with pytest.raises(TokenCountError):
+        asyncio.run(provider.request_budget(_request(), context_estimate=1))
+    with pytest.raises(TokenCountError):
+        asyncio.run(provider.complete(_request()))
+    assert counter.await_count == 2
+    provider.client.responses.create.assert_not_called()
+    provider.client.responses.stream.assert_not_called()
+
+
+def test_chat_latest_nested_model_override_keeps_existing_budget_abstention():
+    provider, counter = _native_provider(
+        extra_request_params={"extra_body": {"model": "chat-latest"}}
+    )
+    request = _request(output=1_000)
+    original = request.model_dump()
+    assert asyncio.run(provider.request_budget(request, context_estimate=10)) is None
+    counter.assert_not_called()
+    params = provider._assemble_initial_responses_params(request)[0]
+    assert params["extra_body"]["model"] == "chat-latest"
+    assert provider.default_model == "gpt-6.1-sol"
+    assert request.model_dump() == original
+
+
 def test_models_without_an_input_ceiling_keep_existing_output_reserve_policy():
     provider = _provider(default_model="gpt-5.3")
     params = provider._budget_params(_request(output=1_000))

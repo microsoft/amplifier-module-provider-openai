@@ -13,6 +13,14 @@ from amplifier_core import llm_errors as kernel_errors
 from openai import AsyncOpenAI
 
 from amplifier_module_provider_openai import OpenAIProvider
+from amplifier_module_provider_openai._capabilities import (
+    ModelCapabilities,
+    RequestPolicy,
+    get_capabilities,
+    get_known_context_window,
+    get_request_policy,
+)
+from amplifier_module_provider_openai._cost import compute_cost
 
 ENDPOINT = "https://catalog.example.invalid/account/v1/"
 
@@ -54,6 +62,81 @@ async def sdk_provider(receive, **config):
         assert provider.client is client and client.max_retries == 2
         assert not http.is_closed  # Caller owns its transport.
     assert http.is_closed
+
+
+def test_chat_latest_exact_facts_without_new_request_policy():
+    assert get_capabilities("chat-latest") == ModelCapabilities(
+        family="chat-latest", context_window=400_000, max_input_tokens=272_000,
+        max_output_tokens=128_000, capability_tags=("tools", "streaming", "json_mode", "vision"),
+    )
+    assert get_known_context_window("chat-latest") == 400_000
+    assert get_request_policy("chat-latest") == RequestPolicy()
+
+
+@pytest.mark.parametrize("model", [
+    "chat-latest-preview", "chat-latest-2099-01-01", "Chat-Latest", " chat-latest ",
+])
+def test_chat_latest_near_misses_remain_unknown(model):
+    assert get_capabilities(model) == ModelCapabilities(family="unknown")
+    assert get_known_context_window(model) is None
+    assert get_request_policy(model) == RequestPolicy()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("long_context", [False, True])
+async def test_chat_latest_catalog_requires_explicit_selector_and_endpoint_presence(long_context):
+    returned = ["chat-latest", "chat-latest-preview", "chat-latest-2099-01-01", "Chat-Latest",
+                "gpt-6.1-sol", "gpt-5.4"]
+    async with sdk_provider(
+        lambda _: httpx.Response(200, json=catalog(*returned)),
+        enable_long_context=long_context,
+    ) as (p, requests, _):
+        before = deepcopy(p.config)
+        assert ids(await p.list_models()) == {"gpt-6.1-sol"}
+        for selector in ({}, {"include": ["chat-latest"]}):
+            rows = await p.list_models(filters=selector)
+            row = next(row for row in rows if row.id == "chat-latest")
+            assert row.context_window == 272_000
+            assert row.max_output_tokens == 128_000
+            assert row.capabilities == ["tools", "streaming", "json_mode", "vision"]
+            # Existing provider omission sentinel, not an API effort qualification.
+            assert row.defaults == {"max_tokens": 16384, "reasoning_effort": "none"}
+            for unknown in (r for r in rows if r.id in returned[1:4]):
+                assert unknown.context_window == unknown.max_output_tokens == 0
+                assert unknown.capabilities == [] and unknown.defaults == {}
+        assert ids(await p.list_models()) == {"gpt-6.1-sol"}
+        assert p.default_model == "gpt-6.1-sol" and p.config == before
+        assert len(requests) == 4
+    async with sdk_provider(
+        lambda _: httpx.Response(200, json=catalog("gpt-5.4")),
+        default_model="gpt-5.4",
+    ) as (p, _, _):
+        assert await p.list_models(filters={"include": ["chat-latest"]}) == []
+        assert ids(await p.list_models(filters={})) == {"gpt-5.4"}
+        assert p.default_model == "gpt-5.4"
+
+
+@pytest.mark.parametrize("model", [
+    "chat-latest", "chat-latest-preview", "chat-latest-2099-01-01",
+])
+def test_chat_latest_cost_remains_unknown_in_response_json(model):
+    from types import SimpleNamespace
+
+    from openai.types.responses import Response
+
+    assert compute_cost(model, prompt_tokens=100, completion_tokens=10) is None
+    response = Response.model_construct(
+        id="resp_offline_chat", model=model, status="completed", output=[],
+        usage=SimpleNamespace(
+            input_tokens=100, output_tokens=10,
+            input_tokens_details=SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
+        ),
+    )
+    provider = OpenAIProvider(api_key="offline-fixture", config={"default_model": "chat-latest"})
+    converted = provider._convert_to_chat_response(response)
+    assert response.model == model  # Never relabel the observed SKU with the requested alias.
+    assert converted.usage.cost_usd is None
+    assert json.loads(converted.model_dump_json())["usage"]["cost_usd"] is None
 
 
 @pytest.mark.asyncio
