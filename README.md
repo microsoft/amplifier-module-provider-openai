@@ -145,6 +145,19 @@ this provider default does not alter their tier policy.
 - `gpt-5.4` - Balanced GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5: 400,000-token total context, 272,000-token maximum input, and 128,000-token maximum output. Preflight retains its 4,096-token safety reserve; reducing the output cap does not raise the input ceiling.
 - `gpt-5-nano` - Smallest GPT-5 variant
+- `chat-latest` - Exact rolling ID: 400,000-token total context, independent
+  272,000-token input ceiling, and 128,000-token output ceiling. Preflight keeps
+  its 4,096-token safety reserve even with reduced output. The official
+  [model page](https://developers.openai.com/api/docs/models/chat-latest.md)
+  (reviewed 2026-11-12) documents text/image input, text output, streaming,
+  ordinary function calling, and structured outputs. Catalog metadata reports
+  the input-oriented 272,000 window only when the endpoint returns the ID and
+  an explicit selector includes it (`filters={}` or `include: ["chat-latest"]`);
+  the default GPT-6 listing and `gpt-6.1-sol` default are unchanged. Dated siblings
+  and near-miss IDs are not inferred. Cost remains unknown (`cost_usd: null`),
+  not zero. This metadata-only addition is not final-candidate live qualification:
+  reasoning efforts, native computer/image operations, and new cache policies
+  are not qualified by it; existing request-policy defaults are unchanged.
 
 ### Model listing and optional filters
 
