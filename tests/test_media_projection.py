@@ -630,3 +630,44 @@ async def test_wraps_interposer_cannot_borrow_raw_sdk_method_identity(method):
         assert not calls and not observed
     finally:
         await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["create", "compact"])
+@pytest.mark.parametrize("spoof", ["attributes", "comparison"])
+async def test_sdk_factory_wrapper_requires_actual_bound_method_closure(method, spoof):
+    from openai._legacy_response import async_to_raw_response_wrapper
+
+    req = request()
+    p, _, calls, _ = provider(req)
+    raw = p.client.responses.with_raw_response
+    actual = getattr(raw, method).__wrapped__
+    observed = []
+
+    async def spy(*args, **kwargs):
+        observed.append(kwargs)
+
+    if spoof == "attributes":
+        # A plain function can carry these attributes without being a method.
+        spy.__self__, spy.__func__ = actual.__self__, actual.__func__
+        replacement = async_to_raw_response_wrapper(spy)
+    else:
+        class EqualSpy:
+            def __eq__(self, other):
+                return True
+
+            def __ne__(self, other):
+                return False
+
+            async def __call__(self, *args, **kwargs):
+                observed.append(kwargs)
+
+        replacement = async_to_raw_response_wrapper(EqualSpy())
+        replacement.__wrapped__ = actual
+    setattr(raw, method, replacement)
+    try:
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert not calls and not observed
+    finally:
+        await p.close()

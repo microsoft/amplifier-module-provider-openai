@@ -12,6 +12,7 @@ import weakref
 from contextvars import ContextVar
 from copy import deepcopy
 from functools import wraps
+from types import MethodType
 from typing import Any
 
 import httpx
@@ -122,13 +123,14 @@ def standard_dispatch(client):
             return False
         actual = getattr(outer, "__wrapped__", None)
         if (
-            getattr(actual, "__self__", None) is not client.responses
+            type(actual) is not MethodType
+            or getattr(actual, "__self__", None) is not client.responses
             or getattr(actual, "__func__", None)
             is not function
         ):
             return False
         cells = getattr(outer, "__closure__", None) or ()
-        if len(cells) != 1 or cells[0].cell_contents != actual:
+        if len(cells) != 1 or cells[0].cell_contents is not actual:
             return False
     return True
 
