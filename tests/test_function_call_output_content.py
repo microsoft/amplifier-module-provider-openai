@@ -9,6 +9,7 @@ from typing import Self
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from amplifier_core.llm_errors import InvalidRequestError
 from amplifier_core.message_models import (
     ChatRequest,
     ImageBlock,
@@ -294,10 +295,16 @@ def test_streaming_complete_uses_effective_model_for_rich_tool_output() -> None:
     "model",
     ["o1", "o1-pro", "o3", "o3-pro", "o4-mini", "o3-2025-04-16", "o4-mini-2025-04-16"],
 )
-def test_o_series_vision_models_preserve_function_tool_images(model: str) -> None:
+def test_o_series_current_images_or_explicit_shutdown_refusal(model: str) -> None:
     provider = _provider(use_streaming=False, default_model="o3-mini")
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
+    if model in {"o1", "o1-pro", "o4-mini", "o4-mini-2025-04-16"}:
+        # Historical vision modality is not present endpoint availability.
+        with pytest.raises(InvalidRequestError, match="shut down"):
+            asyncio.run(provider.complete(_request_with_image_result(), model=model))
+        provider.client.responses.create.assert_not_awaited()
+        return
     asyncio.run(provider.complete(_request_with_image_result(), model=model))
 
     params = provider.client.responses.create.await_args.kwargs
