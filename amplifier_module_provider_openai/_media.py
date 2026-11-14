@@ -23,40 +23,16 @@ from openai.resources.responses import AsyncResponses
 from openai.resources.responses.input_tokens import AsyncInputTokens
 from pydantic import BaseModel
 
+from ._media_catalogue import (
+    MEDIA_LIMITS,  # noqa: F401 -- shared exact facts exported to provider/tests
+    NONSTREAM_MODELS,
+    SHUTDOWN_MODELS,
+    VISION_MODELS,  # noqa: F401 -- shared exact facts exported to provider/tests
+)
+
 NAMESPACE = "experimental.media.v1"
 NOT_RETAINED = "[Image transport not retained; no retrievable pixel reference]"
 UNAVAILABLE = "[Image unavailable: selected model/route image support is unknown; no pixels supplied]"
-# Exact documented input-image model facts. No optimistic unknown-model default.
-VISION_MODELS = frozenset(
-    {
-        "gpt-6-astra",
-        "gpt-6-sol",
-        "gpt-6-luna",
-        "gpt-6.1-sol",
-        "gpt-6.1-terra",
-        "gpt-5.6",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.4",
-        "gpt-5.4-pro",
-        "gpt-5.4-mini",
-        "gpt-5.5",
-        "gpt-5.5-pro",
-        "gpt-5.2",
-        "gpt-5.2-pro",
-        "gpt-4o",
-        "gpt-4o-mini",
-        "gpt-4.1",
-        "gpt-4.1-mini",
-        "gpt-4.1-nano",
-        "o1",
-        "o1-pro",
-        "o3",
-        "o3-pro",
-        "o4-mini",
-    }
-)
 EVIDENCE = "https://developers.openai.com/api/docs/guides/images-vision"
 CURRENT: ContextVar = ContextVar("openai_media_attempt", default=None)
 # Capture SDK/HTTP dispatch implementations before any per-instance callbacks.
@@ -195,6 +171,23 @@ class Scope:
             and any(key in extra["extra_body"] for key in ("input", "model"))
         ):
             refuse()
+        selected = options.get("model") or request.model or provider.default_model
+        selected = extra.get("model", selected)
+        if provider.name == "openai" and provider._has_standard_openai_endpoint():
+            if selected in SHUTDOWN_MODELS:
+                raise InvalidRequestError(
+                    "Selected official media model is documented as shut down; request not sent.",
+                    provider=provider.name, retryable=False,
+                )
+            if selected in NONSTREAM_MODELS and (
+                provider.use_streaming and (request.metadata or {}).get("stream") is not False
+                or extra.get("stream") is True
+                or isinstance(extra.get("extra_body"), dict) and extra["extra_body"].get("stream") is True
+            ):
+                raise InvalidRequestError(
+                    "Selected image model requires an explicitly selected non-streaming HTTP request; request not sent.",
+                    provider=provider.name, retryable=False,
+                )
         self.request_digest, self.options_digest = (
             digest(request.model_dump()),
             digest(options),

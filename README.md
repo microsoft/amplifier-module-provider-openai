@@ -8,10 +8,36 @@ GPT model integration for Amplifier via OpenAI's Responses API.
 exact-model input-image facts for the official Responses route. PNG/JPEG inputs
 remain at their original user or call-bound `function_call_output.output`
 positions as `input_text`/`input_image` parts. The literal catalogue is in
-`_media.VISION_MODELS`; unknown models, custom endpoints and deployment aliases
+`_media.VISION_MODELS` (54 literal IDs, observed November 14, 2026); unknown models, custom endpoints and deployment aliases
 are **unqualified**, not declared incapable. Azure must supply attributable
 deployment facts through its own instance support method, not a global alias
 capability guess.
+
+The checked-in `contracts/openai-media-evidence.v1.json` records exact family
+pages, explicitly listed snapshots, source hashes, lifecycle and numeric window
+facts. It adds documented GPT-5/5.1/5.4 Nano/Codex and dated IDs without making
+up sibling names. Four formerly included, now shut-down families (GPT-4.1 Nano,
+o1, o1 Pro and o4 Mini) no longer qualify. Deprecated-but-not-shut-down models
+remain distinct from current account availability. The documented `chat-latest`
+and Daybreak aliases are moving vendor selectors, not immutable local rewrites.
+Cyber/Daybreak routes still require the chosen organization/project's approval,
+correct access program and any IP/SSO controls; this catalogue neither checks
+entitlement nor changes accounts, model selection or access-program options.
+
+GPT-5.5 Pro and o3 Pro (including their explicit snapshots) require an **explicit
+non-streaming HTTP selection**: configure `use_streaming: false` or request
+metadata `{"stream": false}`. A protected streaming request refuses before
+count/send, rather than silently switching its transport. No mock SSE result is
+claimed as endpoint streaming support. Other specialized image-generation,
+Realtime/Live and pricing-only identifiers are different/unproven contracts,
+not inferred Responses routes. Legacy `list_models` capability tags are not
+substitutes for this prepared-media support query.
+
+Prepared-media budget reports use the exact catalogue's full window and
+separately documented input/output ceilings, with the existing safety reserve
+and configured price threshold. No missing window is manufactured from image
+bytes. This narrow media qualification does not silently revise generic legacy
+capability defaults for Azure aliases, custom routes or text-only callers.
 
 The host owns hydration and private request lifetime. With
 `experimental.media.v1`, count and send validate the original private request,

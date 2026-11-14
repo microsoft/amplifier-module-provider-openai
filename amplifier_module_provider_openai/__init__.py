@@ -1811,35 +1811,44 @@ class OpenAIProvider:
                 provider=self.name,
             )
         caps = get_capabilities(model)
+        media_limits = (
+            _media.MEDIA_LIMITS.get(model)
+            if _media.CURRENT.get() is not None
+            and self.name == "openai" and self._has_standard_openai_endpoint()
+            else None
+        )
+        window, input_ceiling, output_ceiling = media_limits or (
+            caps.context_window, caps.max_input_tokens, caps.max_output_tokens
+        )
         # Direct SDK callers may omit an output cap. Reserve the model's full
         # advertised output capability without changing their wire parameters.
         output = params.get(
-            "max_output_tokens", caps.max_output_tokens or DEFAULT_MAX_TOKENS
+            "max_output_tokens", output_ceiling or DEFAULT_MAX_TOKENS
         )
         if isinstance(output, bool) or not isinstance(output, int) or output < 0:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request budget requires a nonnegative integer max_output_tokens.",
                 provider=self.name,
             )
-        if caps.max_output_tokens and output > caps.max_output_tokens:
+        if output_ceiling and output > output_ceiling:
             raise kernel_errors.ContextLengthError(
                 f"OpenAI max_output_tokens={output} exceeds the model output "
-                f"ceiling ({caps.max_output_tokens}, model={model}).",
+                f"ceiling ({output_ceiling}, model={model}).",
                 provider=self.name,
             )
         # Total context, independent input ceiling and price threshold are
         # different constraints. Output consumes total context, not the input
         # ceiling or the standard-price threshold.
-        allowance = caps.context_window - output
-        if caps.max_input_tokens is not None:
-            allowance = min(allowance, caps.max_input_tokens)
+        allowance = window - output
+        if input_ceiling is not None:
+            allowance = min(allowance, input_ceiling)
         if not self.enable_long_context and caps.long_context_pricing_threshold:
             allowance = min(allowance, caps.long_context_pricing_threshold)
         allowance -= 4096
         if allowance <= 0:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request has no input allowance after its output reserve "
-                f"(model={model}, context={caps.context_window}, output={output}).",
+                f"(model={model}, context={window}, output={output}).",
                 provider=self.name,
             )
         return allowance
@@ -2092,6 +2101,8 @@ class OpenAIProvider:
         ):
             return {}
         window = get_known_context_window(params["model"])
+        if _media.CURRENT.get() is not None and params["model"] in _media.MEDIA_LIMITS:
+            window = _media.MEDIA_LIMITS[params["model"]][0]
         return {"context_window_tokens": window} if window is not None else {}
 
     def _assemble_initial_responses_params_stateful(

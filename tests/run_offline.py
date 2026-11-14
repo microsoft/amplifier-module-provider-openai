@@ -25,6 +25,7 @@ inputs = sorted(
     [
         *root.glob("amplifier_module_provider_openai/**/*.py"),
         *root.glob("tests/**/*.py"),
+        *root.glob("contracts/openai-media-evidence.v1.json"),
         root / "pyproject.toml",
         root / "uv.lock",
     ]

@@ -13,15 +13,25 @@ from PIL import Image
 media = pytest.importorskip("amplifier_foundation.session.media")
 from amplifier_foundation.session.media_provider import MediaPreparedProvider
 
+from amplifier_module_provider_openai import _media
 from tests.test_media_projection import provider
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role", ["user", "tool"])
 @pytest.mark.parametrize("image_format", ["PNG", "JPEG"])
-@pytest.mark.parametrize("stream", [False, True, "native"])
-@pytest.mark.parametrize("revoke", [False, True])
-async def test_store_wrapper_count_send(tmp_path, role, image_format, stream, revoke):
+@pytest.mark.parametrize(
+    "model,stream,revoke",
+    [
+        (model, stream, False)
+        for model in sorted(_media.VISION_MODELS)
+        for stream in [False, True]
+        if not stream or model not in _media.NONSTREAM_MODELS
+    ]
+    + [("gpt-6.1-sol", stream, True) for stream in [False, True, "native"]]
+    + [("gpt-6.1-sol", "native", False)],
+)
+async def test_store_wrapper_count_send(tmp_path, role, image_format, model, stream, revoke):
     output = io.BytesIO()
     Image.new("RGB", (3, 2), (17, 89, 167)).save(output, format=image_format)
     pixels = output.getvalue()
@@ -74,13 +84,13 @@ async def test_store_wrapper_count_send(tmp_path, role, image_format, stream, re
         p.trace_context = lambda data: events.append(("context", data))
         p.coordinator = SimpleNamespace(get_capability=lambda _: cap)
     else:
-        p, _, calls, events = provider(req, stream=stream)
+        p, _, calls, events = provider(req, model, stream=stream)
     p.coordinator.get_capability = lambda _: cap
     wrapped = MediaPreparedProvider(
         p,
         cap,
         provider_identity={"provider": "openai", "account": "offline", "generation": 1},
-        model="gpt-6.1-sol",
+        model=model,
         execution_scope={},
     )
     try:
@@ -108,6 +118,7 @@ async def test_store_wrapper_count_send(tmp_path, role, image_format, stream, re
                 assert encoded not in str(p.seen) and encoded not in str(p.last_context)
             else:
                 assert len(calls) == 3
+                assert all(body["model"] == model for _, body in calls)
                 assert (
                     calls[0][1]["input"] == calls[1][1]["input"] == calls[2][1]["input"]
                 )

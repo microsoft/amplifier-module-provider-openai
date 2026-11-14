@@ -172,9 +172,16 @@ def provider(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", sorted(_media.VISION_MODELS))
+@pytest.mark.parametrize(
+    "model,stream",
+    [
+        (model, stream)
+        for model in sorted(_media.VISION_MODELS)
+        for stream in [False, True]
+        if not stream or model not in _media.NONSTREAM_MODELS
+    ],
+)
 @pytest.mark.parametrize("role", ["user", "tool"])
-@pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("image_format", ["PNG", "JPEG"])
 async def test_model_wire_count_send_original_pixels(model, role, stream, image_format):
     req = request(role, image_format)
@@ -183,6 +190,7 @@ async def test_model_wire_count_send_original_pixels(model, role, stream, image_
     try:
         budget = await p.request_budget(req, context_estimate=100)
         assert budget["measurement"]["kind"] == "provider_count"
+        assert budget["context_window_tokens"] == _media.MEDIA_LIMITS[model][0]
         await p.complete(req)
         assert len(calls) == 3
         assert calls[0][1]["input"] == calls[1][1]["input"] == calls[2][1]["input"]
@@ -669,5 +677,84 @@ async def test_sdk_factory_wrapper_requires_actual_bound_method_closure(method, 
         with pytest.raises(InvalidRequestError):
             await p.complete(req)
         assert not calls and not observed
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-5-mini", "gpt-5.4-2026-03-05", "chat-latest"])
+async def test_documented_catalogue_additions_are_not_unavailable(model):
+    req = request()
+    p, _, _, _ = provider(req, model)
+    try:
+        assert p.get_media_request_support(model=model)["positions"] == ["user", "tool"]
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-4.1-nano", "o1", "o1-pro", "o4-mini"])
+async def test_documented_shutdown_is_not_current_positive_support(model):
+    req = request()
+    p, _, _, _ = provider(req, model)
+    try:
+        assert p.get_media_request_support(model=model)["positions"] == []
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["o3-pro", "gpt-5.5-pro"])
+async def test_documented_nonstream_route_refuses_before_private_count(model):
+    req = request()
+    p, _, calls, _ = provider(req, model, stream=True)
+    try:
+        with pytest.raises(InvalidRequestError, match="non.streaming"):
+            await p.request_budget(req, context_estimate=100)
+        assert not calls
+    finally:
+        await p.close()
+
+
+def test_literal_catalogue_matches_retained_vendor_facts():
+    from pathlib import Path
+
+    evidence = json.loads(
+        (Path(__file__).parents[1] / "contracts/openai-media-evidence.v1.json").read_text()
+    )
+    rows = {row["model"]: row for row in evidence["models"]}
+    assert len(_media.VISION_MODELS) == 54
+    assert _media.VISION_MODELS == {
+        key for key, row in rows.items() if row["status"] != "shutdown"
+    }
+    assert _media.SHUTDOWN_MODELS == {
+        key for key, row in rows.items() if row["status"] == "shutdown"
+    }
+    assert _media.NONSTREAM_MODELS == {
+        key for key, row in rows.items() if not row["streaming"]
+    }
+    for key in _media.VISION_MODELS:
+        row = rows[key]
+        assert row["positions"] == ["user", "tool"]
+        assert row["mime_types"] == ["image/png", "image/jpeg"]
+        assert _media.MEDIA_LIMITS[key] == (
+            row["context_window"], row["max_input_tokens"], row["max_output_tokens"]
+        )
+    assert not {"gpt-5.1-mini", "gpt-6-astra-law", "gpt-5.5-cyber-preview"} & _media.VISION_MODELS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", sorted(_media.NONSTREAM_MODELS))
+async def test_explicit_nonstream_metadata_uses_http_create_without_route_change(model):
+    req = request()
+    req.metadata = {"stream": False}
+    p, _, calls, _ = provider(req, model)
+    # Provider helper creates JSON responses; turn the preference on only.
+    p.use_streaming = True
+    try:
+        await p.request_budget(req, context_estimate=100)
+        await p.complete(req)
+        assert len(calls) == 3 and all(body["model"] == model for _, body in calls)
+        assert not calls[-1][1].get("stream")
     finally:
         await p.close()
