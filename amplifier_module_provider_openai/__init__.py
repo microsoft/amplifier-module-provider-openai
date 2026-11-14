@@ -1842,8 +1842,12 @@ class OpenAIProvider:
         allowance = window - output
         if input_ceiling is not None:
             allowance = min(allowance, input_ceiling)
-        if not self.enable_long_context and caps.long_context_pricing_threshold:
-            allowance = min(allowance, caps.long_context_pricing_threshold)
+        price_threshold = (
+            _media.MEDIA_PRICE_THRESHOLDS.get(model, caps.long_context_pricing_threshold)
+            if media_limits else caps.long_context_pricing_threshold
+        )
+        if not self.enable_long_context and price_threshold:
+            allowance = min(allowance, price_threshold)
         allowance -= 4096
         if allowance <= 0:
             raise kernel_errors.ContextLengthError(
@@ -2003,6 +2007,7 @@ class OpenAIProvider:
         """Return a count, unavailable capability, or a safe counting failure."""
         _media.check("count", params)
         if _media.CURRENT.get() is not None:
+            self._budget_input_limit(params)
             self._media_client()
         if not self._provider_count_available():
             return None
@@ -2355,6 +2360,27 @@ class OpenAIProvider:
 
             configuration_history_input = copy.deepcopy(params["input"])
             self._merge_extra_request_params(params)
+            if (
+                _media.CURRENT.get() is not None
+                and self.name == "openai" and self._has_standard_openai_endpoint()
+                and params["model"] in _media.MEDIA_LIMITS
+                and request.max_output_tokens is None
+            ):
+                # Only an implicit default may follow the final effective
+                # model. Explicit request/config/expert caps remain safety
+                # boundaries and are validated, never silently clamped.
+                if kwargs.get("max_output_tokens") is not None:
+                    params["max_output_tokens"] = kwargs["max_output_tokens"]
+                elif (
+                    kwargs.get("max_tokens") is None
+                    and self.max_output_tokens is None
+                    and "max_output_tokens" not in self.extra_request_params
+                    and not (
+                        isinstance(self.extra_request_params.get("extra_body"), dict)
+                        and "max_output_tokens" in self.extra_request_params["extra_body"]
+                    )
+                ):
+                    params["max_output_tokens"] = _media.MEDIA_LIMITS[params["model"]][2]
             # A request-level cap is an explicit caller safety boundary. Keep
             # it authoritative over provider-wide extra params so a degraded
             # context request cannot silently regain its original reserve.

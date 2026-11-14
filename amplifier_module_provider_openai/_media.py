@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 from ._media_catalogue import (
     MEDIA_LIMITS,  # noqa: F401 -- shared exact facts exported to provider/tests
+    MEDIA_PRICE_THRESHOLDS,  # noqa: F401 -- shared price opt-in facts
     NONSTREAM_MODELS,
     SHUTDOWN_MODELS,
     VISION_MODELS,  # noqa: F401 -- shared exact facts exported to provider/tests

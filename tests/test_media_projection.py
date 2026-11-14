@@ -740,6 +740,7 @@ def test_literal_catalogue_matches_retained_vendor_facts():
         assert _media.MEDIA_LIMITS[key] == (
             row["context_window"], row["max_input_tokens"], row["max_output_tokens"]
         )
+        assert _media.MEDIA_PRICE_THRESHOLDS.get(key) == row["long_context_pricing_threshold"]
     assert not {"gpt-5.1-mini", "gpt-6-astra-law", "gpt-5.5-cyber-preview"} & _media.VISION_MODELS
 
 
@@ -756,5 +757,86 @@ async def test_explicit_nonstream_metadata_uses_http_create_without_route_change
         await p.complete(req)
         assert len(calls) == 3 and all(body["model"] == model for _, body in calls)
         assert not calls[-1][1].get("stream")
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model", sorted(m for m, limits in _media.MEDIA_LIMITS.items() if limits[2] < 128000)
+)
+@pytest.mark.parametrize("selection", ["request", "option", "extra"])
+async def test_omitted_output_cap_uses_final_exact_media_model(model, selection):
+    req = request()
+    req.max_output_tokens = None
+    p, _, calls, _ = provider(req, model if selection == "request" else "gpt-6.1-sol")
+    options = {"model": model} if selection == "option" else {}
+    if selection == "request":
+        req.model = model
+    if selection == "extra":
+        p.extra_request_params["model"] = model
+    try:
+        await p.request_budget(req, context_estimate=100, request_options=options)
+        await p.complete(req, request_options=options)
+        assert len(calls) == 3
+        assert all(body["model"] == model for _, body in calls)
+        # Count API does not accept max_output_tokens; generation does.
+        assert calls[-1][1]["max_output_tokens"] == _media.MEDIA_LIMITS[model][2]
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("long_context,expected", [(False, 267904), (True, 917904)])
+async def test_cyber_price_threshold_requires_long_context_opt_in(long_context, expected):
+    req = request()
+    p, _, _, _ = provider(req, "gpt-6-cyber")
+    p.enable_long_context = long_context
+    try:
+        result = await p.request_budget(req, context_estimate=100)
+        assert result["input_limit_tokens"] == expected
+    finally:
+        await p.close()
+
+
+def test_literal_model_evidence_not_overwritten_by_alias_target():
+    from pathlib import Path
+
+    evidence = json.loads(
+        (Path(__file__).parents[1] / "contracts/openai-media-evidence.v1.json").read_text()
+    )
+    rows = {row["model"]: row for row in evidence["models"]}
+    for model in ["gpt-5.6-sol", "gpt-5.6-cyber"]:
+        assert rows[model]["family_page"] == model
+        assert rows[model]["status"] == "documented"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["request", "config", "option", "legacy_option", "extra"])
+@pytest.mark.parametrize("explicit_cap", [8192, 32769])
+async def test_media_exact_default_does_not_clamp_explicit_output_caps(source, explicit_cap):
+    from amplifier_core.llm_errors import ContextLengthError
+
+    req = request()
+    req.max_output_tokens = explicit_cap if source == "request" else None
+    p, _, calls, _ = provider(req, "gpt-4.1")
+    options = {}
+    if source == "config":
+        p.max_output_tokens = explicit_cap
+    if source == "option":
+        options["max_output_tokens"] = explicit_cap
+    if source == "legacy_option":
+        options["max_tokens"] = explicit_cap
+    if source == "extra":
+        p.extra_request_params["max_output_tokens"] = explicit_cap
+    try:
+        if explicit_cap > 32768:
+            with pytest.raises(ContextLengthError):
+                await p.request_budget(req, context_estimate=100, request_options=options)
+            assert not calls
+        else:
+            await p.request_budget(req, context_estimate=100, request_options=options)
+            await p.complete(req, request_options=options)
+            assert calls[-1][1]["max_output_tokens"] == explicit_cap
     finally:
         await p.close()

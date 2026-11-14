@@ -35,7 +35,13 @@ substitutes for this prepared-media support query.
 
 Prepared-media budget reports use the exact catalogue's full window and
 separately documented input/output ceilings, with the existing safety reserve
-and configured price threshold. No missing window is manufactured from image
+and separately documented price threshold (including GPT-6 Cyber's 272K input
+price boundary unless long context is explicitly enabled). An omitted output cap
+uses the **final effective model's** published output default; explicit caller,
+configuration and expert caps remain authoritative and oversize values refuse,
+not silently clamp. Each literal model retains its own source and lifecycle;
+an alias's deprecated status is not copied onto its target.
+No missing window is manufactured from image
 bytes. This narrow media qualification does not silently revise generic legacy
 capability defaults for Azure aliases, custom routes or text-only callers.
 

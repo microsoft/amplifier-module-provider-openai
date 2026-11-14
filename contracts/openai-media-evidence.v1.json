@@ -438,7 +438,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "chat-latest"
     },
     {
       "model": "gpt-4.1",
@@ -460,7 +462,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-2025-04-14"
     },
     {
       "model": "gpt-4.1-2025-04-14",
@@ -482,7 +486,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-2025-04-14"
     },
     {
       "model": "gpt-4.1-mini",
@@ -504,7 +510,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-mini-2025-04-14"
     },
     {
       "model": "gpt-4.1-mini-2025-04-14",
@@ -526,7 +534,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-mini-2025-04-14"
     },
     {
       "model": "gpt-4.1-nano",
@@ -545,7 +555,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-nano-2025-04-14"
     },
     {
       "model": "gpt-4.1-nano-2025-04-14",
@@ -564,7 +576,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-nano-2025-04-14"
     },
     {
       "model": "gpt-4o",
@@ -586,7 +600,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-2024-08-06"
     },
     {
       "model": "gpt-4o-2024-05-13",
@@ -605,7 +621,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-2024-08-06"
     },
     {
       "model": "gpt-4o-2024-08-06",
@@ -627,7 +645,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-2024-08-06"
     },
     {
       "model": "gpt-4o-2024-11-20",
@@ -649,7 +669,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-2024-08-06"
     },
     {
       "model": "gpt-4o-mini",
@@ -671,7 +693,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-mini-2024-07-18"
     },
     {
       "model": "gpt-4o-mini-2024-07-18",
@@ -693,7 +717,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-mini-2024-07-18"
     },
     {
       "model": "gpt-5",
@@ -715,7 +741,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-2025-08-07"
     },
     {
       "model": "gpt-5-2025-08-07",
@@ -737,7 +765,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-2025-08-07"
     },
     {
       "model": "gpt-5-mini",
@@ -759,7 +789,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-mini-2025-08-07"
     },
     {
       "model": "gpt-5-mini-2025-08-07",
@@ -781,7 +813,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-mini-2025-08-07"
     },
     {
       "model": "gpt-5-nano",
@@ -803,7 +837,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-nano-2025-08-07"
     },
     {
       "model": "gpt-5-nano-2025-08-07",
@@ -825,7 +861,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-nano-2025-08-07"
     },
     {
       "model": "gpt-5-pro",
@@ -847,7 +885,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-pro-2025-10-06"
     },
     {
       "model": "gpt-5-pro-2025-10-06",
@@ -869,7 +909,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-pro-2025-10-06"
     },
     {
       "model": "gpt-5.1",
@@ -891,7 +933,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.1-2025-11-13"
     },
     {
       "model": "gpt-5.1-2025-11-13",
@@ -913,7 +957,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.1-2025-11-13"
     },
     {
       "model": "gpt-5.2",
@@ -935,7 +981,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.2-2025-12-11"
     },
     {
       "model": "gpt-5.2-2025-12-11",
@@ -957,7 +1005,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.2-2025-12-11"
     },
     {
       "model": "gpt-5.2-pro",
@@ -979,7 +1029,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.2-pro-2025-12-11"
     },
     {
       "model": "gpt-5.2-pro-2025-12-11",
@@ -1001,7 +1053,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.2-pro-2025-12-11"
     },
     {
       "model": "gpt-5.3-codex",
@@ -1023,7 +1077,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.3-codex"
     },
     {
       "model": "gpt-5.4",
@@ -1045,7 +1101,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.4-2026-03-05"
     },
     {
       "model": "gpt-5.4-2026-03-05",
@@ -1067,7 +1125,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.4-2026-03-05"
     },
     {
       "model": "gpt-5.4-mini",
@@ -1089,7 +1149,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.4-mini-2026-03-17"
     },
     {
       "model": "gpt-5.4-mini-2026-03-17",
@@ -1111,7 +1173,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.4-mini-2026-03-17"
     },
     {
       "model": "gpt-5.4-nano",
@@ -1133,7 +1197,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.4-nano-2026-03-17"
     },
     {
       "model": "gpt-5.4-nano-2026-03-17",
@@ -1155,7 +1221,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.4-nano-2026-03-17"
     },
     {
       "model": "gpt-5.4-pro",
@@ -1177,7 +1245,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.4-pro-2026-03-05"
     },
     {
       "model": "gpt-5.4-pro-2026-03-05",
@@ -1199,7 +1269,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.4-pro-2026-03-05"
     },
     {
       "model": "gpt-5.5",
@@ -1221,7 +1293,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.5-2026-04-23"
     },
     {
       "model": "gpt-5.5-2026-04-23",
@@ -1243,7 +1317,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.5-2026-04-23"
     },
     {
       "model": "gpt-5.5-pro",
@@ -1265,7 +1341,9 @@
       ],
       "streaming": false,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.5-pro-2026-04-23"
     },
     {
       "model": "gpt-5.5-pro-2026-04-23",
@@ -1287,7 +1365,9 @@
       ],
       "streaming": false,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.5-pro-2026-04-23"
     },
     {
       "model": "gpt-5.6",
@@ -1309,15 +1389,17 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-sol"
     },
     {
       "model": "gpt-5.6-cyber",
-      "family_page": "gpt-daybreak-red-latest",
-      "source_url": "https://developers.openai.com/api/docs/models/gpt-daybreak-red-latest.md",
-      "source_sha256": "ec1a7ac10bd674e80d545475673e2b661bafc4b8a655a876bd763ae710b0cb9e",
+      "family_page": "gpt-5.6-cyber",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-cyber.md",
+      "source_sha256": "6f232d4153cc4ce4b25b24fd7ee3334b7854fc341e9cea8f4c41856b870811cf",
       "observed_date": "2026-11-14",
-      "status": "deprecated",
+      "status": "documented",
       "context_window": 400000,
       "max_input_tokens": 272000,
       "max_output_tokens": 128000,
@@ -1331,7 +1413,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-cyber"
     },
     {
       "model": "gpt-5.6-luna",
@@ -1353,15 +1437,17 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-luna"
     },
     {
       "model": "gpt-5.6-sol",
-      "family_page": "gpt-daybreak-blue-latest",
-      "source_url": "https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest.md",
-      "source_sha256": "59273dd7a9573476a254313eb2246e49a24da62d50bd0478dfe54d77e41cd3a4",
+      "family_page": "gpt-5.6-sol",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
+      "source_sha256": "c0c7f9a635a572335cfe0ba4ea9b920d9b3d2b40aa1ba9f31f3adff203834637",
       "observed_date": "2026-11-14",
-      "status": "deprecated",
+      "status": "documented",
       "context_window": 1050000,
       "max_input_tokens": 922000,
       "max_output_tokens": 128000,
@@ -1375,7 +1461,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-sol"
     },
     {
       "model": "gpt-5.6-terra",
@@ -1397,7 +1485,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-terra"
     },
     {
       "model": "gpt-6-astra",
@@ -1419,7 +1509,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6-astra"
     },
     {
       "model": "gpt-6-cyber",
@@ -1441,7 +1533,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6-cyber"
     },
     {
       "model": "gpt-6-luna",
@@ -1463,7 +1557,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6-luna"
     },
     {
       "model": "gpt-6-sol",
@@ -1485,7 +1581,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6-sol"
     },
     {
       "model": "gpt-6.1-sol",
@@ -1507,7 +1605,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6.1-sol"
     },
     {
       "model": "gpt-6.1-terra",
@@ -1529,7 +1629,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6.1-terra"
     },
     {
       "model": "gpt-daybreak-blue-latest",
@@ -1551,7 +1653,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.6-sol"
     },
     {
       "model": "gpt-daybreak-red-latest",
@@ -1573,7 +1677,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.6-cyber"
     },
     {
       "model": "o1",
@@ -1592,7 +1698,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o1-2024-12-17"
     },
     {
       "model": "o1-2024-12-17",
@@ -1611,7 +1719,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o1-2024-12-17"
     },
     {
       "model": "o1-pro",
@@ -1630,7 +1740,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o1-pro-2025-03-19"
     },
     {
       "model": "o1-pro-2025-03-19",
@@ -1649,7 +1761,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o1-pro-2025-03-19"
     },
     {
       "model": "o3",
@@ -1671,7 +1785,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o3-2025-04-16"
     },
     {
       "model": "o3-2025-04-16",
@@ -1693,7 +1809,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o3-2025-04-16"
     },
     {
       "model": "o3-pro",
@@ -1715,7 +1833,9 @@
       ],
       "streaming": false,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o3-pro-2025-06-10"
     },
     {
       "model": "o3-pro-2025-06-10",
@@ -1737,7 +1857,9 @@
       ],
       "streaming": false,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o3-pro-2025-06-10"
     },
     {
       "model": "o4-mini",
@@ -1756,7 +1878,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o4-mini-2025-04-16"
     },
     {
       "model": "o4-mini-2025-04-16",
@@ -1775,7 +1899,9 @@
       ],
       "streaming": true,
       "entitlement": "not checked",
-      "inference": "not tested"
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o4-mini-2025-04-16"
     }
   ]
 }

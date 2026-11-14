@@ -134,3 +134,24 @@ MEDIA_LIMITS = {
     'o3-pro': (200000, None, 100000),
     'o3-pro-2025-06-10': (200000, None, 100000),
 }
+
+# Price boundary is independent of total window and input ceiling.
+MEDIA_PRICE_THRESHOLDS = {
+    'gpt-5.4': 272000,
+    'gpt-5.4-2026-03-05': 272000,
+    'gpt-5.4-pro': 272000,
+    'gpt-5.4-pro-2026-03-05': 272000,
+    'gpt-5.5': 272000,
+    'gpt-5.5-2026-04-23': 272000,
+    'gpt-5.6': 272000,
+    'gpt-5.6-cyber': 272000,
+    'gpt-5.6-luna': 272000,
+    'gpt-5.6-sol': 272000,
+    'gpt-5.6-terra': 272000,
+    'gpt-6-astra': 272000,
+    'gpt-6-cyber': 272000,
+    'gpt-6-luna': 272000,
+    'gpt-6-sol': 272000,
+    'gpt-6.1-sol': 272000,
+    'gpt-6.1-terra': 272000,
+}
