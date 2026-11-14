@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 from amplifier_core.llm_errors import InvalidRequestError
 from openai import AsyncAzureOpenAI, AsyncOpenAI, DefaultAsyncHttpxClient
+from openai._legacy_response import async_to_raw_response_wrapper
 from openai.resources.responses import AsyncResponses
 from openai.resources.responses.input_tokens import AsyncInputTokens
 from pydantic import BaseModel
@@ -71,6 +72,7 @@ RESOURCE_DISPATCH = {
     cls: dict(inspect.getmembers(cls, inspect.isfunction))
     for cls in (AsyncResponses, AsyncInputTokens)
 }
+RAW_WRAPPER_CODE = async_to_raw_response_wrapper(AsyncResponses.create).__code__
 
 
 def standard_dispatch(client):
@@ -115,12 +117,18 @@ def standard_dispatch(client):
             if hasattr(raw, name):
                 return False
             continue
-        actual = inspect.unwrap(getattr(raw, name, None))
+        outer = getattr(raw, name, None)
+        if getattr(outer, "__code__", None) is not RAW_WRAPPER_CODE:
+            return False
+        actual = getattr(outer, "__wrapped__", None)
         if (
             getattr(actual, "__self__", None) is not client.responses
             or getattr(actual, "__func__", None)
             is not function
         ):
+            return False
+        cells = getattr(outer, "__closure__", None) or ()
+        if len(cells) != 1 or cells[0].cell_contents != actual:
             return False
     return True
 

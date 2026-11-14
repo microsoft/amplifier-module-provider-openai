@@ -28,6 +28,10 @@ Entra/Azure AD callbacks and provider-runtime authentication refuse before
 private count/send because their late await/401 recovery has no qualified
 post-auth media witness. They are not transparently supported, nor declared
 vendor-incapable. Legacy no-capability serializer behavior is separate.
+Dispatch baselines are captured at module import in a trusted cooperative host;
+this is not monitoring of arbitrary pre-import instrumentation or hostile Python.
+Raw SDK wrappers must retain the actual SDK wrapper code and bound-method
+closure; `functools.wraps` metadata alone cannot authorize an interposer.
 
 Ordinary `compact_context(fresh_prepared_request)` uses the same private image
 input for count/compaction. Retained native `native_compact()` cannot safely

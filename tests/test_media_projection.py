@@ -605,3 +605,28 @@ async def test_absent_sdk_optional_compact_does_not_break_create(monkeypatch):
         assert not _media.standard_dispatch(p.client)
     finally:
         await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["create", "compact"])
+async def test_wraps_interposer_cannot_borrow_raw_sdk_method_identity(method):
+    from functools import wraps
+
+    req = request()
+    p, _, calls, _ = provider(req)
+    raw = p.client.responses.with_raw_response
+    original = getattr(raw, method)
+    observed = []
+
+    @wraps(original)
+    async def interpose(*args, **kwargs):
+        observed.append(kwargs)
+        return await original(*args, **kwargs)
+
+    setattr(raw, method, interpose)
+    try:
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert not calls and not observed
+    finally:
+        await p.close()
