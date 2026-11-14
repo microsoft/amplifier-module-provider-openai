@@ -550,3 +550,27 @@ async def test_native_received_error_trace_omits_exact_input_echo(nested):
         assert req.model_dump_json() == canonical
     finally:
         await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method",
+    ["_prepare_url", "_build_headers", "http_auth", "resource_post", "raw_create"],
+)
+async def test_late_dispatch_override_refused_before_http(method):
+    req = request()
+    p, _, calls, _ = provider(req)
+    if method == "http_auth":
+        p.client._client._build_request_auth = lambda *args, **kwargs: None
+    elif method == "resource_post":
+        p.client.responses._post = lambda *args, **kwargs: None
+    elif method == "raw_create":
+        p.client.responses.with_raw_response.create = lambda *args, **kwargs: None
+    else:
+        setattr(p.client, method, lambda *args, **kwargs: None)
+    try:
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert not calls
+    finally:
+        await p.close()

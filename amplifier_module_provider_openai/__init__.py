@@ -3540,6 +3540,8 @@ class OpenAIProvider:
             # replay a 401 independently of max_retries. No late witness exists
             # inside them, so private media must refuse before entering them.
             if (
+                not _media.standard_dispatch(client)
+                or
                 any(getattr(client, name, None) is not None for name in (
                     "_api_key_provider", "_provider_runtime", "_workload_identity_auth",
                     "_azure_ad_token_provider",

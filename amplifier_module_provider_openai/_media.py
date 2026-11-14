@@ -14,7 +14,11 @@ from copy import deepcopy
 from functools import wraps
 from typing import Any
 
+import httpx
 from amplifier_core.llm_errors import InvalidRequestError
+from openai import AsyncAzureOpenAI, AsyncOpenAI, DefaultAsyncHttpxClient
+from openai.resources.responses import AsyncResponses
+from openai.resources.responses.input_tokens import AsyncInputTokens
 from pydantic import BaseModel
 
 NAMESPACE = "experimental.media.v1"
@@ -53,6 +57,64 @@ VISION_MODELS = frozenset(
 )
 EVIDENCE = "https://developers.openai.com/api/docs/guides/images-vision"
 CURRENT: ContextVar = ContextVar("openai_media_attempt", default=None)
+# Capture SDK/HTTP dispatch implementations before any per-instance callbacks.
+# These are function objects, never tokens, requests or image data.
+SDK_DISPATCH = {
+    cls: {name: fn for name, fn in inspect.getmembers(cls, inspect.isfunction)}
+    for cls in (AsyncOpenAI, AsyncAzureOpenAI)
+}
+HTTP_DISPATCH = {
+    cls: dict(inspect.getmembers(cls, inspect.isfunction))
+    for cls in (DefaultAsyncHttpxClient, httpx.AsyncClient)
+}
+RESOURCE_DISPATCH = {
+    cls: dict(inspect.getmembers(cls, inspect.isfunction))
+    for cls in (AsyncResponses, AsyncInputTokens)
+}
+
+
+def standard_dispatch(client):
+    expected = SDK_DISPATCH.get(type(client))
+    if expected is None:
+        return False
+    http = next(
+        (
+            methods
+            for cls, methods in HTTP_DISPATCH.items()
+            if isinstance(client._client, cls)
+        ),
+        None,
+    )
+    if http is None:
+        return False
+    for obj, methods in ((client, expected), (client._client, http)):
+        for name, function in methods.items():
+            actual = getattr(obj, name, None)
+            if getattr(actual, "__func__", actual) is not function:
+                return False
+    for resource in (client.responses, client.responses.input_tokens):
+        methods = RESOURCE_DISPATCH.get(type(resource))
+        if methods is None or resource._client is not client:
+            return False
+        for name, function in methods.items():
+            actual = getattr(resource, name, None)
+            if getattr(actual, "__func__", actual) is not function:
+                return False
+        for method in ("get", "post", "patch", "put", "delete"):
+            if getattr(resource, "_" + method, None) != getattr(client, method):
+                return False
+    raw = client.responses.with_raw_response
+    if raw._responses is not client.responses:
+        return False
+    for name in ("create", "compact"):
+        actual = inspect.unwrap(getattr(raw, name))
+        if (
+            getattr(actual, "__self__", None) is not client.responses
+            or getattr(actual, "__func__", None)
+            is not RESOURCE_DISPATCH[AsyncResponses][name]
+        ):
+            return False
+    return True
 
 
 def digest(value):
