@@ -15,6 +15,7 @@ from functools import wraps
 from typing import Any
 
 from amplifier_core.llm_errors import InvalidRequestError
+from pydantic import BaseModel
 
 NAMESPACE = "experimental.media.v1"
 NOT_RETAINED = "[Image transport not retained; no retrievable pixel reference]"
@@ -76,7 +77,9 @@ def has_refs(request):
 def canonical_images(value):
     if isinstance(value, (list, tuple)):
         return any(canonical_images(v) for v in value)
-    if hasattr(value, "model_dump"):
+    if isinstance(value, BaseModel):
+        value = value.model_dump(warnings=False)
+    elif hasattr(value, "model_dump"):
         value = value.model_dump()
     return isinstance(value, dict) and (
         value.get("type") == "image"
@@ -128,7 +131,9 @@ class Scope:
 
     def binding(self):
         p = self.provider
-        client = p._client
+        # Subclasses (notably Azure) own a different client slot. Bind the
+        # already initialized actual transport, not the base cache attribute.
+        client = p.client
         return (
             id(capability(p)),
             id(p.coordinator),
@@ -217,6 +222,8 @@ def operation(method):
                 and request is not current.native_request_view
             ):
                 refuse()
+            if digest(options) != current.options_digest:
+                refuse()
             return await method(self, request, *args, **kwargs)
         if not protected(self, request):
             return await method(self, request, *args, **kwargs)
@@ -225,6 +232,7 @@ def operation(method):
         scope = Scope(self, request, options)
         token = CURRENT.set(scope)
         try:
+            self._media_client()
             scope.validate("transport")
             return await method(self, request, *args, **kwargs)
         except Exception as error:
@@ -257,6 +265,8 @@ def budget(method):
                 and request is not current.native_request_view
             ):
                 refuse()
+            if digest(options) != current.options_digest:
+                refuse()
             return method(self, request, *args, **kwargs)
         if not protected(self, request):
             return method(self, request, *args, **kwargs)
@@ -264,8 +274,12 @@ def budget(method):
         scope = Scope(self, request, options)
         token = CURRENT.set(scope)
         try:
+            self._media_client()
             scope.validate("count")
             result = method(self, request, *args, **kwargs)
+            if not inspect.isawaitable(result) and result is not None:
+                scope.validate("count")
+                scope.remember_count()
         finally:
             CURRENT.reset(token)
         if not inspect.isawaitable(result):
@@ -288,7 +302,9 @@ def budget(method):
 
 
 def diagnostic_copy(value: Any) -> Any:
-    if hasattr(value, "model_dump"):
+    if isinstance(value, BaseModel):
+        value = value.model_dump(warnings=False)
+    elif hasattr(value, "model_dump"):
         value = value.model_dump()
     if isinstance(value, (list, tuple)):
         return [diagnostic_copy(v) for v in value]
@@ -352,3 +368,29 @@ def safe_text(text, params=None):
     for value in values:
         text = text.replace(value, NOT_RETAINED)
     return text
+
+
+def diagnostic_error_copy(event):
+    """Omit known structured transports and exact submitted error echoes only."""
+    copied = diagnostic_copy(event)
+    scope = CURRENT.get()
+    if not scope or not isinstance(copied, dict):
+        return copied
+
+    def error_fields(value):
+        if not isinstance(value, dict):
+            return
+        safe = diagnostic_copy(value)
+        value.clear()
+        value.update(safe)
+        for key in ("message", "msg", "detail"):
+            if isinstance(value.get(key), str):
+                value[key] = safe_text(value[key])
+        if isinstance(value.get("error"), dict):
+            error_fields(value["error"])
+        if isinstance(value.get("response"), dict):
+            error_fields(value["response"])
+
+    if copied.get("type") in ("error", "response.failed", "response.incomplete"):
+        error_fields(copied)
+    return copied

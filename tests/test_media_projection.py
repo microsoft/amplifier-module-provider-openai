@@ -90,7 +90,14 @@ def response(model):
     }
 
 
-def provider(req, model="gpt-6.1-sol", *, stream=False, handler=None):
+def provider(
+    req,
+    model="gpt-6.1-sol",
+    *,
+    stream=False,
+    handler=None,
+    provider_type=OpenAIProvider,
+):
     cap = Cap(req)
     calls, events = [], []
 
@@ -147,7 +154,7 @@ def provider(req, model="gpt-6.1-sol", *, stream=False, handler=None):
         max_retries=0,
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(receive)),
     )
-    p = OpenAIProvider(
+    p = provider_type(
         client=client,
         coordinator=SimpleNamespace(
             get_capability=lambda _: cap, hooks=SimpleNamespace(emit=emit)
@@ -354,5 +361,192 @@ async def test_nested_request_cannot_borrow_outer_private_witness():
         await p.complete(req)
         assert refused == [True]
         assert sum(not path.endswith("/input_tokens") for path, _ in calls) == 1
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["api_key", "client"])
+async def test_subclass_actual_client_slot_bound_before_transport(mutation):
+    class SeparateClientProvider(OpenAIProvider):
+        @property
+        def client(self):
+            return getattr(self, "_alternate", None) or super().client
+
+    req = request()
+    p, _, calls, _ = provider(req, provider_type=SeparateClientProvider)
+    p._alternate, p._client = p._client, None
+    original = p.client
+
+    async def mutate(name, data):
+        if name == "llm:request":
+            if mutation == "client":
+                p._alternate = original.with_options()
+            else:
+                original.api_key = "changed-account"
+
+    p.coordinator.hooks.emit = mutate
+    try:
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert not calls
+    finally:
+        await original.close()
+
+
+def test_user_only_support_does_not_authorize_tool_position():
+    p = OpenAIProvider(api_key="offline")
+    p.get_media_request_support = lambda **_: {"v": 1, "positions": ["user"]}
+    assert not p._media_tool_output_supported("gpt-6.1-sol")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_response_image_union_never_warns_pixels():
+    import warnings
+
+    encoded = base64.b64encode(pixels()).decode()
+
+    def reply(r, cap, calls):
+        if not r.url.path.endswith("/input_tokens"):
+            body = response("gpt-6.1-sol")
+            body["output"] = [
+                {
+                    "type": "function_call_output",
+                    "call_id": "c1",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64," + encoded,
+                        }
+                    ],
+                }
+            ]
+            return httpx.Response(200, json=body)
+
+    req = request()
+    p, _, _, events = provider(req, handler=reply)
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await p.complete(req)
+        assert not [
+            w
+            for w in caught
+            if "input_image" in str(w.message) or "image/png" in str(w.message)
+        ]
+        assert encoded not in json.dumps(events)
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["count", "send"])
+@pytest.mark.parametrize("auth_kind", ["callback", "runtime", "workload"])
+async def test_unqualified_sdk_async_auth_refuses_before_private_bytes(
+    operation, auth_kind
+):
+    req = request()
+    p, _, calls, _ = provider(req)
+    invoked = []
+
+    async def credential():
+        invoked.append(True)
+        req.messages[0].content[0].text = "changed inside SDK auth"
+        return "different-account"
+
+    if auth_kind == "callback":
+        p.client._api_key_provider = credential
+    elif auth_kind == "runtime":
+        p.client._provider_runtime = SimpleNamespace()
+    else:
+        p.client._workload_identity_auth = SimpleNamespace()
+    try:
+        with pytest.raises(InvalidRequestError):
+            if operation == "count":
+                await p.request_budget(req, context_estimate=100)
+            else:
+                await p.complete(req)
+        assert not calls and not invoked
+    finally:
+        # These synthetic auth stubs must not participate in SDK cleanup.
+        p.client._provider_runtime = None
+        p.client._workload_identity_auth = None
+        await p.close()
+
+
+@pytest.mark.asyncio
+async def test_same_object_nested_options_cannot_borrow_outer_fit():
+    req = request()
+    p, _, calls, _ = provider(req)
+    refused = []
+
+    async def observe(name, data):
+        if name == "llm:request":
+            with pytest.raises(InvalidRequestError):
+                await p.complete(req, reasoning_effort="low")
+            refused.append(True)
+
+    p.coordinator.hooks.emit = observe
+    try:
+        await p.complete(req)
+        assert refused == [True]
+        assert sum(not path.endswith("/input_tokens") for path, _ in calls) == 1
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["api_key", "model"])
+async def test_synchronous_estimated_fit_remembers_wire_without_faking_count(mutation):
+    class EstimatedProvider(OpenAIProvider):
+        def _provider_count_available(self):
+            return False
+
+    req = ChatRequest(
+        messages=[Message(role="user", content="unsupported media warning text")]
+    )
+    p, _, calls, _ = provider(req, provider_type=EstimatedProvider)
+    try:
+        result = p.request_budget(req, context_estimate=100)
+        assert isinstance(result, dict) and "measurement" not in result
+        if mutation == "model":
+            p.extra_request_params["model"] = "gpt-6-luna"
+        else:
+            p.client.api_key = "different-account"
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert not calls
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
+async def test_native_received_error_trace_omits_exact_input_echo(nested):
+    from tests.test_native_transport import make
+
+    req = request()
+    canonical = req.model_dump_json()
+    encoded = base64.b64encode(pixels()).decode()
+    url = "data:image/png;base64," + encoded
+    p, owner = make()
+    p.owner = None
+    owner.messages = [m.model_dump() for m in req.messages]
+    cap = Cap(req)
+    p.coordinator = SimpleNamespace(get_capability=lambda _: cap)
+    observed = []
+    p.trace = lambda name, data: observed.append((name, copy.deepcopy(data)))
+    p.trace_context = lambda data: observed.append(("context", copy.deepcopy(data)))
+    error = {"message": "invalid image " + url}
+    if nested:
+        error["content"] = [{"type": "input_image", "image_url": url}]
+    p.socket.feed({"type": "error", "error": error})
+    socket = p.socket
+    try:
+        with pytest.raises(LLMError) as caught:
+            await p.complete(req)
+        assert not caught.value.retryable and len(socket.sent) == 1
+        assert encoded not in json.dumps(observed)
+        assert req.model_dump_json() == canonical
     finally:
         await p.close()

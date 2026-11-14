@@ -1325,7 +1325,7 @@ class OpenAIProvider:
 
     def _media_tool_output_supported(self, model):
         """Instance-owned extension point for proven deployment modality facts."""
-        return bool(self.get_media_request_support(model=model)["positions"])
+        return "tool" in self.get_media_request_support(model=model)["positions"]
 
     def get_native_computer_tool_spec(self) -> dict[str, str]:
         """Return the bare Responses API computer declaration for serialization.
@@ -2482,6 +2482,7 @@ class OpenAIProvider:
         params = self._budget_params(
             request, **self._merge_request_options(request_options, kwargs)
         )
+        _media.check("count", params)
 
         if self._provider_count_available():
 
@@ -3535,6 +3536,20 @@ class OpenAIProvider:
         if _media.CURRENT.get() is not None and isinstance(client, AsyncOpenAI):
             from ._transport import configure_request
             transport = client._client
+            # These SDK paths perform asynchronous auth/preparation and can
+            # replay a 401 independently of max_retries. No late witness exists
+            # inside them, so private media must refuse before entering them.
+            if (
+                any(getattr(client, name, None) is not None for name in (
+                    "_api_key_provider", "_provider_runtime", "_workload_identity_auth",
+                    "_azure_ad_token_provider",
+                ))
+                or getattr(transport, "_auth", None) is not None
+            ):
+                raise kernel_errors.InvalidRequestError(
+                    "Private media requires qualified static SDK authentication; dynamic credential callbacks require a post-auth attempt witness. Request not sent.",
+                    provider=self.name, retryable=False,
+                )
             if transport.follow_redirects or any(
                 hook is not configure_request
                 for hook in transport.event_hooks.get("request", [])
@@ -4752,7 +4767,7 @@ class OpenAIProvider:
                     else None,
                 }
                 if self.raw:
-                    response_event["raw"] = redact_secrets(_media.diagnostic_copy(response.model_dump()))
+                    response_event["raw"] = redact_secrets(_media.diagnostic_copy(response))
                 if captured_rate_limit_info:
                     response_event["rate_limits"] = captured_rate_limit_info
                 await self.coordinator.hooks.emit("llm:response", response_event)

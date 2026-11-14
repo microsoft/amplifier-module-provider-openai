@@ -1648,7 +1648,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 scope = _media.CURRENT.get()
                 if scope:
                     scope.received = True
-                self.trace("native.receive", _media.diagnostic_copy(event))
+                self.trace("native.receive", _media.diagnostic_error_copy(event))
                 kind = event.get("type")
                 await self._progress(event, progress)
                 if kind == "response.created":
