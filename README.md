@@ -2,6 +2,48 @@
 
 GPT model integration for Amplifier via OpenAI's Responses API.
 
+## Optional prepared-media input
+
+`get_media_request_support(*, model, request_options=None)` supplies local,
+exact-model input-image facts for the official Responses route. PNG/JPEG inputs
+remain at their original user or call-bound `function_call_output.output`
+positions as `input_text`/`input_image` parts. The literal catalogue is in
+`_media.VISION_MODELS`; unknown models, custom endpoints and deployment aliases
+are **unqualified**, not declared incapable. Azure must supply attributable
+deployment facts through its own instance support method, not a global alias
+capability guess.
+
+The host owns hydration and private request lifetime. With
+`experimental.media.v1`, count and send validate the original private request,
+effective options, selected connection and frozen wire plan before every attempt.
+SDK retries are disabled for protected sends, including injected SDK clients;
+redirects and unqualified HTTP callbacks are refused. Unknown transmission
+outcomes and any received generation event do not invite automatic replay.
+Existing count availability remains authoritative: native WebSocket providers
+do not gain an actual token counter from this feature.
+
+Ordinary `compact_context(fresh_prepared_request)` uses the same private image
+input for count/compaction. Retained native `native_compact()` cannot safely
+reconstruct released private pixels: with a media capability it refuses locally
+and requires a freshly prepared `compact_context` request. Automatic continuation
+of protected media requests likewise requires a new host-prepared request rather
+than silently changing the counted input. Existing opaque native lineage,
+computer provenance and non-media continuation behavior remain separate.
+
+Known structured image transports are omitted from a separate diagnostic copy
+before hooks/private diagnostic trace callbacks receive it, including raw opt-in.
+The omission marker is not a retrievable pixel reference. Opaque metadata,
+reasoning and argument strings remain opaque; this is not arbitrary traceback
+or third-party collector pixel-safety certification.
+
+Use `python -I -S tests/run_offline.py --allow-loopback -q -m 'not live'` for credential-cleared,
+pre-import Python socket-fenced tests. It is not a native-code/child-process
+sandbox; `--allow-loopback` is only needed by the existing local keepalive/proxy
+server fixtures and permits literal `127.0.0.1`, not external DNS. Real
+SDK/MockTransport and optional installed Foundation fixtures prove
+serialization, original positions and refusal boundaries, not endpoint
+availability, account entitlement, token-count accuracy or visual inference.
+
 ## Optional Decisions capability (development candidate)
 
 The provider can register a named `decision.backends` capability using the same

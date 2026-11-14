@@ -10,6 +10,7 @@ from amplifier_core.message_models import Message
 from . import (
     OpenAIProvider,
     _add_tool_output_cache_breakpoints,
+    _media,
     _read_raw_json_body,
 )
 
@@ -122,6 +123,10 @@ class NativeCheckpointMixin:
         return self.native_status()
 
     async def native_compact(self, *, canonical, identity):
+        # This retained-request API has no fresh private host association. Never
+        # reuse expired hydrated buffers outside the prepared request lifetime.
+        if _media.capability(self) is not None:
+            raise ValueError("Media-capable native compaction requires a freshly prepared compact_context request")
         if (
             self.owner
             or self._native_busy
