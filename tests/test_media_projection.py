@@ -574,3 +574,17 @@ async def test_late_dispatch_override_refused_before_http(method):
         assert not calls
     finally:
         await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_key", [None, 42, lambda: "not-static"])
+async def test_actual_api_key_must_be_static_string(bad_key):
+    req = request()
+    p, _, calls, _ = provider(req)
+    p.client.api_key = bad_key
+    try:
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert not calls
+    finally:
+        await p.close()

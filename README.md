@@ -22,6 +22,13 @@ outcomes and any received generation event do not invite automatic replay.
 Existing count availability remains authoritative: native WebSocket providers
 do not gain an actual token counter from this feature.
 
+Private media requires an actual nonempty static-string SDK API key and
+qualified SDK/resource/HTTP dispatch. Callable credentials, workload identity,
+Entra/Azure AD callbacks and provider-runtime authentication refuse before
+private count/send because their late await/401 recovery has no qualified
+post-auth media witness. They are not transparently supported, nor declared
+vendor-incapable. Legacy no-capability serializer behavior is separate.
+
 Ordinary `compact_context(fresh_prepared_request)` uses the same private image
 input for count/compaction. Retained native `native_compact()` cannot safely
 reconstruct released private pixels: with a media capability it refuses locally
@@ -35,6 +42,8 @@ before hooks/private diagnostic trace callbacks receive it, including raw opt-in
 The omission marker is not a retrievable pixel reference. Opaque metadata,
 reasoning and argument strings remain opaque; this is not arbitrary traceback
 or third-party collector pixel-safety certification.
+Scalar error projection removes exact known submitted URL/base64 echoes;
+truncated, re-encoded and opaque text is outside that exact-value guarantee.
 
 Use `python -I -S tests/run_offline.py --allow-loopback -q -m 'not live'` for credential-cleared,
 pre-import Python socket-fenced tests. It is not a native-code/child-process
