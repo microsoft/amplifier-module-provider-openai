@@ -588,3 +588,20 @@ async def test_actual_api_key_must_be_static_string(bad_key):
         assert not calls
     finally:
         await p.close()
+
+
+@pytest.mark.asyncio
+async def test_absent_sdk_optional_compact_does_not_break_create(monkeypatch):
+    req = request()
+    p, _, _, _ = provider(req)
+    raw = p.client.responses.with_raw_response
+    del raw.compact
+    methods = dict(_media.RESOURCE_DISPATCH[type(p.client.responses)])
+    methods.pop("compact")
+    monkeypatch.setitem(_media.RESOURCE_DISPATCH, type(p.client.responses), methods)
+    try:
+        assert _media.standard_dispatch(p.client)
+        raw.compact = lambda **_: None
+        assert not _media.standard_dispatch(p.client)
+    finally:
+        await p.close()

@@ -107,11 +107,19 @@ def standard_dispatch(client):
     if raw._responses is not client.responses:
         return False
     for name in ("create", "compact"):
-        actual = inspect.unwrap(getattr(raw, name))
+        function = RESOURCE_DISPATCH[AsyncResponses].get(name)
+        if function is None:
+            # Older Azure setup/runtime SDKs legitimately omit native compact.
+            # Absence is not advertised support; an injected replacement is
+            # not allowed to become a new transport surface.
+            if hasattr(raw, name):
+                return False
+            continue
+        actual = inspect.unwrap(getattr(raw, name, None))
         if (
             getattr(actual, "__self__", None) is not client.responses
             or getattr(actual, "__func__", None)
-            is not RESOURCE_DISPATCH[AsyncResponses][name]
+            is not function
         ):
             return False
     return True
