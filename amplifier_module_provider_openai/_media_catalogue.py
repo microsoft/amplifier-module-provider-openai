@@ -155,3 +155,8 @@ MEDIA_PRICE_THRESHOLDS = {
     'gpt-6.1-sol': 272000,
     'gpt-6.1-terra': 272000,
 }
+
+# The alias's own page does not establish an enduring price threshold.
+# Hold it to the standard boundary unless the caller explicitly opts in to
+# long context. This is a conservative cost gate, NOT an alias rewrite/fact.
+MEDIA_UNCERTAIN_PRICE_BOUNDARIES = {'gpt-daybreak-blue-latest': 272000}

@@ -23,9 +23,11 @@ from openai.resources.responses import AsyncResponses
 from openai.resources.responses.input_tokens import AsyncInputTokens
 from pydantic import BaseModel
 
+from ._lifecycle import is_shutdown
 from ._media_catalogue import (
     MEDIA_LIMITS,  # noqa: F401 -- shared exact facts exported to provider/tests
     MEDIA_PRICE_THRESHOLDS,  # noqa: F401 -- shared price opt-in facts
+    MEDIA_UNCERTAIN_PRICE_BOUNDARIES,  # noqa: F401 -- conservative price gate
     NONSTREAM_MODELS,
     SHUTDOWN_MODELS,
     VISION_MODELS,  # noqa: F401 -- shared exact facts exported to provider/tests
@@ -174,8 +176,9 @@ class Scope:
             refuse()
         selected = options.get("model") or request.model or provider.default_model
         selected = extra.get("model", selected)
+        self.selected_model = selected
         if provider.name == "openai" and provider._has_standard_openai_endpoint():
-            if selected in SHUTDOWN_MODELS:
+            if selected in SHUTDOWN_MODELS or is_shutdown(selected):
                 raise InvalidRequestError(
                     "Selected official media model is documented as shut down; request not sent.",
                     provider=provider.name, retryable=False,
@@ -227,6 +230,15 @@ class Scope:
         )
 
     def validate(self, purpose, params=None):
+        if (
+            self.provider.name == "openai"
+            and self.provider._has_standard_openai_endpoint()
+            and is_shutdown(self.selected_model)
+        ):
+            raise InvalidRequestError(
+                "Selected official media model is documented as shut down; request not sent.",
+                provider=self.provider.name, retryable=False,
+            )
         if (
             self.binding() != self.connection
             or digest(self.request.model_dump()) != self.request_digest
@@ -298,6 +310,16 @@ def operation(method):
                 refuse()
             if digest(options) != current.options_digest:
                 refuse()
+            return await method(self, request, *args, **kwargs)
+        if (
+            options.get("single_attempt") is True
+            and not has_refs(request)
+            and not any(canonical_images(m.content) for m in request.messages)
+        ):
+            # This separate strict text-only contract owns one fresh SDK client
+            # and validates explicit request.stream=False itself. A mounted
+            # media capability alone must not initialize an ordinary client or
+            # reinterpret its transport. Images/refs never take this branch.
             return await method(self, request, *args, **kwargs)
         if not protected(self, request):
             return await method(self, request, *args, **kwargs)

@@ -1308,6 +1308,7 @@ class OpenAIProvider:
 
     def get_media_request_support(self, *, model, request_options=None):
         """Exact endpoint/model media facts; never infer deployment aliases."""
+        from ._lifecycle import is_shutdown
         selected = self.extra_request_params.get("model", model)
         extra = self.extra_request_params.get("extra_body")
         if isinstance(extra, dict):
@@ -1315,6 +1316,7 @@ class OpenAIProvider:
         supported = (
             self.name == "openai" and self._has_standard_openai_endpoint()
             and isinstance(selected, str) and selected in _media.VISION_MODELS
+            and not is_shutdown(selected)
         )
         return {
             "v": 1, "positions": ["user", "tool"] if supported else [],
@@ -1843,7 +1845,11 @@ class OpenAIProvider:
         if input_ceiling is not None:
             allowance = min(allowance, input_ceiling)
         price_threshold = (
-            _media.MEDIA_PRICE_THRESHOLDS.get(model, caps.long_context_pricing_threshold)
+            _media.MEDIA_PRICE_THRESHOLDS.get(
+                model, _media.MEDIA_UNCERTAIN_PRICE_BOUNDARIES.get(
+                    model, caps.long_context_pricing_threshold
+                )
+            )
             if media_limits else caps.long_context_pricing_threshold
         )
         if not self.enable_long_context and price_threshold:

@@ -41,9 +41,20 @@ uses the **final effective model's** published output default; explicit caller,
 configuration and expert caps remain authoritative and oversize values refuse,
 not silently clamp. Each literal model retains its own source and lifecycle;
 an alias's deprecated status is not copied onto its target.
+Support discovery and protected attempts recheck the existing date-aware exact
+shutdown catalogue, including a cutoff crossed during an await/hook. Future
+retirement does not disable a model before its published date.
+The Daybreak Blue moving alias's own page does not promise a stable price
+threshold: a separate **conservative cost gate** keeps it within 272K input unless
+long context is explicitly enabled. That gate is not an immutable alias mapping
+or a claim about the alias's current billing; no model is rewritten.
 No missing window is manufactured from image
 bytes. This narrow media qualification does not silently revise generic legacy
 capability defaults for Azure aliases, custom routes or text-only callers.
+The separately bounded `single_attempt` contract remains strictly text-only and
+owns its fresh client/nonstream selection even when a media capability is
+mounted. Images or canonical refs never take that exclusion; mounting media
+alone does not convert a text readiness check into ordinary streaming dispatch.
 
 The host owns hydration and private request lifetime. With
 `experimental.media.v1`, count and send validate the original private request,

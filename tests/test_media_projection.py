@@ -799,6 +799,68 @@ async def test_cyber_price_threshold_requires_long_context_opt_in(long_context, 
         await p.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("long_context,expected", [(False, 267904), (True, 917904)])
+async def test_daybreak_blue_documented_default_price_guard(long_context, expected):
+    req = request()
+    p, _, _, _ = provider(req, "gpt-daybreak-blue-latest")
+    p.enable_long_context = long_context
+    try:
+        result = await p.request_budget(req, context_estimate=100)
+        assert result["input_limit_tokens"] == expected
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model,cutoff", [
+    ("gpt-5", "2026-12-11"), ("o3", "2026-12-11"), ("gpt-4o", "2027-01-14"),
+])
+@pytest.mark.parametrize("phase", ["before_count", "during_hook"])
+async def test_support_and_private_count_revalidate_future_shutdown(monkeypatch, model, cutoff, phase):
+    from datetime import date
+
+    from amplifier_module_provider_openai import _lifecycle
+
+    initial_day = date(2026, 11, 14)
+
+    class Clock:
+        day = initial_day
+
+        @classmethod
+        def now(cls, _):
+            return cls
+
+        @classmethod
+        def date(cls):
+            return cls.day
+
+    monkeypatch.setattr(_lifecycle, "datetime", Clock)
+    req = request()
+    p, _, calls, _ = provider(req, model)
+    try:
+        assert p.get_media_request_support(model=model)["positions"] == ["user", "tool"]
+        if phase == "before_count":
+            Clock.day = date.fromisoformat(cutoff)
+            assert p.get_media_request_support(model=model)["positions"] == []
+            with pytest.raises(InvalidRequestError, match="shut down"):
+                await p.request_budget(req, context_estimate=100)
+            assert not calls
+        else:
+            await p.request_budget(req, context_estimate=100)
+
+            async def crosses_cutoff(name, _):
+                if name == "llm:request":
+                    Clock.day = date.fromisoformat(cutoff)
+
+            p.coordinator.hooks.emit = crosses_cutoff
+            with pytest.raises(InvalidRequestError, match="shut down"):
+                await p.complete(req)
+            assert all(path.endswith("/input_tokens") for path, _ in calls)
+    finally:
+        await p.close()
+
+
 def test_literal_model_evidence_not_overwritten_by_alias_target():
     from pathlib import Path
 
