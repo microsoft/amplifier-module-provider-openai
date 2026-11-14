@@ -258,10 +258,12 @@ def test_blocking_complete_uses_effective_model_for_rich_tool_output() -> None:
     provider = _provider(use_streaming=False)
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
-    asyncio.run(provider.complete(_request_with_image_result(), model="o3-mini"))
+    # o3-mini is retired; this synthetic nonvision o-series fixture tests the
+    # converter independently, without asserting a currently available model.
+    asyncio.run(provider.complete(_request_with_image_result(), model="o3-text-fixture"))
 
     params = provider.client.responses.create.await_args.kwargs
-    assert params["model"] == "o3-mini"
+    assert params["model"] == "o3-text-fixture"
     output = _function_output(params["input"])["output"]
     assert output[0] == {"type": "input_text", "text": "before"}
     assert output[1]["text"].startswith("[Image omitted:")
