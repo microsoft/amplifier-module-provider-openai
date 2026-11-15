@@ -6,6 +6,7 @@ No hydration/store access, public witness metadata, Foundation or peer imports.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import inspect
 import json
 import weakref
@@ -53,6 +54,109 @@ RESOURCE_DISPATCH = {
     for cls in (AsyncResponses, AsyncInputTokens)
 }
 RAW_WRAPPER_CODE = async_to_raw_response_wrapper(AsyncResponses.create).__code__
+HTTP_TRANSPORT_CLASSES = tuple({
+    transport
+    for http_class in HTTP_DISPATCH
+    for base in http_class.__mro__
+    if base.__name__ == "AsyncClient"
+    for module in (importlib.import_module(base.__module__.split(".")[0]),)
+    for transport in (module.AsyncHTTPTransport, module.MockTransport)
+})
+HTTP_POOL_CLASSES = tuple({
+    pool_class
+    for transport in HTTP_TRANSPORT_CLASSES
+    if transport.__name__ == "AsyncHTTPTransport"
+    for module in (importlib.import_module(
+        "httpcore2" if transport.__module__.split(".")[0] == "httpx2" else "httpcore"
+    ),)
+    for pool_class in (
+        module.AsyncConnectionPool, module.AsyncHTTPProxy, module.AsyncSOCKSProxy,
+    )
+})
+
+
+def _transport_binding(transport):
+    if transport is None:
+        return None
+    if type(transport) not in HTTP_TRANSPORT_CLASSES:
+        refuse()
+    execution = {
+        name for base in type(transport).__mro__
+        for name, function in vars(base).items() if callable(function)
+    }
+    if execution.intersection(vars(transport)):
+        refuse()
+    pool = getattr(transport, "_pool", None)
+    pool_state = None
+    if pool is not None:
+        if type(pool) not in HTTP_POOL_CLASSES or getattr(pool, "_retries", None) != 0:
+            refuse()
+        pool_execution = {
+            name for base in type(pool).__mro__
+            for name, function in vars(base).items() if callable(function)
+        }
+        if pool_execution.intersection(vars(pool)):
+            refuse()
+        pool_state = (
+            id(pool),
+            getattr(pool.handle_async_request, "__func__", pool.handle_async_request),
+            getattr(pool.aclose, "__func__", pool.aclose),
+        )
+    return (
+        id(transport),
+        getattr(transport.handle_async_request, "__func__", transport.handle_async_request),
+        getattr(transport.aclose, "__func__", transport.aclose),
+        pool_state,
+    )
+
+
+def transport_binding(client):
+    if not isinstance(client, AsyncOpenAI):
+        return None  # Existing legacy adapters are not real SDK qualification.
+    http = client._client
+    if http.is_closed:
+        refuse()
+    return (
+        http.follow_redirects,
+        id(http._auth),
+        tuple(id(hook) for hook in http.event_hooks.get("request", [])),
+        tuple(id(hook) for hook in http.event_hooks.get("response", [])),
+        tuple(http.headers.multi_items()),
+        tuple(http.params.multi_items()),
+        tuple((cookie.name, cookie.value, cookie.domain, cookie.path)
+              for cookie in http.cookies.jar),
+        _transport_binding(http._transport),
+        tuple((id(pattern), _transport_binding(transport))
+              for pattern, transport in http._mounts.items()),
+    )
+
+
+def late_bound_client(client, *, purpose="transport", **options):
+    """Keep the real SDK, checking after its first-platform scheduling cut.
+
+    This private SDK copy borrows the original HTTP client; it never owns its
+    closure. Standard dispatch admission applies to the original client, not to
+    this one provider-owned preparation adapter. There are no SDK inner retries.
+    """
+    scope = CURRENT.get()
+    if scope is None or scope.cap is None or type(client) not in SDK_DISPATCH:
+        if client.max_retries == 0 and not options:
+            return client
+        return client.with_options(max_retries=0, **options)
+    prepared = client.with_options(max_retries=0, **options)
+    # SDK copies reconstruct clients and can reread ambient constructor options.
+    # The selected connection, not new environment state, owns these values.
+    for name in ("api_key", "organization", "project", "_custom_headers", "_custom_query"):
+        setattr(prepared, name, deepcopy(getattr(client, name)))
+    prepare = SDK_DISPATCH[type(client)]["_prepare_options"]
+
+    async def prepare_options(value):
+        result = await prepare(prepared, value)
+        scope.validate(purpose)
+        return result
+
+    prepared._prepare_options = prepare_options
+    return prepared
 
 
 def standard_dispatch(client):
@@ -227,6 +331,7 @@ class Scope:
             digest(getattr(client, "_custom_query", None)),
             id(getattr(client, "_client", None)),
             id(getattr(getattr(client, "_client", None), "_transport", None)),
+            transport_binding(client),
         )
 
     def validate(self, purpose, params=None):
@@ -255,6 +360,10 @@ class Scope:
             except Exception:  # noqa: BLE001 -- host refusal text may contain private data
                 refuse()
             if not isinstance(result, dict) or result.get("valid") is not True:
+                refuse()
+            if self.binding() != self.connection:
+                # Host validation is an extension point; it may not change the
+                # selected physical connection behind its own valid response.
                 refuse()
         if params is not None:
             fingerprint = digest(params)

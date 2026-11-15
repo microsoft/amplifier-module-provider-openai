@@ -65,7 +65,12 @@ async def count_tokens(client, params, *, validate=None):
     # Disable SDK retries even for injected clients; our attempt budget is the
     # complete wire budget. The copy shares transport and is not ours to close.
     if isinstance(client, openai.AsyncOpenAI):
-        client = client.with_options(max_retries=0, timeout=ATTEMPT_TIMEOUT)
+        if validate is not None:
+            from ._media import late_bound_client
+
+            client = late_bound_client(client, purpose="count", timeout=ATTEMPT_TIMEOUT)
+        else:
+            client = client.with_options(max_retries=0, timeout=ATTEMPT_TIMEOUT)
     counter = client.responses.input_tokens.count
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if validate is not None:

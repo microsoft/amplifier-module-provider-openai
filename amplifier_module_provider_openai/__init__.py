@@ -3339,7 +3339,7 @@ class OpenAIProvider:
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         # This separate operation has no retry/fallback path: a transport error
         # can mean submission happened. The caller must reconcile before retrying.
-        client = self.client.with_options(max_retries=0)
+        client = self._media_client() if _media.CURRENT.get() is not None else self.client.with_options(max_retries=0)
         _media.check("transport", params)
         response = await client.responses.create(
             **trigger_params, timeout=self._transport_timeout(self._request_timeout(request))
@@ -3606,8 +3606,7 @@ class OpenAIProvider:
                     "Private media transport requires non-redirecting HTTP with qualified hooks.",
                     provider=self.name, retryable=False,
                 )
-            if client.max_retries != 0:
-                return client.with_options(max_retries=0)
+            return _media.late_bound_client(client)
         return client
 
     async def _create_response(
