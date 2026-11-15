@@ -286,7 +286,7 @@ async def test_capability_validation_cannot_reopen_transport_after_check(monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", [
-    "transport", "pool", "key", "base", "http_auth", "http_hook", "closed",
+    "transport", "pool", "key", "base", "http_auth", "http_hook", "closed", "http_send",
 ])
 @pytest.mark.parametrize("cut", ["count", "send"])
 async def test_real_sdk_first_platform_await_cannot_change_transport(monkeypatch, target, cut):
@@ -331,6 +331,8 @@ async def test_real_sdk_first_platform_await_cannot_change_transport(monkeypatch
                 p.client._client.auth = httpx.BasicAuth("other", "account")
             elif target == "http_hook":
                 p.client._client.event_hooks["request"].append(observer)
+            elif target == "http_send":
+                p.client._client.send = observer
             else:
                 from httpx._client import ClientState
                 p.client._client._state = ClientState.CLOSED

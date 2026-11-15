@@ -315,6 +315,8 @@ class Scope:
         # Subclasses (notably Azure) own a different client slot. Bind the
         # already initialized actual transport, not the base cache attribute.
         client = p.client
+        if self.cap is not None and isinstance(client, AsyncOpenAI) and not standard_dispatch(client):
+            refuse()
         return (
             id(capability(p)),
             id(p.coordinator),
@@ -329,6 +331,10 @@ class Scope:
             digest(getattr(client, "api_key", None)),
             digest(getattr(client, "_custom_headers", None)),
             digest(getattr(client, "_custom_query", None)),
+            tuple(id(getattr(client, name, None)) for name in (
+                "_api_key_provider", "_provider_runtime", "_workload_identity_auth",
+                "_azure_ad_token_provider",
+            )),
             id(getattr(client, "_client", None)),
             id(getattr(getattr(client, "_client", None), "_transport", None)),
             transport_binding(client),
