@@ -85,6 +85,18 @@ it sends the selected cookie baseline but does not adopt response-driven cookies
 as new account/routing authority between count, send or retries. Explicit owner
 cookie changes still invalidate the prepared request. Ordinary non-media cookie
 handling and original transport/pool cleanup ownership are unchanged.
+An interleaved ordinary response or cookie expiry can also change that owner jar;
+the outstanding private request then fails closed as a changed connection.
+Do not interleave ordinary and prepared requests on one provider instance while
+depending on the same fitted candidate. Private count/send/retries intentionally
+do not carry newly returned server affinity cookies: routes requiring those new
+cookies are not qualified by this private transport contract.
+
+The legacy inline-image path without a mounted media capability is narrower:
+its count SDK copy pins selected settings, but generation with zero SDK retries
+and no copy options still uses the original HTTP client, including ordinary
+response-cookie handling and without the new private first-await recheck. It is
+not prepared-request/account-lifetime qualification.
 
 Ordinary `compact_context(fresh_prepared_request)` uses the same private image
 input for count/compaction. Retained native `native_compact()` cannot safely
