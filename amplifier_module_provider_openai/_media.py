@@ -146,7 +146,10 @@ def late_bound_client(client, *, purpose="transport", **options):
     prepared = client.with_options(max_retries=0, **options)
     # SDK copies reconstruct clients and can reread ambient constructor options.
     # The selected connection, not new environment state, owns these values.
-    for name in ("api_key", "organization", "project", "_custom_headers", "_custom_query"):
+    for name in (
+        "api_key", "organization", "project", "_custom_headers", "_custom_query",
+        "_strict_response_validation",
+    ):
         setattr(prepared, name, deepcopy(getattr(client, name)))
     prepare = SDK_DISPATCH[type(client)]["_prepare_options"]
 
@@ -331,6 +334,7 @@ class Scope:
             digest(getattr(client, "api_key", None)),
             digest(getattr(client, "_custom_headers", None)),
             digest(getattr(client, "_custom_query", None)),
+            getattr(client, "_strict_response_validation", None),
             tuple(id(getattr(client, name, None)) for name in (
                 "_api_key_provider", "_provider_runtime", "_workload_identity_auth",
                 "_azure_ad_token_provider",

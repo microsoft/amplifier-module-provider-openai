@@ -298,6 +298,7 @@ async def test_real_sdk_first_platform_await_cannot_change_transport(monkeypatch
     p, _, _, _ = provider(req)
     observed = []
     physical = []
+    armed_at = []
 
     async def bottom(_transport, wire):
         physical.append(wire.url.path)
@@ -347,6 +348,7 @@ async def test_real_sdk_first_platform_await_cannot_change_transport(monkeypatch
 
             async def arm(name, payload):
                 if name == "llm:request":
+                    armed_at.append(len(physical))
                     monkeypatch.setattr(sdk_base, "asyncify", platform_wrapper)
                 return await emit(name, payload)
 
@@ -359,7 +361,67 @@ async def test_real_sdk_first_platform_await_cannot_change_transport(monkeypatch
             else:
                 await p.complete(req)
         assert observed == []
-        assert all(path.endswith("/input_tokens") for path in physical)
+        if cut == "count":
+            assert physical == []
+        else:
+            assert len(armed_at) == 1
+            assert len(physical) == armed_at[0]
+            assert all(path.endswith("/input_tokens") for path in physical)
     finally:
         await p.close()
         await transport.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("malformed", [False, True])
+async def test_private_sdk_copy_preserves_selected_response_validation(strict, malformed):
+    from openai import APIResponseValidationError
+
+    from amplifier_module_provider_openai import _media
+
+    req = request()
+    def handler(wire, cap, calls):
+        data = response("gpt-6.1-sol")
+        data.update(parallel_tool_calls=True, tool_choice="auto", tools=[])
+        data["usage"].update(
+            input_tokens_details={"cached_tokens": 0, "cache_write_tokens": 0},
+            output_tokens_details={"reasoning_tokens": 0},
+        )
+        if malformed:
+            data["output"] = 123
+        return httpx.Response(200, json=data)
+    p, _, calls, _ = provider(req, handler=handler)
+    p.client._strict_response_validation = strict
+    scope = _media.Scope(p, req, {})
+    token = _media.CURRENT.set(scope)
+    try:
+        client = p._media_client()
+        if strict and malformed:
+            with pytest.raises(APIResponseValidationError):
+                await client.responses.create(model=p.default_model, input="selected validation")
+        else:
+            result = await client.responses.create(model=p.default_model, input="selected validation")
+            assert result.id == "resp_fixture"
+        assert len(calls) == 1
+        assert client._strict_response_validation is strict
+        assert p.client._strict_response_validation is strict
+    finally:
+        _media.CURRENT.reset(token)
+        await p.close()
+
+
+@pytest.mark.asyncio
+async def test_strict_response_policy_drift_after_count_refuses_without_send():
+    req = request()
+    p, _, calls, _ = provider(req)
+    p.client._strict_response_validation = True
+    try:
+        await fit(p, req)
+        before = len(calls)
+        p.client._strict_response_validation = False
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert len(calls) == before
+    finally:
+        await p.close()
