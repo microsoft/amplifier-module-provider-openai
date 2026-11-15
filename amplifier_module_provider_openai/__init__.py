@@ -49,6 +49,7 @@ from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
+from . import _media
 from ._capabilities import (
     GPT_6_MODELS,
     LONG_CONTEXT_MODEL_PATTERN,
@@ -732,7 +733,7 @@ def _extract_computer_screenshot_data_url(tool_content: Any) -> str:
 
 
 def _convert_function_tool_output_content(
-    content: list[Any], model_name: str
+    content: list[Any], model_name: str, *, supports_vision: bool | None = None,
 ) -> list[dict[str, str]] | None:
     """Convert canonical text/image tool content to Responses output items.
 
@@ -746,7 +747,8 @@ def _convert_function_tool_output_content(
     if not has_image:
         return None
 
-    supports_vision = get_capabilities(model_name).supports_vision
+    if supports_vision is None:
+        supports_vision = get_capabilities(model_name).supports_vision
     output: list[dict[str, str]] = []
     for block in content:
         if not isinstance(block, dict):
@@ -1304,6 +1306,29 @@ class OpenAIProvider:
         }
     )
 
+    def get_media_request_support(self, *, model, request_options=None):
+        """Exact endpoint/model media facts; never infer deployment aliases."""
+        from ._lifecycle import is_shutdown
+        selected = self.extra_request_params.get("model", model)
+        extra = self.extra_request_params.get("extra_body")
+        if isinstance(extra, dict):
+            selected = extra.get("model", selected)
+        supported = (
+            self.name == "openai" and self._has_standard_openai_endpoint()
+            and isinstance(selected, str) and selected in _media.VISION_MODELS
+            and not is_shutdown(selected)
+        )
+        return {
+            "v": 1, "positions": ["user", "tool"] if supported else [],
+            "mime_types": ["image/png", "image/jpeg"],
+            "reason": None if supported else "selected endpoint/model image modality is unknown",
+            "evidence": _media.EVIDENCE,
+        }
+
+    def _media_tool_output_supported(self, model):
+        """Instance-owned extension point for proven deployment modality facts."""
+        return "tool" in self.get_media_request_support(model=model)["positions"]
+
     def get_native_computer_tool_spec(self) -> dict[str, str]:
         """Return the bare Responses API computer declaration for serialization.
 
@@ -1788,35 +1813,52 @@ class OpenAIProvider:
                 provider=self.name,
             )
         caps = get_capabilities(model)
+        media_limits = (
+            _media.MEDIA_LIMITS.get(model)
+            if _media.CURRENT.get() is not None
+            and self.name == "openai" and self._has_standard_openai_endpoint()
+            else None
+        )
+        window, input_ceiling, output_ceiling = media_limits or (
+            caps.context_window, caps.max_input_tokens, caps.max_output_tokens
+        )
         # Direct SDK callers may omit an output cap. Reserve the model's full
         # advertised output capability without changing their wire parameters.
         output = params.get(
-            "max_output_tokens", caps.max_output_tokens or DEFAULT_MAX_TOKENS
+            "max_output_tokens", output_ceiling or DEFAULT_MAX_TOKENS
         )
         if isinstance(output, bool) or not isinstance(output, int) or output < 0:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request budget requires a nonnegative integer max_output_tokens.",
                 provider=self.name,
             )
-        if caps.max_output_tokens and output > caps.max_output_tokens:
+        if output_ceiling and output > output_ceiling:
             raise kernel_errors.ContextLengthError(
                 f"OpenAI max_output_tokens={output} exceeds the model output "
-                f"ceiling ({caps.max_output_tokens}, model={model}).",
+                f"ceiling ({output_ceiling}, model={model}).",
                 provider=self.name,
             )
         # Total context, independent input ceiling and price threshold are
         # different constraints. Output consumes total context, not the input
         # ceiling or the standard-price threshold.
-        allowance = caps.context_window - output
-        if caps.max_input_tokens is not None:
-            allowance = min(allowance, caps.max_input_tokens)
-        if not self.enable_long_context and caps.long_context_pricing_threshold:
-            allowance = min(allowance, caps.long_context_pricing_threshold)
+        allowance = window - output
+        if input_ceiling is not None:
+            allowance = min(allowance, input_ceiling)
+        price_threshold = (
+            _media.MEDIA_PRICE_THRESHOLDS.get(
+                model, _media.MEDIA_UNCERTAIN_PRICE_BOUNDARIES.get(
+                    model, caps.long_context_pricing_threshold
+                )
+            )
+            if media_limits else caps.long_context_pricing_threshold
+        )
+        if not self.enable_long_context and price_threshold:
+            allowance = min(allowance, price_threshold)
         allowance -= 4096
         if allowance <= 0:
             raise kernel_errors.ContextLengthError(
                 "OpenAI request has no input allowance after its output reserve "
-                f"(model={model}, context={caps.context_window}, output={output}).",
+                f"(model={model}, context={window}, output={output}).",
                 provider=self.name,
             )
         return allowance
@@ -1969,6 +2011,10 @@ class OpenAIProvider:
 
     async def _native_input_token_count(self, params: dict[str, Any]) -> int | None:
         """Return a count, unavailable capability, or a safe counting failure."""
+        _media.check("count", params)
+        if _media.CURRENT.get() is not None:
+            self._budget_input_limit(params)
+            self._media_client()
         if not self._provider_count_available():
             return None
         count_params = self._native_count_params(params)
@@ -1993,6 +2039,10 @@ class OpenAIProvider:
         from ._token_count import TokenCountError, count_tokens
 
         try:
+            if _media.CURRENT.get() is not None:
+                return await count_tokens(
+                    count_client, count_params, validate=lambda: _media.check("count", params),
+                )
             return await count_tokens(count_client, count_params)
         except TokenCountError as error:
             try:
@@ -2062,6 +2112,8 @@ class OpenAIProvider:
         ):
             return {}
         window = get_known_context_window(params["model"])
+        if _media.CURRENT.get() is not None and params["model"] in _media.MEDIA_LIMITS:
+            window = _media.MEDIA_LIMITS[params["model"]][0]
         return {"context_window_tokens": window} if window is not None else {}
 
     def _assemble_initial_responses_params_stateful(
@@ -2314,6 +2366,27 @@ class OpenAIProvider:
 
             configuration_history_input = copy.deepcopy(params["input"])
             self._merge_extra_request_params(params)
+            if (
+                _media.CURRENT.get() is not None
+                and self.name == "openai" and self._has_standard_openai_endpoint()
+                and params["model"] in _media.MEDIA_LIMITS
+                and request.max_output_tokens is None
+            ):
+                # Only an implicit default may follow the final effective
+                # model. Explicit request/config/expert caps remain safety
+                # boundaries and are validated, never silently clamped.
+                if kwargs.get("max_output_tokens") is not None:
+                    params["max_output_tokens"] = kwargs["max_output_tokens"]
+                elif (
+                    kwargs.get("max_tokens") is None
+                    and self.max_output_tokens is None
+                    and "max_output_tokens" not in self.extra_request_params
+                    and not (
+                        isinstance(self.extra_request_params.get("extra_body"), dict)
+                        and "max_output_tokens" in self.extra_request_params["extra_body"]
+                    )
+                ):
+                    params["max_output_tokens"] = _media.MEDIA_LIMITS[params["model"]][2]
             # A request-level cap is an explicit caller safety boundary. Keep
             # it authoritative over provider-wide extra params so a degraded
             # context request cannot silently regain its original reserve.
@@ -2429,6 +2502,7 @@ class OpenAIProvider:
         params, _, _ = self._assemble_initial_responses_params(request, **kwargs)
         return params
 
+    @_media.budget
     def request_budget(
         self,
         request: ChatRequest,
@@ -2451,6 +2525,7 @@ class OpenAIProvider:
         params = self._budget_params(
             request, **self._merge_request_options(request_options, kwargs)
         )
+        _media.check("count", params)
 
         if self._provider_count_available():
 
@@ -2608,6 +2683,7 @@ class OpenAIProvider:
             self._client = AsyncOpenAI(
                 api_key=self._api_key, base_url=self.base_url, max_retries=0,
                 http_client=DefaultAsyncHttpxClient(
+                    follow_redirects=False,
                     event_hooks={"request": [configure_request]},
                 ),
             )
@@ -3210,6 +3286,7 @@ class OpenAIProvider:
 
         return canonical_window(message, model or self.default_model) is not None
 
+    @_media.operation
     async def compact_context(self, request: ChatRequest) -> dict[str, Any]:
         """Compact a bounded window and retain every returned canonical item.
 
@@ -3229,7 +3306,8 @@ class OpenAIProvider:
             return await self._compact_configuration_updates(request, params, updates)
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
-        response = await self.client.responses.compact(
+        _media.check("transport", params)
+        response = await self._media_client().responses.compact(
             **compact_params, timeout=self._transport_timeout(self._request_timeout(request))
         )
         # SDK output models can invent unset fields (e.g. phase=None on a
@@ -3261,7 +3339,8 @@ class OpenAIProvider:
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         # This separate operation has no retry/fallback path: a transport error
         # can mean submission happened. The caller must reconcile before retrying.
-        client = self.client.with_options(max_retries=0)
+        client = self._media_client() if _media.CURRENT.get() is not None else self.client.with_options(max_retries=0)
+        _media.check("transport", params)
         response = await client.responses.create(
             **trigger_params, timeout=self._transport_timeout(self._request_timeout(request))
         )
@@ -3281,6 +3360,7 @@ class OpenAIProvider:
             "input_tokens": input_tokens,
         }
 
+    @_media.operation
     async def complete(
         self,
         request: ChatRequest,
@@ -3329,6 +3409,13 @@ class OpenAIProvider:
         original = [m.model_dump() for m in request.messages]
         replay = replay_calls(original)
         plan_observations(original, replay)
+        if _media.CURRENT.get() is not None:
+            if self._find_missing_tool_results(request.messages):
+                raise kernel_errors.InvalidRequestError(
+                    "Prepared media history has a missing tool result; repair canonical history before fitting.",
+                    provider=self.name, retryable=False,
+                )
+            return request, None
         request = request.model_copy(deep=True)
         missing = self._find_missing_tool_results(request.messages)
         pending = set()
@@ -3487,6 +3574,41 @@ class OpenAIProvider:
             return timeout
         return openai.Timeout(timeout, connect=5.0, pool=5.0)
 
+    def _media_client(self):
+        client = self.client
+        if _media.CURRENT.get() is not None and isinstance(client, AsyncOpenAI):
+            from ._transport import configure_request
+            transport = client._client
+            # These SDK paths perform asynchronous auth/preparation and can
+            # replay a 401 independently of max_retries. No late witness exists
+            # inside them, so private media must refuse before entering them.
+            if (
+                type(client.api_key) is not str
+                or not client.api_key
+                or
+                (_media.CURRENT.get().cap is not None and not _media.standard_dispatch(client))
+                or
+                any(getattr(client, name, None) is not None for name in (
+                    "_api_key_provider", "_provider_runtime", "_workload_identity_auth",
+                    "_azure_ad_token_provider",
+                ))
+                or getattr(transport, "_auth", None) is not None
+            ):
+                raise kernel_errors.InvalidRequestError(
+                    "Private media requires qualified static SDK authentication; dynamic credential callbacks require a post-auth attempt witness. Request not sent.",
+                    provider=self.name, retryable=False,
+                )
+            if transport.follow_redirects or any(
+                hook is not configure_request
+                for hook in transport.event_hooks.get("request", [])
+            ) or transport.event_hooks.get("response"):
+                raise kernel_errors.InvalidRequestError(
+                    "Private media transport requires non-redirecting HTTP with qualified hooks.",
+                    provider=self.name, retryable=False,
+                )
+            return _media.late_bound_client(client)
+        return client
+
     async def _create_response(
         self, params: dict[str, Any], *, native_input_tokens: int | None = None,
         timeout=openai.NOT_GIVEN,
@@ -3534,12 +3656,20 @@ class OpenAIProvider:
         else:
             self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         transport_timeout = self._transport_timeout(request_timeout)
+        scope = _media.check("transport", params)
+        if scope:
+            scope.entered = True
         if not _params_declare_computer_tool(params):
-            return await self.client.responses.create(**params, timeout=transport_timeout)
+            result = await self._media_client().responses.create(**params, timeout=transport_timeout)
+            if scope:
+                scope.received = True
+            return result
 
-        raw_response = await self.client.responses.with_raw_response.create(
+        raw_response = await self._media_client().responses.with_raw_response.create(
             **params, timeout=transport_timeout
         )
+        if scope:
+            scope.received = True
         try:
             return await _maybe_await(raw_response.parse())
         except ValidationError as e:
@@ -3549,7 +3679,7 @@ class OpenAIProvider:
                 "PR #58 for the pending_safety_checks SDK defect this works "
                 "around.",
                 self.api_label,
-                e,
+                _media.safe_text(str(e), params),
             )
             try:
                 body = await _read_raw_json_body(raw_response)
@@ -3622,7 +3752,7 @@ class OpenAIProvider:
                 "background_mode": background_mode,
             }
             if self.raw:
-                request_payload["raw"] = redact_secrets(params)
+                request_payload["raw"] = redact_secrets(_media.diagnostic_copy(params))
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -3761,6 +3891,9 @@ class OpenAIProvider:
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info, generation_attempt
+            scope = _media.check("transport", params)
+            if scope:
+                scope.entered = False
 
             # The initial count guarded the completed wire payload before the
             # request event. Reuse it for this first physical dispatch only.
@@ -3820,11 +3953,16 @@ class OpenAIProvider:
 
                     try:
                         async with asyncio.timeout(effective_timeout):
-                            async with self.client.responses.stream(
+                            scope = _media.check("transport", params)
+                            if scope:
+                                scope.entered = True
+                            async with self._media_client().responses.stream(
                                 **params, timeout=self._transport_timeout(request_timeout)
                             ) as stream:
                                 if emit_stream_events:
                                     async for event in stream:
+                                        if scope:
+                                            scope.received = True
                                         et = event.type
 
                                         # Capture the terminal response as we stream so a
@@ -3928,6 +4066,8 @@ class OpenAIProvider:
                                     # their accounting/recovery semantics identical
                                     # without emitting stream UI events.
                                     async for event in stream:
+                                        if scope:
+                                            scope.received = True
                                         et = event.type
                                         if et in (
                                             "response.completed",
@@ -3985,7 +4125,7 @@ class OpenAIProvider:
                                     "request_id": request_id,
                                     "error": {
                                         "type": type(e).__name__,
-                                        "msg": str(e),
+                                        "msg": _media.safe_text(str(e), params),
                                     },
                                 },
                             )
@@ -4180,6 +4320,12 @@ class OpenAIProvider:
 
         async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
             """Callback invoked before each retry sleep."""
+            scope = _media.CURRENT.get()
+            if scope:
+                error.args = (_media.safe_text(str(error), params),)
+                if scope.received or (scope.entered and getattr(error, "status_code", None) is None):
+                    error.retryable = False
+                    raise error
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     PROVIDER_RETRY,
@@ -4189,7 +4335,7 @@ class OpenAIProvider:
                         "max_retries": self._retry_config.max_retries,
                         "delay": delay,
                         "error_type": type(error).__name__,
-                        "error_message": str(error),
+                        "error_message": _media.safe_text(str(error), params),
                     },
                 )
 
@@ -4374,6 +4520,7 @@ class OpenAIProvider:
                 and final_response.status == "incomplete"
                 and response_field(response_field(final_response, "incomplete_details"), "reason") == "max_output_tokens"
                 and kwargs.get("auto_continue", self.auto_continue)
+                and _media.CURRENT.get() is None
                 and continuation_count < MAX_CONTINUATION_ATTEMPTS
             ):
                 if assembly_state["neutral_computer_context"]["neutral"] and any(
@@ -4667,7 +4814,7 @@ class OpenAIProvider:
                     else None,
                 }
                 if self.raw:
-                    response_event["raw"] = redact_secrets(response.model_dump())
+                    response_event["raw"] = redact_secrets(_media.diagnostic_copy(response))
                 if captured_rate_limit_info:
                     response_event["rate_limits"] = captured_rate_limit_info
                 await self.coordinator.hooks.emit("llm:response", response_event)
@@ -4681,7 +4828,7 @@ class OpenAIProvider:
             error_billing = _error_billing(e)
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = _media.safe_text(str(e), params) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4705,7 +4852,7 @@ class OpenAIProvider:
             error_billing = _error_billing(e)
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = _media.safe_text(str(e), params) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             # Emit error event
@@ -5004,7 +5151,11 @@ class OpenAIProvider:
                             # and retains accompanying reference text. A legacy
                             # native image-only envelope would discard it or fail.
                             rich_output = (
-                                _convert_function_tool_output_content(tool_content, model_name)
+                                _convert_function_tool_output_content(
+                                    tool_content, model_name,
+                                    supports_vision=self._media_tool_output_supported(model_name)
+                                    if _media.CURRENT.get() is not None and _media.CURRENT.get().cap is not None else None,
+                                )
                                 if isinstance(tool_content, list) else None
                             )
                             openai_messages.append({
@@ -5095,7 +5246,9 @@ class OpenAIProvider:
                             # Per OpenAI Responses API spec (see ai_context/openai-api-guide.txt)
                             rich_output = (
                                 _convert_function_tool_output_content(
-                                    tool_content, model_name
+                                    tool_content, model_name,
+                                    supports_vision=self._media_tool_output_supported(model_name)
+                                    if _media.CURRENT.get() is not None and _media.CURRENT.get().cap is not None else None,
                                 )
                                 if isinstance(tool_content, list)
                                 else None
@@ -5573,6 +5726,13 @@ class OpenAIProvider:
                                     }
                                 )
                             elif block_type == "image":
+                                if (
+                                    _media.CURRENT.get() is not None
+                                    and _media.CURRENT.get().cap is not None
+                                    and not self._media_tool_output_supported(model_name)
+                                ):
+                                    content_items.append({"type": "input_text", "text": _media.UNAVAILABLE})
+                                    continue
                                 # Convert ImageBlock to OpenAI Responses API input_image format
                                 source = block.get("source", {})
                                 if source.get("type") == "base64":
@@ -5586,6 +5746,7 @@ class OpenAIProvider:
                                         }
                                     )
                                 else:
+                                    content_items.append({"type": "input_text", "text": _media.UNAVAILABLE})
                                     self._assembly_log(
                                         "warning",
                                         f"Unsupported image source type: {source.get('type')}"

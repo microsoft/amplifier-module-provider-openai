@@ -1,0 +1,1907 @@
+{
+  "v": 1,
+  "observed_date": "2026-11-14",
+  "scope": "official Responses image-input and function-output schema plus offline SDK; no account availability or visual-understanding attestation",
+  "derivation": "Literal model pages and explicit snapshot lists only. Shutdown entries excluded; historical published modalities are not current availability. Function guide documents image tool outputs; model pages advertise function_calling. Snapshot modalities share the named family page.",
+  "restrictions": [
+    "Daybreak Cyber requires approved organization/project, selected access program, and for GPT-6 Cyber IP allowlisting; no access or account switch is inferred.",
+    "chat-latest and Daybreak latest are documented moving aliases; no immutable vendor resolution is asserted.",
+    "Nonstream models must use explicitly selected nonstream HTTP; no automatic route change.",
+    "Exact numeric windows are used only for prepared-media budgeting; legacy generic capability defaults are not new media facts.",
+    "Specialized image-generation, Live/Realtime, shutdown Codex/deep-research/computer-preview and unresolved pricing-only IDs are not qualified by this catalogue."
+  ],
+  "sources": [
+    {
+      "id": "gpt-6-astra",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-6-astra.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-astra.md",
+      "observed_at": "2026-11-14T19:59:19.748452+00:00",
+      "bytes": 3960,
+      "sha256": "a9b79d0f5988c879aea6f4f7adb19743c469ee538d8e19744bdaee13d0c50ae2"
+    },
+    {
+      "id": "gpt-6-sol",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-6-sol.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-sol.md",
+      "observed_at": "2026-11-14T19:59:19.746609+00:00",
+      "bytes": 4300,
+      "sha256": "8e3cd3378f0686313dd489ed37347d481d24d4b791e7bd28b1538c4df7762fc4"
+    },
+    {
+      "id": "gpt-6-luna",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-6-luna.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-luna.md",
+      "observed_at": "2026-11-14T19:59:19.749189+00:00",
+      "bytes": 4370,
+      "sha256": "44dcc0a50961150ee700aa701df8d46c59488f003979f3c755c3230bd8a0dfb2"
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md",
+      "observed_at": "2026-11-14T19:59:19.749872+00:00",
+      "bytes": 4335,
+      "sha256": "02dff9ef937bbc97fb24ba7c936269a549563cfb8a49b91a6ba1c1575d2b77c0"
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-6.1-terra.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6.1-terra.md",
+      "observed_at": "2026-11-14T19:59:19.892610+00:00",
+      "bytes": 4438,
+      "sha256": "6a73b3e2e941fbe3813636d5bd2d653ff190e49cc3692eaf8daa3bb125c877f8"
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
+      "observed_at": "2026-11-14T19:59:20.019219+00:00",
+      "bytes": 4072,
+      "sha256": "c0c7f9a635a572335cfe0ba4ea9b920d9b3d2b40aa1ba9f31f3adff203834637"
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra.md",
+      "observed_at": "2026-11-14T19:59:19.869596+00:00",
+      "bytes": 3829,
+      "sha256": "77a5b6c2fcf0b921354158199e2a76f6e90abf895e09c6d30fdc9dc6b56c3702"
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna.md",
+      "observed_at": "2026-11-14T19:59:19.871347+00:00",
+      "bytes": 4045,
+      "sha256": "8e4c2cc03c86804b4f5a0bf73ebb9508666ab712db32b6e2b4723a67d053ede4"
+    },
+    {
+      "id": "gpt-5.6",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.6.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
+      "observed_at": "2026-11-14T19:59:20.045642+00:00",
+      "bytes": 4072,
+      "sha256": "c0c7f9a635a572335cfe0ba4ea9b920d9b3d2b40aa1ba9f31f3adff203834637"
+    },
+    {
+      "id": "gpt-5.4",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.4.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.4.md",
+      "observed_date": "2026-11-14",
+      "bytes": 4190,
+      "sha256": "e9b36be0b1f4b1c3c74dbafdee288cd73767af4befd8895850e8cc3571d75b2d"
+    },
+    {
+      "id": "gpt-5.4-pro",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.4-pro.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.4-pro.md",
+      "observed_date": "2026-11-14",
+      "bytes": 4217,
+      "sha256": "c9dff72fc4859be8ada08899fb7e9843614eea041e600820f084c254c676cdcb"
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3695,
+      "sha256": "f0573705cc885a9de21bbc13c9d504eae364f65834ac7a48b8686a1ef7988e85"
+    },
+    {
+      "id": "gpt-5.5",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.5.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.5.md",
+      "observed_date": "2026-11-14",
+      "bytes": 4126,
+      "sha256": "5c508a781addc036a8d03475e7b7e22587258fe298a8fe95d59631c3b142d0f6"
+    },
+    {
+      "id": "gpt-5.5-pro",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.5-pro.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.5-pro.md",
+      "observed_at": "2026-11-14T19:59:19.992453+00:00",
+      "bytes": 3866,
+      "sha256": "12fe3cbacb51cbdd712becc7264a37385c11709f7fba96094c20988814f71ac5"
+    },
+    {
+      "id": "gpt-5.2",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.2.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.2.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3543,
+      "sha256": "ffdf05b17b1d79d292436395fb910c88779e1922ad24175825c1c7698e2f20fb"
+    },
+    {
+      "id": "gpt-5.2-pro",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.2-pro.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.2-pro.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3915,
+      "sha256": "3ec60ee70452ff5e2349e2a8e8cbc87eb6d3aaeb5353034bb097bea7008a14ab"
+    },
+    {
+      "id": "gpt-4o",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-4o.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-4o.md",
+      "observed_at": "2026-11-14T19:59:20.007829+00:00",
+      "bytes": 3534,
+      "sha256": "c98d07da49edad494c7c945dbd70666f151d6acda57671802118c8515f3c0986"
+    },
+    {
+      "id": "gpt-4o-mini",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-4o-mini.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-4o-mini.md",
+      "observed_at": "2026-11-14T19:59:20.115220+00:00",
+      "bytes": 3579,
+      "sha256": "2077c6c1e3fc9a0d44d972c56596301ab2dfe8210cd41dc8ff610e69903d169d"
+    },
+    {
+      "id": "gpt-4.1",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-4.1.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-4.1.md",
+      "observed_at": "2026-11-14T19:59:20.123996+00:00",
+      "bytes": 3687,
+      "sha256": "baa0f3aa720c9ab9faf3d060d56549ecc6273dd366336d7269c92bebe95b3389"
+    },
+    {
+      "id": "gpt-4.1-mini",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-4.1-mini.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-4.1-mini.md",
+      "observed_at": "2026-11-14T19:59:20.470874+00:00",
+      "bytes": 3719,
+      "sha256": "c04810187c24bc24b5b9c97ce92eb0b565eabb84c0c31b05fbf458174919cf9a"
+    },
+    {
+      "id": "gpt-4.1-nano",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-4.1-nano.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-4.1-nano.md",
+      "observed_at": "2026-11-14T19:59:20.171654+00:00",
+      "bytes": 3727,
+      "sha256": "1ea6f18490e66d7a10f6cf5963474fa1af2f72075239029e4037fc2464a5ff3c"
+    },
+    {
+      "id": "o1",
+      "requested_url": "https://developers.openai.com/api/docs/models/o1.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/o1.md",
+      "observed_at": "2026-11-14T19:59:20.237562+00:00",
+      "bytes": 3283,
+      "sha256": "4691931cc034f2e001c0edb4347deb3e8d4d2358cc516e2b417e688ec9237105"
+    },
+    {
+      "id": "o1-pro",
+      "requested_url": "https://developers.openai.com/api/docs/models/o1-pro.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/o1-pro.md",
+      "observed_at": "2026-11-14T19:59:20.240234+00:00",
+      "bytes": 3476,
+      "sha256": "e818d89baa5ed7693559a3703452b0170214c3cde6ea590011ad8f36ac7115ad"
+    },
+    {
+      "id": "o3",
+      "requested_url": "https://developers.openai.com/api/docs/models/o3.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/o3.md",
+      "observed_at": "2026-11-14T19:59:20.300167+00:00",
+      "bytes": 3818,
+      "sha256": "f2b10b35cc27286cbee11155c1d0cb1b48262b4600ee0037ece376bd4d692615"
+    },
+    {
+      "id": "o3-pro",
+      "requested_url": "https://developers.openai.com/api/docs/models/o3-pro.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/o3-pro.md",
+      "observed_at": "2026-11-14T19:59:20.351142+00:00",
+      "bytes": 3684,
+      "sha256": "3b41ae9e053c803346698ebdaf1a3cb5a02067d5f149a94681a462f361d07fed"
+    },
+    {
+      "id": "o4-mini",
+      "requested_url": "https://developers.openai.com/api/docs/models/o4-mini.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/o4-mini.md",
+      "observed_at": "2026-11-14T19:59:20.362875+00:00",
+      "bytes": 3574,
+      "sha256": "c4e89653bfa6b1f0649cf7f2bf9a453d4cb95d102263a0df0038827db41bb1a0"
+    },
+    {
+      "id": "gpt-5",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3588,
+      "sha256": "6fdfbda34264d299b3642516a4e9047a7c89135f3c751319d7cd950fac454ba1"
+    },
+    {
+      "id": "gpt-5-mini",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5-mini.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5-mini.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3515,
+      "sha256": "7b07ef496f0bc6ab1925825b8ba344591575008f0c676d87cd34a51415805e54"
+    },
+    {
+      "id": "gpt-5-nano",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5-nano.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5-nano.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3557,
+      "sha256": "72750ff00f25ab461bd98f7e83746d506f37c14ede8d9e802e2c2303cc506cfe"
+    },
+    {
+      "id": "gpt-5-pro",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5-pro.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5-pro.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3804,
+      "sha256": "b1ffeff26ce077fd81d97c3e44faf4a351ca000d657016e44910867269198970"
+    },
+    {
+      "id": "gpt-5.1",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.1.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.1.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3531,
+      "sha256": "775c5a80fa61e5a5b657cc57c1fa3efad865f8acd2aa02b61b02fbf31abfbe63"
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.4-nano.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.4-nano.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3715,
+      "sha256": "ca1b92347ef4214704551ffcb2ad023b13eb11736bd47fa4101b1cf635731331"
+    },
+    {
+      "id": "gpt-5.3-codex",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.3-codex.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.3-codex.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3528,
+      "sha256": "18a6039b6e2617159b8358670ce40a62346c9206bf9125a745571ed0e794204b"
+    },
+    {
+      "id": "chat-latest",
+      "requested_url": "https://developers.openai.com/api/docs/models/chat-latest.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/chat-latest.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3213,
+      "sha256": "d04a017fce8d28e54cb28d3e543219bee3e162c82db40bf84b0a5ecbacfa6504"
+    },
+    {
+      "id": "gpt-5.6-cyber",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.6-cyber.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.6-cyber.md",
+      "observed_date": "2026-11-14",
+      "bytes": 4058,
+      "sha256": "6f232d4153cc4ce4b25b24fd7ee3334b7854fc341e9cea8f4c41856b870811cf"
+    },
+    {
+      "id": "gpt-6-cyber",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-6-cyber.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-cyber.md",
+      "observed_date": "2026-11-14",
+      "bytes": 3766,
+      "sha256": "4ef808a763bda3cc7b65ed7cd9cd247deb34fcd5f27e9b03a82bf75b0f9d3553"
+    },
+    {
+      "id": "gpt-daybreak-red-latest",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-daybreak-red-latest.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-daybreak-red-latest.md",
+      "observed_date": "2026-11-14",
+      "bytes": 2904,
+      "sha256": "ec1a7ac10bd674e80d545475673e2b661bafc4b8a655a876bd763ae710b0cb9e"
+    },
+    {
+      "id": "gpt-daybreak-blue-latest",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest.md",
+      "source": "earlier mounted web_fetch saved response",
+      "url": "https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest.md",
+      "observed_date": "2026-11-14",
+      "bytes": 2897,
+      "sha256": "59273dd7a9573476a254313eb2246e49a24da62d50bd0478dfe54d77e41cd3a4"
+    },
+    {
+      "id": "deprecations",
+      "requested_url": "https://developers.openai.com/api/docs/deprecations.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/deprecations.md",
+      "observed_at": "2026-11-14T19:59:20.376618+00:00",
+      "bytes": 63699,
+      "sha256": "7abd85d08446beeb7b8f41692856a5b463ce6a1647337e647a5d4f8adbe45a83"
+    },
+    {
+      "id": "daybreak",
+      "requested_url": "https://developers.openai.com/api/docs/guides/daybreak.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/guides/daybreak.md",
+      "observed_at": "2026-11-14T19:59:20.418341+00:00",
+      "bytes": 10156,
+      "sha256": "0bfe0d6a38804fb55f56623ddbd6ab0f499990c6b336e89e7fce2fcf09e20c38"
+    },
+    {
+      "id": "vision-guide",
+      "requested_url": "https://developers.openai.com/api/docs/guides/images-vision.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/guides/images-vision.md",
+      "observed_at": "2026-11-14T19:59:20.420123+00:00",
+      "bytes": 41416,
+      "sha256": "fe4229978b28c640ef035d77e4ba9e97bd9efe9778db8014125883b6b2e79c27"
+    },
+    {
+      "id": "all-models",
+      "requested_url": "https://developers.openai.com/api/docs/models/all.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/all.md",
+      "observed_at": "2026-11-14T19:59:20.489409+00:00",
+      "bytes": 13196,
+      "sha256": "0b8e9bd76470c0f2d88697f963a4d8d672038a68d2c5751b1b9142163b8259d3"
+    },
+    {
+      "id": "responses-tools",
+      "requested_url": "https://developers.openai.com/api/docs/guides/function-calling.md",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/guides/function-calling.md",
+      "observed_at": "2026-11-14T19:59:20.495741+00:00",
+      "bytes": 77409,
+      "sha256": "ab3a83ee88ba9d076f709c55c9a8f85c3473f7450c678bddf523399d0b4bff1b"
+    },
+    {
+      "id": "gpt-5.5-pro-features",
+      "requested_url": "https://developers.openai.com/api/docs/models/gpt-5.5-pro",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.5-pro",
+      "observed_at": "2026-11-14T19:59:20.659431+00:00",
+      "bytes": 491881,
+      "sha256": "6b1b81138b18db011f69e4e44a379e29ea9315da9db623201abdbe6630824981"
+    },
+    {
+      "id": "o3-pro-features",
+      "requested_url": "https://developers.openai.com/api/docs/models/o3-pro",
+      "source": "unauthenticated official GET",
+      "url": "https://developers.openai.com/api/docs/models/o3-pro",
+      "observed_at": "2026-11-14T19:59:20.642908+00:00",
+      "bytes": 473905,
+      "sha256": "de812463e80ecaeacbd50089394c8f91c5ab9b269daf58dfb9b1521cc4d71950"
+    }
+  ],
+  "models": [
+    {
+      "model": "chat-latest",
+      "family_page": "chat-latest",
+      "source_url": "https://developers.openai.com/api/docs/models/chat-latest.md",
+      "source_sha256": "d04a017fce8d28e54cb28d3e543219bee3e162c82db40bf84b0a5ecbacfa6504",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "chat-latest"
+    },
+    {
+      "model": "gpt-4.1",
+      "family_page": "gpt-4.1",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4.1.md",
+      "source_sha256": "baa0f3aa720c9ab9faf3d060d56549ecc6273dd366336d7269c92bebe95b3389",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 1047576,
+      "max_input_tokens": null,
+      "max_output_tokens": 32768,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-2025-04-14"
+    },
+    {
+      "model": "gpt-4.1-2025-04-14",
+      "family_page": "gpt-4.1",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4.1.md",
+      "source_sha256": "baa0f3aa720c9ab9faf3d060d56549ecc6273dd366336d7269c92bebe95b3389",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 1047576,
+      "max_input_tokens": null,
+      "max_output_tokens": 32768,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-2025-04-14"
+    },
+    {
+      "model": "gpt-4.1-mini",
+      "family_page": "gpt-4.1-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4.1-mini.md",
+      "source_sha256": "c04810187c24bc24b5b9c97ce92eb0b565eabb84c0c31b05fbf458174919cf9a",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 1047576,
+      "max_input_tokens": null,
+      "max_output_tokens": 32768,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-mini-2025-04-14"
+    },
+    {
+      "model": "gpt-4.1-mini-2025-04-14",
+      "family_page": "gpt-4.1-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4.1-mini.md",
+      "source_sha256": "c04810187c24bc24b5b9c97ce92eb0b565eabb84c0c31b05fbf458174919cf9a",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 1047576,
+      "max_input_tokens": null,
+      "max_output_tokens": 32768,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-mini-2025-04-14"
+    },
+    {
+      "model": "gpt-4.1-nano",
+      "family_page": "gpt-4.1-nano",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4.1-nano.md",
+      "source_sha256": "1ea6f18490e66d7a10f6cf5963474fa1af2f72075239029e4037fc2464a5ff3c",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 1047576,
+      "max_input_tokens": null,
+      "max_output_tokens": 32768,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-nano-2025-04-14"
+    },
+    {
+      "model": "gpt-4.1-nano-2025-04-14",
+      "family_page": "gpt-4.1-nano",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4.1-nano.md",
+      "source_sha256": "1ea6f18490e66d7a10f6cf5963474fa1af2f72075239029e4037fc2464a5ff3c",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 1047576,
+      "max_input_tokens": null,
+      "max_output_tokens": 32768,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4.1-nano-2025-04-14"
+    },
+    {
+      "model": "gpt-4o",
+      "family_page": "gpt-4o",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4o.md",
+      "source_sha256": "c98d07da49edad494c7c945dbd70666f151d6acda57671802118c8515f3c0986",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 128000,
+      "max_input_tokens": null,
+      "max_output_tokens": 16384,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-2024-08-06"
+    },
+    {
+      "model": "gpt-4o-2024-05-13",
+      "family_page": "gpt-4o",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4o.md",
+      "source_sha256": "c98d07da49edad494c7c945dbd70666f151d6acda57671802118c8515f3c0986",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 128000,
+      "max_input_tokens": null,
+      "max_output_tokens": 16384,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-2024-08-06"
+    },
+    {
+      "model": "gpt-4o-2024-08-06",
+      "family_page": "gpt-4o",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4o.md",
+      "source_sha256": "c98d07da49edad494c7c945dbd70666f151d6acda57671802118c8515f3c0986",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 128000,
+      "max_input_tokens": null,
+      "max_output_tokens": 16384,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-2024-08-06"
+    },
+    {
+      "model": "gpt-4o-2024-11-20",
+      "family_page": "gpt-4o",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4o.md",
+      "source_sha256": "c98d07da49edad494c7c945dbd70666f151d6acda57671802118c8515f3c0986",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 128000,
+      "max_input_tokens": null,
+      "max_output_tokens": 16384,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-2024-08-06"
+    },
+    {
+      "model": "gpt-4o-mini",
+      "family_page": "gpt-4o-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4o-mini.md",
+      "source_sha256": "2077c6c1e3fc9a0d44d972c56596301ab2dfe8210cd41dc8ff610e69903d169d",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 128000,
+      "max_input_tokens": null,
+      "max_output_tokens": 16384,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-mini-2024-07-18"
+    },
+    {
+      "model": "gpt-4o-mini-2024-07-18",
+      "family_page": "gpt-4o-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-4o-mini.md",
+      "source_sha256": "2077c6c1e3fc9a0d44d972c56596301ab2dfe8210cd41dc8ff610e69903d169d",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 128000,
+      "max_input_tokens": null,
+      "max_output_tokens": 16384,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-4o-mini-2024-07-18"
+    },
+    {
+      "model": "gpt-5",
+      "family_page": "gpt-5",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.md",
+      "source_sha256": "6fdfbda34264d299b3642516a4e9047a7c89135f3c751319d7cd950fac454ba1",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-2025-08-07"
+    },
+    {
+      "model": "gpt-5-2025-08-07",
+      "family_page": "gpt-5",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.md",
+      "source_sha256": "6fdfbda34264d299b3642516a4e9047a7c89135f3c751319d7cd950fac454ba1",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-2025-08-07"
+    },
+    {
+      "model": "gpt-5-mini",
+      "family_page": "gpt-5-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5-mini.md",
+      "source_sha256": "7b07ef496f0bc6ab1925825b8ba344591575008f0c676d87cd34a51415805e54",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-mini-2025-08-07"
+    },
+    {
+      "model": "gpt-5-mini-2025-08-07",
+      "family_page": "gpt-5-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5-mini.md",
+      "source_sha256": "7b07ef496f0bc6ab1925825b8ba344591575008f0c676d87cd34a51415805e54",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-mini-2025-08-07"
+    },
+    {
+      "model": "gpt-5-nano",
+      "family_page": "gpt-5-nano",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5-nano.md",
+      "source_sha256": "72750ff00f25ab461bd98f7e83746d506f37c14ede8d9e802e2c2303cc506cfe",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-nano-2025-08-07"
+    },
+    {
+      "model": "gpt-5-nano-2025-08-07",
+      "family_page": "gpt-5-nano",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5-nano.md",
+      "source_sha256": "72750ff00f25ab461bd98f7e83746d506f37c14ede8d9e802e2c2303cc506cfe",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-nano-2025-08-07"
+    },
+    {
+      "model": "gpt-5-pro",
+      "family_page": "gpt-5-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5-pro.md",
+      "source_sha256": "b1ffeff26ce077fd81d97c3e44faf4a351ca000d657016e44910867269198970",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": null,
+      "max_output_tokens": 272000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-pro-2025-10-06"
+    },
+    {
+      "model": "gpt-5-pro-2025-10-06",
+      "family_page": "gpt-5-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5-pro.md",
+      "source_sha256": "b1ffeff26ce077fd81d97c3e44faf4a351ca000d657016e44910867269198970",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": null,
+      "max_output_tokens": 272000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5-pro-2025-10-06"
+    },
+    {
+      "model": "gpt-5.1",
+      "family_page": "gpt-5.1",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.1.md",
+      "source_sha256": "775c5a80fa61e5a5b657cc57c1fa3efad865f8acd2aa02b61b02fbf31abfbe63",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.1-2025-11-13"
+    },
+    {
+      "model": "gpt-5.1-2025-11-13",
+      "family_page": "gpt-5.1",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.1.md",
+      "source_sha256": "775c5a80fa61e5a5b657cc57c1fa3efad865f8acd2aa02b61b02fbf31abfbe63",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.1-2025-11-13"
+    },
+    {
+      "model": "gpt-5.2",
+      "family_page": "gpt-5.2",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.2.md",
+      "source_sha256": "ffdf05b17b1d79d292436395fb910c88779e1922ad24175825c1c7698e2f20fb",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 400000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.2-2025-12-11"
+    },
+    {
+      "model": "gpt-5.2-2025-12-11",
+      "family_page": "gpt-5.2",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.2.md",
+      "source_sha256": "ffdf05b17b1d79d292436395fb910c88779e1922ad24175825c1c7698e2f20fb",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 400000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.2-2025-12-11"
+    },
+    {
+      "model": "gpt-5.2-pro",
+      "family_page": "gpt-5.2-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.2-pro.md",
+      "source_sha256": "3ec60ee70452ff5e2349e2a8e8cbc87eb6d3aaeb5353034bb097bea7008a14ab",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 400000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.2-pro-2025-12-11"
+    },
+    {
+      "model": "gpt-5.2-pro-2025-12-11",
+      "family_page": "gpt-5.2-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.2-pro.md",
+      "source_sha256": "3ec60ee70452ff5e2349e2a8e8cbc87eb6d3aaeb5353034bb097bea7008a14ab",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 400000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.2-pro-2025-12-11"
+    },
+    {
+      "model": "gpt-5.3-codex",
+      "family_page": "gpt-5.3-codex",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.3-codex.md",
+      "source_sha256": "18a6039b6e2617159b8358670ce40a62346c9206bf9125a745571ed0e794204b",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.3-codex"
+    },
+    {
+      "model": "gpt-5.4",
+      "family_page": "gpt-5.4",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.4.md",
+      "source_sha256": "e9b36be0b1f4b1c3c74dbafdee288cd73767af4befd8895850e8cc3571d75b2d",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.4-2026-03-05"
+    },
+    {
+      "model": "gpt-5.4-2026-03-05",
+      "family_page": "gpt-5.4",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.4.md",
+      "source_sha256": "e9b36be0b1f4b1c3c74dbafdee288cd73767af4befd8895850e8cc3571d75b2d",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.4-2026-03-05"
+    },
+    {
+      "model": "gpt-5.4-mini",
+      "family_page": "gpt-5.4-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md",
+      "source_sha256": "f0573705cc885a9de21bbc13c9d504eae364f65834ac7a48b8686a1ef7988e85",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.4-mini-2026-03-17"
+    },
+    {
+      "model": "gpt-5.4-mini-2026-03-17",
+      "family_page": "gpt-5.4-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md",
+      "source_sha256": "f0573705cc885a9de21bbc13c9d504eae364f65834ac7a48b8686a1ef7988e85",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.4-mini-2026-03-17"
+    },
+    {
+      "model": "gpt-5.4-nano",
+      "family_page": "gpt-5.4-nano",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.4-nano.md",
+      "source_sha256": "ca1b92347ef4214704551ffcb2ad023b13eb11736bd47fa4101b1cf635731331",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.4-nano-2026-03-17"
+    },
+    {
+      "model": "gpt-5.4-nano-2026-03-17",
+      "family_page": "gpt-5.4-nano",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.4-nano.md",
+      "source_sha256": "ca1b92347ef4214704551ffcb2ad023b13eb11736bd47fa4101b1cf635731331",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.4-nano-2026-03-17"
+    },
+    {
+      "model": "gpt-5.4-pro",
+      "family_page": "gpt-5.4-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.4-pro.md",
+      "source_sha256": "c9dff72fc4859be8ada08899fb7e9843614eea041e600820f084c254c676cdcb",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.4-pro-2026-03-05"
+    },
+    {
+      "model": "gpt-5.4-pro-2026-03-05",
+      "family_page": "gpt-5.4-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.4-pro.md",
+      "source_sha256": "c9dff72fc4859be8ada08899fb7e9843614eea041e600820f084c254c676cdcb",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.4-pro-2026-03-05"
+    },
+    {
+      "model": "gpt-5.5",
+      "family_page": "gpt-5.5",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.5.md",
+      "source_sha256": "5c508a781addc036a8d03475e7b7e22587258fe298a8fe95d59631c3b142d0f6",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.5-2026-04-23"
+    },
+    {
+      "model": "gpt-5.5-2026-04-23",
+      "family_page": "gpt-5.5",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.5.md",
+      "source_sha256": "5c508a781addc036a8d03475e7b7e22587258fe298a8fe95d59631c3b142d0f6",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.5-2026-04-23"
+    },
+    {
+      "model": "gpt-5.5-pro",
+      "family_page": "gpt-5.5-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.5-pro.md",
+      "source_sha256": "12fe3cbacb51cbdd712becc7264a37385c11709f7fba96094c20988814f71ac5",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": false,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.5-pro-2026-04-23"
+    },
+    {
+      "model": "gpt-5.5-pro-2026-04-23",
+      "family_page": "gpt-5.5-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.5-pro.md",
+      "source_sha256": "12fe3cbacb51cbdd712becc7264a37385c11709f7fba96094c20988814f71ac5",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": false,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.5-pro-2026-04-23"
+    },
+    {
+      "model": "gpt-5.6",
+      "family_page": "gpt-5.6",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
+      "source_sha256": "c0c7f9a635a572335cfe0ba4ea9b920d9b3d2b40aa1ba9f31f3adff203834637",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-sol"
+    },
+    {
+      "model": "gpt-5.6-cyber",
+      "family_page": "gpt-5.6-cyber",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-cyber.md",
+      "source_sha256": "6f232d4153cc4ce4b25b24fd7ee3334b7854fc341e9cea8f4c41856b870811cf",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-cyber"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "family_page": "gpt-5.6-luna",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna.md",
+      "source_sha256": "8e4c2cc03c86804b4f5a0bf73ebb9508666ab712db32b6e2b4723a67d053ede4",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-luna"
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "family_page": "gpt-5.6-sol",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
+      "source_sha256": "c0c7f9a635a572335cfe0ba4ea9b920d9b3d2b40aa1ba9f31f3adff203834637",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-sol"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "family_page": "gpt-5.6-terra",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra.md",
+      "source_sha256": "77a5b6c2fcf0b921354158199e2a76f6e90abf895e09c6d30fdc9dc6b56c3702",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-5.6-terra"
+    },
+    {
+      "model": "gpt-6-astra",
+      "family_page": "gpt-6-astra",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6-astra.md",
+      "source_sha256": "a9b79d0f5988c879aea6f4f7adb19743c469ee538d8e19744bdaee13d0c50ae2",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6-astra"
+    },
+    {
+      "model": "gpt-6-cyber",
+      "family_page": "gpt-6-cyber",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6-cyber.md",
+      "source_sha256": "4ef808a763bda3cc7b65ed7cd9cd247deb34fcd5f27e9b03a82bf75b0f9d3553",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6-cyber"
+    },
+    {
+      "model": "gpt-6-luna",
+      "family_page": "gpt-6-luna",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6-luna.md",
+      "source_sha256": "44dcc0a50961150ee700aa701df8d46c59488f003979f3c755c3230bd8a0dfb2",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6-luna"
+    },
+    {
+      "model": "gpt-6-sol",
+      "family_page": "gpt-6-sol",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6-sol.md",
+      "source_sha256": "8e3cd3378f0686313dd489ed37347d481d24d4b791e7bd28b1538c4df7762fc4",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6-sol"
+    },
+    {
+      "model": "gpt-6.1-sol",
+      "family_page": "gpt-6.1-sol",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md",
+      "source_sha256": "02dff9ef937bbc97fb24ba7c936269a549563cfb8a49b91a6ba1c1575d2b77c0",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6.1-sol"
+    },
+    {
+      "model": "gpt-6.1-terra",
+      "family_page": "gpt-6.1-terra",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6.1-terra.md",
+      "source_sha256": "6a73b3e2e941fbe3813636d5bd2d653ff190e49cc3692eaf8daa3bb125c877f8",
+      "observed_date": "2026-11-14",
+      "status": "documented",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": 272000,
+      "documented_default_selector": "gpt-6.1-terra"
+    },
+    {
+      "model": "gpt-daybreak-blue-latest",
+      "family_page": "gpt-daybreak-blue-latest",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest.md",
+      "source_sha256": "59273dd7a9573476a254313eb2246e49a24da62d50bd0478dfe54d77e41cd3a4",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.6-sol"
+    },
+    {
+      "model": "gpt-daybreak-red-latest",
+      "family_page": "gpt-daybreak-red-latest",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-daybreak-red-latest.md",
+      "source_sha256": "ec1a7ac10bd674e80d545475673e2b661bafc4b8a655a876bd763ae710b0cb9e",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "gpt-5.6-cyber"
+    },
+    {
+      "model": "o1",
+      "family_page": "o1",
+      "source_url": "https://developers.openai.com/api/docs/models/o1.md",
+      "source_sha256": "4691931cc034f2e001c0edb4347deb3e8d4d2358cc516e2b417e688ec9237105",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o1-2024-12-17"
+    },
+    {
+      "model": "o1-2024-12-17",
+      "family_page": "o1",
+      "source_url": "https://developers.openai.com/api/docs/models/o1.md",
+      "source_sha256": "4691931cc034f2e001c0edb4347deb3e8d4d2358cc516e2b417e688ec9237105",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o1-2024-12-17"
+    },
+    {
+      "model": "o1-pro",
+      "family_page": "o1-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/o1-pro.md",
+      "source_sha256": "e818d89baa5ed7693559a3703452b0170214c3cde6ea590011ad8f36ac7115ad",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o1-pro-2025-03-19"
+    },
+    {
+      "model": "o1-pro-2025-03-19",
+      "family_page": "o1-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/o1-pro.md",
+      "source_sha256": "e818d89baa5ed7693559a3703452b0170214c3cde6ea590011ad8f36ac7115ad",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o1-pro-2025-03-19"
+    },
+    {
+      "model": "o3",
+      "family_page": "o3",
+      "source_url": "https://developers.openai.com/api/docs/models/o3.md",
+      "source_sha256": "f2b10b35cc27286cbee11155c1d0cb1b48262b4600ee0037ece376bd4d692615",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o3-2025-04-16"
+    },
+    {
+      "model": "o3-2025-04-16",
+      "family_page": "o3",
+      "source_url": "https://developers.openai.com/api/docs/models/o3.md",
+      "source_sha256": "f2b10b35cc27286cbee11155c1d0cb1b48262b4600ee0037ece376bd4d692615",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o3-2025-04-16"
+    },
+    {
+      "model": "o3-pro",
+      "family_page": "o3-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/o3-pro.md",
+      "source_sha256": "3b41ae9e053c803346698ebdaf1a3cb5a02067d5f149a94681a462f361d07fed",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": false,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o3-pro-2025-06-10"
+    },
+    {
+      "model": "o3-pro-2025-06-10",
+      "family_page": "o3-pro",
+      "source_url": "https://developers.openai.com/api/docs/models/o3-pro.md",
+      "source_sha256": "3b41ae9e053c803346698ebdaf1a3cb5a02067d5f149a94681a462f361d07fed",
+      "observed_date": "2026-11-14",
+      "status": "deprecated",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [
+        "user",
+        "tool"
+      ],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": false,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o3-pro-2025-06-10"
+    },
+    {
+      "model": "o4-mini",
+      "family_page": "o4-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/o4-mini.md",
+      "source_sha256": "c4e89653bfa6b1f0649cf7f2bf9a453d4cb95d102263a0df0038827db41bb1a0",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o4-mini-2025-04-16"
+    },
+    {
+      "model": "o4-mini-2025-04-16",
+      "family_page": "o4-mini",
+      "source_url": "https://developers.openai.com/api/docs/models/o4-mini.md",
+      "source_sha256": "c4e89653bfa6b1f0649cf7f2bf9a453d4cb95d102263a0df0038827db41bb1a0",
+      "observed_date": "2026-11-14",
+      "status": "shutdown",
+      "context_window": 200000,
+      "max_input_tokens": null,
+      "max_output_tokens": 100000,
+      "positions": [],
+      "mime_types": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "streaming": true,
+      "entitlement": "not checked",
+      "inference": "not tested",
+      "long_context_pricing_threshold": null,
+      "documented_default_selector": "o4-mini-2025-04-16"
+    }
+  ]
+}

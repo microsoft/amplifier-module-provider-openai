@@ -2,6 +2,126 @@
 
 GPT model integration for Amplifier via OpenAI's Responses API.
 
+## Optional prepared-media input
+
+`get_media_request_support(*, model, request_options=None)` supplies local,
+exact-model input-image facts for the official Responses route. PNG/JPEG inputs
+remain at their original user or call-bound `function_call_output.output`
+positions as `input_text`/`input_image` parts. The literal catalogue is in
+`_media.VISION_MODELS` (54 literal IDs, observed November 14, 2026); unknown models, custom endpoints and deployment aliases
+are **unqualified**, not declared incapable. Azure must supply attributable
+deployment facts through its own instance support method, not a global alias
+capability guess.
+
+The checked-in `contracts/openai-media-evidence.v1.json` records exact family
+pages, explicitly listed snapshots, source hashes, lifecycle and numeric window
+facts. It adds documented GPT-5/5.1/5.4 Nano/Codex and dated IDs without making
+up sibling names. Four formerly included, now shut-down families (GPT-4.1 Nano,
+o1, o1 Pro and o4 Mini) no longer qualify. Deprecated-but-not-shut-down models
+remain distinct from current account availability. The documented `chat-latest`
+and Daybreak aliases are moving vendor selectors, not immutable local rewrites.
+Cyber/Daybreak routes still require the chosen organization/project's approval,
+correct access program and any IP/SSO controls; this catalogue neither checks
+entitlement nor changes accounts, model selection or access-program options.
+
+GPT-5.5 Pro and o3 Pro (including their explicit snapshots) require an **explicit
+non-streaming HTTP selection**: configure `use_streaming: false` or request
+metadata `{"stream": false}`. A protected streaming request refuses before
+count/send, rather than silently switching its transport. No mock SSE result is
+claimed as endpoint streaming support. Other specialized image-generation,
+Realtime/Live and pricing-only identifiers are different/unproven contracts,
+not inferred Responses routes. Legacy `list_models` capability tags are not
+substitutes for this prepared-media support query.
+
+Prepared-media budget reports use the exact catalogue's full window and
+separately documented input/output ceilings, with the existing safety reserve
+and separately documented price threshold (including GPT-6 Cyber's 272K input
+price boundary unless long context is explicitly enabled). An omitted output cap
+uses the **final effective model's** published output default; explicit caller,
+configuration and expert caps remain authoritative and oversize values refuse,
+not silently clamp. Each literal model retains its own source and lifecycle;
+an alias's deprecated status is not copied onto its target.
+Support discovery and protected attempts recheck the existing date-aware exact
+shutdown catalogue, including a cutoff crossed during an await/hook. Future
+retirement does not disable a model before its published date.
+The Daybreak Blue moving alias's own page does not promise a stable price
+threshold: a separate **conservative cost gate** keeps it within 272K input unless
+long context is explicitly enabled. That gate is not an immutable alias mapping
+or a claim about the alias's current billing; no model is rewritten.
+No missing window is manufactured from image
+bytes. This narrow media qualification does not silently revise generic legacy
+capability defaults for Azure aliases, custom routes or text-only callers.
+The separately bounded `single_attempt` contract remains strictly text-only and
+owns its fresh client/nonstream selection even when a media capability is
+mounted. Images or canonical refs never take that exclusion; mounting media
+alone does not convert a text readiness check into ordinary streaming dispatch.
+
+The host owns hydration and private request lifetime. With
+`experimental.media.v1`, count and send validate the original private request,
+effective options, selected connection and frozen wire plan before every attempt.
+SDK retries are disabled for protected sends, including injected SDK clients;
+redirects and unqualified HTTP callbacks are refused. Unknown transmission
+outcomes and any received generation event do not invite automatic replay.
+Existing count availability remains authoritative: native WebSocket providers
+do not gain an actual token counter from this feature.
+
+Private media requires an actual nonempty static-string SDK API key and
+qualified SDK/resource/HTTP dispatch. Callable credentials, workload identity,
+Entra/Azure AD callbacks and provider-runtime authentication refuse before
+private count/send because their late await/401 recovery has no qualified
+post-auth media witness. They are not transparently supported, nor declared
+vendor-incapable. Legacy no-capability serializer behavior is separate.
+Dispatch baselines are captured at module import in a trusted cooperative host;
+this is not monitoring of arbitrary pre-import instrumentation or hostile Python.
+Raw SDK wrappers must retain the actual SDK wrapper code and bound-method
+closure; `functools.wraps` metadata alone cannot authorize an interposer.
+
+Prepared SDK copies preserve selected credentials, organization/project,
+headers/query and strict response-validation policy, including legacy inline-image
+count copies. Supported HTTPX/HTTPX2 production/default or mounted transports
+and HTTPcore pools require zero inner retries and no per-instance execution
+overrides. A private borrowed HTTP view isolates response `Set-Cookie` updates:
+it sends the selected cookie baseline but does not adopt response-driven cookies
+as new account/routing authority between count, send or retries. Explicit owner
+cookie changes still invalidate the prepared request. Ordinary non-media cookie
+handling and original transport/pool cleanup ownership are unchanged.
+An interleaved ordinary response or cookie expiry can also change that owner jar;
+the outstanding private request then fails closed as a changed connection.
+Do not interleave ordinary and prepared requests on one provider instance while
+depending on the same fitted candidate. Private count/send/retries intentionally
+do not carry newly returned server affinity cookies: routes requiring those new
+cookies are not qualified by this private transport contract.
+
+The legacy inline-image path without a mounted media capability is narrower:
+its count SDK copy pins selected settings, but generation with zero SDK retries
+and no copy options still uses the original HTTP client, including ordinary
+response-cookie handling and without the new private first-await recheck. It is
+not prepared-request/account-lifetime qualification.
+
+Ordinary `compact_context(fresh_prepared_request)` uses the same private image
+input for count/compaction. Retained native `native_compact()` cannot safely
+reconstruct released private pixels: with a media capability it refuses locally
+and requires a freshly prepared `compact_context` request. Automatic continuation
+of protected media requests likewise requires a new host-prepared request rather
+than silently changing the counted input. Existing opaque native lineage,
+computer provenance and non-media continuation behavior remain separate.
+
+Known structured image transports are omitted from a separate diagnostic copy
+before hooks/private diagnostic trace callbacks receive it, including raw opt-in.
+The omission marker is not a retrievable pixel reference. Opaque metadata,
+reasoning and argument strings remain opaque; this is not arbitrary traceback
+or third-party collector pixel-safety certification.
+Scalar error projection removes exact known submitted URL/base64 echoes;
+truncated, re-encoded and opaque text is outside that exact-value guarantee.
+
+Use `python -I -S tests/run_offline.py --allow-loopback -q -m 'not live'` for credential-cleared,
+pre-import Python socket-fenced tests. It is not a native-code/child-process
+sandbox; `--allow-loopback` is only needed by the existing local keepalive/proxy
+server fixtures and permits literal `127.0.0.1`, not external DNS. Real
+SDK/MockTransport and optional installed Foundation fixtures prove
+serialization, original positions and refusal boundaries, not endpoint
+availability, account entitlement, token-count accuracy or visual inference.
+
 ## Optional Decisions capability (development candidate)
 
 The provider can register a named `decision.backends` capability using the same

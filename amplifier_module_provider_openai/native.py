@@ -28,6 +28,7 @@ from websockets.protocol import State
 from . import (
     OpenAIProvider,
     _add_tool_output_cache_breakpoints,
+    _media,
     _RawResponseObject,
 )
 from ._capabilities import get_request_policy
@@ -91,7 +92,9 @@ class NativeResponse(_RawResponseObject):
 
 
 def key(message):
-    return json.dumps(message, sort_keys=True, default=str)
+    encoded = json.dumps(message, sort_keys=True, default=str)
+    scope = _media.CURRENT.get()
+    return _media.digest(message).hex() if scope and scope.cap is not None else encoded
 
 
 def add_usage(total, usage):
@@ -760,6 +763,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             request, **options
         )
 
+    @_media.operation
     async def complete(self, request, **kwargs):
         kwargs = self._merge_request_options(
             kwargs.pop("request_options", None), kwargs
@@ -868,8 +872,16 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     "converge_native_async_calls", []
                 ):
                     self.async_calls.setdefault(call["call_id"], call)
-            response = await super().complete(request, **kwargs)
-            self._last_native_request = (request, copy.deepcopy(kwargs))
+            scope = _media.CURRENT.get()
+            if scope is not None:
+                scope.native_request_view = request
+            try:
+                response = await super().complete(request, **kwargs)
+            finally:
+                if scope is not None:
+                    scope.native_request_view = None
+            if scope is None or scope.cap is None:
+                self._last_native_request = (request, copy.deepcopy(kwargs))
             self._last_native_model = self._native_wire_model
             calls = [
                 copy.deepcopy(self.async_calls[identity])
@@ -900,6 +912,11 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
             self.__dict__.pop("_staged_computer_images", None)
             self.full_messages = []
             self._native_initial_plan = None
+            scope = _media.CURRENT.get()
+            if scope and scope.cap is not None:
+                self._request_messages = []
+                self._native_full_params = None
+                self.__dict__.pop("_last_native_request", None)
 
     def _find_missing_tool_results(self, messages):
         missing = super()._find_missing_tool_results(messages)
@@ -1556,12 +1573,18 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         )
 
         async_handlers = self._async_tools(payload, neutral_aliases)
-        self.trace_context(payload)
-        self.trace("native.send", {"type": "response.create", **payload})
+        # Preserve the legacy private text preparation callback. Image-bearing
+        # diagnostics must receive a separate omission copy, never wire pixels.
+        self.trace_context(
+            _media.diagnostic_copy(payload)
+            if self._has_nontext_budget_input(payload) else payload
+        )
+        self.trace("native.send", _media.diagnostic_copy({"type": "response.create", **payload}))
         if self.prepare_send is None:
             # Preserve the existing receipt/uncertainty contract for old callers.
             self.request_uncertain = True
             await self._emit("native.submitting", execution_replayed=False)
+            _media.check("transport")
             await self.socket.send(json.dumps({"type": "response.create", **payload}))
         else:
             owner, socket = self.owner, self.socket
@@ -1580,6 +1603,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                     and self._native_admission_digest() != self._native_config_digest
                 ):
                     raise self._send_refused()
+                _media.check("transport")
                 wire = self._admit_send({"type": "response.create", **payload}, admission)
             except BaseException as exc:
                 self._native_send_refused = True
@@ -1621,7 +1645,10 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 if event_count > 100_000:
                     raise RuntimeError("Native event bound exceeded")
                 event = json.loads(await self.socket.recv())
-                self.trace("native.receive", event)
+                scope = _media.CURRENT.get()
+                if scope:
+                    scope.received = True
+                self.trace("native.receive", _media.diagnostic_error_copy(event))
                 kind = event.get("type")
                 await self._progress(event, progress)
                 if kind == "response.created":

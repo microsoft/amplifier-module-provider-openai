@@ -61,13 +61,20 @@ def retry_delay(error, attempt):
     return max(float(2 ** (attempt - 1)), delay) if math.isfinite(delay) and 0 <= delay <= MAX_RETRY_DELAY else None
 
 
-async def count_tokens(client, params):
+async def count_tokens(client, params, *, validate=None):
     # Disable SDK retries even for injected clients; our attempt budget is the
     # complete wire budget. The copy shares transport and is not ours to close.
     if isinstance(client, openai.AsyncOpenAI):
-        client = client.with_options(max_retries=0, timeout=ATTEMPT_TIMEOUT)
+        if validate is not None:
+            from ._media import late_bound_client
+
+            client = late_bound_client(client, purpose="count", timeout=ATTEMPT_TIMEOUT)
+        else:
+            client = client.with_options(max_retries=0, timeout=ATTEMPT_TIMEOUT)
     counter = client.responses.input_tokens.count
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if validate is not None:
+            validate()
         delay = None
         try:
             async with asyncio.timeout(ATTEMPT_TIMEOUT):

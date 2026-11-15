@@ -672,3 +672,21 @@ async def test_v2_no_deadline_keeps_output_completion_and_close_gates(wire, fail
             request(timeout=None), request_options={"single_attempt": True, "single_attempt_version": 2},
         )
     assert len(wire.calls) == 2 and wire.closed == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["o3-pro", "gpt-5.5-pro"])
+async def test_text_only_single_attempt_keeps_owned_client_with_media_capability(wire, model):
+    # Merely mounting a media capability must not turn this separate text-only
+    # contract into the ordinary streaming route or initialize a shared client.
+    cap = SimpleNamespace(version=1, validate=lambda *args, **kwargs: {"valid": True})
+    provider = OpenAIProvider(
+        api_key="offline-dummy", coordinator=SimpleNamespace(get_capability=lambda _: cap)
+    )
+    wire.generation["model"] = model
+    await provider.complete(
+        request(model=model), request_options={"single_attempt": True},
+    )
+    assert len(wire.calls) == 2 and wire.closed == 1
+    assert not wire.calls[-1][1].get("stream")
+    assert provider._client is None
