@@ -76,6 +76,16 @@ this is not monitoring of arbitrary pre-import instrumentation or hostile Python
 Raw SDK wrappers must retain the actual SDK wrapper code and bound-method
 closure; `functools.wraps` metadata alone cannot authorize an interposer.
 
+Prepared SDK copies preserve selected credentials, organization/project,
+headers/query and strict response-validation policy, including legacy inline-image
+count copies. Supported HTTPX/HTTPX2 production/default or mounted transports
+and HTTPcore pools require zero inner retries and no per-instance execution
+overrides. A private borrowed HTTP view isolates response `Set-Cookie` updates:
+it sends the selected cookie baseline but does not adopt response-driven cookies
+as new account/routing authority between count, send or retries. Explicit owner
+cookie changes still invalidate the prepared request. Ordinary non-media cookie
+handling and original transport/pool cleanup ownership are unchanged.
+
 Ordinary `compact_context(fresh_prepared_request)` uses the same private image
 input for count/compaction. Retained native `native_compact()` cannot safely
 reconstruct released private pixels: with a media capability it refuses locally

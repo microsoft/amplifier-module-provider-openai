@@ -425,3 +425,118 @@ async def test_strict_response_policy_drift_after_count_refuses_without_send():
         assert len(calls) == before
     finally:
         await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cookie_at", ["count", "send"])
+@pytest.mark.parametrize("route", ["normal", "raw", "stream"])
+@pytest.mark.parametrize("sdk_default", [False, True])
+async def test_response_cookies_do_not_change_selected_media_account(cookie_at, route, sdk_default):
+    import json
+
+    physical = []
+    module = httpx
+    if sdk_default:
+        base = next(cls for cls in DefaultAsyncHttpxClient.__mro__
+                    if cls.__name__ == "AsyncClient")
+        module = importlib.import_module(base.__module__.split(".")[0])
+    def handler(wire, cap, calls):
+        physical.append((wire.url.path, dict(wire.headers)))
+        data = ({"object": "response.input_tokens", "input_tokens": 30}
+                if wire.url.path.endswith("/input_tokens") else response("gpt-6.1-sol"))
+        cookie = "route=server-cookie; Path=/"
+        headers = ({"set-cookie": cookie}
+                   if (cookie_at == "count") == wire.url.path.endswith("/input_tokens") else {})
+        if route == "stream" and not wire.url.path.endswith("/input_tokens"):
+            headers["content-type"] = "text/event-stream"
+            return module.Response(200, headers=headers, text="".join(
+                "data: " + json.dumps(event) + "\n\n" for event in (
+                    {"type": "response.created", "response": {**data, "output": []}},
+                    {"type": "response.completed", "response": data},
+                )
+            ))
+        return module.Response(200, json=data, headers=headers)
+    req = request()
+    p, cap, _, _ = provider(req, handler=handler, stream=route == "stream")
+    if sdk_default:
+        await p.client.close()
+        p._client = AsyncOpenAI(
+            api_key="offline", max_retries=0,
+            http_client=DefaultAsyncHttpxClient(
+                trust_env=False, follow_redirects=False,
+                transport=module.MockTransport(lambda wire: handler(wire, cap, [])),
+            ),
+        )
+    if route == "raw":
+        p.extra_request_params["tools"] = [{"type": "computer"}]
+    try:
+        p.client._client.cookies.set("selected", "account-A")
+        await fit(p, req)
+        await p.complete(req)
+        assert sum(not path.endswith("/input_tokens") for path, _ in physical) == 1
+        assert p.client._client.cookies.get("route") is None
+        next_request = request()
+        cap.request = next_request
+        await fit(p, next_request)
+        await p.complete(next_request)
+        assert sum(not path.endswith("/input_tokens") for path, _ in physical) == 2
+        assert all(headers.get("cookie") == "selected=account-A" for _, headers in physical)
+        assert not p.client._client.is_closed
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change_at", ["before_count", "before_send"])
+async def test_explicit_cookie_account_drift_still_refuses(change_at):
+    req = request()
+    p, _, calls, _ = provider(req)
+    try:
+        p.client._client.cookies.set("selected", "account-A")
+        if change_at == "before_send":
+            await fit(p, req)
+        else:
+            # Explicit mutation after the original scope snapshot.
+            from amplifier_module_provider_openai import _media
+            scope = _media.Scope(p, req, {})
+            p.client._client.cookies.set("selected", "account-B")
+            with pytest.raises(InvalidRequestError):
+                scope.validate("count")
+            return
+        before = len(calls)
+        p.client._client.cookies.set("selected", "account-B")
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert len(calls) == before
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+async def test_no_cap_canonical_image_count_copy_pins_selected_connection(monkeypatch):
+    captured = []
+    def handler(wire, cap, calls):
+        captured.append((str(wire.url), dict(wire.headers)))
+    req = request()
+    p, _, calls, _ = provider(req, handler=handler)
+    p.coordinator.get_capability = lambda name: None
+    client = p.client
+    client.organization = None
+    client.project = None
+    client._custom_headers = {"x-selected": "original"}
+    client._custom_query = {"selected": "original"}
+    try:
+        monkeypatch.setenv("OPENAI_ORG_ID", "ambient-other-org")
+        monkeypatch.setenv("OPENAI_PROJECT_ID", "ambient-other-project")
+        monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "Host: other.invalid\nx-selected: ambient")
+        await fit(p, req)
+        await p.complete(req)
+        assert len(calls) >= 2
+        for url, headers in captured:
+            assert "selected=original" in url and "other.invalid" not in url
+            assert headers["host"] == "api.openai.com"
+            assert headers["x-selected"] == "original"
+            assert "openai-organization" not in headers and "openai-project" not in headers
+            assert headers["authorization"] == "Bearer offline"
+    finally:
+        await p.close()

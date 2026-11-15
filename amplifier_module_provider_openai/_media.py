@@ -11,7 +11,7 @@ import inspect
 import json
 import weakref
 from contextvars import ContextVar
-from copy import deepcopy
+from copy import copy, deepcopy
 from functools import wraps
 from types import MethodType
 from typing import Any
@@ -121,10 +121,10 @@ def transport_binding(client):
         id(http._auth),
         tuple(id(hook) for hook in http.event_hooks.get("request", [])),
         tuple(id(hook) for hook in http.event_hooks.get("response", [])),
-        tuple(http.headers.multi_items()),
-        tuple(http.params.multi_items()),
-        tuple((cookie.name, cookie.value, cookie.domain, cookie.path)
-              for cookie in http.cookies.jar),
+        digest(http.headers.multi_items()),
+        digest(http.params.multi_items()),
+        digest([(cookie.name, cookie.value, cookie.domain, cookie.path)
+                for cookie in http.cookies.jar]),
         _transport_binding(http._transport),
         tuple((id(pattern), _transport_binding(transport))
               for pattern, transport in http._mounts.items()),
@@ -139,10 +139,12 @@ def late_bound_client(client, *, purpose="transport", **options):
     this one provider-owned preparation adapter. There are no SDK inner retries.
     """
     scope = CURRENT.get()
-    if scope is None or scope.cap is None or type(client) not in SDK_DISPATCH:
+    if scope is None or type(client) not in SDK_DISPATCH:
         if client.max_retries == 0 and not options:
             return client
         return client.with_options(max_retries=0, **options)
+    if scope.cap is None and client.max_retries == 0 and not options:
+        return client  # Preserve the existing legacy inline-image SDK path.
     prepared = client.with_options(max_retries=0, **options)
     # SDK copies reconstruct clients and can reread ambient constructor options.
     # The selected connection, not new environment state, owns these values.
@@ -151,11 +153,35 @@ def late_bound_client(client, *, purpose="transport", **options):
         "_strict_response_validation",
     ):
         setattr(prepared, name, deepcopy(getattr(client, name)))
+    # HTTPX persists response Set-Cookie into its jar. Do not mutate the selected
+    # owner's account state or adopt a response cookie on a later private retry.
+    # The transport/pool remains owned and closed only by the original client.
+    owner_http = client._client
+
+    class BorrowedHTTP(type(owner_http)):
+        async def aclose(self):
+            pass
+
+        async def __aexit__(self, *args):
+            pass
+
+        def __del__(self):
+            pass
+
+    http = object.__new__(BorrowedHTTP)
+    http.__dict__ = copy(vars(owner_http))
+    http._cookies = type(owner_http.cookies)()
+    for cookie in owner_http.cookies.jar:
+        http._cookies.jar.set_cookie(copy(cookie))
+    prepared._client = http
     prepare = SDK_DISPATCH[type(client)]["_prepare_options"]
 
     async def prepare_options(value):
         result = await prepare(prepared, value)
         scope.validate(purpose)
+        http._cookies = type(owner_http.cookies)()
+        for cookie in owner_http.cookies.jar:
+            http._cookies.jar.set_cookie(copy(cookie))
         return result
 
     prepared._prepare_options = prepare_options
