@@ -20,6 +20,53 @@ import pytest
 from amplifier_module_provider_openai._cost import _RATES, _find_rates, compute_cost
 
 
+@pytest.mark.parametrize("counts,expected", [
+    ({"prompt_tokens": 1000}, "0.005"),
+    ({"completion_tokens": 100}, "0.003"),
+    ({"prompt_tokens": 1000, "cached_tokens": 1000}, "0.0005"),
+    ({}, "0"),
+    ({"prompt_tokens": 1000, "cached_tokens": 100, "completion_tokens": 100}, "0.00755"),
+    ({"cache_write_tokens_details": {}}, "0"),
+    ({"cache_write_tokens_details": {"ttl_30m_tokens": 0, "ttl_12h_tokens": 0}}, "0"),
+])
+def test_chat_latest_standard_exact_rates(counts, expected):
+    result = compute_cost("chat-latest", **counts)
+    assert isinstance(result, Decimal)
+    assert result == Decimal(expected)
+
+
+@pytest.mark.parametrize("field", [
+    "prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens",
+])
+@pytest.mark.parametrize("value", [None, False, True, -1, 0.0, "0"])
+def test_chat_latest_price_evidence_unknown(field, value):
+    assert compute_cost("chat-latest", **{field: value}) is None
+
+
+@pytest.mark.parametrize("evidence", [
+    {"prompt_tokens": 1, "cached_tokens": 2},
+    {"cache_write_tokens": 1},
+    *({"service_tier": tier} for tier in (
+        None, "flex", "priority", "fast", "ultrafast", "unknown", "Default", " default ", False,
+    )),
+    *({"cache_write_tokens_details": split} for split in (
+        [], False, "", {"unknown": 0}, {"ttl_30m_tokens": 1},
+        {"ttl_12h_tokens": -1}, {"ttl_30m_tokens": None},
+        {"ttl_12h_tokens": False}, {"ttl_30m_tokens": "0"}, {"ttl_30m_tokens": 0.0},
+    )),
+])
+def test_chat_latest_unsupported_price_evidence_unknown(evidence):
+    assert compute_cost("chat-latest", **evidence) is None
+
+
+@pytest.mark.parametrize("model", [
+    "chat-latest-2099-01-01", "chat-latest-preview", "Chat-Latest", " chat-latest ",
+])
+def test_chat_latest_no_guessed_snapshot_rates(model):
+    assert _find_rates(model) is None
+    assert compute_cost(model, prompt_tokens=1000) is None
+
+
 # ---------------------------------------------------------------------------
 # (a) Known model: gpt-5.4 input cost
 # ---------------------------------------------------------------------------
