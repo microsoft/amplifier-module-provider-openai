@@ -1556,8 +1556,11 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
         )
 
         async_handlers = self._async_tools(payload, neutral_aliases)
-        self.trace_context(payload)
-        self.trace("native.send", {"type": "response.create", **payload})
+        from ._chat_images import diagnostic_copy, media_values
+
+        media_echoes = media_values(payload)
+        self.trace_context(diagnostic_copy(payload, media_echoes))
+        self.trace("native.send", diagnostic_copy({"type": "response.create", **payload}, media_echoes))
         if self.prepare_send is None:
             # Preserve the existing receipt/uncertainty contract for old callers.
             self.request_uncertain = True
@@ -1621,7 +1624,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                 if event_count > 100_000:
                     raise RuntimeError("Native event bound exceeded")
                 event = json.loads(await self.socket.recv())
-                self.trace("native.receive", event)
+                self.trace("native.receive", diagnostic_copy(event, media_echoes))
                 kind = event.get("type")
                 await self._progress(event, progress)
                 if kind == "response.created":
@@ -1794,6 +1797,7 @@ class NativeResponsesProvider(NativeCheckpointMixin, OpenAIProvider):
                         or (event.get("response") or {}).get("error")
                         or {}
                     ).get("code", kind)
+                    code = diagnostic_copy(code, media_echoes)
                     await self._emit("native.error", code=code)
                     raise RuntimeError(
                         "Native Responses failure; no automatic execution replay: "

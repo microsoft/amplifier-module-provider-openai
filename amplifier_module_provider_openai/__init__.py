@@ -59,6 +59,19 @@ from ._capabilities import (
 from ._capabilities import (
     GPT_6_SOL_LUNA_MODELS as GPT_6_SOL_LUNA_MODELS,
 )
+from ._chat_images import (
+    UNAVAILABLE,
+    diagnostic_copy,
+    instruction_text,
+    media_values,
+    sanitize_error,
+)
+from ._chat_images import (
+    image_url as _chat_image_url,
+)
+from ._chat_images import (
+    project_messages as project_chat_images,
+)
 from ._constants import (
     BACKGROUND_POLLING_STATUSES,
     BACKGROUND_STATUS_FAILED,
@@ -766,7 +779,12 @@ def _convert_function_tool_output_content(
     base64-image vocabulary.
     """
     has_image = any(
-        isinstance(block, dict) and block.get("type") == "image" for block in content
+        isinstance(block, dict) and (
+            block.get("type") == "image"
+            or (block.get("type") == "text" and block.get("text") in {
+                UNAVAILABLE, "[Image omitted: selected model does not support vision.]",
+            })
+        ) for block in content
     )
     if not has_image:
         return None
@@ -795,6 +813,9 @@ def _convert_function_tool_output_content(
             )
 
         source = block.get("source")
+        if isinstance(source, dict) and source.get("type") == "url" and _chat_image_url(block):
+            output.append({"type": "input_image", "image_url": _chat_image_url(block)})
+            continue
         if not isinstance(source, dict) or source.get("type") != "base64":
             raise ValueError(
                 "function tool result image block must use a base64 image source"
@@ -2140,7 +2161,7 @@ class OpenAIProvider:
             ]
             instructions = (
                 "\n\n".join(
-                    m.content if isinstance(m.content, str) else "" for m in system_msgs
+                    instruction_text(m.model_dump()["content"]) for m in system_msgs
                 )
                 if system_msgs
                 else None
@@ -2171,6 +2192,7 @@ class OpenAIProvider:
                 "model": model_name,
                 "input": self._convert_messages(
                     messages, model=model_name,
+                    project_images=False,
                     ordinary_computer_names=frozenset(
                         name for name in ordinary_names(history_tools) if name == "computer"
                     ),
@@ -2443,6 +2465,29 @@ class OpenAIProvider:
         planner._deferred_namespace_warnings: list[tuple[str, ...]] = []
         # Repair receipts deduplicate live events, never the request projection.
         planner._repaired_tool_ids = set()
+        from amplifier_core.message_models import Message
+
+        from .neutral_computer import ordinary_names, plan_observations, replay_calls
+
+        originals = [m.model_dump() for m in request.messages]
+        replay = replay_calls(originals)
+        plan_observations(originals, replay)
+        effective_model = kwargs.get("model") or request.model or self.default_model
+        effective_model = self.extra_request_params.get("model", effective_model)
+        effective_model = (self.extra_request_params.get("extra_body") or {}).get("model", effective_model)
+        history_tools = self.extra_request_params.get(
+            "tools", [*(request.tools or []), *(kwargs.get("tools") or [])]
+        )
+        if isinstance(self.extra_request_params.get("extra_body"), dict):
+            history_tools = self.extra_request_params["extra_body"].get("tools", history_tools)
+        request = request.model_copy(update={"messages": [
+            Message.model_validate(m) for m in project_chat_images(
+                originals, model=effective_model,
+                qualified=self.name == "openai" and self._has_standard_openai_endpoint(),
+                native_ids=set(self._native_call_ids) | set(replay), strict_direct=True,
+                ordinary_names=ordinary_names(history_tools),
+            )
+        ]})
         request, repairs = planner._plan_tool_repairs(request)
 
         params = planner._assemble_initial_responses_params_stateful(
@@ -3667,6 +3712,7 @@ class OpenAIProvider:
         unpriced_request_mode = _has_unpriced_gpt_6_2_mode({
             **params, **(params.get("extra_body") or {}),
         })
+        media_echoes = media_values(request.model_dump()) | media_values(params)
 
         message_list = list(request.messages)
         instructions = params.get("instructions")
@@ -3701,7 +3747,7 @@ class OpenAIProvider:
                 "background_mode": background_mode,
             }
             if self.raw:
-                request_payload["raw"] = redact_secrets(params)
+                request_payload["raw"] = redact_secrets(diagnostic_copy(params, media_echoes))
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -4067,7 +4113,7 @@ class OpenAIProvider:
                                     "request_id": request_id,
                                     "error": {
                                         "type": type(e).__name__,
-                                        "msg": str(e),
+                                        "msg": diagnostic_copy(str(e), media_echoes),
                                     },
                                 },
                             )
@@ -4275,6 +4321,16 @@ class OpenAIProvider:
                     },
                 )
 
+        async def _do_complete_sanitized():
+            # Preserve error class/retry/status/billing while removing exact
+            # media echoes before retry observers/logging or public propagation.
+            # No SDK request, response or saved replay object is redacted.
+            try:
+                return await _do_complete()
+            except Exception as caught:
+                sanitize_error(caught, media_echoes)
+                raise
+
         async def _do_complete_guarded():
             """Semaphore-gated wrapper around _do_complete with concurrency logging.
 
@@ -4306,7 +4362,7 @@ class OpenAIProvider:
                                     "process_id": os.getpid(),
                                 },
                             )
-                        return await _do_complete()
+                        return await _do_complete_sanitized()
                     finally:
                         _active_requests -= 1
             else:
@@ -4325,7 +4381,7 @@ class OpenAIProvider:
                                 "process_id": os.getpid(),
                             },
                         )
-                    return await _do_complete()
+                    return await _do_complete_sanitized()
                 finally:
                     _active_requests -= 1
 
@@ -4749,7 +4805,9 @@ class OpenAIProvider:
                     else None,
                 }
                 if self.raw:
-                    response_event["raw"] = redact_secrets(response.model_dump())
+                    response_event["raw"] = redact_secrets(
+                        diagnostic_copy(response.model_dump(), media_echoes)
+                    )
                 if captured_rate_limit_info:
                     response_event["rate_limits"] = captured_rate_limit_info
                 await self.coordinator.hooks.emit("llm:response", response_event)
@@ -4760,10 +4818,13 @@ class OpenAIProvider:
             _error_billing(e)
             raise
         except kernel_errors.LLMError as e:
+            sanitize_error(e, media_echoes)
             error_billing = _error_billing(e)
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = diagnostic_copy(
+                str(e) or f"{type(e).__name__}: (no message)", media_echoes
+            )
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4784,10 +4845,13 @@ class OpenAIProvider:
             raise
 
         except Exception as e:
+            sanitize_error(e, media_echoes)
             error_billing = _error_billing(e)
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = diagnostic_copy(
+                str(e) or f"{type(e).__name__}: (no message)", media_echoes
+            )
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             # Emit error event
@@ -4877,6 +4941,7 @@ class OpenAIProvider:
         reasoning_replay_scope: str | None = None,
         model: str | None = None,
         ordinary_computer_names: frozenset[str] = frozenset(),
+        project_images: bool = True,
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
@@ -4942,6 +5007,13 @@ class OpenAIProvider:
                 }
                 metadata[CALLS] = {k: v for k, v in metadata[CALLS].items() if k in ids}
         current_replay = replay_calls(messages)
+        if project_images:
+            messages = project_chat_images(
+                messages, model=model or self.default_model,
+                qualified=self.name == "openai" and self._has_standard_openai_endpoint(),
+                native_ids=set(self._native_call_ids) | set(current_replay),
+                ordinary_names=ordinary_computer_names,
+            )
         openai_messages = []
         canonical_item_ids = set()
         canonical_response_item_ids = set()
@@ -5630,6 +5702,7 @@ class OpenAIProvider:
 
             # Handle developer messages as XML-wrapped user messages
             elif role == "developer":
+                content = instruction_text(content)
                 wrapped = f"<context_file>\n{content}\n</context_file>"
                 openai_messages.append(
                     {
@@ -5655,23 +5728,10 @@ class OpenAIProvider:
                                     }
                                 )
                             elif block_type == "image":
-                                # Convert ImageBlock to OpenAI Responses API input_image format
-                                source = block.get("source", {})
-                                if source.get("type") == "base64":
-                                    # OpenAI uses data URI format: data:image/jpeg;base64,{data}
-                                    media_type = source.get("media_type", "image/jpeg")
-                                    data = source.get("data", "")
-                                    content_items.append(
-                                        {
-                                            "type": "input_image",
-                                            "image_url": f"data:{media_type};base64,{data}",
-                                        }
-                                    )
-                                else:
-                                    self._assembly_log(
-                                        "warning",
-                                        f"Unsupported image source type: {source.get('type')}"
-                                    )
+                                content_items.append({
+                                    "type": "input_image",
+                                    "image_url": _chat_image_url(block),
+                                })
 
                     if content_items:
                         openai_messages.append(

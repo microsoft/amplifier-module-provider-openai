@@ -313,6 +313,11 @@ class TestWireToolChoice:
             raise CapturedAndAborted()
 
         fake_client = MagicMock()
+        # Retain the original endpoint identity when replacing only transport.
+        fake_client.base_url = provider.base_url or "https://api.openai.com/v1"
+        fake_client.responses.input_tokens.count = AsyncMock(
+            return_value=SimpleNamespace(input_tokens=1)
+        )
         fake_client.responses.create = AsyncMock(side_effect=fake_create)
         fake_client.responses.with_raw_response.create = AsyncMock(
             side_effect=fake_create

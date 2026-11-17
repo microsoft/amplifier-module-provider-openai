@@ -473,3 +473,56 @@ def test_configuration_update_uses_bounded_efforts_and_existing_guards(model):
             }]})
     with pytest.raises(ValueError, match="single-agent"):
         validate_request({**params, "reasoning": {"effort": "low", "mode": "pro"}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("source", ["url", "base64"])
+@pytest.mark.parametrize("discounted", [False, True])
+async def test_accepted_image_union_keeps_gpt62_pixels_diagnostics_and_cost_boundary(model, source, discounted):
+    from amplifier_core.message_models import TextBlock
+
+    from tests.test_chat_image_loss import DATA, URL, body, image
+    from tests.test_chat_image_loss import provider as image_provider
+
+    terminal = body()
+    terminal.update(model=model, service_tier="default")
+    terminal["usage"]["input_tokens_details"] = {
+        "cached_tokens": 0, "cache_write_tokens": 0,
+    }
+    p, wires, events = image_provider(replies=[httpx.Response(200, json=terminal)])
+    # Test both sides of the only merge conflict together: pricing-mode snapshot
+    # and diagnostic media snapshot, without changing accepted image transport.
+    if discounted:
+        # SDK 3.29 exposes the new beta field through its extra_body escape.
+        p.extra_request_params = {"extra_body": {
+            "background_options": {"completion_window": "2h"},
+        }}
+    req = ChatRequest(model=model, messages=[Message(role="user", content=[
+        TextBlock(text="before"), image(source), TextBlock(text="after"),
+    ])])
+    before = req.model_dump()
+    try:
+        response = await p.complete(req)
+        generated = [body for path, body in wires if path == "/v1/responses"]
+        assert len(generated) == 1 and generated[0]["model"] == model
+        assert generated[0]["input"][0]["content"] == [
+            {"type": "input_text", "text": "before"},
+            {"type": "input_image", "image_url": (
+                URL if source == "url" else f"data:image/png;base64,{DATA}"
+            )},
+            {"type": "input_text", "text": "after"},
+        ]
+        counts = [body for path, body in wires if path.endswith("/input_tokens")]
+        if not discounted:
+            assert len(counts) == 1
+            assert counts[0]["input"] == generated[0]["input"]
+        assert URL not in json.dumps(events) and DATA not in json.dumps(events)
+        assert response.usage.input_tokens == 12
+        assert response.usage.cost_usd == (
+            None if discounted else
+            Decimal(".000136") if model.endswith("astra") else Decimal(".000034")
+        )
+        assert req.model_dump() == before
+    finally:
+        await p.client.close()

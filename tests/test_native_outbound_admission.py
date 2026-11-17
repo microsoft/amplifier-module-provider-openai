@@ -84,7 +84,20 @@ async def test_final_bytes_follow_awaited_preparation_and_cannot_be_mutated():
         await original_send(value)
 
     socket.send = send
-    p.trace_context = lambda payload: held.update(payload=payload)
+    # Observe the actual mutable plan at its assembly seam, not through a
+    # diagnostic callback: trace_context intentionally receives an isolated copy.
+    original_async_tools = p._async_tools
+
+    def capture_plan(payload, neutral_aliases):
+        held["payload"] = payload
+        return original_async_tools(payload, neutral_aliases)
+
+    def trace_context(snapshot):
+        held["diagnostic"] = snapshot
+        snapshot["input"][0]["content"] = "diagnostic observer mutation"
+
+    p._async_tools = capture_plan
+    p.trace_context = trace_context
 
     async def lifecycle(kind, data):
         if kind == "native.submitting":
@@ -100,7 +113,38 @@ async def test_final_bytes_follow_awaited_preparation_and_cannot_be_mutated():
     assert records[0].attempt_id == "attempt-1"
     assert records[0].kind == "response.create" and records[0].input_id is None
     assert json.loads(socket.wire[0])["input"][0]["content"] == "after preparation"
+    assert held["payload"]["input"][0]["content"] == "after freeze"
+    assert held["diagnostic"]["input"][0]["content"] == "diagnostic observer mutation"
+    assert held["payload"]["input"] is not held["diagnostic"]["input"]
     assert "after preparation" not in repr(records[0])
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_observer_mutation_cannot_change_admitted_media_bytes():
+    records, observed = [], []
+    url = "https://images.example.test/private.png?token=fixture"
+    p, _ = make(lambda *args, **kwargs: admission(records))
+    original = {"input": [{
+        "role": "user", "content": [{"type": "input_image", "image_url": url}],
+    }]}
+    before = copy.deepcopy(original)
+
+    def mutate_snapshot(snapshot):
+        observed.append(copy.deepcopy(snapshot))
+        snapshot["input"][0]["content"] = "observer cannot replace the real image"
+
+    p.trace_context = mutate_snapshot
+    p.trace = lambda kind, snapshot: (
+        mutate_snapshot(snapshot) if kind == "native.send" else None
+    )
+    p.socket.feed(created("r1"), finished("r1"))
+    await p._native_response(original)
+    assert len(observed) == 2
+    assert url not in json.dumps(observed)
+    assert original == before
+    assert json.loads(records[0].payload)["input"] == before["input"]
+    assert p.socket.wire == [records[0].payload]
+    assert not p.request_uncertain
 
 
 @pytest.mark.asyncio

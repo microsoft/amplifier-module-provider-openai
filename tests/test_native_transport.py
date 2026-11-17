@@ -84,6 +84,30 @@ def make():
     return provider, owner
 
 
+@pytest.mark.asyncio
+async def test_media_trace_copies_do_not_change_native_wire_or_response():
+    p, _ = make()
+    traces, contexts = [], []
+    url = "https://images.example.test/private.png?token=fixture"
+    p.trace = lambda name, data: traces.append((name, copy.deepcopy(data)))
+    p.trace_context = lambda data: contexts.append(copy.deepcopy(data))
+    params = {"model": "gpt-6-astra", "input": [{
+        "role": "user", "content": [{"type": "input_image", "image_url": url}],
+    }]}
+    response = finished("media-fixture")
+    response["response"]["output"] = [{
+        "type": "message", "id": "msg-media", "role": "assistant",
+        "status": "completed", "content": [{"type": "output_text", "text": url}],
+    }]
+    before = copy.deepcopy(params)
+    p.socket.feed(created("media-fixture"), response)
+    result = await p._native_response(params)
+    assert p.socket.sent[0]["input"] == before["input"]
+    assert result.output[0]["content"][0]["text"] == url
+    assert params == before
+    assert url not in json.dumps([traces, contexts])
+
+
 def created(identity):
     return {"type": "response.created", "response": {"id": identity}}
 
