@@ -37,7 +37,8 @@ class DummyResponse:
 
 
 def _make_provider(**config_overrides) -> OpenAIProvider:
-    config = {"max_retries": 0, "use_streaming": False, **config_overrides}
+    config = {"default_model": "gpt-6.1-sol", "max_retries": 0,
+              "use_streaming": False, **config_overrides}
     provider = OpenAIProvider(api_key="test-key", config=config)
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     return provider

@@ -281,6 +281,8 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
 
 def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     """Reject documented-invalid fields from a final exact GPT-6 wire payload."""
+    from ._capabilities import GPT_6_2_MODELS
+
     model = params.get("model")
     policy = get_request_policy(model)
     if policy.allowed_efforts is None:
@@ -292,6 +294,13 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     if effort is not None and (
         not isinstance(effort, str) or effort not in allowed_efforts
     ):
+        if model in GPT_6_2_MODELS:
+            raise kernel_errors.InvalidRequestError(
+                f"Model {model!r} reasoning.effort={effort!r} is not established "
+                "by the documented request policy. Use 'low' for lightweight "
+                "tasks, or omit reasoning.effort. "
+                f"Documented efforts: {sorted(allowed_efforts)}."
+            )
         raise kernel_errors.InvalidRequestError(
             f"Model {model!r} does not support reasoning.effort={effort!r}. "
             "Use 'low' for lightweight tasks, or omit reasoning.effort. "
@@ -1420,6 +1429,7 @@ class OpenAIProvider:
             True,
         )  # Legacy date-only option; never meant "all model families".
         configured_filters = self.config.get("model_filters")
+        self._use_default_recommendations = configured_filters is None
         self._model_filters = (
             ModelFilters(("gpt-6*",), (), self.hide_dated_models, hide_shutdown=True)
             if configured_filters is None
@@ -1680,6 +1690,28 @@ class OpenAIProvider:
 
     def _prepare_gpt_6_params(self, params: dict[str, Any]) -> None:
         """Apply exact-model final-wire rules; retain this internal call seam."""
+        from ._capabilities import GPT_6_2_MODELS
+
+        body = params.get("extra_body")
+        if isinstance(body, dict) and any(
+            isinstance(model, str) and model in GPT_6_2_MODELS
+            for model in (params.get("model"), body.get("model"))
+        ):
+            # The SDK overlays extra_body last. Validate that actual identity
+            # and values, not a superseded pre-overlay reasoning/model pair.
+            effective = {**params, **body}
+            effective.pop("extra_body", None)
+            self._prepare_gpt_6_params(effective)
+            for field in ("prompt_cache_retention", "temperature", "top_p",
+                          "top_logprobs", "logprobs", "include"):
+                if field not in effective:
+                    params.pop(field, None)
+                    body.pop(field, None)
+                elif field in body:
+                    body[field] = effective[field]
+                elif field in params:
+                    params[field] = effective[field]
+            return
         model = params.get("model")
         _validate_gpt_5_5_pro_effort(model, params.get("reasoning"))
         policy = get_request_policy(model)
@@ -2287,9 +2319,18 @@ class OpenAIProvider:
             if background_mode:
                 params["background"] = True
             if kwargs.get("extended_thinking") and "reasoning" not in params:
+                from ._capabilities import GPT_6_2_MODELS
+
+                extras = self.extra_request_params
+                final_model = (extras.get("extra_body") or {}).get(
+                    "model", extras.get("model", model_name)
+                )
                 params["reasoning"] = {
                     "effort": kwargs.get("reasoning_effort")
-                    or self.config.get("reasoning_effort", "high"),
+                    or (
+                        "medium" if final_model in GPT_6_2_MODELS
+                        else self.config.get("reasoning_effort", "high")
+                    ),
                     "summary": self.reasoning_summary,
                 }
             if (
@@ -2868,12 +2909,20 @@ class OpenAIProvider:
 
     def get_model_list_info(self) -> dict[str, Any]:
         """Describe the optional selector extension locally, without API I/O."""
+        from ._model_listing import MODEL_SUPERSESSION
+
         return {
             "version": 1,
             "source": "provider-api",
             "filters_keyword": "filters",
             "filters_schema": selector_schema(),
             "default_filters": self._model_filters.as_dict(),
+            "default_supersession": (
+                dict(MODEL_SUPERSESSION)
+                if self._use_default_recommendations
+                and self.name == "openai" and self._has_standard_openai_endpoint()
+                else {}
+            ),
             "unfiltered": {},
             "override": "replace",
         }
@@ -2991,7 +3040,15 @@ class OpenAIProvider:
                 and is_shutdown(model_id, reported=reported)
             )
         ]
-        for model_id in selector.select(available_ids):
+        selected_ids = selector.select(available_ids)
+        if filters is None and self._use_default_recommendations and direct_openai:
+            from ._model_listing import MODEL_SUPERSESSION
+
+            selected_ids = [
+                model_id for model_id in selected_ids
+                if MODEL_SUPERSESSION.get(model_id) not in selected_ids
+            ]
+        for model_id in selected_ids:
             retirement = (
                 shutdown_date(model_id, catalog[model_id]) if direct_openai else None
             )

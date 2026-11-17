@@ -19,7 +19,8 @@ from amplifier_module_provider_openai.native import (
 )
 from tests.test_native_transport import created, finished, make, wait_created
 
-MODELS = ("gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna")
+MODELS = ("gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
+          "gpt-6.2-astra", "gpt-6.2-sol")
 
 
 def request(model=None):
@@ -273,8 +274,9 @@ def async_call(identity, *, name="lookup", kind="function", namespace=None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"])
 @pytest.mark.parametrize("kind", ["function", "custom"])
-async def test_explicit_async_handler_gets_complete_original_item_once(kind):
+async def test_explicit_async_handler_gets_complete_original_item_once(kind, model):
     p, owner = make()
     start = AsyncMock(return_value={"status": "queued"})  # not a tool result
     owner.native_async_tools = lambda: [NativeAsyncTool("lookup", start, kind=kind)]
@@ -285,7 +287,7 @@ async def test_explicit_async_handler_gets_complete_original_item_once(kind):
         {"type": "response.output_item.done", "item": item},
         finished("p"),
     )
-    await p._native_response({"model": "gpt-6-astra", "input": [], "tools": [{"type": kind, "name": "lookup"}]})
+    await p._native_response({"model": model, "input": [], "tools": [{"type": kind, "name": "lookup"}]})
     start.assert_awaited_once_with(item)
     assert p.socket.sent[0]["tools"][0]["async"] is True
     assert p.async_calls["original"] == item

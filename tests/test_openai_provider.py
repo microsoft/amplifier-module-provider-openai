@@ -55,7 +55,8 @@ def test_extended_thinking_forces_high_effort_without_budget_arithmetic():
     adjusts max_output_tokens -- the budget/buffer arithmetic was removed.
     Set max_output_tokens directly if a larger budget is needed."""
     provider = OpenAIProvider(
-        api_key="test-key", config={"max_tokens": 1024, "use_streaming": False}
+        api_key="test-key", config={"default_model": "gpt-6.1-sol",
+                                    "max_tokens": 1024, "use_streaming": False}
     )
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 

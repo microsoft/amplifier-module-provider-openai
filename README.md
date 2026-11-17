@@ -133,9 +133,13 @@ Provides access to OpenAI's GPT-6, GPT-5, and GPT-4 models as an LLM provider fo
 
 ## Supported Models
 
-The default is `gpt-6.1-sol` (October 2026 Sol-family refresh). Explicit
+The default is `gpt-6.2-sol` (November 2026 Sol-family refresh). Explicit
 `default_model` pins are preserved. Routing bundles choose their own candidates;
 this provider default does not alter their tier policy.
+
+- `gpt-6.2-astra` / `gpt-6.2-sol` - Exact IDs, text/image input and text output, 1,050,000-token native window, 922,000 maximum input, 128,000 maximum output. The reported input budget remains 272,000 by default (922,000 with long context opted in); preflight keeps its existing safety reserve. Native `apply_patch`, `computer`, and tool search are supported by Responses, not Chat Completions tool calling. The evidence-bounded effort registry advertises only `low` and `medium`: the migration guide recommends starting at `medium` and replacing `none`/`minimal` with `low`, but does not publish a full model-specific enum. Literal API `none` is rejected; other unadvertised efforts are not asserted to be upstream rejections. Configured `reasoning_effort: none` still means omit the parameter, not silently send `low`. Sampling/logprobs parameters and `include: ["message.output_text.logprobs"]` are rejected before dispatch. No snapshots, sibling aliases, model-switch history stripping, multi-agent beta or background-discount opt-in is added.
+- GPT-6.2 Standard prices per 1M input/cache-read/output tokens are $8/$0.40/$40 (Astra) and $2/$0.10/$10 (Sol); 30m/12h writes are $10/$20 and $2.50/$5. Above 272,000 input tokens the entire request uses 2x input/cache/write and 1.5x output rates. Fast is 2x; no published 6.2 Flex rate is assumed, and date-dependent Ultrafast remains unknown. Missing tier or cache-write lifetime evidence still yields unknown cost. [Official models](https://developers.openai.com/api/docs/models/gpt-6.2-astra), [migration](https://developers.openai.com/api/docs/guides/latest-model), [pricing](https://developers.openai.com/api/docs/pricing) checked 2026-11-17.
+- The existing native steering, async function/custom-tool and configuration-update paths are eligible for these two exact IDs: [steering](https://developers.openai.com/api/docs/guides/steering) covers the GPT-6 family, [async compatibility](https://developers.openai.com/api/docs/guides/async-tool-calling) covers Astra and later models, and the GPT-6.2 migration links [append-only guidance](https://developers.openai.com/api/docs/guides/keep-prefix-unchanged) recommending configuration updates. The existing standard/single-agent restrictions and low/medium effort registry still apply. This is documentary eligibility, not live host/account qualification. No new protocol implementation is introduced.
 
 - `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna` - GPT-6 exact model set. Each reports a 272,000-token input budget by default, or 922,000 with long context enabled (within its 1,050,000-token native total window), and supports a 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` tools. Sol and Luna have an API default of `medium` reasoning and also accept literal request-level `reasoning = { effort = "none" }`; Astra does not. No bare GPT-6, unversioned Terra, or dated GPT-6 IDs are inferred.
 - `gpt-6.1-sol` - Exact GPT-6.1 Sol model. It has the same reported 272,000-token standard input budget (922,000 with long context enabled), 128,000-token output limit, reasoning, vision, streaming, and native `apply_patch` and `computer` support. It accepts `low`, `medium`, `high`, `xhigh`, and `max` reasoning effort. The configured `reasoning_effort = "none"` remains an omission sentinel, but literal API `reasoning.effort = "none"` and `minimal` are invalid. No snapshots or unlisted sibling GPT-6.1 IDs are inferred.
@@ -155,6 +159,13 @@ The default view now shows endpoint-returned **`gpt-6*`** IDs, including future
 variants and previews, not a fixed known-model allowlist. GPT-5, o-series and
 deep-research models remain usable through explicit inference selection but are
 not in the default listing. No default, alias or synthetic model is added.
+On direct OpenAI only, this default recommendation view suppresses `gpt-6-astra`
+when `gpt-6.2-astra` is selected from the returned inventory, and `gpt-6-sol` /
+`gpt-6.1-sol` when `gpt-6.2-sol` is selected. Terra 6.1, Luna 6 and future previews
+remain visible. This is not retirement or inference aliasing: old pins, facts and
+prices remain. Explicit call selectors or non-null configured `model_filters`
+(even an explicit copy of the defaults) bypass recommendation supersession.
+Gateways/deployments do not inherit these public-model replacement assumptions.
 
 ```python
 await provider.list_models()                 # Frozen provider/config defaults
@@ -193,7 +204,8 @@ mutate another call's filtering. Reconstruct the provider to change defaults.
 
 Optional local `get_model_list_info()` returns version `1`, `source: "provider-api"`, `filters_keyword`,
 `filters_schema`, effective `default_filters`, `unfiltered: {}`, and
-`override: "replace"`. Consumers must inspect support before passing keywords;
+`override: "replace"`, plus a detached `default_supersession` map (empty for a
+custom configured selector or nonstandard endpoint). Consumers must inspect support before passing keywords;
 this is **not** a Core protocol change or a promise about legacy/other providers.
 `source` advertises fresh strict API-backed listing, not current account access;
 listing failures still raise rather than becoming successful static results.
@@ -242,8 +254,8 @@ configured directly in `settings.yaml` / the bundle config block — see the
 module = "provider-openai"
 name = "openai"
 config = {
-    default_model = "gpt-6.1-sol",
-    reasoning_effort = "low",              # none|minimal|low|medium|high|xhigh|max
+    default_model = "gpt-6.2-sol",
+    reasoning_effort = "low",              # GPT-6.2: low|medium; none = omit
     max_output_tokens = null,              # null = the model's capability max
     prompt_cache_options = { ttl = "30m" }, # exact GPT-5.6/GPT-6 models: "30m" | "12h"
     # ...see the settings-key reference table for every key
@@ -477,10 +489,14 @@ Precedence (highest wins):
 Notes:
 
 - **`"none"` and unset both send no reasoning parameter.**
-- **Values are validated at mount**, not at request time. An unrecognized
-  effort, or one the default model rejects (`gpt-5.5-pro` accepts only
-  `medium`, `high`, `xhigh`), raises immediately instead of surfacing as an
-  HTTP 400 mid-session.
+- **Config vocabulary is validated at mount** (including the retained
+  `gpt-5.5-pro` restriction). Exact model policy is validated after final
+  request overrides, including GPT-6.2 SDK `extra_body`, before dispatch.
+  This preserves explicit old-model overrides rather than validating against
+  the configured default model prematurely.
+- `extended_thinking: true` with no explicit effort selects `medium` for the
+  exact GPT-6.2 IDs (the highest effort established by this registry), retaining
+  `high` for older models. Explicit request/config effort is never coerced.
 - **Non-reasoning models are skipped with a warning**, not an error.
 - Use the legacy `reasoning` key when you need the dict form to also set
   `reasoning.mode` (`{effort = "high", mode = "pro"}`) or `reasoning.context`

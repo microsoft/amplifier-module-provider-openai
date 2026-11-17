@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, replace
 
 __all__ = [
+    "GPT_6_2_MODELS",
     "GPT_6_MODELS",
     "GPT_6_SOL_LUNA_MODELS",
     "ModelCapabilities",
@@ -19,9 +20,10 @@ __all__ = [
     "get_request_policy",
 ]
 
+GPT_6_2_MODELS = frozenset({"gpt-6.2-astra", "gpt-6.2-sol"})
 GPT_6_MODELS = frozenset(
     {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"}
-)
+) | GPT_6_2_MODELS
 GPT_6_SOL_LUNA_MODELS = frozenset({"gpt-6-sol", "gpt-6-luna"})
 GPT_5_6_MODELS = frozenset(
     {"gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
@@ -63,7 +65,24 @@ _REQUEST_POLICIES = {
             supports_async_tools=True,
             display_name="GPT " + model.removeprefix("gpt-").replace("-", " ").title(),
         )
-        for model in GPT_6_MODELS
+        for model in GPT_6_MODELS - GPT_6_2_MODELS
+    },
+    **{
+        # Checked 2026-11-17: latest-model migration documents low/medium,
+        # not an exhaustive 6.2 enum. Do not inherit high/xhigh/max from 6.0.
+        # Steering documents the GPT-6 family; async tools document Astra and
+        # later models. Apply that evidence to these two exact IDs only.
+        # keep-prefix-unchanged (linked by the 6.2 migration) recommends
+        # configuration_update; its existing standard/single-agent guards apply.
+        model: RequestPolicy(
+            allowed_efforts=frozenset({"low", "medium"}),
+            cache_ttls=_CACHE_TTLS,
+            supports_configuration_update=True,
+            supports_steering=True,
+            supports_async_tools=True,
+            display_name="GPT " + model.removeprefix("gpt-").replace("-", " ").title(),
+        )
+        for model in GPT_6_2_MODELS
     },
     **{
         model: RequestPolicy(
