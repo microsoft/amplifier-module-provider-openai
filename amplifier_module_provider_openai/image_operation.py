@@ -23,7 +23,9 @@ _IMAGES_ONLY_MODELS = {"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"}
 CONTROLLERS = {"gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-5", "gpt-5-mini",
                "gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.5", "gpt-5.6-sol",
                "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol",
-               "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"}
+               "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra",
+               # Exact model cards list the Responses image_generation tool.
+               "gpt-6.2-astra", "gpt-6.2-sol"}
 
 class _BoundHTTP(httpx.AsyncClient):
     """Borrow the selected HTTP client without changing or closing it."""

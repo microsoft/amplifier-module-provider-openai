@@ -66,15 +66,17 @@ async def test_legacy_images_also_sends_once(failure):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("controller", ["gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol", None])
 @pytest.mark.parametrize("edit", [False, True])
-async def test_responses_uses_distinct_models_bound_account_and_final_image(edit):
+async def test_responses_uses_distinct_models_bound_account_and_final_image(edit, controller):
+    selected = controller or "gpt-6.2-sol"  # fresh provider default
     sent = []
     def respond(req):
         sent.append(req)
         assert req.headers["authorization"] == "Bearer fixture-blue"
         assert str(req.url) == "https://api.openai.com/v1/responses"
         payload = json.loads(req.content)
-        assert payload["model"] == "gpt-6.1-sol"
+        assert payload["model"] == selected
         tool = payload["tools"][0]
         assert tool["type"] == "image_generation" and tool["model"] == "gpt-image-2.5-flare"
         assert tool["action"] == ("edit" if edit else "generate")
@@ -82,23 +84,36 @@ async def test_responses_uses_distinct_models_bound_account_and_final_image(edit
         assert payload["max_tool_calls"] == 1 and payload["parallel_tool_calls"] is False
         assert payload["store"] is False and payload["stream"] is False
         assert "previous_response_id" not in payload
+        assert not set(payload) & {"reasoning", "temperature", "top_p", "top_logprobs"}
         if edit:
             assert payload["input"][0]["content"][1]["image_url"].startswith("data:image/png;base64,")
-        return httpx.Response(200, json=response(), headers={"x-request-id": "req-fixture"})
+        body = response()
+        body["model"] = selected
+        return httpx.Response(200, json=body, headers={"x-request-id": "req-fixture"})
     async with AsyncOpenAI(api_key="fixture-blue", http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))) as client:
         provider = OpenAIProvider(api_key="fixture-blue", client=client)
         assert provider.get_image_generation_capabilities()["supported"] is True
         original = deepcopy(provider.config)
         item = request(edit=edit)
+        item["selection"]["model"] = controller or provider.default_model
+        # Chat effort is a role preference, not an image operation parameter.
+        item["selection"]["config"]["reasoning_effort"] = "high"
+        before = deepcopy(item)
         prepared = await provider.prepare_image_generation(item)
         assert prepared["supported"] is True and sent == []
+        assert prepared["plan"]["controller"] == selected
+        assert prepared["plan"]["model"] == "gpt-image-2.5-flare"
         result = await provider.generate_image(item, plan=prepared["plan"])
         assert result["status"] == "completed" and result["outputs"][0]["data"] == png()
         assert result["outputs"][1]["text"] == "Accompanying text"
         assert result["models"][1]["resolved"] is None
+        assert result["models"][0] == {
+            "purpose": "controller", "requested": selected, "resolved": selected,
+        }
         assert result["usage"]["normalized"] is None
         assert result["upstream"]["request_id"] == "req-fixture"
         assert provider.config == original
+        assert item == before
         with pytest.raises(ValueError, match="consumed"):
             await provider.generate_image(item, plan=prepared["plan"])
         assert len(sent) == 1
@@ -159,6 +174,8 @@ async def test_images_preserves_documented_exact_model_pins_on_real_sdk(model, e
     ("gpt-image-2.6-flare-2026-11-01", "images", "gpt-6.1-sol", "unsupported_model_or_transport"),
     ("auto", "images", "gpt-6.1-sol", "unsupported_model_or_transport"),
     ("gpt-image-2.5-flare", "responses", "gpt-6.2", "unsupported_controller"),
+    ("gpt-image-2.5-flare", "responses", "gpt-6.2-astra-preview", "unsupported_controller"),
+    ("gpt-image-2.5-flare", "responses", "gpt-6.2-sol-2099-01-01", "unsupported_controller"),
     ("gpt-image-2.5-flare", "responses", "gpt-99-sol", "unsupported_controller"),
 ])
 async def test_unqualified_model_transport_combinations_never_create_client(
@@ -183,6 +200,23 @@ async def test_image_model_updates_preserve_saved_opt_out_without_client_creatio
     result = await provider.prepare_image_generation(item)
     assert result["supported"] is False and result["reason_code"] == "unsupported_connection"
     assert provider._client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("controller", ["gpt-6.2-astra", "gpt-6.2-sol"])
+@pytest.mark.parametrize("config", [
+    {"image_generation": {"enabled": False}},
+    {"base_url": "https://gateway.invalid/v1"},
+])
+async def test_new_controllers_preserve_optout_and_endpoint_guards(controller, config):
+    provider = OpenAIProvider(api_key="fixture-blue", config=config)
+    item = request()
+    item["selection"]["model"] = controller
+    prepared = await provider.prepare_image_generation(item)
+    assert prepared["supported"] is False
+    assert prepared["reason_code"] == "unsupported_connection"
+    assert provider._client is None
+    assert getattr(provider, "_prepared_image_operations", {}) == {}
 
 
 @pytest.mark.asyncio
