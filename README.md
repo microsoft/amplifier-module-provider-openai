@@ -918,9 +918,47 @@ to Amplifier. No extra configuration is required.
 #### Tool-result images
 
 Ordinary function tools may return an ordered list of canonical text and
-base64-image blocks. The provider sends these directly as `input_text` and
+base64-image or URL-image blocks. The provider sends these directly as `input_text` and
 `input_image` items in the matching `function_call_output`; known
 non-vision models retain the text and receive an explicit image-omitted notice.
+
+Canonical `Message(role="tool", tool_call_id=..., name=..., content=[...])`
+and image-bearing `ToolResultBlock.output` lists (or `{content: [...]}` envelopes)
+use that same transport. Image results require one preceding assistant call,
+matching identity and one result; ambiguous/orphan/duplicate results fail before
+counting or generation. Envelope status/error fields are retained as text.
+Saved history is never edited or moved into a fabricated user-image turn.
+
+On the standard OpenAI Responses endpoint, user images (including earlier turns)
+and correlated ordinary function images support canonical base64 sources and
+HTTP(S) URL sources. URLs are forwarded, **never downloaded locally**.
+The existing exact capability catalog and named legacy image models qualify
+image input; unknown model IDs do not inherit the optimistic capability default.
+Custom endpoints and Azure deployment subclasses remain unqualified here, not
+declared universally text-only. Unqualified source/model/endpoint slots and
+generic assistant/system/developer images become explicit same-slot unavailable
+text, retaining surrounding text and allowing later plain followups. Native
+computer, compacted windows and authoritative `openai:output_items` replay keep
+their separate existing validation and transport.
+
+The native counter still sees the final projected input; media is not estimated
+as base64 text. Opt-in raw request/response hooks and native diagnostic traces
+receive separate image-omitted copies **before their first subscriber**.
+Exact submitted URL/base64 echoes are also removed from diagnostic copies and
+public error chains, without redacting SDK payloads or saved replay state.
+Transformed/truncated media hidden in arbitrary prose is not a promised
+redaction boundary. No account entitlement or live visual-understanding result
+is implied by these offline transport contracts.
+
+Official transport references:
+[image inputs](https://developers.openai.com/api/docs/guides/images-vision.md),
+[function result formatting](https://developers.openai.com/api/docs/guides/function-calling.md),
+and [Responses create schema](https://developers.openai.com/api/reference/resources/responses/methods/create.md).
+Diagnostic-copy/echo-removal design credits the separately owned, retained
+[draft #149](https://github.com/microsoft/amplifier-module-provider-openai/pull/149)
+(Brian Krabach); this narrow change does not adopt its prepared-media protocol,
+lifetime registry or authentication migration. Existing direct function-image
+transport predates that draft ([#93](https://github.com/microsoft/amplifier-module-provider-openai/pull/93)).
 
 #### Neutral computer-use v1
 
