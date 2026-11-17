@@ -279,6 +279,22 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     )
 
 
+def _has_unpriced_gpt_6_2_mode(value: Any) -> bool:
+    """Visible beta-mode evidence must not become a precise Standard estimate."""
+    from ._capabilities import GPT_6_2_MODELS
+
+    model = response_field(value, "model")
+    if not isinstance(model, str) or model not in GPT_6_2_MODELS:
+        return False
+    window = response_field(response_field(value, "background_options"), "completion_window")
+    if window not in (None, "soonest"):
+        return True
+    multi_agent = response_field(value, "multi_agent")
+    return multi_agent is not None and multi_agent is not False and (
+        response_field(multi_agent, "enabled") is not False
+    )
+
+
 def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     """Reject documented-invalid fields from a final exact GPT-6 wire payload."""
     from ._capabilities import GPT_6_2_MODELS
@@ -3645,6 +3661,12 @@ class OpenAIProvider:
             request, **kwargs
         )
         params.pop("timeout", None)
+        # Snapshot the assembled request, including SDK overlay, rather than
+        # consulting mutable config during billing. No beta pricing is inferred
+        # when the server omits its requested window/mode from the response.
+        unpriced_request_mode = _has_unpriced_gpt_6_2_mode({
+            **params, **(params.get("extra_body") or {}),
+        })
 
         message_list = list(request.messages)
         instructions = params.get("instructions")
@@ -3732,6 +3754,7 @@ class OpenAIProvider:
                 self._compute_attempt_cost(item)
                 if response_field(item, "usage") is not None
                 and isinstance(response_field(item, "model"), str)
+                and not unpriced_request_mode
                 else None
                 for item in observations
             ]
@@ -3745,7 +3768,9 @@ class OpenAIProvider:
                 # adapter aggregate can carry a cached partial cost even when
                 # its complete cost is unknown; do not split/recount its usage.
                 known_costs = [
-                    cost if cost is not None else self._known_attempt_cost(item)
+                    cost if cost is not None else (
+                        None if unpriced_request_mode else self._known_attempt_cost(item)
+                    )
                     for item, cost in zip(observations, costs, strict=True)
                 ]
                 if any(cost is not None for cost in known_costs):
@@ -6008,6 +6033,8 @@ class OpenAIProvider:
         attempts have completed, using the same result this base conversion
         places on its standalone response usage.
         """
+        if _has_unpriced_gpt_6_2_mode(response):
+            return None
         usage_obj = getattr(response, "usage", None)
         if usage_obj is None:
             return None

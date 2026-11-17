@@ -215,6 +215,67 @@ async def test_real_sdk_count_projection_uses_exact_registry(model):
         assert "prompt_cache_retention" not in wires[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("mode", [
+    {"background_options": {"completion_window": "2h"}},
+    {"background_options": {"completion_window": "8h"}},
+    {"multi_agent": {"enabled": True}},
+])
+@pytest.mark.parametrize("source", ["request", "overlay", "response"])
+async def test_unpriced_beta_mode_never_reports_standard_as_exact(model, mode, source):
+    from tests.test_gpt_6_1_sol import _response
+
+    extras = mode if source == "request" else {"extra_body": mode} if source == "overlay" else {}
+    p = provider(model, extra_request_params=extras)
+    charged = []
+    p._add_cost = charged.append
+    raw = _response(model=model)
+    if source == "response":
+        for key, value in mode.items():
+            setattr(raw, key, copy.deepcopy(value))
+    p.client.responses.create = AsyncMock(return_value=raw)
+    result = await p.complete(request())
+    assert result.usage.input_tokens == 100
+    assert result.usage.cost_usd is None
+    assert charged == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("source", ["overlay", "response"])
+async def test_native_unpriced_mode_keeps_complete_token_usage_but_unknown_cost(model, source):
+    mode = {"background_options": {"completion_window": "2h"}}
+    p, owner = native_provider(model, extra_request_params={"extra_body": mode} if source == "overlay" else {})
+    end = finished("r")
+    end["response"].update({
+        "model": model, "service_tier": "default", "usage": {
+            "input_tokens": 100, "output_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+        }, **(mode if source == "response" else {}),
+    })
+    p.socket.feed(created("r"), end)
+    owner.messages = [{"role": "user", "content": "hello"}]
+    charged = []
+    p._add_cost = charged.append
+    result = await p.complete(request())
+    assert result.usage.input_tokens == 100 and result.usage.output_tokens == 10
+    assert result.usage.cost_usd is None
+    assert charged == []
+
+
+@pytest.mark.parametrize("model", MODELS)
+def test_explicit_nonbeta_settings_keep_known_standard_cost(model):
+    from tests.test_gpt_6_1_sol import _response
+
+    raw = _response(model=model)
+    raw.background_options = {"completion_window": "soonest"}
+    raw.multi_agent = {"enabled": False}
+    assert provider(model)._compute_attempt_cost(raw) == (
+        Decimal(".0012") if model.endswith("astra") else Decimal(".0003")
+    )
+
+
 @pytest.mark.parametrize("model,scale", [("gpt-6.2-astra", 4), ("gpt-6.2-sol", 1)])
 @pytest.mark.parametrize("tokens,expected", [
     (272_000, "0.654"), (272_001, "1.208004"),
