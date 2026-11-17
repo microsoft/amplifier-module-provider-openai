@@ -1117,12 +1117,17 @@ def _calibrate_text(provider):
 def test_typed_images_without_native_count_dispatch_unchanged_without_calibration(
     use_streaming,
     caplog,
+    monkeypatch,
 ):
     provider = _provider(
         default_model="gpt-5.6-terra",
         enable_long_context=True,
         use_streaming=use_streaming,
+        base_url="https://api.openai.com/v1",
     )
+    # Exercise missing counting support independently from unqualified gateways.
+    # Compatible endpoints now use explicit image-slot unavailability.
+    monkeypatch.setattr(provider, "_provider_count_available", lambda: False)
     calibration = _calibrate_text(provider)
     request = _image_request()
     expected = provider._budget_params(request)
