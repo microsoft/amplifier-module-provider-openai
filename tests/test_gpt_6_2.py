@@ -121,6 +121,57 @@ async def test_actual_http_sdk_wire_policy_and_omission(model, effort, overlay):
         assert not set(wire) & {"temperature", "top_p", "top_logprobs", "logprobs"}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_pin", [False, True], ids=["model-unset", "explicit-6.1-sol"])
+@pytest.mark.parametrize("source", ["config", "request", "call-effort", "call-dict"])
+async def test_explicit_high_without_model_rejects_locally_but_old_pin_remains_usable(old_pin, source):
+    wires = []
+    config = {"use_streaming": False, "max_retries": 0}
+    if old_pin:
+        config["default_model"] = "gpt-6.1-sol"
+    if source == "config":
+        config["reasoning_effort"] = "high"
+    req = request(**({"reasoning_effort": "high"} if source == "request" else {}))
+    options = (
+        {"reasoning_effort": "high"} if source == "call-effort"
+        else {"reasoning": {"effort": "high"}} if source == "call-dict" else {}
+    )
+    before = copy.deepcopy((config, req.model_dump(), options))
+
+    def receive(outgoing):
+        wires.append(json.loads(outgoing.content))
+        assert outgoing.url.path == "/v1/responses"
+        assert old_pin, "A rejected fresh-default request must not dispatch."
+        return httpx.Response(200, json={
+            "id": "r", "object": "response", "created_at": 0,
+            "model": "gpt-6.1-sol", "status": "completed", "output": [],
+        })
+
+    async with AsyncOpenAI(api_key="offline", base_url="https://offline.invalid/v1",
+                           http_client=httpx.AsyncClient(
+                               transport=httpx.MockTransport(receive), trust_env=False),
+                           max_retries=0) as client:
+        p = OpenAIProvider(client=client, config=config)
+        assert req.model is None and "model" not in options
+        if old_pin:
+            await p.complete(req, **options)
+            assert len(wires) == 1
+            assert wires[0]["model"] == p.default_model == "gpt-6.1-sol"
+            assert wires[0]["reasoning"]["effort"] == "high"
+        else:
+            assert "default_model" not in config
+            assert p.default_model == "gpt-6.2-sol"
+            with pytest.raises(llm_errors.InvalidRequestError) as rejected:
+                await p.complete(req, **options)
+            assert "Model 'gpt-6.2-sol' reasoning.effort='high'" in str(rejected.value)
+            assert "not established" in str(rejected.value)
+            assert "Documented efforts: ['low', 'medium']" in str(rejected.value)
+            assert wires == []
+        assert (config, req.model_dump(), options) == before
+        if source == "config":
+            assert p.reasoning_effort == "high"  # no silent low/medium coercion
+
+
 @pytest.mark.parametrize("layer", ["top", "body"])
 def test_overlay_to_old_literal_none_preserves_include_normalization(layer):
     extras = {"extra_body": {
