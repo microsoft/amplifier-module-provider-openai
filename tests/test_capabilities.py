@@ -99,6 +99,22 @@ class TestGPT52Family:
         assert caps.default_reasoning_effort is None
 
 
+@pytest.mark.parametrize("model_id", ["gpt-5", "gpt-5-2025-08-07"])
+def test_documented_gpt5_image_model_facts(model_id):
+    # https://developers.openai.com/api/docs/models/gpt-5.md (2026-11-18)
+    from amplifier_module_provider_openai._capabilities import get_known_context_window
+    from amplifier_module_provider_openai._chat_images import known_vision
+
+    caps = get_capabilities(model_id)
+    assert known_vision(model_id) and caps.supports_vision
+    assert "vision" in caps.capability_tags
+    assert caps.context_window == get_known_context_window(model_id) == 400_000
+    assert caps.max_input_tokens == 272_000
+    assert caps.max_output_tokens == 128_000
+    assert caps.supports_reasoning and caps.supports_streaming
+    assert not caps.supports_native_apply_patch and not caps.supports_native_computer_use
+
+
 class TestGPT5MiniFamily:
     """Test GPT-5-mini model capabilities."""
 
