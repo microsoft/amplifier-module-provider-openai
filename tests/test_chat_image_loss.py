@@ -509,8 +509,9 @@ def test_media_walkers_preserve_schema_type_values_and_still_find_nested_media(d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.2-sol"])
 @pytest.mark.parametrize("raw", [False, True])
-async def test_ordinary_tool_schema_property_named_type_survives_count_and_completion(raw):
+async def test_ordinary_tool_schema_property_named_type_survives_count_and_completion(model, raw):
     schema = {
         "type": "object",
         "properties": {
@@ -523,7 +524,7 @@ async def test_ordinary_tool_schema_property_named_type_survives_count_and_compl
     p, wire, events = provider()
     p.raw = raw
     tool = ToolSpec(name="inspect", parameters=schema)
-    req = ChatRequest(model="gpt-6.2-sol", reasoning_effort="medium", tools=[tool],
+    req = ChatRequest(model=model, reasoning_effort="medium", tools=[tool],
                       messages=[Message(role="user", content="Inspect the business type")])
     before = req.model_dump()
     try:
