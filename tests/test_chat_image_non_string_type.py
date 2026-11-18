@@ -2,9 +2,11 @@
 
 Request and response data are free-form JSON below the canonical blocks. A tool
 parameter named "type" holds a dict there, and a JSON-schema type can be a list.
-A call identity or name in such data is a key only when it is hashable.
-Each case here raised ``TypeError: unhashable type`` on c2fe22df. Offline: the
-real SDK on a mock transport, and the native protocol doubles.
+A call identity or name in such data is a key only when it is hashable, and a
+"text" there is not always a string. Each case here raised a ``TypeError`` on
+c2fe22df (#150). #152 repaired ``media_values`` and ``diagnostic_copy``; the
+cases for the other places fail without the change that added this file.
+Offline: the real SDK on a mock transport, and the native protocol doubles.
 """
 
 import copy
@@ -29,6 +31,7 @@ from amplifier_module_provider_openai import (
 )
 from amplifier_module_provider_openai._chat_images import (
     OMITTED,
+    UNAVAILABLE,
     diagnostic_copy,
     has_images,
     instruction_text,
@@ -201,6 +204,8 @@ async def test_free_form_request_data_named_type_is_sent_as_before(place, value)
             assert items[0]["call_id"] == items[1]["call_id"] == "one"
         if place == "call-arguments":
             assert json.loads(items[0]["arguments"]) == {"type": value}
+        if place in {"call-arguments", "tool-calls-view"}:
+            assert items[1]["output"][0]["text"] == "plain result"
         if place in {"result-output", "result-envelope-content"}:
             # Legacy opaque ToolResult JSON remains unchanged, not media-classified.
             result = items[1]["output"]
@@ -415,6 +420,7 @@ def test_serializer_keeps_a_call_whose_name_is_not_hashable(value):
     ])
     assert [item["type"] for item in items] == ["function_call", "function_call_output"]
     assert items[0]["call_id"] == items[1]["call_id"] == "one"
+    assert items[1]["output"] == "plain result"
 
 
 # Core refuses the shapes of the next three cases. The native path gives the
@@ -436,12 +442,16 @@ def test_serializer_skips_a_saved_message_whose_role_is_not_a_string(content, va
 
 
 @pytest.mark.parametrize("value", NOT_A_KEY)
-def test_serializer_keeps_a_saved_text_result_whose_identity_is_not_hashable(value):
+def test_saved_text_result_whose_identity_is_not_hashable_matches_no_call_as_before(value):
+    # The result cannot belong to a call. As on the commit before c2fe22df, the
+    # serializer leaves it out and gives the call its own missing-result text.
     items = serializer()._convert_messages([RAW_CALL, {"role": "user", "content": [
         {"type": "tool_result", "tool_call_id": value, "output": "plain result"},
     ]}])
     assert [item["type"] for item in items] == ["function_call", "function_call_output"]
     assert items[0]["call_id"] == items[1]["call_id"] == "one"
+    assert items[1]["output"].startswith("[error] Tool execution result missing")
+    assert "plain result" not in json.dumps(items)
 
 
 @pytest.mark.parametrize("value", NOT_A_KEY)
@@ -468,6 +478,30 @@ def test_instruction_text_alone_skips_a_block_whose_type_is_not_a_string(value):
         {"type": value}, {"type": "text", "text": "kept"},
     ]}])
     assert items[0]["content"][0]["text"] == "<context_file>\nkept\n</context_file>"
+
+
+@pytest.mark.parametrize("value, written", [
+    ({"nested": 1}, "{'nested': 1}"),
+    (["string", "null"], "['string', 'null']"),
+    (("string", ["null"]), "('string', ['null'])"),
+    (7, "7"),
+    (None, "None"),
+])
+def test_instruction_text_writes_a_text_that_is_not_a_string_with_str(value, written):
+    # Core refuses such a block; saved history as plain dicts can hold it. The
+    # commit before c2fe22df wrote the whole list with str(). An image in the
+    # same message is still replaced, and its data is not in the text.
+    blocks = [
+        {"type": "text", "text": value}, image("base64").model_dump(),
+        {"type": "text", "text": "kept"},
+    ]
+    expected = f"{written}\n{UNAVAILABLE}\nkept"
+    assert instruction_text(blocks) == expected
+    items = serializer()._convert_messages([{"role": "developer", "content": blocks}])
+    assert items == [{"role": "user", "content": [
+        {"type": "input_text", "text": f"<context_file>\n{expected}\n</context_file>"},
+    ]}]
+    assert DATA not in json.dumps(items)
 
 
 @pytest.mark.parametrize("value", NOT_A_STRING)

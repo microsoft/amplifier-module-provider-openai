@@ -20,7 +20,8 @@ OMITTED = "[image omitted from diagnostics]"
 # tool parameter named "type" holds a dict as its "type", and a JSON-schema
 # type can be a list. A set hashes the value and raises TypeError there. So a
 # value from data is tested against a tuple, or as a string first, and a call
-# identity or name from data is a key only when hash() takes it.
+# identity or name from data is a key only when hash() takes it. A "text"
+# from data is joined through str(), because join() takes strings only.
 
 
 def _key(value):
@@ -272,7 +273,7 @@ def instruction_text(content):
     if isinstance(content, str):
         return content
     return "\n".join(
-        block.get("text", "") if block.get("type") == "text" else UNAVAILABLE
+        str(block.get("text", "")) if block.get("type") == "text" else UNAVAILABLE
         for block in content if isinstance(block, dict) and block.get("type") in ("text", "image")
     )
 
