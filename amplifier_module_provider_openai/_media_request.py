@@ -16,12 +16,17 @@ from contextlib import asynccontextmanager
 import httpx
 import openai
 from amplifier_core.llm_errors import InvalidRequestError
+from openai import _base_client
 
-from ._chat_images import image_url, project_messages
+from ._chat_images import image_url, known_vision, project_messages
 
 KEY = "experimental.media.v1"
-MODEL = "gpt-6.1-sol"
-MIMES = ["image/png", "image/jpeg"]
+# The API permits non-animated GIF, which a MIME-only fact cannot express.
+MIMES = ("image/png", "image/jpeg", "image/webp")
+
+
+def empty_support():
+    return {"v": 2, "positions": [], "mime_types": list(MIMES)}
 
 
 def refused():
@@ -51,27 +56,38 @@ def marked(request):
     return any(KEY in (m.metadata or {}) for m in request.messages)
 
 
-def option_digest(request, options):
+def option_digest(provider, request, options):
     """Match Foundation's redundant model/effort normalization, not SDK fields."""
     normalized = dict(options)
-    if normalized.get("model") == MODEL:
+    if normalized.get("model") == provider._resolve_request_model(request):
         normalized.pop("model", None)
     if normalized.get("reasoning_effort") == request.reasoning_effort:
         normalized.pop("reasoning_effort", None)
     return digest(normalized)
 
 
+def _qualified_client(client):
+    # SDK 3.29/3.51 construct this exact wrapper when no http_client is supplied.
+    # It adds destructor cleanup, not a custom send path. Do not use isinstance:
+    # arbitrary subclasses can override send/auth after our physical witness.
+    # If a future SDK removes the private wrapper, fail closed for that type.
+    return type(client) is openai.AsyncOpenAI and type(client._client) in {
+        httpx.AsyncClient, openai.DefaultAsyncHttpxClient,
+        getattr(_base_client, "AsyncHttpxClientWrapper", None),
+    }
+
+
 def support(provider, request, model, options):
     """Only classify the frozen Core positions the existing converter accepts."""
-    empty = {"v": 2, "positions": [], "mime_types": list(MIMES)}
+    empty = empty_support()
     if (
         not provider._uses_standard_openai_endpoint()
-        or model != MODEL or request.model not in (None, MODEL)
-        or provider.default_model != MODEL
         or not isinstance(options, Mapping)
-        or options.get("model", MODEL) != MODEL
+        or not isinstance(model, str)
+        or model != provider._resolve_request_model(request, options.get("model"))
+        or not known_vision(model)
         or provider.extra_request_params
-        or (provider._client is not None and type(provider._client) is not openai.AsyncOpenAI)
+        or (provider._client is not None and not _qualified_client(provider._client))
     ):
         return empty
     # These routes have separate contracts, not indexed generic image input.
@@ -125,7 +141,12 @@ def support(provider, request, model, options):
             content = [{"type": "text", "text": content}]
         if any(not isinstance(b, dict) or b.get("type") not in {"text", "image"} for b in content):
             continue
-        if any(b.get("type") == "image" and image_url(b) is None for b in content):
+        if any(
+            b.get("type") == "image" and (
+                image_url(b) is None
+                or (b["source"].get("type") == "base64" and b["source"].get("media_type") not in MIMES)
+            ) for b in content
+        ):
             return empty
         positions.append({"message_index": index, "role": msg["role"]})
         # Detached synthetic classifier input, never a request or asset. This
@@ -195,7 +216,8 @@ class Binding:
         self.provider = provider
         self.request_ref = weakref.ref(request)
         self.options = options
-        self.options_digest = option_digest(request, options)
+        self.model = provider._resolve_request_model(request, options.get("model"))
+        self.options_digest = option_digest(provider, request, options)
         self.original_options_digest = digest(options)
         self.request_digest = digest(request.model_dump())
         self.coordinator = provider.coordinator
@@ -212,9 +234,7 @@ class Binding:
         if before_injected is not None and self._connection() != before_injected:
             raise refused()
         self.client = provider.client
-        if type(self.client) is not openai.AsyncOpenAI or type(self.client._client) not in {
-            httpx.AsyncClient, openai.DefaultAsyncHttpxClient,
-        }:
+        if not _qualified_client(self.client):
             raise refused()
         # Dynamic auth/providers and custom HTTP auth require their own proven
         # after-auth binding. Do not invent it for this first finite route.
@@ -277,7 +297,10 @@ class Binding:
 
     def _connection(self):
         p, c = self.provider, self.client
-        if p._client is not c or not p._uses_standard_openai_endpoint() or p.default_model != MODEL:
+        if (
+            p._client is not c or not _qualified_client(c)
+            or not p._uses_standard_openai_endpoint()
+        ):
             raise refused()
         if any(getattr(c, k, None) is not None for k in (
             "_api_key_provider", "_provider_runtime", "workload_identity",
@@ -318,7 +341,7 @@ class Binding:
     def validate(self, params, purpose):
         self.purpose = purpose
         body = {k: v for k, v in params.items() if k != "timeout"}
-        if body.get("model") != MODEL or body.get("background") or body.get("extra_body"):
+        if body.get("model") != self.model or body.get("background") or body.get("extra_body"):
             raise refused()
         fingerprint = digest(body)
         if self.params_digest is None:
@@ -390,13 +413,14 @@ def binding(provider, request, options):
     records = getattr(provider, "_media_request_bindings", None)
     existing = (records or {}).get(id(request))
     if existing is not None and existing.request_ref() is request:
-        if not marked(request) or existing.options_digest != option_digest(request, options):
+        if not marked(request) or existing.options_digest != option_digest(provider, request, options):
             raise refused()
         existing.validate_capability()
         return existing
     if not marked(request):
         return None
-    if not support(provider, request, options.get("model") or request.model or provider.default_model, options)["positions"]:
+    model = provider._resolve_request_model(request, options.get("model"))
+    if not support(provider, request, model, options)["positions"]:
         raise refused()
     if records is None:
         records = provider._media_request_bindings = {}

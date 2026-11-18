@@ -21,8 +21,8 @@ from tests.test_media_request_seams import KEY, MODEL, facts, fixture
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sdk_default_http", [False, True])
-async def test_real_store_prepared_issuer_exact_private_count_send_and_refusals(tmp_path, sdk_default_http):
+@pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
+async def test_real_store_prepared_issuer_exact_private_count_send_and_refusals(tmp_path, http_mode):
     stream = io.BytesIO()
     Image.new("RGB", (2, 2), (20, 80, 130)).save(stream, format="PNG")
     pixels = stream.getvalue()
@@ -44,7 +44,7 @@ async def test_real_store_prepared_issuer_exact_private_count_send_and_refusals(
             TextBlock(text="before"), TextBlock(text=f"[Session image {ref['sha256']}]"), TextBlock(text="after"),
         ], metadata={KEY: {"refs": [ref]}}),
     ])
-    p, _, wires, events = fixture(canonical, sdk_default_http=sdk_default_http)
+    p, _, wires, events = fixture(canonical, http_mode=http_mode)
     p.coordinator.cap = cap
     before = canonical.model_dump()
     identity = {"provider": "openai", "account": "fixture", "generation": 1,

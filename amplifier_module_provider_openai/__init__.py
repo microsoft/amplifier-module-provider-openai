@@ -781,9 +781,10 @@ def _convert_function_tool_output_content(
     has_image = any(
         isinstance(block, dict) and (
             block.get("type") == "image"
-            or (block.get("type") == "text" and block.get("text") in {
+            or (block.get("type") == "text" and block.get("text") in (
+                # A tuple: a set would hash a "text" that is not a string.
                 UNAVAILABLE, "[Image omitted: selected model does not support vision.]",
-            })
+            ))
         ) for block in content
     )
     if not has_image:
@@ -1997,13 +1998,22 @@ class OpenAIProvider:
             endpoint = self.base_url or os.environ.get("OPENAI_BASE_URL")
         if endpoint is None:
             return True
-        parsed = urlparse(str(endpoint))
-        return (
-            parsed.scheme == "https"
-            and parsed.hostname == "api.openai.com"
-            and parsed.port in (None, 443)
-            and parsed.path.rstrip("/") == "/v1"
-        )
+        try:
+            parsed = urlparse(str(endpoint))
+            return (
+                parsed.scheme == "https"
+                and parsed.hostname == "api.openai.com"
+                and parsed.port in (None, 443)
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.path in ("/v1", "/v1/")
+                and not (parsed.params or parsed.query or parsed.fragment)
+            )
+        except ValueError:
+            return False
+
+    def _resolve_request_model(self, request: ChatRequest, override: str | None = None) -> str:
+        return override or request.model or self.default_model
 
     def _tool_output_cache_breakpoints_supported(self, model: str) -> bool:
         """Endpoint owners opt in to their proven wire/deployment capability."""
@@ -2178,7 +2188,7 @@ class OpenAIProvider:
                 *(m.model_dump() for m in developer_msgs),
                 *(m.model_dump() for m in conversation),
             ]
-            model_name = kwargs.get("model") or request.model or self.default_model
+            model_name = self._resolve_request_model(request, kwargs.get("model"))
             from .neutral_computer import ordinary_names
 
             history_tools = self.extra_request_params.get(
@@ -2480,7 +2490,7 @@ class OpenAIProvider:
         originals = [m.model_dump() for m in request.messages]
         replay = replay_calls(originals)
         plan_observations(originals, replay)
-        effective_model = kwargs.get("model") or request.model or self.default_model
+        effective_model = self._resolve_request_model(request, kwargs.get("model"))
         effective_model = self.extra_request_params.get("model", effective_model)
         effective_model = (self.extra_request_params.get("extra_body") or {}).get("model", effective_model)
         history_tools = self.extra_request_params.get(
@@ -2547,14 +2557,14 @@ class OpenAIProvider:
         request_options: Mapping[str, Any] | None = None,
     ) -> dict:
         """Read-only, prehydration indexed facts; never initialize a client."""
-        from ._media_request import support
+        from ._media_request import empty_support, support
 
         if request_options is not None and not isinstance(request_options, Mapping):
-            return {"v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg"]}
+            return empty_support()
         try:
             return support(self, request, model, dict(request_options or {}))
         except (TypeError, ValueError, AttributeError):
-            return {"v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg"]}
+            return empty_support()
 
     def request_budget(
         self,

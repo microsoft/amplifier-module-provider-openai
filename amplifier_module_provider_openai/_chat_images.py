@@ -16,10 +16,27 @@ UNAVAILABLE = (
     "result on an image-capable OpenAI Responses model.]"
 )
 OMITTED = "[image omitted from diagnostics]"
+# Request and response data are free-form JSON below the canonical fields: a
+# tool parameter named "type" holds a dict as its "type", and a JSON-schema
+# type can be a list. A set hashes the value and raises TypeError there. So a
+# value from data is tested against a tuple, or as a string first, and a call
+# identity or name from data is a key only when hash() takes it. A "text"
+# from data that is not a string is refused without its value.
+
+
+def _key(value):
+    # isinstance(value, Hashable) is not enough: a tuple that holds a list passes it.
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
 
 
 def known_vision(model):
     # Never use the legacy optimistic unknown-bucket supports_vision default.
+    # GPT-5's published alias/snapshot resolve through exact facts only; adding
+    # its bare name to the legacy set would admit invented dated snapshots.
     caps = _EXACT_CAPABILITIES.get(model)
     legacy = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model)
     return (caps is not None and caps.supports_vision) or legacy in {
@@ -65,7 +82,7 @@ def has_images(value):
         content = value.get("content")
         return (
             isinstance(content, list)
-            and all(isinstance(b, dict) and b.get("type") in {"text", "image"} for b in content)
+            and all(isinstance(b, dict) and b.get("type") in ("text", "image") for b in content)
             and has_images(content)
         )
     return False
@@ -94,9 +111,12 @@ def project_messages(
     for message in messages:
         if message.get("role") == "tool" and message.get("tool_call_id"):
             result_counts[message["tool_call_id"]] += 1
-        elif message.get("role") in {"user", "tool"} and isinstance(message.get("content"), list):
+        elif message.get("role") in ("user", "tool") and isinstance(message.get("content"), list):
             for block in message["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
+                if (
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    and _key(block.get("tool_call_id"))
+                ):
                     result_counts[block.get("tool_call_id")] += 1
     for original in messages:
         msg = copy.deepcopy(original)
@@ -125,11 +145,12 @@ def project_messages(
                 kind = block.get("type")
                 if kind == "tool_result" and has_images(block.get("output")):
                     identity = block.get("tool_call_id")
-                    if role not in {"user", "tool"}:
+                    if role not in ("user", "tool"):
                         projected.append({"type": "text", "text": UNAVAILABLE})
                         continue
                     if (
-                        not identity or calls.get(identity) != 1 or identity in results
+                        not identity or not _key(identity)
+                        or calls.get(identity) != 1 or identity in results
                         or result_counts[identity] != 1
                         or (msg.get("tool_call_id") and msg["tool_call_id"] != identity)
                     ):
@@ -147,7 +168,7 @@ def project_messages(
                             *output["content"],
                         ]
                     if not isinstance(output, list) or any(
-                        not isinstance(b, dict) or b.get("type") not in {"text", "image"}
+                        not isinstance(b, dict) or b.get("type") not in ("text", "image")
                         for b in output
                     ):
                         raise _error()
@@ -184,11 +205,14 @@ def project_messages(
             *(content if isinstance(content, list) else []),
         ]
         for call in call_items:
-            if isinstance(call, dict) and call.get("type") in {"computer_call", "apply_patch_call"}:
+            if (
+                isinstance(call, dict) and call.get("type") in ("computer_call", "apply_patch_call")
+                and _key(call.get("call_id"))
+            ):
                 native_ids.add(call.get("call_id"))
-            if isinstance(call, dict) and call.get("type") in {None, "tool_call", "function_call"}:
+            if isinstance(call, dict) and call.get("type") in (None, "tool_call", "function_call"):
                 identity = call.get("call_id") or call.get("id") or call.get("tool_call_id")
-                if identity:
+                if identity and _key(identity):
                     # Equivalent Core tool_calls/content views denote one call.
                     def equivalent(block, call=call, identity=identity):
                         if not isinstance(block, dict) or block.get("type") != "tool_call":
@@ -210,15 +234,17 @@ def project_messages(
                     ):
                         continue
                     calls[identity] = calls.get(identity, 0) + 1
-                    if call.get("name") in ordinary_names or call.get("type") == "function_call":
+                    if (
+                        _key(call.get("name")) and call.get("name") in ordinary_names
+                    ) or call.get("type") == "function_call":
                         native_ids.discard(identity)
                         continue
                     arguments = call.get("input") or {}
                     if isinstance(arguments, dict) and (
                         (call.get("name") == "computer" and isinstance(arguments.get("actions"), list))
-                        or (call.get("name") == "apply_patch" and arguments.get("type") in {
+                        or (call.get("name") == "apply_patch" and arguments.get("type") in (
                             "create_file", "update_file", "delete_file", "rename_file",
-                        })
+                        ))
                     ):
                         native_ids.add(identity)
     if any(calls.get(identity) != 1 for identity in image_ids):
@@ -231,7 +257,7 @@ def _project_blocks(blocks, qualified, model, *, tool=False, role="user"):
     for block in blocks:
         if block.get("type") != "image":
             out.append(block)
-        elif role not in {"user", "tool"} or not qualified or not known_vision(model):
+        elif role not in ("user", "tool") or not qualified or not known_vision(model):
             marker = (
                 "[Image omitted: selected model does not support vision.]"
                 if tool and not get_capabilities(model).supports_vision else UNAVAILABLE
@@ -248,9 +274,15 @@ def _project_blocks(blocks, qualified, model, *, tool=False, role="user"):
 def instruction_text(content):
     if isinstance(content, str):
         return content
+    if any(
+        isinstance(block, dict) and block.get("type") == "text"
+        and not isinstance(block.get("text", ""), str) for block in content
+    ):
+        # No str() of the value: it would write media that is nested in it.
+        raise TypeError("instruction text block must contain a string 'text' value")
     return "\n".join(
         block.get("text", "") if block.get("type") == "text" else UNAVAILABLE
-        for block in content if isinstance(block, dict) and block.get("type") in {"text", "image"}
+        for block in content if isinstance(block, dict) and block.get("type") in ("text", "image")
     )
 
 

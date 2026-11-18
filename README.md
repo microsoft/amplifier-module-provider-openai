@@ -982,16 +982,19 @@ transport predates that draft ([#93](https://github.com/microsoft/amplifier-modu
 The synchronous, read-only provider method
 `get_media_request_support_for_request(*, request, model, request_options=None)`
 returns exactly `{v: 2, positions: [{message_index, role}], mime_types: [...]}`.
-Positions describe the actual post-overlay **prehydration** Core request; PNG
-and JPEG user slots and unambiguously correlated ordinary tool-result slots can
-qualify without opening assets or constructing an SDK client. The first finite
-route requires this base provider, standard OpenAI Responses, explicit selected
-`gpt-6.1-sol`, matching request/options/default model, and no opaque/native or
-input/transport override. Unknown/ambiguous routes return empty positions.
-The fresh `gpt-6.2-sol` default and explicit GPT-6.2 selections do not widen this
-finite route: pin `default_model: gpt-6.1-sol` as well as the selected request
-model when using it. Ordinary unmarked GPT-6.2 image requests keep their existing
-transport; the optional issuer-bound route does not yet advertise those models.
+Positions describe the actual post-overlay **prehydration** Core request. User
+slots and unambiguously correlated ordinary tool-result slots can qualify
+without opening assets or constructing an SDK client. This route requires the
+base provider, the canonical OpenAI Responses endpoint, and a selected model
+known to support vision that matches the effective model (explicit option,
+then request, then provider default). Opaque/native or input/transport
+overrides and unknown routes return empty positions.
+
+The indexed route advertises PNG, JPEG, and WebP. OpenAI also documents support
+for non-animated GIF, but these facts cannot distinguish it from animated GIF
+without inspecting bytes. OpenAI documents up to 512 MB total payload and
+1,500 images per request; these are API-wide bounds, not per-asset or
+model-specific limits inferred by the classifier.
 This is implementation support, not account entitlement or host acceptance.
 
 Requests carrying message metadata `experimental.media.v1` require the **current

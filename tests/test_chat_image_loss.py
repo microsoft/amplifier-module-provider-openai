@@ -87,15 +87,17 @@ def provider(*, stream=False, failure=False, replies=None):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("source", ["url", "base64"])
-async def test_user_images_count_and_send_same_order_without_local_fetch(stream, source):
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-5", "gpt-5-2025-08-07"])
+async def test_user_images_count_and_send_same_order_without_local_fetch(stream, source, model):
     p, wire, events = provider(stream=stream)
-    request = ChatRequest(messages=[Message(role="user", content=[
+    request = ChatRequest(model=model, messages=[Message(role="user", content=[
         TextBlock(text="before"), image(source), TextBlock(text="after"),
     ])])
     before = request.model_dump()
     try:
         await p.complete(request)
         assert [path for path, _ in wire] == ["/v1/responses/input_tokens", "/v1/responses"]
+        assert all(payload["model"] == model for _, payload in wire)
         assert wire[0][1]["input"] == wire[1][1]["input"]
         content = wire[1][1]["input"][0]["content"]
         assert content == [
@@ -112,12 +114,13 @@ async def test_user_images_count_and_send_same_order_without_local_fetch(stream,
 @pytest.mark.asyncio
 @pytest.mark.parametrize("envelope", [False, True])
 @pytest.mark.parametrize("role", ["tool", "user"])
-async def test_nested_tool_result_uses_existing_rich_transport_and_keeps_status(envelope, role):
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-5", "gpt-5-2025-08-07"])
+async def test_nested_tool_result_uses_existing_rich_transport_and_keeps_status(envelope, role, model):
     p, wire, events = provider()
     blocks = [TextBlock(text="before").model_dump(), image("base64").model_dump(),
               TextBlock(text="after").model_dump()]
     output = {"success": False, "status": "failed", "content": blocks} if envelope else blocks
-    request = ChatRequest(messages=[
+    request = ChatRequest(model=model, messages=[
         Message(role="assistant", content=[ToolCallBlock(id="call-1", name="inspect", input={})]),
         Message(role=role, tool_call_id="call-1" if role == "tool" else None,
                 name="inspect", content=[ToolResultBlock(tool_call_id="call-1", output=output)]),
@@ -213,7 +216,10 @@ async def test_error_echoes_are_removed_before_first_subscriber_and_public_trace
         await p.client.close()
 
 
-@pytest.mark.parametrize("model", ["unknown-deployment", "gpt-6.2-future", "o3-mini"])
+@pytest.mark.parametrize("model", [
+    "unknown-deployment", "gpt-6.2-future", "o3-mini",
+    "gpt-5-2099-01-01", "gpt-5-unknown", "gpt-5.99-future",
+])
 def test_unknown_or_text_only_model_is_not_forced_vision(model):
     p = OpenAIProvider(api_key="fixture")
     converted = p._convert_messages([Message(role="user", content=[image()]).model_dump()], model=model)

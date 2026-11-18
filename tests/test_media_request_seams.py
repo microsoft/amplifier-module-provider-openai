@@ -4,6 +4,7 @@ import asyncio
 import copy
 import gc
 import json
+import traceback
 import weakref
 from types import SimpleNamespace
 
@@ -67,7 +68,7 @@ class Capability:
         return self.result
 
 
-def fixture(private, *, streaming=False, hook=None, replies=None, sdk_default_http=False, default_model=MODEL):
+def fixture(private, *, streaming=False, hook=None, replies=None, http_mode="legacy", default_model=MODEL):
     cap = Capability(private)
     wires, events = [], []
 
@@ -91,9 +92,9 @@ def fixture(private, *, streaming=False, hook=None, replies=None, sdk_default_ht
             ))
         return httpx.Response(200, json=completed())
 
-    # SDK3.29's default is HTTPX2; legacy HTTPX injection is independently
-    # supported by the SDK and must not conceal default request/stream types.
-    if sdk_default_http:
+    # Exercise both explicit injection families AND the actual SDK-owned
+    # default. Only the network boundary is mocked, never SDK serialization.
+    if http_mode in {"sdk-injected", "sdk-default"}:
         import httpx2
 
         legacy_transport = transport
@@ -104,14 +105,33 @@ def fixture(private, *, streaming=False, hook=None, replies=None, sdk_default_ht
                 response.status_code, headers=dict(response.headers), content=await response.aread(),
             )
 
-        http = openai.DefaultAsyncHttpxClient(
-            transport=httpx2.MockTransport(default_transport), trust_env=False,
-            event_hooks={"request": [hook] if hook else []},
-        )
+        mock_transport = httpx2.MockTransport(default_transport)
+        if http_mode == "sdk-default":
+            sdk = openai.AsyncOpenAI(
+                api_key="offline-fixture", max_retries=0,
+                base_url="https://api.openai.com/v1",
+                organization="offline-org", project="offline-project",
+            )
+            http = sdk._client
+            assert type(http) is openai._base_client.AsyncHttpxClientWrapper
+            # Preserve the real default wrapper, pools, routing and send path.
+            # Stub every selected pool (including environment proxy mounts) so
+            # this test cannot contact the network.
+            for pool in [http._transport, *http._mounts.values()]:
+                if pool is not None:
+                    pool.handle_async_request = mock_transport.handle_async_request
+            http.event_hooks["request"] = [hook] if hook else []
+        else:
+            http = openai.DefaultAsyncHttpxClient(
+                transport=mock_transport, trust_env=False,
+                event_hooks={"request": [hook] if hook else []},
+            )
     else:
+        assert http_mode == "legacy"
         http = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False,
                                  event_hooks={"request": [hook] if hook else []})
-    sdk = openai.AsyncOpenAI(api_key="offline-fixture", max_retries=0, http_client=http)
+    if http_mode != "sdk-default":
+        sdk = openai.AsyncOpenAI(api_key="offline-fixture", max_retries=0, http_client=http)
     p = OpenAIProvider(client=sdk, config={
         **({"default_model": default_model} if default_model is not None else {}),
         "use_streaming": streaming, "raw": True, "max_retries": 0,
@@ -126,8 +146,8 @@ def fixture(private, *, streaming=False, hook=None, replies=None, sdk_default_ht
     return p, cap, wires, events
 
 
-def facts(p, req, **kwargs):
-    return p.get_media_request_support_for_request(request=req, model=MODEL, **kwargs)
+def facts(p, req, *, model=MODEL, **kwargs):
+    return p.get_media_request_support_for_request(request=req, model=model, **kwargs)
 
 
 def test_indexed_support_is_readonly_and_needs_no_client_capability_or_pixels():
@@ -137,11 +157,42 @@ def test_indexed_support_is_readonly_and_needs_no_client_capability_or_pixels():
     before = req.model_dump()
     assert facts(p, req) == {"v": 2, "positions": [
         {"message_index": 0, "role": "user"}, {"message_index": 2, "role": "tool"},
-    ], "mime_types": ["image/png", "image/jpeg"]}
+    ], "mime_types": ["image/png", "image/jpeg", "image/webp"]}
     assert req.model_dump() == before and p._client is None
     first = facts(p, req)
     first["positions"].clear()
     assert len(facts(p, req)["positions"]) == 2
+
+
+def test_indexed_support_uses_effective_model_not_provider_default():
+    p, req = OpenAIProvider(api_key=None), request()
+    p.default_model = "gpt-6.1-sol"
+    req.model = "gpt-4.1"
+    assert len(facts(p, req, model="gpt-4.1")["positions"]) == 2
+    assert not facts(p, req)["positions"]
+    options = {"model": "gpt-4.1-mini"}
+    assert len(facts(p, req, model="gpt-4.1-mini", request_options=options)["positions"]) == 2
+    assert not facts(p, req, model="gpt-4.1", request_options=options)["positions"]
+    req.model = "unknown-deployment"
+    assert not facts(p, req, model=req.model)["positions"]
+
+
+@pytest.mark.parametrize("suffix", ["//", "?query=1", "#fragment", ";parameter"])
+def test_indexed_support_requires_canonical_endpoint(suffix):
+    p, req = OpenAIProvider(api_key=None), request()
+    p.base_url = "https://api.openai.com/v1" + suffix
+    assert not facts(p, req)["positions"]
+    assert p._client is None
+
+
+def test_indexed_support_does_not_claim_gif_without_animation_facts():
+    p, req = OpenAIProvider(api_key=None), request()
+    req.messages[0].content = [ImageBlock(source={
+        "type": "base64", "media_type": "image/gif", "data": PIXELS,
+    })]
+    result = facts(p, req)
+    assert not result["positions"]
+    assert "image/gif" not in result["mime_types"]
 
 
 @pytest.mark.parametrize("bad", ["orphan", "duplicate", "wrong", "following", "dual-conflict", "native", "model", "proxy"])
@@ -179,21 +230,21 @@ def test_indexed_overlay_indices_and_equivalent_dual_core_calls():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("default_model,selected", [
     (None, MODEL),
-    (None, "gpt-6.2-sol"),
-    ("gpt-6.2-astra", "gpt-6.2-astra"),
+    (None, "gpt-6.2-astra"),
+    ("gpt-6.2-astra", "gpt-6.2-sol"),
     (MODEL, "gpt-6.2-sol"),
 ])
-async def test_model_union_does_not_expand_indexed_media_route(default_model, selected):
+async def test_model_union_rejects_facts_for_a_model_other_than_effective(default_model, selected):
     config = {"default_model": default_model} if default_model is not None else {}
     p = OpenAIProvider(api_key=None, config=config)
     req = request()
     req.model = selected
     before = req.model_dump()
-    options = {"model": selected}
+    options = {"model": "unknown-deployment"}
     assert p.default_model == (default_model or "gpt-6.2-sol")
     assert p.get_media_request_support_for_request(
         request=req, model=selected, request_options=options,
-    ) == {"v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg"]}
+    ) == {"v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg", "image/webp"]}
     with pytest.raises(InvalidRequestError):
         p.request_budget(req, context_estimate=1, request_options=options)
     with pytest.raises(InvalidRequestError):
@@ -203,20 +254,22 @@ async def test_model_union_does_not_expand_indexed_media_route(default_model, se
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
-@pytest.mark.parametrize("sdk_default_http", [False, True])
-async def test_fresh_model_unmarked_images_keep_both_sdk_transports(streaming, sdk_default_http):
+@pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
+async def test_fresh_model_unmarked_images_keep_both_sdk_transports(streaming, http_mode):
     req = request(marked=False)
     req.model = "gpt-6.2-sol"
     req.reasoning_effort = "medium"
     p, cap, wires, events = fixture(
-        req, streaming=streaming, sdk_default_http=sdk_default_http, default_model=None,
+        req, streaming=streaming, http_mode=http_mode, default_model=None,
     )
     before = req.model_dump()
     try:
         assert p.default_model == "gpt-6.2-sol"
         assert p.get_media_request_support_for_request(
             request=req, model=req.model,
-        )["positions"] == []
+        )["positions"] == [
+            {"message_index": 0, "role": "user"}, {"message_index": 2, "role": "tool"},
+        ]
         decision = await p.request_budget(req, context_estimate=4)
         response = await p.complete(req)
         assert response.content[0].text == "OK"
@@ -238,12 +291,22 @@ async def test_fresh_model_unmarked_images_keep_both_sdk_transports(streaming, s
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
-@pytest.mark.parametrize("sdk_default_http", [False, True])
-async def test_exact_private_request_budget_count_and_send_same_pixels(streaming, sdk_default_http):
+@pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
+@pytest.mark.parametrize("model", [
+    "gpt-4.1", "gpt-5", "gpt-5-2025-08-07", "gpt-6.2-astra", "gpt-6.2-sol",
+])
+async def test_exact_private_request_budget_count_and_send_same_pixels(streaming, http_mode, model, caplog):
     req = request()
-    p, cap, wires, events = fixture(req, streaming=streaming, sdk_default_http=sdk_default_http)
+    req.model = model
+    req.messages[0].content = [TextBlock(text="Inspect"), ImageBlock(source={
+        "type": "base64", "media_type": "image/webp", "data": PIXELS,
+    })]
+    p, cap, wires, events = fixture(req, streaming=streaming, http_mode=http_mode)
     before = req.model_dump()
     try:
+        assert facts(p, req, model=model)["positions"] == [
+            {"message_index": 0, "role": "user"}, {"message_index": 2, "role": "tool"},
+        ]
         decision = await p.request_budget(req, context_estimate=4)
         assert decision["measurement"]["kind"] == "provider_count"
         result = await p.complete(req)
@@ -252,20 +315,40 @@ async def test_exact_private_request_budget_count_and_send_same_pixels(streaming
             "/v1/responses/input_tokens", "/v1/responses/input_tokens", "/v1/responses",
         ]
         assert wires[0][1]["input"] == wires[1][1]["input"] == wires[2][1]["input"]
+        assert all(w[1]["model"] == model for w in wires)
+        user = wires[-1][1]["input"][0]
+        assert user["role"] == "user"
+        assert user["content"] == [
+            {"type": "input_text", "text": "Inspect"},
+            {"type": "input_image", "image_url": "data:image/webp;base64," + PIXELS},
+        ]
+        call = wires[-1][1]["input"][-2]
+        assert call == {
+            "type": "function_call", "call_id": "read-1", "name": "read_file", "arguments": "{}",
+        }
         output = wires[-1][1]["input"][-1]
-        assert output["type"] == "function_call_output" and output["call_id"] == "read-1"
-        assert output["output"][1]["image_url"] == "data:image/png;base64," + PIXELS
+        tail = {"type": "input_text", "text": "after"}
+        if model in {"gpt-6.2-astra", "gpt-6.2-sol"}:
+            tail["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        assert output == {
+            "type": "function_call_output", "call_id": "read-1", "output": [
+                {"type": "input_text", "text": "before"},
+                {"type": "input_image", "image_url": "data:image/png;base64," + PIXELS},
+                tail,
+            ],
+        }
         assert all(same for same, _, _ in cap.calls)
         assert {purpose for _, purpose, _ in cap.calls} == {"provider-count", "provider-send"}
-        assert req.model_dump() == before and PIXELS not in json.dumps(events)
+        assert req.model_dump() == before and PIXELS not in json.dumps(events) + caplog.text
+        assert not p.client.is_closed()
     finally:
         await p.client.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("where", ["count", "send"])
-@pytest.mark.parametrize("sdk_default_http", [False, True])
-async def test_revocation_during_awaited_http_hook_precedes_physical_transport(where, sdk_default_http):
+@pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
+async def test_revocation_during_awaited_http_hook_precedes_physical_transport(where, http_mode):
     req = request()
 
     async def hook(wire):
@@ -273,7 +356,7 @@ async def test_revocation_during_awaited_http_hook_precedes_physical_transport(w
             await asyncio.sleep(0)
             cap.allowed = False
 
-    p, cap, wires, events = fixture(req, hook=hook, sdk_default_http=sdk_default_http)
+    p, cap, wires, events = fixture(req, hook=hook, http_mode=http_mode)
     try:
         with pytest.raises(InvalidRequestError):
             await p.complete(req)
@@ -285,10 +368,11 @@ async def test_revocation_during_awaited_http_hook_precedes_physical_transport(w
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ["capability", "enabled", "coordinator", "key", "project", "endpoint", "client", "model", "options", "wire"])
-async def test_changes_after_count_before_send_refuse(mutation):
+@pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
+async def test_changes_after_count_before_send_refuse(mutation, http_mode):
     req = request()
     options = {"reasoning": {"effort": "low"}}
-    p, cap, wires, _ = fixture(req)
+    p, cap, wires, _ = fixture(req, http_mode=http_mode)
     original_emit = p.coordinator.hooks.emit
 
     async def emit(name, data):
@@ -413,10 +497,10 @@ async def test_guarded_binding_does_not_retain_private_pixels_after_collection()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sdk_default_http", [False, True])
-async def test_cold_count_and_generation_bind_one_legitimate_client(monkeypatch, sdk_default_http):
+@pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
+async def test_cold_count_and_generation_bind_one_legitimate_client(monkeypatch, http_mode):
     req = request()
-    p, cap, wires, _ = fixture(req, sdk_default_http=sdk_default_http)
+    p, cap, wires, _ = fixture(req, http_mode=http_mode)
     sdk = p._client
     p._client = None
     p._api_key = "offline-fixture"
@@ -437,11 +521,12 @@ async def test_cold_count_and_generation_bind_one_legitimate_client(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_default_sdk_family_transport_identity_change_refuses():
+@pytest.mark.parametrize("http_mode", ["sdk-injected", "sdk-default"])
+async def test_default_sdk_family_transport_identity_change_refuses(http_mode):
     import httpx2
 
     req = request()
-    p, _, wires, _ = fixture(req, sdk_default_http=True)
+    p, _, wires, _ = fixture(req, http_mode=http_mode)
     original_emit = p.coordinator.hooks.emit
     original_transport = p.client._client._transport
 
@@ -753,5 +838,55 @@ async def test_http_default_account_override_is_refused_not_silently_dropped(hea
         with pytest.raises(InvalidRequestError):
             await p.complete(req)
         assert not wires
+    finally:
+        await p.client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ["legacy", "sdk-injected", "sdk-default"])
+async def test_arbitrary_http_subclasses_are_not_advertised_or_bound(family):
+    from amplifier_module_provider_openai._media_request import Binding
+
+    req = request()
+    p, _, wires, _ = fixture(req, http_mode=family)
+    original_sdk = p.client
+    original_http = original_sdk._client
+
+    async def bypass(self, request):
+        pytest.fail("custom HTTP send override reached")
+
+    subclass = type("CustomHTTP", (type(original_http),), {"_send_single_request": bypass})
+    custom = subclass(trust_env=False)
+    p._client = original_sdk.with_options(http_client=custom)
+    try:
+        assert facts(p, req)["positions"] == []
+        with pytest.raises(InvalidRequestError):
+            Binding(p, req, {})
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert not wires
+    finally:
+        await p.client.close()
+        await original_sdk.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_actual_sdk_default_error_diagnostics_do_not_expose_pixels(streaming, caplog):
+    req = request()
+    req.model = "gpt-5"
+    p, _, wires, events = fixture(req, http_mode="sdk-default", streaming=streaming, replies=[
+        httpx.Response(200, json={"input_tokens": 12}),
+        httpx.Response(400, json={"error": {
+            "type": "invalid_request_error", "message": f"bad image {PIXELS}",
+        }}),
+    ])
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await p.complete(req)
+        assert len(wires) == 2
+        diagnostic = "".join(traceback.format_exception(caught.value)) + json.dumps(events) + caplog.text
+        assert PIXELS not in diagnostic
+        assert caught.value.retryable is False and caught.value.status_code == 400
     finally:
         await p.client.close()
