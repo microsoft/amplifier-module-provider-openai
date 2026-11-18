@@ -36,7 +36,9 @@ def legacy_generation_counter(monkeypatch):
     from amplifier_module_provider_openai import OpenAIProvider
     original = OpenAIProvider._native_input_token_count
 
-    async def count(self, params):
+    async def count(self, params, *, media_guard=None):
+        if media_guard is not None:
+            return await original(self, params, media_guard=media_guard)
         client = self._client
         responses = getattr(client, 'responses', None)
         counter = getattr(getattr(responses, 'input_tokens', None), 'count', None)
