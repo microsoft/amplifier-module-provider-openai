@@ -219,7 +219,9 @@ class TestWireBodyComputerDeclaration:
         # path instead of the client.responses.stream() async-context-manager
         # path (the default) -- this test only needs to assert on the outbound
         # request body, not exercise the streaming transport.
-        provider = _make_provider(use_streaming=False)
+        # The capture sentinel is not a transient API error; exercise one send,
+        # not the production retry backoff (qualified in test_retry.py).
+        provider = _make_provider(use_streaming=False, max_retries=0)
         # A real ToolSpec (extra="allow"), not a MagicMock -- this is what
         # ChatRequest validation actually requires, and it's also the real
         # shape amplifier-module-loop-streaming's native_tool_spec mechanism
@@ -275,6 +277,7 @@ class TestWireBodyComputerDeclaration:
             f"got chain of types: {seen!r}"
         )
 
+        fake_client.responses.with_raw_response.create.assert_awaited_once()
         assert "tools" in captured_params, (
             "tools must reach the actual client.responses.create(**params) call"
         )
