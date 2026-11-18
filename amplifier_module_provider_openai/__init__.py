@@ -756,9 +756,10 @@ def _convert_function_tool_output_content(
     has_image = any(
         isinstance(block, dict) and (
             block.get("type") == "image"
-            or (block.get("type") == "text" and block.get("text") in {
+            or (block.get("type") == "text" and block.get("text") in (
+                # A tuple: a set would hash a "text" that is not a string.
                 UNAVAILABLE, "[Image omitted: selected model does not support vision.]",
-            })
+            ))
         ) for block in content
     )
     if not has_image:
