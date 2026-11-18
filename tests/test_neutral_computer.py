@@ -39,9 +39,11 @@ def image(tint=0):
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
-    # A backend fake's full screenshot, matching the real declared pixel space.
-    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1280, 720, 8, 2, 0, 0, 0))
-    png += chunk(b"IDAT", zlib.compress((b"\x00" + bytes([tint]) * (1280 * 3)) * 720)) + chunk(b"IEND", b"")
+    # A complete screenshot in the real declared pixel space. One-bit grayscale
+    # keeps repeated history validation cheap without mocking the PNG validator.
+    # tint selects distinct bit patterns, not a solid RGB color.
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1280, 720, 1, 0, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress((b"\x00" + bytes([tint]) * ((1280 + 7) // 8)) * 720)) + chunk(b"IEND", b"")
     return {"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                          "data": base64.b64encode(png).decode()}}
 
