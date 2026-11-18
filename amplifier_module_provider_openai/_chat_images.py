@@ -35,6 +35,8 @@ def _key(value):
 
 def known_vision(model):
     # Never use the legacy optimistic unknown-bucket supports_vision default.
+    # GPT-5's published alias/snapshot resolve through exact facts only; adding
+    # its bare name to the legacy set would admit invented dated snapshots.
     caps = _EXACT_CAPABILITIES.get(model)
     legacy = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model)
     return (caps is not None and caps.supports_vision) or legacy in {

@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 import httpx
 import openai
 from amplifier_core.llm_errors import InvalidRequestError
+from openai import _base_client
 
 from ._chat_images import image_url, known_vision, project_messages
 
@@ -65,6 +66,17 @@ def option_digest(provider, request, options):
     return digest(normalized)
 
 
+def _qualified_client(client):
+    # SDK 3.29/3.51 construct this exact wrapper when no http_client is supplied.
+    # It adds destructor cleanup, not a custom send path. Do not use isinstance:
+    # arbitrary subclasses can override send/auth after our physical witness.
+    # If a future SDK removes the private wrapper, fail closed for that type.
+    return type(client) is openai.AsyncOpenAI and type(client._client) in {
+        httpx.AsyncClient, openai.DefaultAsyncHttpxClient,
+        getattr(_base_client, "AsyncHttpxClientWrapper", None),
+    }
+
+
 def support(provider, request, model, options):
     """Only classify the frozen Core positions the existing converter accepts."""
     empty = empty_support()
@@ -75,7 +87,7 @@ def support(provider, request, model, options):
         or model != provider._resolve_request_model(request, options.get("model"))
         or not known_vision(model)
         or provider.extra_request_params
-        or (provider._client is not None and type(provider._client) is not openai.AsyncOpenAI)
+        or (provider._client is not None and not _qualified_client(provider._client))
     ):
         return empty
     # These routes have separate contracts, not indexed generic image input.
@@ -222,9 +234,7 @@ class Binding:
         if before_injected is not None and self._connection() != before_injected:
             raise refused()
         self.client = provider.client
-        if type(self.client) is not openai.AsyncOpenAI or type(self.client._client) not in {
-            httpx.AsyncClient, openai.DefaultAsyncHttpxClient,
-        }:
+        if not _qualified_client(self.client):
             raise refused()
         # Dynamic auth/providers and custom HTTP auth require their own proven
         # after-auth binding. Do not invent it for this first finite route.
@@ -287,7 +297,10 @@ class Binding:
 
     def _connection(self):
         p, c = self.provider, self.client
-        if p._client is not c or not p._uses_standard_openai_endpoint():
+        if (
+            p._client is not c or not _qualified_client(c)
+            or not p._uses_standard_openai_endpoint()
+        ):
             raise refused()
         if any(getattr(c, k, None) is not None for k in (
             "_api_key_provider", "_provider_runtime", "workload_identity",

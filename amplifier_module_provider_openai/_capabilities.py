@@ -310,6 +310,21 @@ _MODERN_CAPABILITIES = ModelCapabilities(
 # Exact GPT-6 IDs have no documented dated snapshots. Legacy GPT-5 snapshot
 # parsing below remains a compatibility path, not qualification for new features.
 _EXACT_CAPABILITIES = {
+    # https://developers.openai.com/api/docs/models/gpt-5.md (2026-11-18):
+    # text/image input, Responses, 400k context, 272k input, 128k output.
+    # Qualify only the published alias and snapshot, not arbitrary GPT-5 IDs.
+    **{
+        model: ModelCapabilities(
+            family="gpt-5",
+            context_window=400_000,
+            max_input_tokens=272_000,
+            supports_reasoning=True,
+            default_reasoning_effort="medium",
+            capability_tags=_GPT5_TAGS,
+            supports_native_apply_patch=False,
+        )
+        for model in ("gpt-5", "gpt-5-2025-08-07")
+    },
     **{
         model: replace(_MODERN_CAPABILITIES, family=model)
         for model in GPT_6_MODELS
