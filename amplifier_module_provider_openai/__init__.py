@@ -3589,13 +3589,15 @@ class OpenAIProvider:
         try:
             return await _maybe_await(raw_response.parse())
         except ValidationError as e:
+            # ValidationError text includes rejected response values, which can
+            # echo submitted image URLs/base64 before outer error sanitization.
             logger.warning(
                 "[PROVIDER] %s: typed Response model rejected a computer-use "
                 "response (%s). Falling back to the raw JSON body -- see "
                 "PR #58 for the pending_safety_checks SDK defect this works "
                 "around.",
                 self.api_label,
-                e,
+                type(e).__name__,
             )
             try:
                 body = await _read_raw_json_body(raw_response)

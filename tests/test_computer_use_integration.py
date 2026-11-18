@@ -22,7 +22,10 @@ openai-turn1.json (real traffic captured against gpt-5.6).
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -895,6 +898,104 @@ class _FakeRawAPIResponse:
 
 
 class TestCreateResponseComputerUseFallback:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["url", "base64"])
+    @pytest.mark.parametrize("malformed_call", [False, True], ids=["fallback-success", "terminal-error"])
+    async def test_typed_parse_warning_never_logs_submitted_media(
+        self, source, malformed_call, caplog,
+    ) -> None:
+        import httpx
+        from amplifier_core.llm_errors import InvalidRequestError
+        from amplifier_core.message_models import ImageBlock, TextBlock
+        from openai import AsyncOpenAI
+        from openai.types.responses import Response
+
+        from tests.test_neutral_computer import spec
+
+        secret = (
+            "https://p.test/a?key=TESTMEDIA"
+            if source == "url" else "c3ludGhldGljLXByaXZhdGUtcGl4ZWxz"
+        )
+        image_source = (
+            {"type": "url", "url": secret} if source == "url" else
+            {"type": "base64", "media_type": "image/png", "data": secret}
+        )
+        block = _load_fixture("openai-turn1.json")
+        if malformed_call:
+            block["actions"][0]["x"] = secret
+        envelope = _envelope_for(block)
+        envelope.update(model="gpt-6.1-sol", service_tier="default")
+        envelope["usage"] = {
+            "input_tokens": 12, "output_tokens": 1, "total_tokens": 13,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+        }
+        if not malformed_call:
+            # Trigger a real SDK scalar ValidationError while leaving the
+            # computer action valid for the existing raw fallback converter.
+            envelope["temperature"] = secret
+        with pytest.raises(ValidationError) as original_error:
+            Response.model_validate(envelope)
+        assert secret in str(original_error.value)
+        raw = _FakeRawAPIResponse(envelope)
+        original_body = copy.deepcopy(envelope)
+        events, charged = [], []
+
+        def no_network(_):
+            raise AssertionError("The synthetic SDK response must not contact an endpoint.")
+
+        async with AsyncOpenAI(
+            api_key="offline-fixture", max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(no_network), trust_env=False),
+        ) as client:
+            provider = OpenAIProvider(client=client, config={
+                "default_model": "gpt-6.1-sol", "use_streaming": False,
+                "max_retries": 0, "raw": True, "max_output_tokens": 32,
+            })
+            provider._guard_assembled_params_with_provider_count = AsyncMock(return_value=12)
+            client.responses.with_raw_response.create = AsyncMock(return_value=raw)
+            client.responses.create = AsyncMock(side_effect=AssertionError("not the raw path"))
+            provider._add_cost = charged.append
+
+            async def emit(name, data):
+                events.append((name, copy.deepcopy(data)))
+
+            provider.coordinator = SimpleNamespace(
+                hooks=SimpleNamespace(emit=emit), get_capability=lambda _: None,
+            )
+            tool = spec(alias="computer")
+            request = ChatRequest(messages=[Message(role="user", content=[
+                TextBlock(text="inspect"), ImageBlock(source=image_source),
+            ])], tools=[tool])
+            original_request = request.model_dump()
+            with caplog.at_level(logging.WARNING):
+                if malformed_call:
+                    with pytest.raises(InvalidRequestError) as terminal:
+                        await provider.complete(request)
+                    assert terminal.value.retryable is False
+                    assert terminal.value.status_code is None
+                    assert terminal.value.usage.input_tokens == 12
+                    assert terminal.value.usage.output_tokens == 1
+                    assert secret not in "".join(traceback.format_exception(terminal.value))
+                else:
+                    result = await provider.complete(request)
+                    assert result.tool_calls[0].arguments["actions"][0]["coordinate"] == [426, 87]
+                    assert result.usage.input_tokens == 12 and result.usage.output_tokens == 1
+            assert request.model_dump() == original_request
+            assert envelope == original_body
+            client.responses.with_raw_response.create.assert_awaited_once()
+            client.responses.create.assert_not_awaited()
+            sent = client.responses.with_raw_response.create.call_args.kwargs
+            assert sent["tools"] == [{"type": "computer"}]
+            assert sent["input"][0]["content"][1]["image_url"] == (
+                secret if source == "url" else f"data:image/png;base64,{secret}"
+            )
+            from decimal import Decimal
+            assert charged == [Decimal(".000034")]
+        warnings = [r for r in caplog.records if "typed Response model rejected" in r.message]
+        assert len(warnings) == 1 and "Falling back to the raw JSON body" in warnings[0].message
+        assert secret not in caplog.text
+        assert secret not in json.dumps(events, default=str)
+
     def test_declares_computer_tool_detection(self) -> None:
         from amplifier_module_provider_openai import _params_declare_computer_tool
 

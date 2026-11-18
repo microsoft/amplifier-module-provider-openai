@@ -479,3 +479,61 @@ async def test_retry_observer_has_no_json_escaped_media_echo_and_retry_policy_is
         assert wire[1][1]["input"] == wire[-1][1]["input"]
     finally:
         await p.client.close()
+
+
+@pytest.mark.parametrize("discriminator", [
+    {"type": "string"}, ["string", "null"], {}, [], None, 7,
+])
+def test_media_walkers_preserve_schema_type_values_and_still_find_nested_media(discriminator):
+    from amplifier_module_provider_openai._chat_images import (
+        OMITTED,
+        diagnostic_copy,
+        media_values,
+    )
+
+    schema = {"properties": {"type": discriminator}}
+    before = copy.deepcopy(schema)
+    assert media_values(schema) == set()
+    assert diagnostic_copy(schema) == before
+    assert schema == before
+    # A non-media discriminator must not stop recursion or disable redaction.
+    nested = {"type": discriminator, "content": [
+        image().model_dump(), image("base64").model_dump(),
+    ]}
+    echoes = media_values(nested)
+    assert echoes == {URL, DATA}
+    sanitized = diagnostic_copy(nested, echoes)
+    assert sanitized["type"] == discriminator
+    assert URL not in json.dumps(sanitized) and DATA not in json.dumps(sanitized)
+    assert all(item["media"] == OMITTED for item in sanitized["content"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [False, True])
+async def test_ordinary_tool_schema_property_named_type_survives_count_and_completion(raw):
+    schema = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "description": "Ordinary business type"},
+            "value": {"type": ["string", "null"]},
+        },
+        "required": ["type", "value"],
+        "additionalProperties": False,
+    }
+    p, wire, events = provider()
+    p.raw = raw
+    tool = ToolSpec(name="inspect", parameters=schema)
+    req = ChatRequest(model="gpt-6.1-sol", reasoning_effort="medium", tools=[tool],
+                      messages=[Message(role="user", content="Inspect the business type")])
+    before = req.model_dump()
+    try:
+        result = await p.complete(req)
+        assert [path for path, _ in wire] == ["/v1/responses/input_tokens", "/v1/responses"]
+        assert wire[0][1]["tools"] == wire[1][1]["tools"]
+        assert wire[1][1]["tools"][0]["parameters"] == schema
+        assert wire[1][1]["reasoning"]["effort"] == "medium"
+        assert result.content[0].text == "OK"
+        assert req.model_dump() == before
+        assert any(name == "llm:response" for name, _ in events)
+    finally:
+        await p.client.close()
