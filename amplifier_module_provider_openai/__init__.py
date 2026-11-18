@@ -6090,6 +6090,33 @@ class OpenAIProvider:
         if usage_obj is None:
             return None
         input_details = getattr(usage_obj, "input_tokens_details", None)
+        if getattr(response, "model", None) == "chat-latest":
+            # Preserve missing/null/malformed evidence before legacy zero defaults.
+            # This alias does not require the newer mandatory cache-write field.
+            missing = object()
+            writes = getattr(input_details, "cache_write_tokens", missing)
+            split = getattr(input_details, "cache_write_tokens_details", missing)
+            fields_set = getattr(input_details, "model_fields_set", None)
+            declared = getattr(type(input_details), "model_fields", {})
+            if fields_set is not None:
+                if "cache_write_tokens" in declared and "cache_write_tokens" not in fields_set:
+                    writes = missing
+                if "cache_write_tokens_details" in declared and "cache_write_tokens_details" not in fields_set:
+                    split = missing
+            if split is not missing:
+                if hasattr(split, "model_dump"):
+                    split = split.model_dump()
+                if not isinstance(split, dict):
+                    return None
+            return compute_cost(
+                "chat-latest",
+                prompt_tokens=getattr(usage_obj, "input_tokens", None),
+                completion_tokens=getattr(usage_obj, "output_tokens", None),
+                cached_tokens=getattr(input_details, "cached_tokens", None),
+                cache_write_tokens=0 if writes is missing else writes,
+                cache_write_tokens_details=None if split is missing else split,
+                service_tier=getattr(response, "service_tier", None),
+            )
         if requires_cache_usage_evidence(getattr(response, "model", "")) and (
             any(
                 type(getattr(input_details, key, None)) is not int

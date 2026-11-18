@@ -5,6 +5,7 @@ import inspect
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -13,6 +14,14 @@ from amplifier_core import llm_errors as kernel_errors
 from openai import AsyncOpenAI
 
 from amplifier_module_provider_openai import OpenAIProvider
+from amplifier_module_provider_openai._capabilities import (
+    ModelCapabilities,
+    RequestPolicy,
+    get_capabilities,
+    get_known_context_window,
+    get_request_policy,
+)
+from amplifier_module_provider_openai._cost import compute_cost
 
 ENDPOINT = "https://catalog.example.invalid/account/v1/"
 
@@ -54,6 +63,290 @@ async def sdk_provider(receive, **config):
         assert provider.client is client and client.max_retries == 2
         assert not http.is_closed  # Caller owns its transport.
     assert http.is_closed
+
+
+def test_chat_latest_exact_facts_without_new_request_policy():
+    assert get_capabilities("chat-latest") == ModelCapabilities(
+        family="chat-latest", context_window=400_000, max_input_tokens=272_000,
+        max_output_tokens=128_000, capability_tags=("tools", "streaming", "json_mode", "vision"),
+    )
+    assert get_known_context_window("chat-latest") == 400_000
+    assert get_request_policy("chat-latest") == RequestPolicy()
+
+
+@pytest.mark.parametrize("model", [
+    "chat-latest-preview", "chat-latest-2099-01-01", "Chat-Latest", " chat-latest ",
+])
+def test_chat_latest_near_misses_remain_unknown(model):
+    assert get_capabilities(model) == ModelCapabilities(family="unknown")
+    assert get_known_context_window(model) is None
+    assert get_request_policy(model) == RequestPolicy()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("long_context", [False, True])
+async def test_chat_latest_catalog_requires_explicit_selector_and_endpoint_presence(long_context):
+    returned = ["chat-latest", "chat-latest-preview", "chat-latest-2099-01-01", "Chat-Latest",
+                "gpt-6.1-sol", "gpt-5.4"]
+    async with sdk_provider(
+        lambda _: httpx.Response(200, json=catalog(*returned)),
+        enable_long_context=long_context,
+    ) as (p, requests, _):
+        before = deepcopy(p.config)
+        assert ids(await p.list_models()) == {"gpt-6.1-sol"}
+        for selector in ({}, {"include": ["chat-latest"]}):
+            rows = await p.list_models(filters=selector)
+            row = next(row for row in rows if row.id == "chat-latest")
+            assert row.context_window == 272_000
+            assert row.max_output_tokens == 128_000
+            assert row.capabilities == ["tools", "streaming", "json_mode", "vision"]
+            # Existing provider omission sentinel, not an API effort qualification.
+            assert row.defaults == {"max_tokens": 16384, "reasoning_effort": "none"}
+            for unknown in (r for r in rows if r.id in returned[1:4]):
+                assert unknown.context_window == unknown.max_output_tokens == 0
+                assert unknown.capabilities == [] and unknown.defaults == {}
+        assert ids(await p.list_models()) == {"gpt-6.1-sol"}
+        assert p.default_model == "gpt-6.1-sol" and p.config == before
+        assert len(requests) == 4
+    async with sdk_provider(
+        lambda _: httpx.Response(200, json=catalog("gpt-5.4")),
+        default_model="gpt-5.4",
+    ) as (p, _, _):
+        assert await p.list_models(filters={"include": ["chat-latest"]}) == []
+        assert ids(await p.list_models(filters={})) == {"gpt-5.4"}
+        assert p.default_model == "gpt-5.4"
+
+
+@pytest.mark.parametrize("model", [
+    "chat-latest-preview", "chat-latest-2099-01-01",
+])
+def test_chat_latest_cost_remains_unknown_in_response_json(model):
+    from types import SimpleNamespace
+
+    from openai.types.responses import Response
+
+    assert compute_cost(model, prompt_tokens=100, completion_tokens=10) is None
+    response = Response.model_construct(
+        id="resp_offline_chat", model=model, status="completed", output=[],
+        usage=SimpleNamespace(
+            input_tokens=100, output_tokens=10,
+            input_tokens_details=SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
+        ),
+    )
+    provider = OpenAIProvider(api_key="offline-fixture", config={"default_model": "chat-latest"})
+    converted = provider._convert_to_chat_response(response)
+    assert response.model == model  # Never relabel the observed SKU with the requested alias.
+    assert converted.usage.cost_usd is None
+    assert json.loads(converted.model_dump_json())["usage"]["cost_usd"] is None
+
+
+@pytest.mark.parametrize("requested,observed,expected", [
+    ("chat-latest", "chat-latest-2099-01-01", None),
+    ("unknown-request", "chat-latest", Decimal("0.00755")),
+])
+def test_chat_latest_cost_uses_observed_not_requested_identity(requested, observed, expected):
+    from openai.types.responses import Response
+
+    response = Response.model_validate({
+        "id": "resp_identity", "object": "response", "created_at": 1,
+        "model": observed, "status": "completed", "output": [],
+        "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
+        "service_tier": "default",
+        "usage": {
+            "input_tokens": 1000, "output_tokens": 100, "total_tokens": 1100,
+            "input_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    })
+    provider = OpenAIProvider(config={"default_model": requested})
+    converted = provider._convert_to_chat_response(response)
+    assert response.model == observed
+    assert converted.usage.cost_usd == expected
+    assert json.loads(converted.model_dump_json())["usage"]["cost_usd"] == (
+        str(expected) if expected is not None else None
+    )
+
+
+@pytest.mark.parametrize("shape", ["raw", "sdk"])
+@pytest.mark.parametrize("change", [
+    {"usage": None}, {"service_tier": None}, {"service_tier": "priority"},
+    {"input_tokens": None}, {"output_tokens": False}, {"cached_tokens": None},
+    {"cached_tokens": False}, {"cached_tokens": 1001},
+    {"cache_write_tokens": None}, {"cache_write_tokens": False},
+    {"cache_write_tokens": 0.0}, {"cache_write_tokens": 1},
+    {"cache_write_tokens_details": None}, {"cache_write_tokens_details": {"unknown": 0}},
+    {"cache_write_tokens_details": {"ttl_30m_tokens": False}},
+    {"cache_write_tokens_details": {"ttl_12h_tokens": 1}},
+])
+def test_chat_latest_response_missing_or_invalid_evidence_stays_unknown(change, shape):
+    from openai._models import construct_type
+    from openai.types.responses import Response
+
+    payload = {
+        "model": "chat-latest", "output": [], "service_tier": "default",
+        "usage": {
+            "input_tokens": 1000, "output_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 100},
+        },
+    }
+    for key, value in change.items():
+        if key in {"usage", "service_tier"}:
+            payload[key] = value
+        elif key in {"input_tokens", "output_tokens"}:
+            payload["usage"][key] = value
+        else:
+            payload["usage"]["input_tokens_details"][key] = value
+    from amplifier_module_provider_openai import _RawResponseObject
+    provider = OpenAIProvider()
+    # Match SDK transport's non-validating construction; do not coerce bad evidence.
+    response = (
+        construct_type(type_=Response, value=payload)
+        if shape == "sdk" else _RawResponseObject(payload)
+    )
+    assert provider._compute_attempt_cost(response) is None
+
+
+def test_chat_latest_response_explicit_zero_distinct_from_missing_evidence():
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    provider = OpenAIProvider()
+    payload = {
+        "model": "chat-latest", "service_tier": "default",
+        "usage": {"input_tokens": 0, "output_tokens": 0,
+                  "input_tokens_details": {"cached_tokens": 0}},
+    }
+    assert provider._compute_attempt_cost(_RawResponseObject(payload)) == Decimal(0)
+    for owner, key in (
+        (payload["usage"], "input_tokens"), (payload["usage"], "output_tokens"),
+        (payload["usage"]["input_tokens_details"], "cached_tokens"),
+        (payload, "service_tier"),
+    ):
+        saved = owner.pop(key)
+        assert provider._compute_attempt_cost(_RawResponseObject(payload)) is None
+        owner[key] = saved
+
+
+@pytest.mark.parametrize("split", [{}, {"ttl_30m_tokens": 0, "ttl_12h_tokens": 0}])
+@pytest.mark.parametrize("shape", ["raw", "sdk", "typed"])
+def test_chat_latest_optional_zero_write_breakdown(split, shape):
+    from types import SimpleNamespace
+
+    from openai._models import construct_type
+    from openai.types.responses import Response
+
+    from amplifier_module_provider_openai import _RawResponseObject
+
+    payload = {
+        "model": "chat-latest", "service_tier": "default",
+        "usage": {"input_tokens": 1000, "output_tokens": 100,
+                  "input_tokens_details": {"cached_tokens": 100,
+                                          "cache_write_tokens_details": split}},
+    }
+    if shape == "sdk":
+        response = construct_type(type_=Response, value=payload)
+    elif shape == "typed":
+        from pydantic import BaseModel
+
+        class Split(BaseModel):
+            ttl_30m_tokens: int = 0
+            ttl_12h_tokens: int = 0
+
+        response = SimpleNamespace(
+            model="chat-latest", service_tier="default",
+            usage=SimpleNamespace(
+                input_tokens=1000, output_tokens=100,
+                input_tokens_details=SimpleNamespace(
+                    cached_tokens=100, cache_write_tokens_details=Split(**split),
+                ),
+            ),
+        )
+    else:
+        response = _RawResponseObject(payload)
+    assert OpenAIProvider()._compute_attempt_cost(response) == Decimal("0.00755")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("observed,expected", [
+    ("chat-latest", Decimal("0.00755")),
+    ("chat-latest-2099-01-01", None),
+])
+async def test_chat_latest_sdk_generation_accounting(streaming, observed, expected):
+    from amplifier_core import ChatRequest, Message
+
+    sent, added, events = [], [], []
+    payload = {
+        "id": "resp_pricing", "object": "response", "created_at": 1,
+        "model": observed, "service_tier": "default", "status": "completed",
+        "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
+        "output": [{
+            "id": "msg_pricing", "type": "message", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Hello", "annotations": []}],
+        }],
+        "usage": {
+            "input_tokens": 1000, "output_tokens": 100, "total_tokens": 1100,
+            "input_tokens_details": {"cached_tokens": 100},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    }
+
+    def transport(request):
+        body = json.loads(request.content)
+        if request.url.path.endswith("/input_tokens"):
+            return httpx.Response(200, json={"input_tokens": 1000})
+        sent.append(body)
+        if body.get("stream"):
+            data = "".join(
+                "data: " + json.dumps({
+                    "type": kind, "sequence_number": index, "response": payload,
+                }) + "\n\n"
+                for index, kind in enumerate(("response.created", "response.completed"))
+            )
+            return httpx.Response(200, text=data, headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json=payload)
+
+    class Hooks:
+        async def emit(self, name, event):
+            if name == "llm:response":
+                events.append(json.loads(json.dumps(event)))
+
+    class Coordinator:
+        hooks = Hooks()
+
+    async with AsyncOpenAI(
+        api_key="offline", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False),
+    ) as client:
+        provider = OpenAIProvider(
+            client=client, coordinator=Coordinator(), add_cost=added.append,
+            config={"use_streaming": streaming, "max_retries": 0},
+        )
+        result = await provider.complete(ChatRequest(
+            model="chat-latest", messages=[Message(role="user", content="Hello")],
+        ))
+        assert result.usage.cost_usd == expected
+        emitted = str(expected) if expected is not None else None
+        assert json.loads(result.model_dump_json())["usage"]["cost_usd"] == emitted
+        assert events[0]["usage"]["cost_usd"] == emitted
+        assert sum((cost for cost in added if cost is not None), Decimal(0)) == (
+            expected if expected is not None else Decimal(0)
+        )
+        if expected is None:
+            assert not any(cost is not None for cost in added)
+        assert len(sent) == 1 and sent[0]["model"] == "chat-latest"
+        assert provider.default_model == "gpt-6.1-sol"
+        if expected is not None:
+            # A later unpriced response stays null; the session callback retains
+            # only the known subtotal, never assigns it as the unknown call's cost.
+            payload["model"] = "chat-latest-2099-01-01"
+            unknown = await provider.complete(ChatRequest(
+                model="chat-latest", messages=[Message(role="user", content="Again")],
+            ))
+            assert unknown.usage.cost_usd is None
+            assert events[-1]["usage"]["cost_usd"] is None
+            assert sum((cost for cost in added if cost is not None), Decimal(0)) == expected
+            assert len([cost for cost in added if cost is not None]) == 1
 
 
 @pytest.mark.asyncio
