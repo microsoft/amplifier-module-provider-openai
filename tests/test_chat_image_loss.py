@@ -447,6 +447,103 @@ async def test_ordinary_computer_roster_wins_over_native_name_shape(source, nest
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.2-sol"])
+@pytest.mark.parametrize("source", ["url", "base64"])
+@pytest.mark.parametrize("names,prior,nested", [
+    (["computer", "inspect"], True, True),
+    (["inspect", "computer"], True, True),
+    (["computer"], False, True),
+    (["computer"], True, True),
+    (["computer", "inspect"], True, False),
+])
+async def test_ordinary_image_history_is_independent_of_roster_consumption(
+    model, source, names, prior, nested,
+):
+    p, wire, events = provider()
+    history = []
+    if prior:
+        history = [
+            Message(role="assistant", content=[ToolCallBlock(id="prior", name="inspect", input={})]),
+            Message(role="tool", tool_call_id="prior", name="inspect", content="plain prior result"),
+        ]
+    content = [TextBlock(text="before"), image(source), TextBlock(text="after")]
+    if nested:
+        content = [ToolResultBlock(tool_call_id="target", output=[b.model_dump() for b in content])]
+    history.extend([
+        Message(role="assistant", content=[ToolCallBlock(
+            id="target", name="computer", input={"actions": []},
+        )]),
+        Message(role="tool", tool_call_id="target", name="computer", content=content),
+    ])
+    request = ChatRequest(model=model, tools=[
+        ToolSpec(name=name, parameters={"type": "object", "properties": {}})
+        for name in names
+    ], messages=history)
+    before = request.model_dump()
+    try:
+        response = await p.complete(request)
+        assert response.content[0].text == "OK"
+        assert [path for path, _ in wire] == ["/v1/responses/input_tokens", "/v1/responses"]
+        assert wire[0][1]["input"] == wire[1][1]["input"]
+        assert wire[0][1]["tools"] == wire[1][1]["tools"]
+        assert [t["name"] for t in wire[1][1]["tools"]] == names
+        assert all(t["type"] == "function" for t in wire[1][1]["tools"])
+        items = wire[1][1]["input"]
+        assert [i["type"] for i in items] == (
+            ["function_call", "function_call_output"] * (2 if prior else 1)
+        )
+        outputs = [i for i in items if i["type"] == "function_call_output"]
+        assert [i["call_id"] for i in outputs] == (["prior", "target"] if prior else ["target"])
+        rich = outputs[-1]["output"]
+        assert [b["type"] for b in rich] == ["input_text", "input_image", "input_text"]
+        assert rich[0]["text"] == "before" and rich[2]["text"] == "after"
+        assert rich[1]["image_url"] == (
+            URL if source == "url" else f"data:image/png;base64,{DATA}"
+        )
+        assert URL not in json.dumps([b for b in rich if b["type"] == "input_text"])
+        assert DATA not in json.dumps([b for b in rich if b["type"] == "input_text"])
+        assert URL not in json.dumps(events) and DATA not in json.dumps(events)
+        assert request.model_dump() == before
+    finally:
+        await p.client.close()
+
+
+@pytest.mark.asyncio
+async def test_image_projection_snapshots_escaped_roster_without_hashing_names(monkeypatch):
+    import amplifier_module_provider_openai as module
+
+    p, _, _ = provider()
+    # Untyped extra-body rosters are validated later. Snapshotting them must
+    # not introduce a set/hash requirement before that existing boundary.
+    p.extra_request_params = {"extra_body": {"tools": [
+        {"type": "computer"},
+        {"type": "apply_patch"},
+        {"type": "function", "name": ["escaped"]},
+        {"type": "function", "name": "computer"},
+    ]}}
+    captured = []
+
+    class ProjectionReached(Exception):
+        pass
+
+    def capture(messages, **kwargs):
+        inventory = kwargs["ordinary_names"]
+        captured.append(inventory)
+        assert isinstance(inventory, tuple)
+        assert list(inventory) == list(inventory) == [["escaped"], "computer"]
+        assert ["escaped"] in inventory and "computer" in inventory
+        raise ProjectionReached()
+
+    monkeypatch.setattr(module, "project_chat_images", capture)
+    try:
+        with pytest.raises(ProjectionReached):
+            p._budget_params(ChatRequest(messages=[Message(role="user", content="plain")]))
+        assert len(captured) == 1
+    finally:
+        await p.client.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("historical", [False, True])
 async def test_image_only_user_turn_is_preserved_even_before_plain_followup(historical):
     p, wire, _ = provider()

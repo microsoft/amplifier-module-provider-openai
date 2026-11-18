@@ -2480,12 +2480,15 @@ class OpenAIProvider:
         )
         if isinstance(self.extra_request_params.get("extra_body"), dict):
             history_tools = self.extra_request_params["extra_body"].get("tools", history_tools)
+        # Membership is repeated across historical calls; do not consume the
+        # generator per call or require escaped roster names to be hashable.
+        history_ordinary_names = tuple(ordinary_names(history_tools))
         request = request.model_copy(update={"messages": [
             Message.model_validate(m) for m in project_chat_images(
                 originals, model=effective_model,
                 qualified=self.name == "openai" and self._has_standard_openai_endpoint(),
                 native_ids=set(self._native_call_ids) | set(replay), strict_direct=True,
-                ordinary_names=ordinary_names(history_tools),
+                ordinary_names=history_ordinary_names,
             )
         ]})
         request, repairs = planner._plan_tool_repairs(request)
