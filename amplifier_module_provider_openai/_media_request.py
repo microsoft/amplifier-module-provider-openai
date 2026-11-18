@@ -153,7 +153,7 @@ def support(provider, request, model, options):
     return {"v": 2, "positions": positions, "mime_types": list(MIMES)}
 
 
-class _PhysicalClient(httpx.AsyncClient):
+class _PhysicalValidation:
     """Provider-owned SDK adapter: run AFTER SDK auth and HTTP request hooks.
 
     The original HTTP client still owns routing, connection pools and transport.
@@ -164,8 +164,8 @@ class _PhysicalClient(httpx.AsyncClient):
         self._original = original
         self._validate = validate
         super().__init__(
-            event_hooks=original.event_hooks, cookies=original.cookies,
-            headers=original.headers, params=original.params,
+            event_hooks=original.event_hooks, cookies=original.cookies.jar,
+            headers=dict(original.headers), params=dict(original.params),
             follow_redirects=False, trust_env=False,
         )
 
@@ -174,12 +174,20 @@ class _PhysicalClient(httpx.AsyncClient):
         # headers before validation; a retained hook reference cannot mutate the
         # admitted request while the original transport later awaits connection.
         body = b"".join([part async for part in request.stream])
-        request = httpx.Request(
+        request = type(request)(
             request.method, request.url, headers=request.headers,
             content=body, extensions=dict(request.extensions),
         )
         self._validate(request)
         return await self._original._send_single_request(request)
+
+
+class _PhysicalClient(_PhysicalValidation, httpx.AsyncClient):
+    """The SDK's supported legacy HTTPX injection path."""
+
+
+class _SDKPhysicalClient(_PhysicalValidation, openai.DefaultAsyncHttpxClient):
+    """The SDK's own default HTTP family (HTTPX2 in SDK3.29)."""
 
 
 class Binding:
@@ -297,7 +305,9 @@ class Binding:
             "headers": dict(c._custom_headers), "query": dict(c._custom_query),
             "http_headers": dict(c._client.headers), "http_query": str(c._client.params),
             "auth": id(c._client.auth),
-            "transport": id(c._client._transport_for_url(httpx.URL("https://api.openai.com/v1/responses"))),
+            "transport": id(c._client._transport_for_url(
+                type(c._client.base_url)("https://api.openai.com/v1/responses")
+            )),
             "cookies": [(cookie.name, cookie.value, cookie.domain, cookie.path) for cookie in c._client.cookies.jar],
             "request_hooks": [id(h) for h in c._client.event_hooks["request"]],
             "streaming": p.use_streaming, "timeout": str(p.timeout),
@@ -354,7 +364,8 @@ class Binding:
             ):
                 raise refused()
 
-        adapter = _PhysicalClient(self.client._client, physical)
+        adapter_type = _PhysicalClient if isinstance(self.client._client, httpx.AsyncClient) else _SDKPhysicalClient
+        adapter = adapter_type(self.client._client, physical)
         return self.client.with_options(http_client=adapter, max_retries=0)
 
     @asynccontextmanager

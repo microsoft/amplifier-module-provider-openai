@@ -67,7 +67,7 @@ class Capability:
         return self.result
 
 
-def fixture(private, *, streaming=False, hook=None, replies=None):
+def fixture(private, *, streaming=False, hook=None, replies=None, sdk_default_http=False):
     cap = Capability(private)
     wires, events = [], []
 
@@ -91,8 +91,26 @@ def fixture(private, *, streaming=False, hook=None, replies=None):
             ))
         return httpx.Response(200, json=completed())
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False,
-                             event_hooks={"request": [hook] if hook else []})
+    # SDK3.29's default is HTTPX2; legacy HTTPX injection is independently
+    # supported by the SDK and must not conceal default request/stream types.
+    if sdk_default_http:
+        import httpx2
+
+        legacy_transport = transport
+
+        async def default_transport(req):
+            response = await legacy_transport(req)
+            return httpx2.Response(
+                response.status_code, headers=dict(response.headers), content=await response.aread(),
+            )
+
+        http = openai.DefaultAsyncHttpxClient(
+            transport=httpx2.MockTransport(default_transport), trust_env=False,
+            event_hooks={"request": [hook] if hook else []},
+        )
+    else:
+        http = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False,
+                                 event_hooks={"request": [hook] if hook else []})
     sdk = openai.AsyncOpenAI(api_key="offline-fixture", max_retries=0, http_client=http)
     p = OpenAIProvider(client=sdk, config={
         "default_model": MODEL, "use_streaming": streaming, "raw": True, "max_retries": 0,
@@ -159,9 +177,10 @@ def test_indexed_overlay_indices_and_equivalent_dual_core_calls():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_exact_private_request_budget_count_and_send_same_pixels(streaming):
+@pytest.mark.parametrize("sdk_default_http", [False, True])
+async def test_exact_private_request_budget_count_and_send_same_pixels(streaming, sdk_default_http):
     req = request()
-    p, cap, wires, events = fixture(req, streaming=streaming)
+    p, cap, wires, events = fixture(req, streaming=streaming, sdk_default_http=sdk_default_http)
     before = req.model_dump()
     try:
         decision = await p.request_budget(req, context_estimate=4)
@@ -184,7 +203,8 @@ async def test_exact_private_request_budget_count_and_send_same_pixels(streaming
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("where", ["count", "send"])
-async def test_revocation_during_awaited_http_hook_precedes_physical_transport(where):
+@pytest.mark.parametrize("sdk_default_http", [False, True])
+async def test_revocation_during_awaited_http_hook_precedes_physical_transport(where, sdk_default_http):
     req = request()
 
     async def hook(wire):
@@ -192,7 +212,7 @@ async def test_revocation_during_awaited_http_hook_precedes_physical_transport(w
             await asyncio.sleep(0)
             cap.allowed = False
 
-    p, cap, wires, events = fixture(req, hook=hook)
+    p, cap, wires, events = fixture(req, hook=hook, sdk_default_http=sdk_default_http)
     try:
         with pytest.raises(InvalidRequestError):
             await p.complete(req)
@@ -332,9 +352,10 @@ async def test_guarded_binding_does_not_retain_private_pixels_after_collection()
 
 
 @pytest.mark.asyncio
-async def test_cold_count_and_generation_bind_one_legitimate_client(monkeypatch):
+@pytest.mark.parametrize("sdk_default_http", [False, True])
+async def test_cold_count_and_generation_bind_one_legitimate_client(monkeypatch, sdk_default_http):
     req = request()
-    p, cap, wires, _ = fixture(req)
+    p, cap, wires, _ = fixture(req, sdk_default_http=sdk_default_http)
     sdk = p._client
     p._client = None
     p._api_key = "offline-fixture"
@@ -352,6 +373,30 @@ async def test_cold_count_and_generation_bind_one_legitimate_client(monkeypatch)
         assert len(wires) == 3 and all(same for same, _, _ in cap.calls)
     finally:
         await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_default_sdk_family_transport_identity_change_refuses():
+    import httpx2
+
+    req = request()
+    p, _, wires, _ = fixture(req, sdk_default_http=True)
+    original_emit = p.coordinator.hooks.emit
+    original_transport = p.client._client._transport
+
+    async def emit(name, data):
+        await original_emit(name, data)
+        if name == "llm:request":
+            p.client._client._transport = httpx2.MockTransport(lambda _: pytest.fail("changed transport reached"))
+
+    p.coordinator.hooks.emit = emit
+    try:
+        with pytest.raises(InvalidRequestError):
+            await p.complete(req)
+        assert len(wires) == 1 and wires[0][0].endswith("input_tokens")
+    finally:
+        p.client._client._transport = original_transport
+        await p.client.close()
 
 
 @pytest.mark.asyncio
