@@ -125,8 +125,8 @@ def fixture(private, *, streaming=False, hook=None, replies=None, sdk_default_ht
     return p, cap, wires, events
 
 
-def facts(p, req, **kwargs):
-    return p.get_media_request_support_for_request(request=req, model=MODEL, **kwargs)
+def facts(p, req, *, model=MODEL, **kwargs):
+    return p.get_media_request_support_for_request(request=req, model=model, **kwargs)
 
 
 def test_indexed_support_is_readonly_and_needs_no_client_capability_or_pixels():
@@ -136,11 +136,42 @@ def test_indexed_support_is_readonly_and_needs_no_client_capability_or_pixels():
     before = req.model_dump()
     assert facts(p, req) == {"v": 2, "positions": [
         {"message_index": 0, "role": "user"}, {"message_index": 2, "role": "tool"},
-    ], "mime_types": ["image/png", "image/jpeg"]}
+    ], "mime_types": ["image/png", "image/jpeg", "image/webp"]}
     assert req.model_dump() == before and p._client is None
     first = facts(p, req)
     first["positions"].clear()
     assert len(facts(p, req)["positions"]) == 2
+
+
+def test_indexed_support_uses_effective_model_not_provider_default():
+    p, req = OpenAIProvider(api_key=None), request()
+    p.default_model = "gpt-6.1-sol"
+    req.model = "gpt-4.1"
+    assert len(facts(p, req, model="gpt-4.1")["positions"]) == 2
+    assert not facts(p, req)["positions"]
+    options = {"model": "gpt-4.1-mini"}
+    assert len(facts(p, req, model="gpt-4.1-mini", request_options=options)["positions"]) == 2
+    assert not facts(p, req, model="gpt-4.1", request_options=options)["positions"]
+    req.model = "unknown-deployment"
+    assert not facts(p, req, model=req.model)["positions"]
+
+
+@pytest.mark.parametrize("suffix", ["//", "?query=1", "#fragment", ";parameter"])
+def test_indexed_support_requires_canonical_endpoint(suffix):
+    p, req = OpenAIProvider(api_key=None), request()
+    p.base_url = "https://api.openai.com/v1" + suffix
+    assert not facts(p, req)["positions"]
+    assert p._client is None
+
+
+def test_indexed_support_does_not_claim_gif_without_animation_facts():
+    p, req = OpenAIProvider(api_key=None), request()
+    req.messages[0].content = [ImageBlock(source={
+        "type": "base64", "media_type": "image/gif", "data": PIXELS,
+    })]
+    result = facts(p, req)
+    assert not result["positions"]
+    assert "image/gif" not in result["mime_types"]
 
 
 @pytest.mark.parametrize("bad", ["orphan", "duplicate", "wrong", "following", "dual-conflict", "native", "model", "proxy"])
@@ -180,6 +211,10 @@ def test_indexed_overlay_indices_and_equivalent_dual_core_calls():
 @pytest.mark.parametrize("sdk_default_http", [False, True])
 async def test_exact_private_request_budget_count_and_send_same_pixels(streaming, sdk_default_http):
     req = request()
+    req.model = "gpt-4.1"
+    req.messages[0].content = [TextBlock(text="Inspect"), ImageBlock(source={
+        "type": "base64", "media_type": "image/webp", "data": PIXELS,
+    })]
     p, cap, wires, events = fixture(req, streaming=streaming, sdk_default_http=sdk_default_http)
     before = req.model_dump()
     try:
@@ -191,6 +226,10 @@ async def test_exact_private_request_budget_count_and_send_same_pixels(streaming
             "/v1/responses/input_tokens", "/v1/responses/input_tokens", "/v1/responses",
         ]
         assert wires[0][1]["input"] == wires[1][1]["input"] == wires[2][1]["input"]
+        assert all(w[1]["model"] == "gpt-4.1" for w in wires)
+        user = wires[-1][1]["input"][0]
+        assert user["role"] == "user"
+        assert user["content"][1]["image_url"] == "data:image/webp;base64," + PIXELS
         output = wires[-1][1]["input"][-1]
         assert output["type"] == "function_call_output" and output["call_id"] == "read-1"
         assert output["output"][1]["image_url"] == "data:image/png;base64," + PIXELS
