@@ -261,13 +261,14 @@ def media_values(value):
         for item in value:
             found.update(media_values(item))
     elif isinstance(value, dict):
-        if value.get("type") == "image":
+        kind = value.get("type")
+        if kind == "image":
             source = value.get("source") or {}
             source = source if isinstance(source, dict) else {}
             for key in ("data", "url"):
                 if isinstance(source.get(key), str) and source[key]:
                     found.add(source[key])
-        if value.get("type") in {"input_image", "computer_screenshot"}:
+        if isinstance(kind, str) and kind in {"input_image", "computer_screenshot"}:
             url = value.get("image_url")
             if isinstance(url, str) and url:
                 found.add(url)
@@ -285,8 +286,9 @@ def diagnostic_copy(value, echoes=()):
     This cannot recognize transformed media hidden in arbitrary prose.
     """
     if isinstance(value, dict):
-        if value.get("type") in {"image", "input_image", "computer_screenshot"}:
-            return {"type": value["type"], "media": OMITTED}
+        kind = value.get("type")
+        if isinstance(kind, str) and kind in {"image", "input_image", "computer_screenshot"}:
+            return {"type": kind, "media": OMITTED}
         return {k: diagnostic_copy(v, echoes) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [diagnostic_copy(v, echoes) for v in value]
