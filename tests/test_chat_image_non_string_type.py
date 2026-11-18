@@ -31,7 +31,6 @@ from amplifier_module_provider_openai import (
 )
 from amplifier_module_provider_openai._chat_images import (
     OMITTED,
-    UNAVAILABLE,
     diagnostic_copy,
     has_images,
     instruction_text,
@@ -480,28 +479,23 @@ def test_instruction_text_alone_skips_a_block_whose_type_is_not_a_string(value):
     assert items[0]["content"][0]["text"] == "<context_file>\nkept\n</context_file>"
 
 
-@pytest.mark.parametrize("value, written", [
-    ({"nested": 1}, "{'nested': 1}"),
-    (["string", "null"], "['string', 'null']"),
-    (("string", ["null"]), "('string', ['null'])"),
-    (7, "7"),
-    (None, "None"),
+@pytest.mark.parametrize("value", [
+    {"nested": 1}, ["string", "null"], ("string", ["null"]), 7, None,
+    {"content": [image("base64").model_dump()]},
 ])
-def test_instruction_text_writes_a_text_that_is_not_a_string_with_str(value, written):
-    # Core refuses such a block; saved history as plain dicts can hold it. The
-    # commit before c2fe22df wrote the whole list with str(). An image in the
-    # same message is still replaced, and its data is not in the text.
-    blocks = [
-        {"type": "text", "text": value}, image("base64").model_dump(),
-        {"type": "text", "text": "kept"},
-    ]
-    expected = f"{written}\n{UNAVAILABLE}\nkept"
-    assert instruction_text(blocks) == expected
-    items = serializer()._convert_messages([{"role": "developer", "content": blocks}])
-    assert items == [{"role": "user", "content": [
-        {"type": "input_text", "text": f"<context_file>\n{expected}\n</context_file>"},
-    ]}]
-    assert DATA not in json.dumps(items)
+def test_instruction_text_refuses_a_text_that_is_not_a_string_without_its_value(value):
+    # Core refuses such a block; saved history as plain dicts can hold it. str()
+    # of the value would write media that is nested in it into the instructions.
+    blocks = [{"type": "text", "text": value}, {"type": "text", "text": "kept"}]
+    refusal = "instruction text block must contain a string 'text' value"
+    with pytest.raises(TypeError, match=refusal) as alone:
+        instruction_text(blocks)
+    with pytest.raises(TypeError, match=refusal) as serialized:
+        serializer()._convert_messages([{"role": "developer", "content": blocks}])
+    for error in (alone, serialized):
+        assert DATA not in "".join(traceback.format_exception(error.value))
+    # A block without a "text" is an empty text, as before.
+    assert instruction_text([{"type": "text"}, {"type": "text", "text": "kept"}]) == "\nkept"
 
 
 @pytest.mark.parametrize("value", NOT_A_STRING)

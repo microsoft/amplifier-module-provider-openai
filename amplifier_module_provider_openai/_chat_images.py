@@ -21,7 +21,7 @@ OMITTED = "[image omitted from diagnostics]"
 # type can be a list. A set hashes the value and raises TypeError there. So a
 # value from data is tested against a tuple, or as a string first, and a call
 # identity or name from data is a key only when hash() takes it. A "text"
-# from data is joined through str(), because join() takes strings only.
+# from data that is not a string is refused without its value.
 
 
 def _key(value):
@@ -272,8 +272,14 @@ def _project_blocks(blocks, qualified, model, *, tool=False, role="user"):
 def instruction_text(content):
     if isinstance(content, str):
         return content
+    if any(
+        isinstance(block, dict) and block.get("type") == "text"
+        and not isinstance(block.get("text", ""), str) for block in content
+    ):
+        # No str() of the value: it would write media that is nested in it.
+        raise TypeError("instruction text block must contain a string 'text' value")
     return "\n".join(
-        str(block.get("text", "")) if block.get("type") == "text" else UNAVAILABLE
+        block.get("text", "") if block.get("type") == "text" else UNAVAILABLE
         for block in content if isinstance(block, dict) and block.get("type") in ("text", "image")
     )
 
