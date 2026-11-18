@@ -977,6 +977,58 @@ Diagnostic-copy/echo-removal design credits the separately owned, retained
 lifetime registry or authentication migration. Existing direct function-image
 transport predates that draft ([#93](https://github.com/microsoft/amplifier-module-provider-openai/pull/93)).
 
+#### Optional request-indexed Foundation media route (source candidate)
+
+The synchronous, read-only provider method
+`get_media_request_support_for_request(*, request, model, request_options=None)`
+returns exactly `{v: 2, positions: [{message_index, role}], mime_types: [...]}`.
+Positions describe the actual post-overlay **prehydration** Core request; PNG
+and JPEG user slots and unambiguously correlated ordinary tool-result slots can
+qualify without opening assets or constructing an SDK client. The first finite
+route requires this base provider, standard OpenAI Responses, explicit selected
+`gpt-6.1-sol`, matching request/options/default model, and no opaque/native or
+input/transport override. Unknown/ambiguous routes return empty positions.
+The fresh `gpt-6.2-sol` default and explicit GPT-6.2 selections do not widen this
+finite route: pin `default_model: gpt-6.1-sol` as well as the selected request
+model when using it. Ordinary unmarked GPT-6.2 image requests keep their existing
+transport; the optional issuer-bound route does not yet advertise those models.
+This is implementation support, not account entitlement or host acceptance.
+
+Requests carrying message metadata `experimental.media.v1` require the **current
+actual** coordinator capability of that name. At every physical count and
+generation transmission, the provider requires
+`cap.validate(exact_private_request, purpose="provider-count" | "provider-send",
+request_options=effective_options)` to return a synchronous dict with
+`result.get("valid") is True`, with `enabled is True` and unchanged capability and
+coordinator identity. No Foundation import or hydration is performed here.
+Copied/unregistered/released/mutated requests fail payload-free.
+
+A request-local binding holds the same legitimately initialized SDK connection
+across cold counting and generation, including account/project/organization,
+endpoint, client, configuration, options and finalized request fingerprints.
+The native counter receives an explicit per-attempt callback after backoff.
+A provider-owned short-lived SDK/HTTP adapter checks the actual immutable wire
+body and auth/endpoint **after SDK preparation and awaited HTTP request hooks**,
+before delegating to the original HTTP client's transport/pools. Shared SDK and
+HTTP clients are not patched; SDK automatic retries/redirects are disabled for
+these guarded transmissions. Provider retries still require a fresh count and
+current validation. Dynamic/custom auth or unsupported client implementations
+refuse rather than invent a late-binding guarantee.
+
+Marked native-count unavailability is a refusal, not a text-byte media estimate.
+Count failures retain their existing typed failure contract. Marked transformed
+continuations and native compaction require a fresh host projection/fit and are
+not silently sent under the old witness. Unmarked ordinary requests retain
+their existing transport/retry contract. Inline-only traffic without the message
+carrier is not claimed to have issuer registration.
+
+The finite real-Foundation check is explicitly invoked as
+`python -m pytest tests/experiments/media_request_foundation_contract.py`
+after installing the independently selected Foundation media wheel in the owned
+test environment; it has no source-path fallback or synthetic registration.
+The ordinary provider package does not depend on Foundation. Host assembly,
+installed-graph qualification and any publication remain separate.
+
 #### Neutral computer-use v1
 
 A neutral-enabled executor can carry provider-independent intent in the existing

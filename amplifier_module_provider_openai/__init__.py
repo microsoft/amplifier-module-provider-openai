@@ -2036,7 +2036,7 @@ class OpenAIProvider:
             return None
         return {key: copy.deepcopy(params[key]) for key in self._COUNT_FIELDS if key in params}
 
-    async def _native_input_token_count(self, params: dict[str, Any]) -> int | None:
+    async def _native_input_token_count(self, params: dict[str, Any], *, media_guard=None) -> int | None:
         """Return a count, unavailable capability, or a safe counting failure."""
         if not self._provider_count_available():
             return None
@@ -2046,7 +2046,10 @@ class OpenAIProvider:
         # A budget probe must not initialize or otherwise mutate the live
         # generation client. When it has not been created yet, use and close a
         # short-lived equivalent SDK client for this one official operation.
-        count_client = self._client
+        count_client = (
+            media_guard.sdk_client(params, "provider-count")
+            if media_guard is not None else self._client
+        )
         temporary_client = count_client is None
         if count_client is None:
             count_client = AsyncOpenAI(api_key=self._api_key, base_url=self.base_url, max_retries=0)
@@ -2062,6 +2065,11 @@ class OpenAIProvider:
         from ._token_count import TokenCountError, count_tokens
 
         try:
+            if media_guard is not None:
+                return await count_tokens(
+                    count_client, count_params,
+                    before_attempt=lambda: media_guard.validate(params, "provider-count"),
+                )
             return await count_tokens(count_client, count_params)
         except TokenCountError as error:
             try:
@@ -2082,7 +2090,7 @@ class OpenAIProvider:
             # contain private data) cannot become the count failure's context.
             raise
         finally:
-            if temporary_client:
+            if temporary_client or media_guard is not None:
                 await count_client.close()
 
     def _budget_decision(
@@ -2534,6 +2542,20 @@ class OpenAIProvider:
         params, _, _ = self._assemble_initial_responses_params(request, **kwargs)
         return params
 
+    def get_media_request_support_for_request(
+        self, *, request: ChatRequest, model: str,
+        request_options: Mapping[str, Any] | None = None,
+    ) -> dict:
+        """Read-only, prehydration indexed facts; never initialize a client."""
+        from ._media_request import support
+
+        if request_options is not None and not isinstance(request_options, Mapping):
+            return {"v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg"]}
+        try:
+            return support(self, request, model, dict(request_options or {}))
+        except (TypeError, ValueError, AttributeError):
+            return {"v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg"]}
+
     def request_budget(
         self,
         request: ChatRequest,
@@ -2553,16 +2575,24 @@ class OpenAIProvider:
             raise ValueError("context_estimate must be a nonnegative integer")  # noqa: TRY004
         if context_estimate < 0:
             raise ValueError("context_estimate must be a nonnegative integer")
-        params = self._budget_params(
-            request, **self._merge_request_options(request_options, kwargs)
-        )
+        options = self._merge_request_options(request_options, kwargs)
+        from ._media_request import binding, refused
+
+        media_guard = binding(self, request, options)
+        params = self._budget_params(request, **options)
 
         if self._provider_count_available():
 
             async def native_decision() -> dict[str, Any] | None:
-                count = await self._native_input_token_count(params)
+                count = await self._native_input_token_count(
+                    params, **({"media_guard": media_guard} if media_guard is not None else {})
+                )
                 if count is None:
+                    if media_guard is not None:
+                        raise refused()
                     return None
+                if media_guard is not None:
+                    media_guard.validate(params, "provider-count")
                 return self._budget_decision(
                     params,
                     context_estimate=context_estimate,
@@ -2576,6 +2606,8 @@ class OpenAIProvider:
 
             return native_decision()
 
+        if media_guard is not None:
+            raise refused()
         serialized_bytes = self._serialized_input_bytes(params)
         allowance = self._budget_input_limit(params)
         if self._has_nontext_budget_input(params):
@@ -2661,10 +2693,18 @@ class OpenAIProvider:
             self._budget_uncalibrated_warned_models.add(model)
 
     async def _guard_assembled_params_with_provider_count(
-        self, params: dict[str, Any]
+        self, params: dict[str, Any], *, media_guard=None,
     ) -> int | None:
         """Apply the final-dispatch guard using a fresh native count when possible."""
-        native_input_tokens = await self._native_input_token_count(params)
+        native_input_tokens = await self._native_input_token_count(
+            params, **({"media_guard": media_guard} if media_guard is not None else {})
+        )
+        if media_guard is not None:
+            from ._media_request import refused
+
+            if native_input_tokens is None:
+                raise refused()
+            media_guard.validate(params, "provider-count")
         self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         return native_input_tokens
 
@@ -3338,8 +3378,13 @@ class OpenAIProvider:
         conversation is created. Hosts persist this derived checkpoint alongside
         (never in place of) canonical history.
         """
+        from ._media_request import marked, refused
         from .compaction import canonical_usage, compacted_message
 
+        if marked(request) or id(request) in getattr(self, "_media_request_bindings", {}):
+            # Compaction changes the fitted transcript and has no generic
+            # image-projection lifetime; require the host to prepare a new one.
+            raise refused()
         if not self.supports_native_compaction():
             raise NotImplementedError("This endpoint does not advertise native Responses compaction")
         params = self._budget_params(request)
@@ -3419,6 +3464,9 @@ class OpenAIProvider:
             ChatResponse with content blocks, tool calls, usage
         """
         kwargs = self._merge_request_options(request_options, kwargs)
+        from ._media_request import binding
+
+        media_guard = binding(self, request, kwargs)
 
         if "single_attempt" in kwargs or "single_attempt_version" in kwargs:
             from ._single_attempt import SingleAttemptError, complete
@@ -3441,7 +3489,7 @@ class OpenAIProvider:
         if type(auto_continue) is not bool:
             raise ValueError("auto_continue must be a boolean")
 
-        return await self._complete_chat_request(request, **kwargs)
+        return await self._complete_chat_request(request, _media_guard=media_guard, **kwargs)
 
     def _plan_tool_repairs(self, request: ChatRequest):
         """Validate originals first; repair only an isolated request copy."""
@@ -3610,7 +3658,7 @@ class OpenAIProvider:
 
     async def _create_response(
         self, params: dict[str, Any], *, native_input_tokens: int | None = None,
-        timeout=openai.NOT_GIVEN,
+        timeout=openai.NOT_GIVEN, media_guard=None, _dispatch_client=None,
     ) -> Any:
         """Call `client.responses.create(**params)`.
 
@@ -3651,14 +3699,23 @@ class OpenAIProvider:
         extra_timeout = params.pop("timeout", self.timeout)
         request_timeout = extra_timeout if timeout is openai.NOT_GIVEN else timeout
         if native_input_tokens is None:
-            native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
+            native_input_tokens = await self._guard_assembled_params_with_provider_count(
+                params, **({"media_guard": media_guard} if media_guard is not None else {})
+            )
         else:
             self._guard_assembled_params(params, native_input_tokens=native_input_tokens)
         transport_timeout = self._transport_timeout(request_timeout)
+        if media_guard is not None:
+            async with media_guard.sdk_context(params, "provider-send") as client:
+                return await self._create_response(
+                    params, native_input_tokens=native_input_tokens,
+                    timeout=request_timeout, _dispatch_client=client,
+                )
+        client = self.client if _dispatch_client is None else _dispatch_client
         if not _params_declare_computer_tool(params):
-            return await self.client.responses.create(**params, timeout=transport_timeout)
+            return await client.responses.create(**params, timeout=transport_timeout)
 
-        raw_response = await self.client.responses.with_raw_response.create(
+        raw_response = await client.responses.with_raw_response.create(
             **params, timeout=transport_timeout
         )
         try:
@@ -3691,7 +3748,7 @@ class OpenAIProvider:
             return _RawResponseObject(body)
 
     async def _complete_chat_request(
-        self, request: ChatRequest, **kwargs
+        self, request: ChatRequest, *, _media_guard=None, **kwargs
     ) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
 
@@ -3726,7 +3783,8 @@ class OpenAIProvider:
         # Guard the complete, final wire payload before emitting llm:request.
         # `_create_response` repeats this guard for direct continuation and
         # truncation-retry dispatches; stream() bypasses that helper.
-        native_input_tokens = await self._guard_assembled_params_with_provider_count(params)
+        guard_options = {"media_guard": _media_guard} if _media_guard is not None else {}
+        native_input_tokens = await self._guard_assembled_params_with_provider_count(params, **guard_options)
         repair_event = copy.deepcopy(assembly_state["repairs"])
         if repair_event:
             repair_event["repairs"] = [
@@ -3903,7 +3961,7 @@ class OpenAIProvider:
             attempt_native_input_tokens = native_input_tokens
             if generation_attempt:
                 attempt_native_input_tokens = (
-                    await self._guard_assembled_params_with_provider_count(params)
+                    await self._guard_assembled_params_with_provider_count(params, **guard_options)
                 )
             generation_attempt += 1
 
@@ -3953,9 +4011,13 @@ class OpenAIProvider:
 
                     try:
                         async with asyncio.timeout(effective_timeout):
-                            async with self.client.responses.stream(
-                                **params, timeout=self._transport_timeout(request_timeout)
-                            ) as stream:
+                            stream_context = (
+                                _media_guard.stream(params, self._transport_timeout(request_timeout))
+                                if _media_guard is not None else self.client.responses.stream(
+                                    **params, timeout=self._transport_timeout(request_timeout)
+                                )
+                            )
+                            async with stream_context as stream:
                                 if emit_stream_events:
                                     async for event in stream:
                                         et = event.type
@@ -4129,6 +4191,7 @@ class OpenAIProvider:
                         self._create_response(
                             params, native_input_tokens=attempt_native_input_tokens,
                             timeout=request_timeout,
+                            **guard_options,
                         ),
                         timeout=effective_timeout,
                     )
@@ -4519,6 +4582,12 @@ class OpenAIProvider:
                 and kwargs.get("auto_continue", self.auto_continue)
                 and continuation_count < MAX_CONTINUATION_ATTEMPTS
             ):
+                if _media_guard is not None:
+                    from ._media_request import refused
+
+                    # New model work with a changed/continued transcript needs
+                    # a fresh host projection/fit, not the old private witness.
+                    raise refused()
                 if assembly_state["neutral_computer_context"]["neutral"] and any(
                     (item.get("type") if isinstance(item, dict) else getattr(item, "type", None))
                     in {"computer_call", "function_call", "tool_call", "apply_patch_call"}
@@ -4575,7 +4644,7 @@ class OpenAIProvider:
                         params["max_output_tokens"] = cap_tokens
                         retry_start = time.time()
                         final_response = await asyncio.wait_for(
-                            self._create_response(params, timeout=request_timeout),
+                            self._create_response(params, timeout=request_timeout, **guard_options),
                             timeout=effective_timeout,
                         )
                         final_response = await _wait_for_generated_response(final_response)
@@ -4698,7 +4767,7 @@ class OpenAIProvider:
                 try:
                     continue_start = time.time()
                     final_response = await asyncio.wait_for(
-                        self._create_response(continue_params, timeout=request_timeout),
+                        self._create_response(continue_params, timeout=request_timeout, **guard_options),
                         timeout=effective_timeout,
                     )
                     final_response = await _wait_for_generated_response(final_response)
