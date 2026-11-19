@@ -203,6 +203,12 @@ Config is snapshotted at construction; each call snapshots its selector before
 I/O. Changing caller mappings, capability readback or legacy attributes cannot
 mutate another call's filtering. Reconstruct the provider to change defaults.
 
+For a per-turn effort picker, `get_model_list_info()["request_reasoning_efforts"]`
+maps known exact model IDs to their ordered, literal request choices. A missing
+entry means the provider has no documented effort policy for that ID. Connection
+setup continues to use the configuration schema, where the saved value `none`
+means to omit the effort parameter.
+
 Optional local `get_model_list_info()` returns version `1`, `source: "provider-api"`, `filters_keyword`,
 `filters_schema`, effective `default_filters`, `unfiltered: {}`, and
 `override: "replace"`, plus a detached `default_supersession` map (empty for a

@@ -70,6 +70,22 @@ def test_exact_facts_registry_and_no_snapshot_invention(model):
         assert compute_cost(unknown, prompt_tokens=1) is None
 
 
+def test_effort_picker_advertises_literal_request_policy_independently_of_connection_defaults():
+    p = provider("gpt-6.2-astra", reasoning_effort="none")
+    choices = p.get_model_list_info()["request_reasoning_efforts"]
+    for model in MODELS:
+        assert choices[model] == list(EFFORTS)
+    assert "none" in choices["gpt-6-sol"]
+    assert choices["gpt-5.5-pro"] == ["medium", "high", "xhigh"]
+    assert "gpt-6.2-astra-preview" not in choices
+    assert all(set(efforts) == get_request_policy(model).allowed_efforts
+               for model, efforts in choices.items())
+    choices["gpt-6.2-astra"].clear()
+    assert p.get_model_list_info()["request_reasoning_efforts"]["gpt-6.2-astra"] == list(EFFORTS)
+    config = next(field for field in p.get_info().config_fields if field.id == "reasoning_effort")
+    assert config.default == "none" and "none" in config.choices
+
+
 def native_provider(model, **config):
     owner = Owner()
     base = provider(model, **config)
