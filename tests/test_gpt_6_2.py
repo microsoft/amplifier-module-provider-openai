@@ -29,6 +29,7 @@ from amplifier_module_provider_openai.native import NativeResponsesProvider
 from tests.test_native_transport import Owner, Socket, created, finished
 
 MODELS = ("gpt-6.2-astra", "gpt-6.2-sol")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 def request(**kwargs):
@@ -55,7 +56,7 @@ def test_exact_facts_registry_and_no_snapshot_invention(model):
     assert caps.supports_native_apply_patch and caps.supports_native_computer_use
     assert caps.default_reasoning_effort is None  # recommendation is not API default evidence
     policy = get_request_policy(model)
-    assert policy.allowed_efforts == frozenset({"low", "medium"})
+    assert policy.allowed_efforts == frozenset(EFFORTS)
     assert policy.cache_ttls == {"30m", "12h"}
     assert policy.supports_steering and policy.supports_async_tools
     assert policy.supports_configuration_update
@@ -80,7 +81,7 @@ def native_provider(model, **config):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", MODELS)
-@pytest.mark.parametrize("effort", [None, "none", "low", "medium"])
+@pytest.mark.parametrize("effort", [None, "none", *EFFORTS])
 @pytest.mark.parametrize("overlay", [False, True])
 async def test_actual_http_sdk_wire_policy_and_omission(model, effort, overlay):
     wires = []
@@ -124,7 +125,7 @@ async def test_actual_http_sdk_wire_policy_and_omission(model, effort, overlay):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("old_pin", [False, True], ids=["model-unset", "explicit-6.1-sol"])
 @pytest.mark.parametrize("source", ["config", "request", "call-effort", "call-dict"])
-async def test_explicit_high_without_model_rejects_locally_but_old_pin_remains_usable(old_pin, source):
+async def test_explicit_high_reaches_default_or_pinned_model(old_pin, source):
     wires = []
     config = {"use_streaming": False, "max_retries": 0}
     if old_pin:
@@ -141,10 +142,9 @@ async def test_explicit_high_without_model_rejects_locally_but_old_pin_remains_u
     def receive(outgoing):
         wires.append(json.loads(outgoing.content))
         assert outgoing.url.path == "/v1/responses"
-        assert old_pin, "A rejected fresh-default request must not dispatch."
         return httpx.Response(200, json={
             "id": "r", "object": "response", "created_at": 0,
-            "model": "gpt-6.1-sol", "status": "completed", "output": [],
+            "model": wires[-1]["model"], "status": "completed", "output": [],
         })
 
     async with AsyncOpenAI(api_key="offline", base_url="https://offline.invalid/v1",
@@ -153,23 +153,13 @@ async def test_explicit_high_without_model_rejects_locally_but_old_pin_remains_u
                            max_retries=0) as client:
         p = OpenAIProvider(client=client, config=config)
         assert req.model is None and "model" not in options
-        if old_pin:
-            await p.complete(req, **options)
-            assert len(wires) == 1
-            assert wires[0]["model"] == p.default_model == "gpt-6.1-sol"
-            assert wires[0]["reasoning"]["effort"] == "high"
-        else:
-            assert "default_model" not in config
-            assert p.default_model == "gpt-6.2-sol"
-            with pytest.raises(llm_errors.InvalidRequestError) as rejected:
-                await p.complete(req, **options)
-            assert "Model 'gpt-6.2-sol' reasoning.effort='high'" in str(rejected.value)
-            assert "not established" in str(rejected.value)
-            assert "Documented efforts: ['low', 'medium']" in str(rejected.value)
-            assert wires == []
+        await p.complete(req, **options)
+        assert len(wires) == 1
+        assert wires[0]["model"] == p.default_model == ("gpt-6.1-sol" if old_pin else "gpt-6.2-sol")
+        assert wires[0]["reasoning"]["effort"] == "high"
         assert (config, req.model_dump(), options) == before
         if source == "config":
-            assert p.reasoning_effort == "high"  # no silent low/medium coercion
+            assert p.reasoning_effort == "high"
 
 
 @pytest.mark.parametrize("layer", ["top", "body"])
@@ -195,8 +185,8 @@ def test_extended_thinking_implicit_effort_is_documented_without_coercing_explic
                  reasoning_effort=sentinel)
     params = p._budget_params(request(), extended_thinking=True)
     assert params["reasoning"]["effort"] == "medium"
-    with pytest.raises(llm_errors.InvalidRequestError, match="not established"):
-        p._budget_params(request(), extended_thinking=True, reasoning={"effort": "high"})
+    explicit = p._budget_params(request(), extended_thinking=True, reasoning={"effort": "high"})
+    assert explicit["reasoning"]["effort"] == "high"
 
 
 @pytest.mark.asyncio
@@ -206,9 +196,6 @@ def test_extended_thinking_implicit_effort_is_documented_without_coercing_explic
 @pytest.mark.parametrize("invalid", [
     {"reasoning": {"effort": "none"}},
     {"reasoning": {"effort": "minimal"}},
-    {"reasoning": {"effort": "high"}},
-    {"reasoning": {"effort": "xhigh"}},
-    {"reasoning": {"effort": "max"}},
     {"temperature": 0},
     {"top_p": 0},
     {"top_logprobs": 0},
@@ -244,7 +231,8 @@ def test_budget_keeps_independent_input_and_reserve(model, long_context, limit, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", MODELS)
-async def test_real_sdk_count_projection_uses_exact_registry(model):
+@pytest.mark.parametrize("effort", EFFORTS)
+async def test_real_sdk_count_projection_uses_exact_registry(model, effort):
     wires = []
 
     def receive(req):
@@ -257,12 +245,12 @@ async def test_real_sdk_count_projection_uses_exact_registry(model):
                                transport=httpx.MockTransport(receive), trust_env=False),
                            max_retries=0) as client:
         p = OpenAIProvider(client=client, config={"default_model": model, "max_retries": 0})
-        result = await p.request_budget(request(reasoning_effort="low"), context_estimate=42)
+        result = await p.request_budget(request(reasoning_effort=effort), context_estimate=42)
         assert result["input_limit_tokens"] == 267_904
         assert result["context_window_tokens"] == 1_050_000
         assert result["estimated_input_tokens"] == 272_001
         assert len(wires) == 1 and wires[0]["model"] == model
-        assert wires[0]["reasoning"]["effort"] == "low"
+        assert wires[0]["reasoning"]["effort"] == effort
         assert "prompt_cache_retention" not in wires[0]
 
 
@@ -431,24 +419,25 @@ async def test_model_switch_and_append_only_preserve_reasoning_bytes_and_order(m
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("overlay", [False, True])
-async def test_native_final_wire_and_model_switch_preserve_history(model, overlay):
+@pytest.mark.parametrize("effort", ["low", "xhigh"])
+async def test_native_final_wire_and_model_switch_preserve_history(model, overlay, effort):
     p, owner = native_provider("gpt-6-astra")
     socket = p.socket
     # Seed a successful old-model lineage, then switch to either new exact ID.
     for step, selected in enumerate(("gpt-6-astra", model, model)):
         if overlay:
             p.extra_request_params = {"extra_body": {
-                "model": selected, "reasoning": {"effort": "low"},
+                "model": selected, "reasoning": {"effort": effort},
                 "prompt_cache_options": {"ttl": "30m"},
             }}
         owner.messages.append({"role": "user", "content": f"append {step}"})
         snapshot = copy.deepcopy(owner.messages)
         socket.feed(created(f"r{step}"), finished(f"r{step}"))
         await p.complete(ChatRequest(messages=[Message(**m) for m in owner.messages]),
-                         model=selected, reasoning={"effort": "low"})
+                         model=selected, reasoning={"effort": effort})
         wire = socket.sent[-1]
         assert wire["model"] == selected
-        assert wire["reasoning"]["effort"] == "low"
+        assert wire["reasoning"]["effort"] == effort
         assert "prompt_cache_retention" not in wire
         assert owner.messages == snapshot
         if step == 1:
@@ -466,7 +455,10 @@ def test_configuration_update_uses_bounded_efforts_and_existing_guards(model):
     update = {"type": "configuration_update", "reasoning": {"effort": "medium"}}
     params = {"model": model, "reasoning": {"effort": "low"}, "input": [update]}
     assert validate_request(params) == [update]
-    for effort in ("none", "high", "xhigh", "max"):
+    for effort in EFFORTS:
+        item = {"type": "configuration_update", "reasoning": {"effort": effort}}
+        assert validate_request({**params, "input": [item]}) == [item]
+    for effort in ("none", "minimal"):
         with pytest.raises(ValueError, match="not supported"):
             validate_request({**params, "input": [{
                 "type": "configuration_update", "reasoning": {"effort": effort},

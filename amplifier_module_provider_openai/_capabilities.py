@@ -51,12 +51,14 @@ class RequestPolicy:
 
 _MODERN_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 _CACHE_TTLS = frozenset({"30m", "12h"})
+# The OpenAI model catalog lists low through max for GPT-6.2 Astra and Sol.
+# https://developers.openai.com/api/docs/models
 _REQUEST_POLICIES = {
     **{
         model: RequestPolicy(
             allowed_efforts=(
                 _MODERN_EFFORTS - {"none"}
-                if model in {"gpt-6-astra", "gpt-6.1-sol"}
+                if model in {"gpt-6-astra", "gpt-6.1-sol"} or model in GPT_6_2_MODELS
                 else _MODERN_EFFORTS
             ),
             cache_ttls=_CACHE_TTLS,
@@ -65,24 +67,7 @@ _REQUEST_POLICIES = {
             supports_async_tools=True,
             display_name="GPT " + model.removeprefix("gpt-").replace("-", " ").title(),
         )
-        for model in GPT_6_MODELS - GPT_6_2_MODELS
-    },
-    **{
-        # Checked 2026-11-17: latest-model migration documents low/medium,
-        # not an exhaustive 6.2 enum. Do not inherit high/xhigh/max from 6.0.
-        # Steering documents the GPT-6 family; async tools document Astra and
-        # later models. Apply that evidence to these two exact IDs only.
-        # keep-prefix-unchanged (linked by the 6.2 migration) recommends
-        # configuration_update; its existing standard/single-agent guards apply.
-        model: RequestPolicy(
-            allowed_efforts=frozenset({"low", "medium"}),
-            cache_ttls=_CACHE_TTLS,
-            supports_configuration_update=True,
-            supports_steering=True,
-            supports_async_tools=True,
-            display_name="GPT " + model.removeprefix("gpt-").replace("-", " ").title(),
-        )
-        for model in GPT_6_2_MODELS
+        for model in GPT_6_MODELS
     },
     **{
         model: RequestPolicy(

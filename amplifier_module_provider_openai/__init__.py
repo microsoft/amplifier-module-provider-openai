@@ -310,8 +310,6 @@ def _has_unpriced_gpt_6_2_mode(value: Any) -> bool:
 
 def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     """Reject documented-invalid fields from a final exact GPT-6 wire payload."""
-    from ._capabilities import GPT_6_2_MODELS
-
     model = params.get("model")
     policy = get_request_policy(model)
     if policy.allowed_efforts is None:
@@ -323,13 +321,6 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     if effort is not None and (
         not isinstance(effort, str) or effort not in allowed_efforts
     ):
-        if model in GPT_6_2_MODELS:
-            raise kernel_errors.InvalidRequestError(
-                f"Model {model!r} reasoning.effort={effort!r} is not established "
-                "by the documented request policy. Use 'low' for lightweight "
-                "tasks, or omit reasoning.effort. "
-                f"Documented efforts: {sorted(allowed_efforts)}."
-            )
         raise kernel_errors.InvalidRequestError(
             f"Model {model!r} does not support reasoning.effort={effort!r}. "
             "Use 'low' for lightweight tasks, or omit reasoning.effort. "
