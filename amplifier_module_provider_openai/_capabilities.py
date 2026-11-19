@@ -18,6 +18,7 @@ __all__ = [
     "RequestPolicy",
     "get_capabilities",
     "get_request_policy",
+    "request_reasoning_efforts",
 ]
 
 GPT_6_2_MODELS = frozenset({"gpt-6.2-astra", "gpt-6.2-sol"})
@@ -49,7 +50,8 @@ class RequestPolicy:
     display_name: str | None = None
 
 
-_MODERN_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
+_EFFORT_ORDER = ("none", "low", "medium", "high", "xhigh", "max")
+_MODERN_EFFORTS = frozenset(_EFFORT_ORDER)
 _CACHE_TTLS = frozenset({"30m", "12h"})
 # The OpenAI model catalog lists low through max for GPT-6.2 Astra and Sol.
 # https://developers.openai.com/api/docs/models
@@ -97,6 +99,15 @@ def get_request_policy(model_id: str) -> RequestPolicy:
         _REQUEST_POLICIES.get(model_id, RequestPolicy())
         if isinstance(model_id, str) else RequestPolicy()
     )
+
+def request_reasoning_efforts() -> dict[str, list[str]]:
+    """Literal per-request choices for known model IDs, in slider order."""
+    return {
+        model: [effort for effort in _EFFORT_ORDER if effort in policy.allowed_efforts]
+        for model, policy in _REQUEST_POLICIES.items()
+        if policy.allowed_efforts is not None
+    }
+
 
 _GPT5_TAGS: tuple[str, ...] = (
     "tools",

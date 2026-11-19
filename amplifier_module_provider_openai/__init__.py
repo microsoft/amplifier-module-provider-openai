@@ -3014,11 +3014,13 @@ class OpenAIProvider:
 
     def get_model_list_info(self) -> dict[str, Any]:
         """Describe the optional selector extension locally, without API I/O."""
+        from ._capabilities import request_reasoning_efforts
         from ._model_listing import MODEL_SUPERSESSION
 
         return {
             "version": 1,
             "source": "provider-api",
+            "request_reasoning_efforts": request_reasoning_efforts(),
             "filters_keyword": "filters",
             "filters_schema": selector_schema(),
             "default_filters": self._model_filters.as_dict(),
