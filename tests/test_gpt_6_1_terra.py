@@ -100,7 +100,7 @@ def test_capabilities_are_exact_and_default_is_unchanged():
     assert caps.supports_native_apply_patch and caps.supports_native_computer_use
     assert set(caps.capability_tags) == {"tools", "reasoning", "streaming", "json_mode", "vision"}
     assert not caps.supports_in_memory_retention
-    assert OpenAIProvider(api_key="offline-fixture").default_model == "gpt-6.1-sol"
+    assert OpenAIProvider(api_key="offline-fixture").default_model == "gpt-6.2-sol"
     assert _provider(default_model="gpt-5.4").default_model == "gpt-5.4"
     for model in NEAR_MISSES:
         assert get_capabilities(model).family == "unknown"

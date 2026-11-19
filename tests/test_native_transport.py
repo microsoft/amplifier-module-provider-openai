@@ -178,11 +178,13 @@ async def test_complete_preserves_final_model_cache_policy_and_fresh_observation
 
 
 @pytest.mark.asyncio
-async def test_acceptance_is_not_application_and_successor_does_not_recreate():
+@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"])
+async def test_acceptance_is_not_application_and_successor_does_not_recreate(model):
     p, o = make()
+    p.default_model = model
     p.socket.feed(created("parent"))
     task = asyncio.create_task(
-        p._native_response({"model": "gpt-6-astra", "input": []})
+        p._native_response({"model": model, "input": []})
     )
     await wait_created(p)
     command = SimpleNamespace(id="input-2", text="Change direction")

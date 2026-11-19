@@ -10,8 +10,8 @@ from amplifier_module_provider_openai._constants import (
 class TestDefaultModel:
     """Verify the default follows Sol without overriding explicit model pins."""
 
-    def test_default_model_is_gpt_6_1_sol(self):
-        assert DEFAULT_MODEL == "gpt-6.1-sol"
+    def test_default_model_is_gpt_6_2_sol(self):
+        assert DEFAULT_MODEL == "gpt-6.2-sol"
         assert OpenAIProvider(api_key="test").default_model == DEFAULT_MODEL
 
     def test_explicit_old_model_is_preserved(self):

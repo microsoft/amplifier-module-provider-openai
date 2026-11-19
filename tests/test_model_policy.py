@@ -91,7 +91,7 @@ def test_request_policy_and_its_sets_are_immutable(model):
     "gpt-6-terra",
     "gpt-6.1-luna",
     "gpt-6.1-terra-pro",
-    "gpt-6.2-sol",
+    "gpt-6.2-unknown",
     "gpt-5.6-sol-preview",
     "gpt-5.7",
     "gpt-5.4-nano",

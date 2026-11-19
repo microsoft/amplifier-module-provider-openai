@@ -68,7 +68,7 @@ class Capability:
         return self.result
 
 
-def fixture(private, *, streaming=False, hook=None, replies=None, http_mode="legacy"):
+def fixture(private, *, streaming=False, hook=None, replies=None, http_mode="legacy", default_model=MODEL):
     cap = Capability(private)
     wires, events = [], []
 
@@ -133,7 +133,8 @@ def fixture(private, *, streaming=False, hook=None, replies=None, http_mode="leg
     if http_mode != "sdk-default":
         sdk = openai.AsyncOpenAI(api_key="offline-fixture", max_retries=0, http_client=http)
     p = OpenAIProvider(client=sdk, config={
-        "default_model": MODEL, "use_streaming": streaming, "raw": True, "max_retries": 0,
+        **({"default_model": default_model} if default_model is not None else {}),
+        "use_streaming": streaming, "raw": True, "max_retries": 0,
     })
 
     async def emit(name, data):
@@ -150,7 +151,7 @@ def facts(p, req, *, model=MODEL, **kwargs):
 
 
 def test_indexed_support_is_readonly_and_needs_no_client_capability_or_pixels():
-    p = OpenAIProvider(api_key=None)
+    p = OpenAIProvider(api_key=None, config={"default_model": MODEL})
     req = request()
     req.messages[2].content = [TextBlock(text="[Session image digest]")]
     before = req.model_dump()
@@ -196,7 +197,7 @@ def test_indexed_support_does_not_claim_gif_without_animation_facts():
 
 @pytest.mark.parametrize("bad", ["orphan", "duplicate", "wrong", "following", "dual-conflict", "native", "model", "proxy"])
 def test_indexed_support_refuses_ambiguous_opaque_or_unqualified_request(bad):
-    p, req = OpenAIProvider(api_key=None), request()
+    p, req = OpenAIProvider(api_key=None, config={"default_model": MODEL}), request()
     if bad == "orphan":
         req.messages.pop(1)
     elif bad == "duplicate":
@@ -218,7 +219,7 @@ def test_indexed_support_refuses_ambiguous_opaque_or_unqualified_request(bad):
 
 
 def test_indexed_overlay_indices_and_equivalent_dual_core_calls():
-    req, p = request(), OpenAIProvider(api_key=None)
+    req, p = request(), OpenAIProvider(api_key=None, config={"default_model": MODEL})
     req.messages.insert(0, Message(role="system", content="overlay"))
     req.messages[2].tool_calls = [{"id": "read-1", "name": "read_file", "arguments": "{}"}]
     assert facts(p, req)["positions"] == [
@@ -227,9 +228,73 @@ def test_indexed_overlay_indices_and_equivalent_dual_core_calls():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("default_model,selected", [
+    (None, MODEL),
+    (None, "gpt-6.2-astra"),
+    ("gpt-6.2-astra", "gpt-6.2-sol"),
+    (MODEL, "gpt-6.2-sol"),
+])
+async def test_model_union_rejects_facts_for_a_model_other_than_effective(default_model, selected):
+    config = {"default_model": default_model} if default_model is not None else {}
+    p = OpenAIProvider(api_key=None, config=config)
+    req = request()
+    req.model = selected
+    before = req.model_dump()
+    options = {"model": "unknown-deployment"}
+    assert p.default_model == (default_model or "gpt-6.2-sol")
+    assert p.get_media_request_support_for_request(
+        request=req, model=selected, request_options=options,
+    ) == {"v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg", "image/webp"]}
+    with pytest.raises(InvalidRequestError):
+        p.request_budget(req, context_estimate=1, request_options=options)
+    with pytest.raises(InvalidRequestError):
+        await p.complete(req, request_options=options)
+    assert p._client is None and req.model_dump() == before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
-@pytest.mark.parametrize("model", ["gpt-4.1", "gpt-5", "gpt-5-2025-08-07"])
+async def test_fresh_model_unmarked_images_keep_both_sdk_transports(streaming, http_mode):
+    req = request(marked=False)
+    req.model = "gpt-6.2-sol"
+    req.reasoning_effort = "medium"
+    p, cap, wires, events = fixture(
+        req, streaming=streaming, http_mode=http_mode, default_model=None,
+    )
+    before = req.model_dump()
+    try:
+        assert p.default_model == "gpt-6.2-sol"
+        assert p.get_media_request_support_for_request(
+            request=req, model=req.model,
+        )["positions"] == [
+            {"message_index": 0, "role": "user"}, {"message_index": 2, "role": "tool"},
+        ]
+        decision = await p.request_budget(req, context_estimate=4)
+        response = await p.complete(req)
+        assert response.content[0].text == "OK"
+        assert decision["measurement"]["kind"] == "provider_count"
+        assert [path for path, _, _ in wires] == [
+            "/v1/responses/input_tokens", "/v1/responses/input_tokens", "/v1/responses",
+        ]
+        assert all(body["model"] == "gpt-6.2-sol" for _, body, _ in wires)
+        assert all(body["input"] == wires[0][1]["input"] for _, body, _ in wires)
+        assert wires[-1][1]["reasoning"]["effort"] == "medium"
+        output = wires[-1][1]["input"][-1]
+        assert output["type"] == "function_call_output" and output["call_id"] == "read-1"
+        assert output["output"][1]["image_url"] == "data:image/png;base64," + PIXELS
+        assert req.model_dump() == before and PIXELS not in json.dumps(events)
+        assert cap.calls == []
+    finally:
+        await p.client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
+@pytest.mark.parametrize("model", [
+    "gpt-4.1", "gpt-5", "gpt-5-2025-08-07", "gpt-6.2-astra", "gpt-6.2-sol",
+])
 async def test_exact_private_request_budget_count_and_send_same_pixels(streaming, http_mode, model, caplog):
     req = request()
     req.model = model
@@ -262,11 +327,14 @@ async def test_exact_private_request_budget_count_and_send_same_pixels(streaming
             "type": "function_call", "call_id": "read-1", "name": "read_file", "arguments": "{}",
         }
         output = wires[-1][1]["input"][-1]
+        tail = {"type": "input_text", "text": "after"}
+        if model in {"gpt-6.2-astra", "gpt-6.2-sol"}:
+            tail["prompt_cache_breakpoint"] = {"mode": "explicit"}
         assert output == {
             "type": "function_call_output", "call_id": "read-1", "output": [
                 {"type": "input_text", "text": "before"},
                 {"type": "input_image", "image_url": "data:image/png;base64," + PIXELS},
-                {"type": "input_text", "text": "after"},
+                tail,
             ],
         }
         assert all(same for same, _, _ in cap.calls)
@@ -643,7 +711,7 @@ async def test_removing_marker_cannot_downgrade_already_bound_private_object():
     ("computer", {"actions": []}),
 ])
 def test_indexed_support_never_qualifies_inferred_native_image_results(name, args):
-    req, p = request(), OpenAIProvider(api_key=None)
+    req, p = request(), OpenAIProvider(api_key=None, config={"default_model": MODEL})
     req.messages[1].content[0].name = name
     req.messages[1].content[0].input = args
     req.messages[2].name = name

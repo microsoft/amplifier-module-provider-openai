@@ -162,6 +162,7 @@ def test_models_without_an_input_ceiling_keep_existing_output_reserve_policy():
 
 @pytest.mark.parametrize("model", [
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra",
+    "gpt-6.2-astra", "gpt-6.2-sol",
     "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
 ])
 @pytest.mark.parametrize("long_context,allowance", [(False, 267_904), (True, 917_904)])

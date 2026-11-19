@@ -30,7 +30,7 @@ METADATA_TOOL_CALL_NAMESPACES = "openai:tool_call_namespaces"
 # Default follows the current Sol family. Explicit operator pins are unchanged.
 # Routing bundles choose their own tiers; this provider default does not lift
 # a downstream matrix's deliberate Sol pause.
-DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_MODEL = "gpt-6.2-sol"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
 DEFAULT_TIMEOUT = None  # Wait for completion unless the caller selects a deadline.

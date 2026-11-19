@@ -292,8 +292,26 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     )
 
 
+def _has_unpriced_gpt_6_2_mode(value: Any) -> bool:
+    """Visible beta-mode evidence must not become a precise Standard estimate."""
+    from ._capabilities import GPT_6_2_MODELS
+
+    model = response_field(value, "model")
+    if not isinstance(model, str) or model not in GPT_6_2_MODELS:
+        return False
+    window = response_field(response_field(value, "background_options"), "completion_window")
+    if window not in (None, "soonest"):
+        return True
+    multi_agent = response_field(value, "multi_agent")
+    return multi_agent is not None and multi_agent is not False and (
+        response_field(multi_agent, "enabled") is not False
+    )
+
+
 def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     """Reject documented-invalid fields from a final exact GPT-6 wire payload."""
+    from ._capabilities import GPT_6_2_MODELS
+
     model = params.get("model")
     policy = get_request_policy(model)
     if policy.allowed_efforts is None:
@@ -305,6 +323,13 @@ def _validate_gpt_6_params(params: dict[str, Any]) -> None:
     if effort is not None and (
         not isinstance(effort, str) or effort not in allowed_efforts
     ):
+        if model in GPT_6_2_MODELS:
+            raise kernel_errors.InvalidRequestError(
+                f"Model {model!r} reasoning.effort={effort!r} is not established "
+                "by the documented request policy. Use 'low' for lightweight "
+                "tasks, or omit reasoning.effort. "
+                f"Documented efforts: {sorted(allowed_efforts)}."
+            )
         raise kernel_errors.InvalidRequestError(
             f"Model {model!r} does not support reasoning.effort={effort!r}. "
             "Use 'low' for lightweight tasks, or omit reasoning.effort. "
@@ -1442,6 +1467,7 @@ class OpenAIProvider:
             True,
         )  # Legacy date-only option; never meant "all model families".
         configured_filters = self.config.get("model_filters")
+        self._use_default_recommendations = configured_filters is None
         self._model_filters = (
             ModelFilters(("gpt-6*",), (), self.hide_dated_models, hide_shutdown=True)
             if configured_filters is None
@@ -1702,6 +1728,28 @@ class OpenAIProvider:
 
     def _prepare_gpt_6_params(self, params: dict[str, Any]) -> None:
         """Apply exact-model final-wire rules; retain this internal call seam."""
+        from ._capabilities import GPT_6_2_MODELS
+
+        body = params.get("extra_body")
+        if isinstance(body, dict) and any(
+            isinstance(model, str) and model in GPT_6_2_MODELS
+            for model in (params.get("model"), body.get("model"))
+        ):
+            # The SDK overlays extra_body last. Validate that actual identity
+            # and values, not a superseded pre-overlay reasoning/model pair.
+            effective = {**params, **body}
+            effective.pop("extra_body", None)
+            self._prepare_gpt_6_params(effective)
+            for field in ("prompt_cache_retention", "temperature", "top_p",
+                          "top_logprobs", "logprobs", "include"):
+                if field not in effective:
+                    params.pop(field, None)
+                    body.pop(field, None)
+                elif field in body:
+                    body[field] = effective[field]
+                elif field in params:
+                    params[field] = effective[field]
+            return
         model = params.get("model")
         _validate_gpt_5_5_pro_effort(model, params.get("reasoning"))
         policy = get_request_policy(model)
@@ -2327,9 +2375,18 @@ class OpenAIProvider:
             if background_mode:
                 params["background"] = True
             if kwargs.get("extended_thinking") and "reasoning" not in params:
+                from ._capabilities import GPT_6_2_MODELS
+
+                extras = self.extra_request_params
+                final_model = (extras.get("extra_body") or {}).get(
+                    "model", extras.get("model", model_name)
+                )
                 params["reasoning"] = {
                     "effort": kwargs.get("reasoning_effort")
-                    or self.config.get("reasoning_effort", "high"),
+                    or (
+                        "medium" if final_model in GPT_6_2_MODELS
+                        else self.config.get("reasoning_effort", "high")
+                    ),
                     "summary": self.reasoning_summary,
                 }
             if (
@@ -2966,12 +3023,20 @@ class OpenAIProvider:
 
     def get_model_list_info(self) -> dict[str, Any]:
         """Describe the optional selector extension locally, without API I/O."""
+        from ._model_listing import MODEL_SUPERSESSION
+
         return {
             "version": 1,
             "source": "provider-api",
             "filters_keyword": "filters",
             "filters_schema": selector_schema(),
             "default_filters": self._model_filters.as_dict(),
+            "default_supersession": (
+                dict(MODEL_SUPERSESSION)
+                if self._use_default_recommendations
+                and self.name == "openai" and self._has_standard_openai_endpoint()
+                else {}
+            ),
             "unfiltered": {},
             "override": "replace",
         }
@@ -3089,7 +3154,15 @@ class OpenAIProvider:
                 and is_shutdown(model_id, reported=reported)
             )
         ]
-        for model_id in selector.select(available_ids):
+        selected_ids = selector.select(available_ids)
+        if filters is None and self._use_default_recommendations and direct_openai:
+            from ._model_listing import MODEL_SUPERSESSION
+
+            selected_ids = [
+                model_id for model_id in selected_ids
+                if MODEL_SUPERSESSION.get(model_id) not in selected_ids
+            ]
+        for model_id in selected_ids:
             retirement = (
                 shutdown_date(model_id, catalog[model_id]) if direct_openai else None
             )
@@ -3705,6 +3778,12 @@ class OpenAIProvider:
             request, **kwargs
         )
         params.pop("timeout", None)
+        # Snapshot the assembled request, including SDK overlay, rather than
+        # consulting mutable config during billing. No beta pricing is inferred
+        # when the server omits its requested window/mode from the response.
+        unpriced_request_mode = _has_unpriced_gpt_6_2_mode({
+            **params, **(params.get("extra_body") or {}),
+        })
         media_echoes = media_values(request.model_dump()) | media_values(params)
 
         message_list = list(request.messages)
@@ -3794,6 +3873,7 @@ class OpenAIProvider:
                 self._compute_attempt_cost(item)
                 if response_field(item, "usage") is not None
                 and isinstance(response_field(item, "model"), str)
+                and not unpriced_request_mode
                 else None
                 for item in observations
             ]
@@ -3807,7 +3887,9 @@ class OpenAIProvider:
                 # adapter aggregate can carry a cached partial cost even when
                 # its complete cost is unknown; do not split/recount its usage.
                 known_costs = [
-                    cost if cost is not None else self._known_attempt_cost(item)
+                    cost if cost is not None else (
+                        None if unpriced_request_mode else self._known_attempt_cost(item)
+                    )
                     for item, cost in zip(observations, costs, strict=True)
                 ]
                 if any(cost is not None for cost in known_costs):
@@ -6095,6 +6177,8 @@ class OpenAIProvider:
         attempts have completed, using the same result this base conversion
         places on its standalone response usage.
         """
+        if _has_unpriced_gpt_6_2_mode(response):
+            return None
         usage_obj = getattr(response, "usage", None)
         if usage_obj is None:
             return None

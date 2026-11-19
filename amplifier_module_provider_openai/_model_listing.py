@@ -5,6 +5,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 
+# Recommendation policy only, never a capability alias or inference rewrite.
+# Hide an old exact ID only when its exact successor survives the selector.
+MODEL_SUPERSESSION = {
+    "gpt-6-astra": "gpt-6.2-astra",
+    "gpt-6-sol": "gpt-6.2-sol",
+    "gpt-6.1-sol": "gpt-6.2-sol",
+}
+
 
 @dataclass(frozen=True)
 class ModelFilters:

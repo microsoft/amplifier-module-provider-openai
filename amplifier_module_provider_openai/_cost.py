@@ -45,7 +45,7 @@ import re
 from collections.abc import Mapping
 from decimal import Decimal
 
-from ._capabilities import GPT_6_MODELS, get_capabilities
+from ._capabilities import GPT_6_2_MODELS, GPT_6_MODELS, get_capabilities
 
 # ---------------------------------------------------------------------------
 # Internal constants
@@ -86,6 +86,21 @@ _SNAPSHOT_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 # Dated snapshots are handled by _find_rates() — no duplicate entries needed here.
 #
 _RATES: dict[str, dict[str, Decimal]] = {
+    # Exact GPT-6.2 Standard prices, checked 2026-11-17.
+    "gpt-6.2-astra": {
+        "input_per_m": Decimal("8.00"),
+        "output_per_m": Decimal("40.00"),
+        "cache_read_per_m": Decimal("0.40"),
+        "cache_write_per_m": Decimal("10.00"),
+        "cache_write_12h_per_m": Decimal("20.00"),
+    },
+    "gpt-6.2-sol": {
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("10.00"),
+        "cache_read_per_m": Decimal("0.10"),
+        "cache_write_per_m": Decimal("2.50"),
+        "cache_write_12h_per_m": Decimal("5.00"),
+    },
     # GPT-6 and GPT-6.1 short-context Standard pricing, per 1M tokens.
     # Source: https://developers.openai.com/api/docs/pricing
     "gpt-6-astra": {
@@ -315,6 +330,20 @@ _RATES: dict[str, dict[str, Decimal]] = {
 #   luna  input $0.40  cached $0.04  cache-write  $0.50  output  $1.80
 # Source: https://developers.openai.com/api/docs/pricing.md (verified 2026-11-06).
 _LONG_RATES: dict[str, dict[str, Decimal]] = {
+    "gpt-6.2-astra": {
+        "input_per_m": Decimal("16.00"),
+        "output_per_m": Decimal("60.00"),
+        "cache_read_per_m": Decimal("0.80"),
+        "cache_write_per_m": Decimal("20.00"),
+        "cache_write_12h_per_m": Decimal("40.00"),
+    },
+    "gpt-6.2-sol": {
+        "input_per_m": Decimal("4.00"),
+        "output_per_m": Decimal("15.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("5.00"),
+        "cache_write_12h_per_m": Decimal("10.00"),
+    },
     # GPT-6 and GPT-6.1 long-context (>272K input) Standard pricing, per 1M tokens.
     "gpt-6-astra": {
         "input_per_m": Decimal("20.00"),
@@ -511,6 +540,9 @@ def compute_cost(
             return None
         tier = service_tier.lower()
         if tier == "flex":
+            # No published GPT-6.2 Flex rate. Do not borrow an older discount.
+            if model in GPT_6_2_MODELS:
+                return None
             tier_multiplier = Decimal("0.5")
         elif tier in {"priority", "fast"}:
             tier_multiplier = Decimal(2)
