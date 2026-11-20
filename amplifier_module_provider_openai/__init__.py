@@ -3374,6 +3374,26 @@ class OpenAIProvider:
 
         return canonical_window(message, model or self.default_model) is not None
 
+    def _standalone_compaction_scope(self):
+        if not self._uses_standard_openai_endpoint():
+            return None
+        from hmac import digest
+
+        client = self.client
+        key = getattr(client, "api_key", None)
+        if not isinstance(key, str) or not key:
+            return None
+        # Bind replay to the exact credential, API route, organization and project.
+        # Only the domain-separated digest is stored with the window.
+        scope = json.dumps(["openai:standalone-compaction:v1", str(client.base_url),
+                            getattr(client, "organization", None), getattr(client, "project", None)]).encode()
+        return digest(key.encode(), scope, "sha256").hex()
+
+    def rebind_compacted_context(self, message, *, source_model, model):
+        from .compaction import rebind_window
+
+        return rebind_window(message, source_model, model, self._standalone_compaction_scope())
+
     async def compact_context(self, request: ChatRequest) -> dict[str, Any]:
         """Compact a bounded window and retain every returned canonical item.
 
@@ -3382,7 +3402,7 @@ class OpenAIProvider:
         (never in place of) canonical history.
         """
         from ._media_request import marked, refused
-        from .compaction import canonical_usage, compacted_message
+        from .compaction import QUALIFIED_SWITCH, canonical_usage, compacted_message
 
         if marked(request) or id(request) in getattr(self, "_media_request_bindings", {}):
             # Compaction changes the fitted transcript and has no generic
@@ -3410,7 +3430,8 @@ class OpenAIProvider:
         usage = getattr(response, "usage", None)
         if hasattr(usage, "model_dump"):
             usage = usage.model_dump()
-        return {"kind": "native", "message": compacted_message(params["model"], output),
+        scope = self._standalone_compaction_scope() if params["model"] in QUALIFIED_SWITCH else None
+        return {"kind": "native", "message": compacted_message(params["model"], output, scope=scope),
                 "usage": canonical_usage(usage), "input_tokens": input_tokens}
 
     async def _compact_configuration_updates(self, request, params, updates):

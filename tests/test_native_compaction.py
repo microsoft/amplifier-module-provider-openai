@@ -188,6 +188,30 @@ def test_validation_uses_explicit_continuation_model_without_changing_provider_d
     assert provider.default_model == default
 
 
+@pytest.mark.parametrize("source,target", [
+    ("gpt-6.2-astra", "gpt-6.2-sol"), ("gpt-6.2-sol", "gpt-6.2-astra"),
+])
+async def test_standalone_window_rebind_requires_matching_openai_scope(source, target):
+    from openai import AsyncOpenAI
+    from amplifier_module_provider_openai.compaction import canonical_window
+
+    _, _, window = fixture()
+    async with (
+        AsyncOpenAI(api_key="fixture", base_url="https://api.openai.com/v1", project="project-one") as sdk,
+        AsyncOpenAI(api_key="fixture", base_url="https://api.openai.com/v1", project="project-two") as other,
+    ):
+        provider = OpenAIProvider(client=sdk)
+        foreign = OpenAIProvider(client=other)
+        message = compacted_message(source, window, scope=provider._standalone_compaction_scope())
+        rebound = provider.rebind_compacted_context(message, source_model=source, model=target)
+        assert canonical_window(rebound, target) == window
+        assert canonical_window(message, source) == window
+        assert provider.rebind_compacted_context(message, source_model=source, model="gpt-6.1-sol") is None
+        assert foreign.rebind_compacted_context(message, source_model=source, model=target) is None
+        legacy = compacted_message(source, window)
+        assert provider.rebind_compacted_context(legacy, source_model=source, model=target) is None
+
+
 @pytest.mark.asyncio
 async def test_sdk_defaults_do_not_become_unknown_input_parameters():
     from pydantic import BaseModel

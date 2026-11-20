@@ -5,8 +5,10 @@ Never decode, summarize, normalize, filter, or prune that returned window.
 """
 
 import copy
+import hmac
 
 KEY = "openai:compaction"
+QUALIFIED_SWITCH = frozenset({"gpt-6.2-astra", "gpt-6.2-sol"})
 
 
 def canonical_usage(usage):
@@ -42,7 +44,7 @@ def canonical_usage(usage):
     return result
 
 
-def compacted_message(model, output):
+def compacted_message(model, output, *, scope=None):
     if (
         not isinstance(output, list)
         or not output
@@ -63,7 +65,8 @@ def compacted_message(model, output):
             "ephemeral": True,
             "persisted": True,
             "source": "context-managed",
-            KEY: {"version": 1, "model": model, "output": copy.deepcopy(output)},
+            KEY: {"version": 1, "model": model, "output": copy.deepcopy(output),
+                  **({"scope": scope} if scope else {})},
         },
     }
 
@@ -82,3 +85,14 @@ def canonical_window(message, model):
         )
     # Reuse the structural validation without interpreting the opaque payload.
     return compacted_message(model, state.get("output"))["metadata"][KEY]["output"]
+
+
+def rebind_window(message, source_model, model, scope):
+    if not scope or {source_model, model} != QUALIFIED_SWITCH:
+        return None
+    state = (message.get("metadata") or {}).get(KEY)
+    if (not isinstance(state, dict) or not isinstance(state.get("scope"), str)
+            or not hmac.compare_digest(state["scope"], scope)):
+        return None
+    window = canonical_window(message, source_model)
+    return compacted_message(model, window, scope=scope)
