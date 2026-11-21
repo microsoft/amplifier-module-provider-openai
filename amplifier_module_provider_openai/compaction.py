@@ -16,6 +16,20 @@ KEY = "openai:compaction"
 QUALIFIED_SWITCH = frozenset({"gpt-6.2-astra", "gpt-6.2-sol"})
 
 
+def operation_params(assembled, messages):
+    """Project the exact standalone or explicit-trigger request for both count and send."""
+    from .configuration_updates import validate_request
+
+    updates = validate_request(assembled, [message.model_dump() for message in messages])
+    if not updates:
+        return {key: assembled[key] for key in ("model", "input", "instructions") if key in assembled}, []
+    body = {**assembled, **(assembled.get("extra_body") or {})}
+    params = {key: body[key] for key in ("model", "instructions", "reasoning") if key in body}
+    params["input"] = [*body["input"], {"type": "compaction_trigger"}]
+    params["store"] = False
+    return params, updates
+
+
 async def submit_compaction(operation, params, *, timeout):
     """Keep the SDK's image-bearing HTTP objects out of public compaction errors."""
     try:
