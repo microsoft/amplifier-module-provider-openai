@@ -3364,8 +3364,12 @@ class OpenAIProvider:
             name=tool_name,
         )
 
-    def supports_native_compaction(self) -> bool:
+    def supports_native_compaction(self, *, model: str | None = None) -> bool:
         """Only claim the official endpoint contract, never an inherited proxy."""
+        from .compaction import QUALIFIED_SWITCH
+
+        if (model or self.default_model) in QUALIFIED_SWITCH and self._standalone_compaction_scope() is None:
+            return False
         return self._uses_standard_openai_endpoint() and callable(getattr(self.client.responses, "compact", None))
 
     def validate_compacted_context(
@@ -3392,6 +3396,18 @@ class OpenAIProvider:
         key = getattr(client, "api_key", None)
         if not isinstance(key, str) or not key:
             return None
+        # Expert wire overrides can make SDK identity or prefix differ from the
+        # actual request. Those routes use the ordinary portable handoff.
+        wire_options = {"model", "input", "instructions", "previous_response_id",
+                        "conversation", "extra_headers", "extra_query"}
+        extras = self.extra_request_params
+        body = extras.get("extra_body", {})
+        http = getattr(client, "_client", None)
+        configured_headers = [*getattr(client, "_custom_headers", {}), *getattr(http, "headers", {})]
+        if (getattr(http, "auth", None) is not None
+                or {"authorization", "openai-project", "openai-organization"}.intersection(map(str.lower, configured_headers))
+                or not isinstance(body, dict) or wire_options.intersection(extras) or wire_options.intersection(body)):
+            return None
         # Bind replay to the exact credential, API route, organization and project.
         # Only the domain-separated digest is stored with the window.
         scope = json.dumps(["openai:standalone-compaction:v1", str(client.base_url),
@@ -3417,7 +3433,7 @@ class OpenAIProvider:
             # Compaction changes the fitted transcript and has no generic
             # image-projection lifetime; require the host to prepare a new one.
             raise refused()
-        if not self.supports_native_compaction():
+        if not self.supports_native_compaction(model=request.model or self.default_model):
             raise NotImplementedError("This endpoint does not advertise native Responses compaction")
         params = self._budget_params(request)
         from .configuration_updates import validate_request

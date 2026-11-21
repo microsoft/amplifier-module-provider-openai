@@ -216,6 +216,13 @@ async def test_standalone_window_rebind_requires_matching_openai_scope(source, t
         legacy = compacted_message(source, window)
         assert provider.rebind_compacted_context(legacy, source_model=source, model=target) is None
 
+        overridden = OpenAIProvider(client=sdk.with_options(default_headers={"OpenAI-Project": "different"}))
+        assert not overridden.supports_native_compaction(model=target)
+        assert overridden.rebind_compacted_context(message, source_model=source, model=target) is None
+        provider.extra_request_params = {"extra_body": {"model": "different"}}
+        assert not provider.supports_native_compaction(model=target)
+        assert provider.rebind_compacted_context(message, source_model=source, model=target) is None
+
 
 @pytest.mark.asyncio
 async def test_sdk_defaults_do_not_become_unknown_input_parameters():
