@@ -326,6 +326,8 @@ class MediaRedactor:
         for echo in self._echoes:
             variants.add(json.dumps(echo)[1:-1])
             variants.add(json.dumps(echo, ensure_ascii=False)[1:-1])
+        # Some services escape forward slashes in JSON strings, including base64.
+        variants |= {value.replace("/", r"\/") for value in variants}
         return sorted(variants, key=len, reverse=True)
 
     def copy(self, value):
@@ -351,16 +353,8 @@ class MediaRedactor:
         return json.dumps(self.copy(body))
 
     def sanitize_error(self, error):
-        """Remove media echoes, without changing error policy or clean cause chains."""
-        cursor, seen = error, set()
-        while cursor is not None and id(cursor) not in seen:
-            seen.add(id(cursor))
-            text = str(cursor)
-            body = getattr(cursor, "body", None)
-            if self.copy(text) != text or (body is not None and self.copy(body) != body):
-                break
-            cursor = cursor.__cause__ or cursor.__context__
-        else:
+        """Detach SDK causes that retain an image-bearing HTTP request."""
+        if not self._echoes:
             return
         error.args = tuple(self.copy(list(error.args)))
         # Some public SDK exceptions render .message/.body rather than .args.

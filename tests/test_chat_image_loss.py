@@ -672,10 +672,13 @@ async def test_request_reuses_encoded_image_values_across_diagnostic_events(monk
 
 
 @pytest.mark.asyncio
-async def test_preescaped_image_url_in_sdk_error_stays_out_of_logs_and_traceback(monkeypatch, caplog):
+@pytest.mark.parametrize("escape_slashes", [False, True])
+async def test_preescaped_image_url_in_sdk_error_stays_out_of_logs_and_traceback(monkeypatch, caplog, escape_slashes):
     private_url = 'https://images.example.test/private-thumb?token="秘密\\fixture"'
     monkeypatch.setattr(sys.modules[__name__], "URL", private_url)
     escaped_url = json.dumps(private_url)[1:-1]
+    if escape_slashes:
+        escaped_url = escaped_url.replace("/", r"\/")
     error_body = {"error": {"type": "invalid_request_error", "message": f"bad input {escaped_url}"}}
     p, _, events = provider(replies=[httpx.Response(400, json=error_body)])
     try:
@@ -684,5 +687,20 @@ async def test_preescaped_image_url_in_sdk_error_stays_out_of_logs_and_traceback
         assert caught.value.status_code == 400 and not caught.value.retryable
         assert json.loads(str(caught.value))["message"] == "bad input [image omitted from diagnostics]"
         assert "private-thumb" not in json.dumps(events) + caplog.text + "".join(traceback.format_exception(caught.value))
+    finally:
+        await p.client.close()
+
+
+@pytest.mark.asyncio
+async def test_non_echoing_sdk_failure_does_not_expose_image_in_attached_http_request():
+    p, _, _ = provider(replies=[httpx.Response(400, json={
+        "error": {"type": "invalid_request_error", "message": "Invalid request."},
+    })])
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await p.complete(ChatRequest(messages=[Message(role="user", content=[image("base64")])]))
+        assert caught.value.status_code == 400
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
     finally:
         await p.client.close()

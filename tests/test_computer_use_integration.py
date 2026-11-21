@@ -330,13 +330,11 @@ class TestWireToolChoice:
         )
         provider._client = fake_client
 
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(Exception):
             await provider.complete(request, **kwargs)
-
-        cause: BaseException | None = exc_info.value
-        while cause is not None and not isinstance(cause, CapturedAndAborted):
-            cause = cause.__cause__
-        assert isinstance(cause, CapturedAndAborted)
+        # The transport itself is the witness. Image-bearing SDK causes are
+        # intentionally detached before an error reaches the caller.
+        assert captured_params
         return captured_params
 
     @pytest.mark.asyncio
