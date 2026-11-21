@@ -4,6 +4,7 @@ import copy
 import json
 import re
 from collections import Counter
+from functools import cached_property
 from urllib.parse import urlsplit
 
 from amplifier_core.llm_errors import InvalidRequestError
@@ -311,43 +312,60 @@ def media_values(value):
     return found
 
 
+class MediaRedactor:
+    """Remove submitted image data from diagnostics for a single request."""
+
+    def __init__(self, echoes):
+        self._echoes = tuple(echoes)
+
+    @cached_property
+    def _patterns(self):
+        # Only diagnostics need escaped forms. Retain them across request,
+        # response, retry and stream events, never across independent requests.
+        variants = set(self._echoes)
+        for echo in self._echoes:
+            variants.add(json.dumps(echo)[1:-1])
+            variants.add(json.dumps(echo, ensure_ascii=False)[1:-1])
+        # Some services escape forward slashes in JSON strings, including base64.
+        variants |= {value.replace("/", r"\/") for value in variants}
+        return sorted(variants, key=len, reverse=True)
+
+    def copy(self, value):
+        """Build a diagnostic copy without modifying SDK or replay payloads."""
+        if isinstance(value, dict):
+            kind = value.get("type")
+            if isinstance(kind, str) and kind in {"image", "input_image", "computer_screenshot"}:
+                return {"type": kind, "media": OMITTED}
+            return {k: self.copy(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.copy(v) for v in value]
+        if isinstance(value, str):
+            for pattern in self._patterns:
+                value = value.replace(pattern, OMITTED)
+        return value
+
+    def error_message(self, error):
+        body = getattr(error, "body", None)
+        if body is None:
+            return self.copy(str(error))
+        # SDKs can echo an already JSON-escaped URL in a structured field.
+        # Redact the field before serializing the public error adds another layer.
+        return json.dumps(self.copy(body))
+
+    def sanitize_error(self, error):
+        """Detach SDK causes that retain an image-bearing HTTP request."""
+        if not self._echoes:
+            return
+        error.args = tuple(self.copy(list(error.args)))
+        # Some public SDK exceptions render .message/.body rather than .args.
+        for name in ("message", "body", "response_details"):
+            if hasattr(error, name):
+                setattr(error, name, self.copy(getattr(error, name)))
+        error.__cause__ = None
+        error.__context__ = None
+        error.__suppress_context__ = True
+
+
 def diagnostic_copy(value, echoes=()):
-    """Copy before the first subscriber; never apply to SDK/replay payloads.
-
-    Known image envelopes plus exact submitted URL/base64 echoes are omitted.
-    This cannot recognize transformed media hidden in arbitrary prose.
-    """
-    if isinstance(value, dict):
-        kind = value.get("type")
-        if isinstance(kind, str) and kind in {"image", "input_image", "computer_screenshot"}:
-            return {"type": kind, "media": OMITTED}
-        return {k: diagnostic_copy(v, echoes) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [diagnostic_copy(v, echoes) for v in value]
-    if isinstance(value, str):
-        encoded = {
-            encoded for secret in echoes
-            for encoded in (secret, json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1])
-        }
-        for secret in sorted(encoded, key=len, reverse=True):
-            value = value.replace(secret, OMITTED)
-    return value
-
-
-def sanitize_error(error, echoes):
-    """Remove media echoes, without changing error policy or clean cause chains."""
-    cursor, texts, seen = error, [], set()
-    while cursor is not None and id(cursor) not in seen:
-        seen.add(id(cursor))
-        texts.append(str(cursor))
-        cursor = cursor.__cause__ or cursor.__context__
-    if not any(diagnostic_copy(text, echoes) != text for text in texts):
-        return
-    error.args = tuple(diagnostic_copy(list(error.args), echoes))
-    # Some public SDK exceptions render .message/.body rather than .args.
-    for name in ("message", "body", "response_details"):
-        if hasattr(error, name):
-            setattr(error, name, diagnostic_copy(getattr(error, name), echoes))
-    error.__cause__ = None
-    error.__context__ = None
-    error.__suppress_context__ = True
+    """Redact one value for callers without an ongoing request."""
+    return MediaRedactor(echoes).copy(value)
