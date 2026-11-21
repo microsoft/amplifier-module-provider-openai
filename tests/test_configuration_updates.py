@@ -538,6 +538,53 @@ async def test_real_sdk_streaming_records_actual_baseline_not_response_echo():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_update", [False, True])
+@pytest.mark.parametrize("has_template", [False, True])
+async def test_native_compaction_budget_and_guard_count_exact_wire_input(with_update, has_template):
+    from amplifier_core.message_models import ToolSpec
+
+    calls = []
+    window = [{"type": "compaction", "id": "cmp1", "encrypted_content": "opaque"}]
+
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append((request.url.path, body))
+        if request.url.path.endswith("/input_tokens"):
+            return httpx.Response(200, json={"input_tokens": 30})
+        return httpx.Response(200, json=response_body(window))
+
+    async with openai.AsyncOpenAI(
+        api_key="offline", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ) as client:
+        p = provider(client=client)
+        request = request_with_update() if with_update else ChatRequest(
+            model=MODEL, messages=[Message(role="user", content="Original")], reasoning_effort="low")
+        request = request.model_copy(update={
+            "messages": [Message(role="system", content="Stable instructions"), *request.messages],
+            "tools": [ToolSpec(name="lookup", description="Foreground tool", parameters={"type": "object"})],
+            "max_output_tokens": 4096,
+            "metadata": {"purpose": "context-compaction", "native_compaction_request_context": has_template},
+        })
+        before = request.model_dump()
+        decision = await p.request_budget(request, context_estimate=50)
+        result = await p.compact_context(request)
+        portable = request.model_copy(update={"metadata": {"purpose": "context-compaction"}})
+        await p.request_budget(portable, context_estimate=50)
+
+    assert decision["measurement"]["input_tokens"] == result["input_tokens"] == 30
+    assert decision["max_output_tokens"] == 4096
+    budget, guard, compacted, ordinary = calls
+    endpoint = "/v1/responses" if with_update else "/v1/responses/compact"
+    assert compacted[0] == endpoint
+    assert budget[0] == guard[0] == ordinary[0] == "/v1/responses/input_tokens"
+    assert "tools" in ordinary[1] and "reasoning" in ordinary[1]
+    assert budget[1] == guard[1] == {k: v for k, v in compacted[1].items() if k != "store"}
+    assert ("reasoning" in budget[1]) == with_update
+    assert (budget[1]["input"][-1] == {"type": "compaction_trigger"}) == with_update
+    assert request.model_dump() == before
+
+
+@pytest.mark.asyncio
 async def test_explicit_compaction_uses_responses_not_standalone_then_restates():
     calls = []
     window = [{"type": "compaction", "id": "cmp1", "encrypted_content": "opaque"}]

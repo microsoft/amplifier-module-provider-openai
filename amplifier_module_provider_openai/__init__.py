@@ -2576,10 +2576,24 @@ class OpenAIProvider:
         if context_estimate < 0:
             raise ValueError("context_estimate must be a nonnegative integer")
         options = self._merge_request_options(request_options, kwargs)
-        from ._media_request import binding, refused
+        from ._media_request import binding, marked, refused
 
-        media_guard = binding(self, request, options)
-        params = self._budget_params(request, **options)
+        metadata = request.metadata or {}
+        if (metadata.get("purpose") == "context-compaction"
+                and isinstance(metadata.get("native_compaction_request_context"), bool)):
+            from .compaction import operation_params
+
+            if marked(request) or id(request) in getattr(self, "_media_request_bindings", {}):
+                raise refused()
+            media_guard = None
+            # Native dispatch takes its selection from the request. Keep its
+            # output reservation for budgeting, outside the input-token count.
+            assembled = self._budget_params(request)
+            params, _ = operation_params(assembled, request.messages)
+            params["max_output_tokens"] = assembled["max_output_tokens"]
+        else:
+            media_guard = binding(self, request, options)
+            params = self._budget_params(request, **options)
 
         if self._provider_count_available():
 
@@ -3431,7 +3445,13 @@ class OpenAIProvider:
         (never in place of) canonical history.
         """
         from ._media_request import marked, refused
-        from .compaction import QUALIFIED_SWITCH, canonical_usage, compacted_message, submit_compaction
+        from .compaction import (
+            QUALIFIED_SWITCH,
+            canonical_usage,
+            compacted_message,
+            operation_params,
+            submit_compaction,
+        )
 
         if marked(request) or id(request) in getattr(self, "_media_request_bindings", {}):
             # Compaction changes the fitted transcript and has no generic
@@ -3439,19 +3459,18 @@ class OpenAIProvider:
             raise refused()
         if not self.supports_native_compaction(model=request.model or self.default_model):
             raise NotImplementedError("This endpoint does not advertise native Responses compaction")
-        params = self._budget_params(request)
-        from .configuration_updates import validate_request
-
-        updates = validate_request(params, [m.model_dump() for m in request.messages])
+        assembled = self._budget_params(request)
+        params, updates = operation_params(assembled, request.messages)
+        input_tokens = await self._guard_assembled_params_with_provider_count(
+            {**params, "max_output_tokens": assembled["max_output_tokens"]}
+        )
         if updates:
-            return await self._compact_configuration_updates(request, params, updates)
-        input_tokens = await self._guard_assembled_params_with_provider_count(params)
-        compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
+            return await self._compact_configuration_updates(request, params, updates, input_tokens)
         client = self.client
         if isinstance(client, AsyncOpenAI):
             client = client.with_options(max_retries=0)
         response = await submit_compaction(
-            client.responses.compact, compact_params,
+            client.responses.compact, params,
             timeout=self._transport_timeout(self._request_timeout(request)),
         )
         # SDK output models can invent unset fields (e.g. phase=None on a
@@ -3467,26 +3486,17 @@ class OpenAIProvider:
         return {"kind": "native", "message": compacted_message(params["model"], output, scope=scope),
                 "usage": canonical_usage(usage), "input_tokens": input_tokens}
 
-    async def _compact_configuration_updates(self, request, params, updates):
+    async def _compact_configuration_updates(self, request, params, updates, input_tokens):
         """One explicit Responses trigger; never retry or strip update history."""
         from ._response_handling import response_items
         from .compaction import canonical_usage, submit_compaction
         from .configuration_updates import compacted_update_message
 
-        body = {**params, **(params.get("extra_body") or {})}
-        trigger_params = {
-            key: copy.deepcopy(body[key])
-            for key in ("model", "input", "instructions", "reasoning")
-            if key in body
-        }
-        trigger_params["input"].append({"type": "compaction_trigger"})
-        trigger_params["store"] = False
-        input_tokens = await self._guard_assembled_params_with_provider_count(params)
         # This separate operation has no retry/fallback path: a transport error
         # can mean submission happened. The caller must reconcile before retrying.
         client = self.client.with_options(max_retries=0)
         response = await submit_compaction(
-            client.responses.create, trigger_params,
+            client.responses.create, params,
             timeout=self._transport_timeout(self._request_timeout(request)),
         )
         if getattr(response, "status", None) != "completed":
@@ -3498,8 +3508,8 @@ class OpenAIProvider:
         return {
             "kind": "native",
             "message": compacted_update_message(
-                body["model"], output, updates,
-                request_effort=(body.get("reasoning") or {}).get("effort"),
+                params["model"], output, updates,
+                request_effort=(params.get("reasoning") or {}).get("effort"),
             ),
             "usage": canonical_usage(usage),
             "input_tokens": input_tokens,
