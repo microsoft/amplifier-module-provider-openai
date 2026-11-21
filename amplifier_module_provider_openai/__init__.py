@@ -3393,7 +3393,11 @@ class OpenAIProvider:
 
         client = self.client
         key = getattr(client, "api_key", None)
-        if not isinstance(key, str) or not key:
+        if (not isinstance(key, str) or not key
+                or getattr(client, "workload_identity", None) is not None
+                or getattr(client, "_api_key_provider", None) is not None):
+            # A workload identity has a shared SDK placeholder. A callable key
+            # may change between checking the checkpoint and physical dispatch.
             return None
         # Expert wire overrides can make SDK identity or prefix differ from the
         # actual request. Those routes use the ordinary portable handoff.
@@ -3404,6 +3408,7 @@ class OpenAIProvider:
         http = getattr(client, "_client", None)
         configured_headers = [*getattr(client, "_custom_headers", {}), *getattr(http, "headers", {})]
         if (getattr(http, "auth", None) is not None
+                or getattr(client, "_custom_query", None) or getattr(http, "params", None)
                 or {"authorization", "openai-project", "openai-organization"}.intersection(map(str.lower, configured_headers))
                 or not isinstance(body, dict) or wire_options.intersection(extras) or wire_options.intersection(body)):
             return None
@@ -3426,7 +3431,7 @@ class OpenAIProvider:
         (never in place of) canonical history.
         """
         from ._media_request import marked, refused
-        from .compaction import QUALIFIED_SWITCH, canonical_usage, compacted_message
+        from .compaction import QUALIFIED_SWITCH, canonical_usage, compacted_message, submit_compaction
 
         if marked(request) or id(request) in getattr(self, "_media_request_bindings", {}):
             # Compaction changes the fitted transcript and has no generic
@@ -3442,8 +3447,12 @@ class OpenAIProvider:
             return await self._compact_configuration_updates(request, params, updates)
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
-        response = await self.client.responses.compact(
-            **compact_params, timeout=self._transport_timeout(self._request_timeout(request))
+        client = self.client
+        if isinstance(client, AsyncOpenAI):
+            client = client.with_options(max_retries=0)
+        response = await submit_compaction(
+            client.responses.compact, compact_params,
+            timeout=self._transport_timeout(self._request_timeout(request)),
         )
         # SDK output models can invent unset fields (e.g. phase=None on a
         # retained user message), which are illegal when replayed as input.
@@ -3461,7 +3470,7 @@ class OpenAIProvider:
     async def _compact_configuration_updates(self, request, params, updates):
         """One explicit Responses trigger; never retry or strip update history."""
         from ._response_handling import response_items
-        from .compaction import canonical_usage
+        from .compaction import canonical_usage, submit_compaction
         from .configuration_updates import compacted_update_message
 
         body = {**params, **(params.get("extra_body") or {})}
@@ -3476,8 +3485,9 @@ class OpenAIProvider:
         # This separate operation has no retry/fallback path: a transport error
         # can mean submission happened. The caller must reconcile before retrying.
         client = self.client.with_options(max_retries=0)
-        response = await client.responses.create(
-            **trigger_params, timeout=self._transport_timeout(self._request_timeout(request))
+        response = await submit_compaction(
+            client.responses.create, trigger_params,
+            timeout=self._transport_timeout(self._request_timeout(request)),
         )
         if getattr(response, "status", None) != "completed":
             raise ValueError("Explicit Responses compaction did not complete")

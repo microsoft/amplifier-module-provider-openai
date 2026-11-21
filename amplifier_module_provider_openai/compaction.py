@@ -7,8 +7,30 @@ Never decode, summarize, normalize, filter, or prune that returned window.
 import copy
 import hmac
 
+import openai
+from amplifier_core.llm_errors import LLMError
+
+from ._chat_images import media_values
+
 KEY = "openai:compaction"
 QUALIFIED_SWITCH = frozenset({"gpt-6.2-astra", "gpt-6.2-sol"})
+
+
+async def submit_compaction(operation, params, *, timeout):
+    """Keep the SDK's image-bearing HTTP objects out of public compaction errors."""
+    try:
+        return await operation(**params, timeout=timeout)
+    except openai.APIError as error:
+        if not media_values(params):
+            raise
+        public_error = LLMError(
+            f"OpenAI native compaction failed ({type(error).__name__}).",
+            provider="openai", model=params["model"],
+            status_code=getattr(error, "status_code", None), retryable=False,
+        )
+    # The submitted request may already have been processed. Drop the SDK
+    # exception chain and leave any further attempt to the caller's admission.
+    raise public_error
 
 
 def canonical_usage(usage):

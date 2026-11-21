@@ -225,6 +225,27 @@ async def test_standalone_window_rebind_requires_matching_openai_scope(source, t
 
 
 @pytest.mark.asyncio
+async def test_native_scope_declines_dynamic_credentials_and_default_query():
+    from openai import AsyncOpenAI
+
+    async def key_provider():
+        return "fixture-refreshed"
+
+    async with (
+        AsyncOpenAI(api_key=key_provider) as rotating,
+        AsyncOpenAI(workload_identity={"identity_provider_id": "identity-fixture",
+                                       "service_account_id": "account-fixture",
+                                       "provider": key_provider}) as federated,
+        AsyncOpenAI(api_key="fixture", default_query={"route": "fixture"}) as routed,
+    ):
+        await rotating._refresh_api_key()
+        for client in (rotating, federated, routed):
+            assert client.api_key
+            provider = OpenAIProvider(client=client)
+            assert not provider.supports_native_compaction(model="gpt-6.2-sol")
+
+
+@pytest.mark.asyncio
 async def test_sdk_defaults_do_not_become_unknown_input_parameters():
     from pydantic import BaseModel
 
