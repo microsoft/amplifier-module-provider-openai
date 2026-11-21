@@ -5,8 +5,32 @@ Never decode, summarize, normalize, filter, or prune that returned window.
 """
 
 import copy
+import hmac
+
+import openai
+from amplifier_core.llm_errors import LLMError
+
+from ._chat_images import media_values
 
 KEY = "openai:compaction"
+QUALIFIED_SWITCH = frozenset({"gpt-6.2-astra", "gpt-6.2-sol"})
+
+
+async def submit_compaction(operation, params, *, timeout):
+    """Keep the SDK's image-bearing HTTP objects out of public compaction errors."""
+    try:
+        return await operation(**params, timeout=timeout)
+    except openai.APIError as error:
+        if not media_values(params):
+            raise
+        public_error = LLMError(
+            f"OpenAI native compaction failed ({type(error).__name__}).",
+            provider="openai", model=params["model"],
+            status_code=getattr(error, "status_code", None), retryable=False,
+        )
+    # The submitted request may already have been processed. Drop the SDK
+    # exception chain and leave any further attempt to the caller's admission.
+    raise public_error
 
 
 def canonical_usage(usage):
@@ -42,7 +66,7 @@ def canonical_usage(usage):
     return result
 
 
-def compacted_message(model, output):
+def compacted_message(model, output, *, scope=None):
     if (
         not isinstance(output, list)
         or not output
@@ -63,7 +87,8 @@ def compacted_message(model, output):
             "ephemeral": True,
             "persisted": True,
             "source": "context-managed",
-            KEY: {"version": 1, "model": model, "output": copy.deepcopy(output)},
+            KEY: {"version": 1, "model": model, "output": copy.deepcopy(output),
+                  **({"scope": scope} if scope else {})},
         },
     }
 
@@ -82,3 +107,18 @@ def canonical_window(message, model):
         )
     # Reuse the structural validation without interpreting the opaque payload.
     return compacted_message(model, state.get("output"))["metadata"][KEY]["output"]
+
+
+def matches_scope(state, scope):
+    stored = state.get("scope")
+    return bool(scope and isinstance(stored, str) and hmac.compare_digest(stored, scope))
+
+
+def rebind_window(message, source_model, model, scope):
+    if not scope or {source_model, model} != QUALIFIED_SWITCH:
+        return None
+    state = (message.get("metadata") or {}).get(KEY)
+    if not isinstance(state, dict) or not matches_scope(state, scope):
+        return None
+    window = canonical_window(message, source_model)
+    return compacted_message(model, window, scope=scope)

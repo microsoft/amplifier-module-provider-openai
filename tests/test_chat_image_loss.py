@@ -704,3 +704,34 @@ async def test_non_echoing_sdk_failure_does_not_expose_image_in_attached_http_re
         assert caught.value.__context__ is None
     finally:
         await p.client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_update", [False, True])
+async def test_image_compaction_failure_preserves_status_without_media_or_sdk_request(with_update):
+    from amplifier_core.llm_errors import LLMError
+    from amplifier_module_provider_openai.configuration_updates import configuration_update_message
+
+    model = "gpt-6-astra" if with_update else "gpt-6.2-sol"
+    messages = [Message(role="user", content=[image("base64")])]
+    if with_update:
+        messages.extend([
+            Message(role="assistant", content="Received."),
+            Message(**configuration_update_message(model, "high", request_effort="low")),
+            Message(role="user", content="Continue."),
+        ])
+    p, wire, _ = provider(replies=[httpx.Response(503, json={"error": {"message": DATA}})])
+    request = ChatRequest(model=model, messages=messages, reasoning_effort="low")
+    try:
+        with pytest.raises(LLMError) as caught:
+            await p.compact_context(request)
+        assert [path for path, _ in wire] == [
+            "/v1/responses/input_tokens", "/v1/responses" if with_update else "/v1/responses/compact",
+        ]
+        assert DATA in json.dumps(wire[-1][1])
+        assert caught.value.status_code == 503 and not caught.value.retryable
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
+        assert not hasattr(caught.value, "request") and not hasattr(caught.value, "response")
+        assert DATA not in str(caught.value)
+    finally:
+        await p.client.close()

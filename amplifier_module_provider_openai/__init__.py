@@ -2823,6 +2823,8 @@ class OpenAIProvider:
             "json_mode",
             "completion:auto_continue:v1",
         ]
+        if self._uses_standard_openai_endpoint():
+            provider_capabilities.extend(("prompt-cache:model-scoped", "prompt-cache:top-level-tools-prefix"))
         if self._provider_count_available():
             provider_capabilities.append("request_budget:provider_count")
         from ._single_attempt import CAPABILITY, CAPABILITY_V2, endpoint
@@ -3361,17 +3363,65 @@ class OpenAIProvider:
             name=tool_name,
         )
 
-    def supports_native_compaction(self) -> bool:
+    def supports_native_compaction(self, *, model: str | None = None) -> bool:
         """Only claim the official endpoint contract, never an inherited proxy."""
+        from .compaction import QUALIFIED_SWITCH
+
+        if (model or self.default_model) in QUALIFIED_SWITCH and self._standalone_compaction_scope() is None:
+            return False
         return self._uses_standard_openai_endpoint() and callable(getattr(self.client.responses, "compact", None))
 
     def validate_compacted_context(
         self, message: dict[str, Any], *, model: str | None = None
     ) -> bool:
         """Validate opaque transport for the effective continuation model."""
-        from .compaction import canonical_window
+        return self._compacted_window(message, model or self.default_model) is not None
 
-        return canonical_window(message, model or self.default_model) is not None
+    def _compacted_window(self, message, model):
+        from .compaction import KEY, canonical_window, matches_scope
+
+        state = (message.get("metadata") or {}).get(KEY)
+        if isinstance(state, dict) and "scope" in state:
+            if not matches_scope(state, self._standalone_compaction_scope()):
+                raise ValueError("Native compacted context belongs to a different connection")
+        return canonical_window(message, model)
+
+    def _standalone_compaction_scope(self):
+        if not self._uses_standard_openai_endpoint():
+            return None
+        from hmac import digest
+
+        client = self.client
+        key = getattr(client, "api_key", None)
+        if (not isinstance(key, str) or not key
+                or getattr(client, "workload_identity", None) is not None
+                or getattr(client, "_api_key_provider", None) is not None):
+            # A workload identity has a shared SDK placeholder. A callable key
+            # may change between checking the checkpoint and physical dispatch.
+            return None
+        # Expert wire overrides can make SDK identity or prefix differ from the
+        # actual request. Those routes use the ordinary portable handoff.
+        wire_options = {"model", "input", "instructions", "previous_response_id",
+                        "conversation", "extra_headers", "extra_query"}
+        extras = self.extra_request_params
+        body = extras.get("extra_body", {})
+        http = getattr(client, "_client", None)
+        configured_headers = [*getattr(client, "_custom_headers", {}), *getattr(http, "headers", {})]
+        if (getattr(http, "auth", None) is not None
+                or getattr(client, "_custom_query", None) or getattr(http, "params", None)
+                or {"authorization", "openai-project", "openai-organization"}.intersection(map(str.lower, configured_headers))
+                or not isinstance(body, dict) or wire_options.intersection(extras) or wire_options.intersection(body)):
+            return None
+        # Bind replay to the exact credential, API route, organization and project.
+        # Only the domain-separated digest is stored with the window.
+        scope = json.dumps(["openai:standalone-compaction:v1", str(client.base_url),
+                            getattr(client, "organization", None), getattr(client, "project", None)]).encode()
+        return digest(key.encode(), scope, "sha256").hex()
+
+    def rebind_compacted_context(self, message, *, source_model, model):
+        from .compaction import rebind_window
+
+        return rebind_window(message, source_model, model, self._standalone_compaction_scope())
 
     async def compact_context(self, request: ChatRequest) -> dict[str, Any]:
         """Compact a bounded window and retain every returned canonical item.
@@ -3381,13 +3431,13 @@ class OpenAIProvider:
         (never in place of) canonical history.
         """
         from ._media_request import marked, refused
-        from .compaction import canonical_usage, compacted_message
+        from .compaction import QUALIFIED_SWITCH, canonical_usage, compacted_message, submit_compaction
 
         if marked(request) or id(request) in getattr(self, "_media_request_bindings", {}):
             # Compaction changes the fitted transcript and has no generic
             # image-projection lifetime; require the host to prepare a new one.
             raise refused()
-        if not self.supports_native_compaction():
+        if not self.supports_native_compaction(model=request.model or self.default_model):
             raise NotImplementedError("This endpoint does not advertise native Responses compaction")
         params = self._budget_params(request)
         from .configuration_updates import validate_request
@@ -3397,8 +3447,12 @@ class OpenAIProvider:
             return await self._compact_configuration_updates(request, params, updates)
         input_tokens = await self._guard_assembled_params_with_provider_count(params)
         compact_params = {key: params[key] for key in ("model", "input", "instructions") if key in params}
-        response = await self.client.responses.compact(
-            **compact_params, timeout=self._transport_timeout(self._request_timeout(request))
+        client = self.client
+        if isinstance(client, AsyncOpenAI):
+            client = client.with_options(max_retries=0)
+        response = await submit_compaction(
+            client.responses.compact, compact_params,
+            timeout=self._transport_timeout(self._request_timeout(request)),
         )
         # SDK output models can invent unset fields (e.g. phase=None on a
         # retained user message), which are illegal when replayed as input.
@@ -3409,13 +3463,14 @@ class OpenAIProvider:
         usage = getattr(response, "usage", None)
         if hasattr(usage, "model_dump"):
             usage = usage.model_dump()
-        return {"kind": "native", "message": compacted_message(params["model"], output),
+        scope = self._standalone_compaction_scope() if params["model"] in QUALIFIED_SWITCH else None
+        return {"kind": "native", "message": compacted_message(params["model"], output, scope=scope),
                 "usage": canonical_usage(usage), "input_tokens": input_tokens}
 
     async def _compact_configuration_updates(self, request, params, updates):
         """One explicit Responses trigger; never retry or strip update history."""
         from ._response_handling import response_items
-        from .compaction import canonical_usage
+        from .compaction import canonical_usage, submit_compaction
         from .configuration_updates import compacted_update_message
 
         body = {**params, **(params.get("extra_body") or {})}
@@ -3430,8 +3485,9 @@ class OpenAIProvider:
         # This separate operation has no retry/fallback path: a transport error
         # can mean submission happened. The caller must reconcile before retrying.
         client = self.client.with_options(max_retries=0)
-        response = await client.responses.create(
-            **trigger_params, timeout=self._transport_timeout(self._request_timeout(request))
+        response = await submit_compaction(
+            client.responses.create, trigger_params,
+            timeout=self._transport_timeout(self._request_timeout(request)),
         )
         if getattr(response, "status", None) != "completed":
             raise ValueError("Explicit Responses compaction did not complete")
@@ -5020,7 +5076,6 @@ class OpenAIProvider:
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
         """
-        from .compaction import canonical_window
         from .computer_history import project_failed_computer_history
         from .configuration_updates import compaction_restatement, message_item
         from .neutral_computer import CALLS, KEY, plan_observations, replay_calls
@@ -5126,7 +5181,7 @@ class OpenAIProvider:
                 openai_messages.append(update)
                 i += 1
                 continue
-            window = canonical_window(msg, model_name)
+            window = self._compacted_window(msg, model_name)
             if window is not None:
                 # Standalone compact output is already canonical. Preserve the
                 # full list byte-for-byte in JSON values, including retained
