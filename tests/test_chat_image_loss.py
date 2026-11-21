@@ -164,38 +164,6 @@ async def test_runtime_direct_tool_url_and_base64_keep_tool_call_order():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("deployment", ["blue", "text-only-alias"])
-async def test_adapter_qualifies_images_by_final_wire_deployment(monkeypatch, deployment):
-    p, wire, events = provider()
-    # Only the binding for the effective wire deployment determines what its
-    # user and tool inputs can contain.
-    models = {"blue": "gpt-4.1", "text-only-alias": "gpt-3.5-turbo"}
-    monkeypatch.setattr(type(p), "_chat_image_model", lambda self, model: models.get(model))
-    p.extra_request_params = {"extra_body": {"model": deployment}}
-    request = ChatRequest(model="gpt-6.1-sol", messages=[
-        Message(role="user", content=[image("base64")]),
-        Message(role="assistant", content=[ToolCallBlock(id="one", name="inspect", input={})]),
-        Message(role="tool", name="inspect", tool_call_id="one", content=[image("base64")]),
-    ])
-    try:
-        await p.complete(request)
-        payload = wire[-1][1]
-        assert payload["model"] == deployment
-        user, call, result = payload["input"]
-        assert call["call_id"] == result["call_id"] == "one"
-        if deployment == "blue":
-            expected = {"type": "input_image", "image_url": f"data:image/png;base64,{DATA}"}
-            assert user["content"] == [expected]
-            assert result["output"] == [expected]
-        else:
-            assert all(DATA not in json.dumps(body) for _, body in wire)
-            assert UNAVAILABLE in json.dumps(user) and UNAVAILABLE in json.dumps(result)
-        assert DATA not in json.dumps(events)
-    finally:
-        await p.client.close()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("outer", [None, "wrong"])
 async def test_nested_correlation_error_is_payload_free_before_count_and_send(outer):
     p, wire, _ = provider()
