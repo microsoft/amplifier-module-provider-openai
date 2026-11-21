@@ -641,3 +641,48 @@ async def test_ordinary_tool_schema_property_named_type_survives_count_and_compl
         assert any(name == "llm:response" for name, _ in events)
     finally:
         await p.client.close()
+
+@pytest.mark.asyncio
+async def test_request_reuses_encoded_image_values_across_diagnostic_events(monkeypatch):
+    from collections import Counter
+    from amplifier_module_provider_openai import _chat_images
+
+    data_url = f"data:image/png;base64,{DATA}"
+    encodings = Counter()
+
+    def counted_dumps(value, **kwargs):
+        if isinstance(value, str) and value in {DATA, data_url}:
+            encodings[value, kwargs.get("ensure_ascii", True)] += 1
+        return json.dumps(value, **kwargs)
+
+    monkeypatch.setattr(_chat_images, "json", SimpleNamespace(dumps=counted_dumps, loads=json.loads))
+    p, wire, events = provider()
+    try:
+        request = ChatRequest(messages=[Message(role="user", content=[
+            image("base64"), *(TextBlock(text=f"ordinary field {i}") for i in range(40))
+        ])])
+        await p.complete(request)
+        assert {name for name, payload in events if "raw" in payload} >= {"llm:request", "llm:response"}
+        assert data_url in json.dumps(wire[-1][1])
+        assert DATA not in json.dumps(events)
+        assert encodings == {(value, ascii_only): 1 for value in (DATA, data_url)
+                             for ascii_only in (True, False)}
+    finally:
+        await p.client.close()
+
+
+@pytest.mark.asyncio
+async def test_preescaped_image_url_in_sdk_error_stays_out_of_logs_and_traceback(monkeypatch, caplog):
+    private_url = 'https://images.example.test/private-thumb?token="秘密\\fixture"'
+    monkeypatch.setattr(sys.modules[__name__], "URL", private_url)
+    escaped_url = json.dumps(private_url)[1:-1]
+    error_body = {"error": {"type": "invalid_request_error", "message": f"bad input {escaped_url}"}}
+    p, _, events = provider(replies=[httpx.Response(400, json=error_body)])
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await p.complete(ChatRequest(messages=[Message(role="user", content=[image()])]))
+        assert caught.value.status_code == 400 and not caught.value.retryable
+        assert json.loads(str(caught.value))["message"] == "bad input [image omitted from diagnostics]"
+        assert "private-thumb" not in json.dumps(events) + caplog.text + "".join(traceback.format_exception(caught.value))
+    finally:
+        await p.client.close()

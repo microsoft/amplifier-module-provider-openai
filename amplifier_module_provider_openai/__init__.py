@@ -61,10 +61,9 @@ from ._capabilities import (
 )
 from ._chat_images import (
     UNAVAILABLE,
-    diagnostic_copy,
+    MediaRedactor,
     instruction_text,
     media_values,
-    sanitize_error,
 )
 from ._chat_images import (
     image_url as _chat_image_url,
@@ -3777,7 +3776,7 @@ class OpenAIProvider:
         unpriced_request_mode = _has_unpriced_gpt_6_2_mode({
             **params, **(params.get("extra_body") or {}),
         })
-        media_echoes = media_values(request.model_dump()) | media_values(params)
+        redactor = MediaRedactor(media_values(request.model_dump()) | media_values(params))
 
         message_list = list(request.messages)
         instructions = params.get("instructions")
@@ -3813,7 +3812,7 @@ class OpenAIProvider:
                 "background_mode": background_mode,
             }
             if self.raw:
-                request_payload["raw"] = redact_secrets(diagnostic_copy(params, media_echoes))
+                request_payload["raw"] = redact_secrets(redactor.copy(params))
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -4183,7 +4182,7 @@ class OpenAIProvider:
                                     "request_id": request_id,
                                     "error": {
                                         "type": type(e).__name__,
-                                        "msg": diagnostic_copy(str(e), media_echoes),
+                                        "msg": redactor.error_message(e),
                                     },
                                 },
                             )
@@ -4226,8 +4225,7 @@ class OpenAIProvider:
                     and retry_after > self._retry_config.max_delay
                 ):
                     retryable = False
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = redactor.error_message(e)
                 raise kernel_errors.RateLimitError(
                     error_msg,
                     provider=self.name,
@@ -4236,8 +4234,7 @@ class OpenAIProvider:
                     retry_after=retry_after,
                 ) from e
             except openai.AuthenticationError as e:
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = redactor.error_message(e)
                 raise kernel_errors.AuthenticationError(
                     error_msg,
                     provider=self.name,
@@ -4246,7 +4243,7 @@ class OpenAIProvider:
             except openai.BadRequestError as e:
                 raw_msg = str(e).lower()
                 body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = redactor.error_message(e)
                 err_code, _ = _extract_error_fields(body)
                 if _is_context_overflow(err_code, raw_msg):
                     return await _handle_context_overflow(e, error_msg)
@@ -4268,8 +4265,7 @@ class OpenAIProvider:
                     ) from e
             except openai.APIStatusError as e:
                 status = getattr(e, "status_code", 500)
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = redactor.error_message(e)
                 if status == 403:
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
@@ -4335,11 +4331,7 @@ class OpenAIProvider:
                         retryable=True,
                     ) from e
                 body = getattr(e, "body", None)
-                error_msg = (
-                    json.dumps(body)
-                    if body is not None
-                    else (str(e) or f"{type(e).__name__}: (no message)")
-                )
+                error_msg = redactor.error_message(e) or f"{type(e).__name__}: (no message)"
                 err_code, err_type = _extract_error_fields(body)
                 raw_msg = str(e).lower()
                 if _is_context_overflow(err_code, raw_msg):
@@ -4366,11 +4358,7 @@ class OpenAIProvider:
                     retryable=True,
                 ) from e
             except Exception as e:
-                body = getattr(e, "body", None)
-                if body is not None:
-                    error_msg = json.dumps(body)
-                else:
-                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
+                error_msg = redactor.error_message(e) or f"{type(e).__name__}: (no message)"
                 raise kernel_errors.LLMError(
                     error_msg,
                     provider=self.name,
@@ -4399,7 +4387,7 @@ class OpenAIProvider:
             try:
                 return await _do_complete()
             except Exception as caught:
-                sanitize_error(caught, media_echoes)
+                redactor.sanitize_error(caught)
                 raise
 
         async def _do_complete_guarded():
@@ -4883,7 +4871,7 @@ class OpenAIProvider:
                 }
                 if self.raw:
                     response_event["raw"] = redact_secrets(
-                        diagnostic_copy(response.model_dump(), media_echoes)
+                        redactor.copy(response.model_dump())
                     )
                 if captured_rate_limit_info:
                     response_event["rate_limits"] = captured_rate_limit_info
@@ -4895,13 +4883,11 @@ class OpenAIProvider:
             _error_billing(e)
             raise
         except kernel_errors.LLMError as e:
-            sanitize_error(e, media_echoes)
+            redactor.sanitize_error(e)
             error_billing = _error_billing(e)
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = diagnostic_copy(
-                str(e) or f"{type(e).__name__}: (no message)", media_echoes
-            )
+            error_msg = redactor.copy(str(e) or f"{type(e).__name__}: (no message)")
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4922,13 +4908,11 @@ class OpenAIProvider:
             raise
 
         except Exception as e:
-            sanitize_error(e, media_echoes)
+            redactor.sanitize_error(e)
             error_billing = _error_billing(e)
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
-            error_msg = diagnostic_copy(
-                str(e) or f"{type(e).__name__}: (no message)", media_echoes
-            )
+            error_msg = redactor.copy(str(e) or f"{type(e).__name__}: (no message)")
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             # Emit error event
