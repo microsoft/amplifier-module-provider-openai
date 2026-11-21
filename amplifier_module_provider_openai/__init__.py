@@ -2824,6 +2824,8 @@ class OpenAIProvider:
             "json_mode",
             "completion:auto_continue:v1",
         ]
+        if self._uses_standard_openai_endpoint():
+            provider_capabilities.extend(("prompt-cache:model-scoped", "prompt-cache:top-level-tools-prefix"))
         if self._provider_count_available():
             provider_capabilities.append("request_budget:provider_count")
         from ._single_attempt import CAPABILITY, CAPABILITY_V2, endpoint
@@ -3370,9 +3372,16 @@ class OpenAIProvider:
         self, message: dict[str, Any], *, model: str | None = None
     ) -> bool:
         """Validate opaque transport for the effective continuation model."""
-        from .compaction import canonical_window
+        return self._compacted_window(message, model or self.default_model) is not None
 
-        return canonical_window(message, model or self.default_model) is not None
+    def _compacted_window(self, message, model):
+        from .compaction import KEY, canonical_window, matches_scope
+
+        state = (message.get("metadata") or {}).get(KEY)
+        if isinstance(state, dict) and "scope" in state:
+            if not matches_scope(state, self._standalone_compaction_scope()):
+                raise ValueError("Native compacted context belongs to a different connection")
+        return canonical_window(message, model)
 
     def _standalone_compaction_scope(self):
         if not self._uses_standard_openai_endpoint():
@@ -5057,7 +5066,6 @@ class OpenAIProvider:
         Returns:
             List of OpenAI-formatted message objects per Responses API spec
         """
-        from .compaction import canonical_window
         from .computer_history import project_failed_computer_history
         from .configuration_updates import compaction_restatement, message_item
         from .neutral_computer import CALLS, KEY, plan_observations, replay_calls
@@ -5163,7 +5171,7 @@ class OpenAIProvider:
                 openai_messages.append(update)
                 i += 1
                 continue
-            window = canonical_window(msg, model_name)
+            window = self._compacted_window(msg, model_name)
             if window is not None:
                 # Standalone compact output is already canonical. Preserve the
                 # full list byte-for-byte in JSON values, including retained

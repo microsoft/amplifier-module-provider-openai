@@ -87,12 +87,16 @@ def canonical_window(message, model):
     return compacted_message(model, state.get("output"))["metadata"][KEY]["output"]
 
 
+def matches_scope(state, scope):
+    stored = state.get("scope")
+    return bool(scope and isinstance(stored, str) and hmac.compare_digest(stored, scope))
+
+
 def rebind_window(message, source_model, model, scope):
     if not scope or {source_model, model} != QUALIFIED_SWITCH:
         return None
     state = (message.get("metadata") or {}).get(KEY)
-    if (not isinstance(state, dict) or not isinstance(state.get("scope"), str)
-            or not hmac.compare_digest(state["scope"], scope)):
+    if not isinstance(state, dict) or not matches_scope(state, scope):
         return None
     window = canonical_window(message, source_model)
     return compacted_message(model, window, scope=scope)

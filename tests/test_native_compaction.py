@@ -188,6 +188,7 @@ def test_validation_uses_explicit_continuation_model_without_changing_provider_d
     assert provider.default_model == default
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source,target", [
     ("gpt-6.2-astra", "gpt-6.2-sol"), ("gpt-6.2-sol", "gpt-6.2-astra"),
 ])
@@ -208,6 +209,10 @@ async def test_standalone_window_rebind_requires_matching_openai_scope(source, t
         assert canonical_window(message, source) == window
         assert provider.rebind_compacted_context(message, source_model=source, model="gpt-6.1-sol") is None
         assert foreign.rebind_compacted_context(message, source_model=source, model=target) is None
+        with pytest.raises(ValueError, match="different connection"):
+            foreign.validate_compacted_context(message, model=source)
+        with pytest.raises(ValueError, match="different connection"):
+            foreign._convert_messages([message], model=source)
         legacy = compacted_message(source, window)
         assert provider.rebind_compacted_context(legacy, source_model=source, model=target) is None
 
