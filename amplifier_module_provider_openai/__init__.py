@@ -1974,6 +1974,12 @@ class OpenAIProvider:
             return False
         return self._has_standard_openai_endpoint()
 
+    def _chat_image_model(self, model: str) -> str | None:
+        """Return the underlying model for ordinary image projection on this route."""
+        if self.name == "openai" and self._has_standard_openai_endpoint():
+            return model
+        return None
+
     def _has_standard_openai_endpoint(self) -> bool:
         """Check the actual route, including the native transport's client."""
         if self._client is not None:
@@ -2142,7 +2148,7 @@ class OpenAIProvider:
         return {"context_window_tokens": window} if window is not None else {}
 
     def _assemble_initial_responses_params_stateful(
-        self, request: ChatRequest, *, restore_state: bool, **kwargs: Any
+        self, request: ChatRequest, *, restore_state: bool, image_model: str | None, **kwargs: Any
     ) -> dict[str, Any]:
         """Assemble initial Responses params against this isolated state snapshot.
 
@@ -2200,7 +2206,7 @@ class OpenAIProvider:
                 "model": model_name,
                 "input": self._convert_messages(
                     messages, model=model_name,
-                    project_images=False,
+                    project_images=False, image_model=image_model,
                     ordinary_computer_names=frozenset(
                         name for name in ordinary_names(history_tools) if name == "computer"
                     ),
@@ -2491,10 +2497,10 @@ class OpenAIProvider:
         # Membership is repeated across historical calls; do not consume the
         # generator per call or require escaped roster names to be hashable.
         history_ordinary_names = tuple(ordinary_names(history_tools))
+        image_model = self._chat_image_model(effective_model)
         request = request.model_copy(update={"messages": [
             Message.model_validate(m) for m in project_chat_images(
-                originals, model=effective_model,
-                qualified=self.name == "openai" and self._has_standard_openai_endpoint(),
+                originals, model=image_model or effective_model, qualified=image_model is not None,
                 native_ids=set(self._native_call_ids) | set(replay), strict_direct=True,
                 ordinary_names=history_ordinary_names,
             )
@@ -2502,7 +2508,7 @@ class OpenAIProvider:
         request, repairs = planner._plan_tool_repairs(request)
 
         params = planner._assemble_initial_responses_params_stateful(
-            request, restore_state=False, **kwargs
+            request, restore_state=False, image_model=image_model, **kwargs
         )
         state = {
             "repairs": repairs,
@@ -5003,6 +5009,7 @@ class OpenAIProvider:
         model: str | None = None,
         ordinary_computer_names: frozenset[str] = frozenset(),
         project_images: bool = True,
+        image_model: str | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API format.
 
@@ -5068,10 +5075,11 @@ class OpenAIProvider:
                 }
                 metadata[CALLS] = {k: v for k, v in metadata[CALLS].items() if k in ids}
         current_replay = replay_calls(messages)
+        model_name = model or self.default_model
         if project_images:
+            image_model = self._chat_image_model(model_name)
             messages = project_chat_images(
-                messages, model=model or self.default_model,
-                qualified=self.name == "openai" and self._has_standard_openai_endpoint(),
+                messages, model=image_model or model_name, qualified=image_model is not None,
                 native_ids=set(self._native_call_ids) | set(current_replay),
                 ordinary_names=ordinary_computer_names,
             )
@@ -5079,7 +5087,6 @@ class OpenAIProvider:
         canonical_item_ids = set()
         canonical_response_item_ids = set()
         i = 0
-        model_name = model or self.default_model
 
         # Occurrence counter for _stable_message_id: how many times an assistant
         # message with this exact (content, status) pair has already been emitted
@@ -5310,7 +5317,7 @@ class OpenAIProvider:
                             # Per OpenAI Responses API spec (see ai_context/openai-api-guide.txt)
                             rich_output = (
                                 _convert_function_tool_output_content(
-                                    tool_content, model_name
+                                    tool_content, image_model or model_name
                                 )
                                 if isinstance(tool_content, list)
                                 else None
