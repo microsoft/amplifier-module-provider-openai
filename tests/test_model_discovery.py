@@ -5,6 +5,7 @@ import inspect
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -216,6 +217,118 @@ def test_optional_selector_advertisement_no_parallel_discovery_surface():
         "include": ["gpt-6*"], "exclude": [], "hide_dated": True, "hide_shutdown": True,
     }
     assert p._client is None
+
+
+def test_prompt_suggestion_recommendations_are_local_detached_metadata(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    p = OpenAIProvider(config={"default_model": "gpt-6.2-astra", "reasoning_effort": "low"})
+    before = deepcopy(p.config)
+    filters = p._model_filters
+    monkeypatch.setattr(
+        OpenAIProvider, "client",
+        property(lambda _: pytest.fail("metadata must not construct or access the SDK client")),
+    )
+    first, second = p.get_model_list_info(), p.get_model_list_info()
+    expected = {"prompt-suggestions": ["gpt-6-luna"]}
+    assert first["purpose_recommendations"] == second["purpose_recommendations"] == expected
+    assert first is not second
+    assert first["purpose_recommendations"] is not second["purpose_recommendations"]
+    assert (
+        first["purpose_recommendations"]["prompt-suggestions"]
+        is not second["purpose_recommendations"]["prompt-suggestions"]
+    )
+    first["purpose_recommendations"]["prompt-suggestions"].append("guessed-future-luna")
+    second["purpose_recommendations"].clear()
+    assert p.get_model_list_info()["purpose_recommendations"] == expected
+    assert p.config == before and p._model_filters is filters
+    assert p.default_model == "gpt-6.2-astra" and p.reasoning_effort == "low"
+    assert p._client is None and p._api_key is None
+
+
+@pytest.mark.parametrize("selector", [
+    {}, {"include": []}, {"include": ["gpt-6*"]}, {"exclude": ["gpt-6-luna"]},
+])
+def test_prompt_suggestion_recommendations_defer_to_explicit_filters(selector, monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    p = OpenAIProvider(config={"model_filters": selector})
+    before = deepcopy(p.get_model_list_info()["default_filters"])
+    assert p.get_model_list_info()["purpose_recommendations"] == {}
+    assert p.get_model_list_info()["default_filters"] == before
+
+
+@pytest.mark.parametrize("endpoint, expected", [
+    (None, True),
+    ("https://api.openai.com/v1", True),
+    ("https://api.openai.com:443/v1/", True),
+    ("https://gateway.invalid/v1", False),
+    ("https://deployment.openai.azure.com/openai/deployments/luna", False),
+    ("http://api.openai.com/v1", False),
+    ("https://api.openai.com/other", False),
+    ("https://api.openai.com/v1?deployment=luna", False),
+])
+def test_prompt_suggestion_recommendations_require_standard_endpoint(endpoint, expected, monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    p = OpenAIProvider(config={"base_url": endpoint})
+    assert p.get_model_list_info()["purpose_recommendations"] == (
+        {"prompt-suggestions": ["gpt-6-luna"]} if expected else {}
+    )
+    assert p._client is None
+
+
+def test_prompt_suggestion_recommendations_check_environment_endpoint(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.invalid/v1")
+    assert OpenAIProvider().get_model_list_info()["purpose_recommendations"] == {}
+
+
+@pytest.mark.parametrize("endpoint, expected", [
+    ("https://api.openai.com/v1/", True),
+    ("https://gateway.invalid/v1/", False),
+    (None, False),
+])
+def test_prompt_suggestion_recommendations_follow_bound_client_route(endpoint, expected, monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    client = SimpleNamespace(base_url=endpoint)
+    p = OpenAIProvider(client=client, config={"base_url": "https://api.openai.com/v1"})
+    assert p.get_model_list_info()["purpose_recommendations"] == (
+        {"prompt-suggestions": ["gpt-6-luna"]} if expected else {}
+    )
+    assert p._client is client
+
+
+@pytest.mark.parametrize("name", ["openai", "azure"])
+def test_prompt_suggestion_recommendations_do_not_claim_subclass_authority(name, monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+    class AdaptedProvider(OpenAIProvider):
+        pass
+
+    p = AdaptedProvider()
+    p.name = name
+    assert p.get_model_list_info()["purpose_recommendations"] == {}
+
+
+@pytest.mark.asyncio
+async def test_prompt_suggestion_metadata_never_synthesizes_inventory_or_changes_overrides(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    inventory = {"gpt-6.2-sol": None, "gpt-6-luna": None, "gpt-6-future-luna": None}
+    p = OpenAIProvider(config={"default_model": "explicit-account-pin"})
+
+    async def fetch():
+        return dict(inventory)
+
+    monkeypatch.setattr(p, "_fetch_model_catalog", fetch)
+    assert p.get_model_list_info()["purpose_recommendations"] == {
+        "prompt-suggestions": ["gpt-6-luna"],
+    }
+    assert ids(await p.list_models()) == set(inventory)
+    assert ids(await p.list_models(filters={"exclude": ["gpt-6-luna"]})) == {
+        "gpt-6.2-sol", "gpt-6-future-luna",
+    }
+    inventory.pop("gpt-6-luna")
+    assert ids(await p.list_models()) == set(inventory)
+    inventory.clear()
+    assert await p.list_models() == []
+    assert p.default_model == "explicit-account-pin" and p._client is None
 
 
 @pytest.mark.asyncio

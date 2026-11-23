@@ -3045,6 +3045,15 @@ class OpenAIProvider:
                 and self.name == "openai" and self._has_standard_openai_endpoint()
                 else {}
             ),
+            # Exact provider-owned candidates, not account availability or a
+            # capability/cost guarantee. Consumers must intersect live inventory.
+            # Custom selectors and adapted providers retain their own policy.
+            "purpose_recommendations": (
+                {"prompt-suggestions": ["gpt-6-luna"]}
+                if self._use_default_recommendations
+                and self.name == "openai" and self._uses_standard_openai_endpoint()
+                else {}
+            ),
             "unfiltered": {},
             "override": "replace",
         }
