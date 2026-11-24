@@ -14,6 +14,7 @@ from ._chat_images import media_values
 
 KEY = "openai:compaction"
 QUALIFIED_SWITCH = frozenset({"gpt-6.2-astra", "gpt-6.2-sol"})
+SOL_UPGRADE = ("gpt-6.1-sol", "gpt-6.2-sol")
 
 
 def operation_params(assembled, messages):
@@ -129,7 +130,7 @@ def matches_scope(state, scope):
 
 
 def rebind_window(message, source_model, model, scope):
-    if not scope or {source_model, model} != QUALIFIED_SWITCH:
+    if not scope or ({source_model, model} != QUALIFIED_SWITCH and (source_model, model) != SOL_UPGRADE):
         return None
     state = (message.get("metadata") or {}).get(KEY)
     if not isinstance(state, dict) or not matches_scope(state, scope):

@@ -3437,6 +3437,43 @@ class OpenAIProvider:
 
         return rebind_window(message, source_model, model, self._standalone_compaction_scope())
 
+    def checkpoint_renewal_request(self, message, *, source_model, model):
+        """Plan source-model reissuance of a legacy standalone Sol window."""
+        from amplifier_core.message_models import Message
+        from .compaction import KEY, SOL_UPGRADE, canonical_window
+
+        state = (message.get("metadata") or {}).get(KEY)
+        if (source_model, model) != SOL_UPGRADE or not isinstance(state, dict) or "scope" in state:
+            return None
+        scope = self._standalone_compaction_scope()
+        if scope is None:
+            return None
+        canonical_window(message, source_model)
+        return ChatRequest(
+            model=source_model,
+            messages=[Message(**message)],
+            max_output_tokens=get_capabilities(source_model).max_output_tokens,
+            metadata={"openai:renewal_scope": scope},
+        )
+
+    async def renew_compacted_context(self, request, *, model):
+        """Send the complete old window to its original model through normal native compaction."""
+        if len(request.messages) != 1:
+            raise ValueError("Checkpoint renewal requires one complete source window")
+        source = request.model
+        message = request.messages[0].model_dump(exclude_none=True)
+        scope = self._standalone_compaction_scope()
+        if (not scope
+                or self.checkpoint_renewal_request(message, source_model=source, model=model) != request):
+            raise ValueError("Invalid source-model checkpoint renewal")
+        result = await self.compact_context(request)
+        if self._standalone_compaction_scope() != scope:
+            raise ValueError("Connection changed during source-model checkpoint renewal")
+        rebound = self.rebind_compacted_context(result["message"], source_model=source, model=model)
+        if rebound is None:
+            raise ValueError("Renewed checkpoint is unavailable on the selected connection")
+        return rebound
+
     async def compact_context(self, request: ChatRequest) -> dict[str, Any]:
         """Compact a bounded window and retain every returned canonical item.
 
@@ -3447,6 +3484,7 @@ class OpenAIProvider:
         from ._media_request import marked, refused
         from .compaction import (
             QUALIFIED_SWITCH,
+            SOL_UPGRADE,
             canonical_usage,
             compacted_message,
             operation_params,
@@ -3482,7 +3520,8 @@ class OpenAIProvider:
         usage = getattr(response, "usage", None)
         if hasattr(usage, "model_dump"):
             usage = usage.model_dump()
-        scope = self._standalone_compaction_scope() if params["model"] in QUALIFIED_SWITCH else None
+        scoped_model = params["model"] in QUALIFIED_SWITCH or params["model"] == SOL_UPGRADE[0]
+        scope = self._standalone_compaction_scope() if scoped_model else None
         return {"kind": "native", "message": compacted_message(params["model"], output, scope=scope),
                 "usage": canonical_usage(usage), "input_tokens": input_tokens}
 
