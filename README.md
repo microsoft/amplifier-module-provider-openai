@@ -150,6 +150,27 @@ this provider default does not alter their tier policy.
 - `gpt-5.4` - Balanced GPT-5 model
 - `gpt-5-mini` - Smaller, faster GPT-5: 400,000-token total context, 272,000-token maximum input, and 128,000-token maximum output. Preflight retains its 4,096-token safety reserve; reducing the output cap does not raise the input ceiling.
 - `gpt-5-nano` - Smallest GPT-5 variant
+- `chat-latest` - Exact rolling ID: 400,000-token total context, independent
+  272,000-token input ceiling, and 128,000-token output ceiling. Preflight keeps
+  its 4,096-token safety reserve even with reduced output. The official
+  [model page](https://developers.openai.com/api/docs/models/chat-latest.md)
+  (reviewed 2026-11-15) documents text/image input, text output, streaming,
+  ordinary function calling, and structured outputs. Catalog metadata reports
+  the input-oriented 272,000 window only when the endpoint returns the ID and
+  an explicit selector includes it (`filters={}` or `include: ["chat-latest"]`);
+  the default GPT-6 listing and `gpt-6.1-sol` default are unchanged. Dated siblings
+  and near-miss IDs are not inferred. Exact observed `chat-latest` has a Standard
+  token estimate of USD $5 input / $30 output / $0.50 cached input per million,
+  with cached reads subtracted from total input (1000 input, 100 cached, 100 output
+  estimates $0.00755). This is not an invoice or hosted-tool fee estimate.
+  Missing/invalid input, output, cached usage or response tier, non-`default`
+  tiers, reported writes, and unknown observed IDs leave `cost_usd: null`, not zero.
+  Absent optional write evidence or empty/recognized all-zero lifetime buckets
+  mean no reported writes; they do not establish write pricing. Valid all-zero
+  counts estimate zero. Nested `extra_body.model` retains budget abstention.
+  These limits and estimates are not final-candidate live qualification:
+  reasoning efforts, native computer/image operations, and new cache policies
+  are not qualified by it; existing request-policy defaults are unchanged.
 
 ### Model listing and optional filters
 

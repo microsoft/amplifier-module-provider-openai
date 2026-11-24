@@ -101,6 +101,13 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_write_per_m": Decimal("2.50"),
         "cache_write_12h_per_m": Decimal("5.00"),
     },
+    # Exact rolling alias only; no documented write, tier, or long-context rates.
+    # https://developers.openai.com/api/docs/models/chat-latest.md (2026-11-15).
+    "chat-latest": {
+        "input_per_m": Decimal("5.00"),
+        "output_per_m": Decimal("30.00"),
+        "cache_read_per_m": Decimal("0.50"),
+    },
     # GPT-6 and GPT-6.1 short-context Standard pricing, per 1M tokens.
     # Source: https://developers.openai.com/api/docs/pricing
     "gpt-6-astra": {
@@ -460,9 +467,9 @@ def _find_rates(
     m = _SNAPSHOT_RE.match(model)
     if m is None:
         return None
-    # GPT-6 plus GPT-6.1 have exact documented model IDs and no dated snapshots. Do not
+    # GPT-6, GPT-6.1 and chat-latest have exact IDs and no dated snapshots. Do not
     # assign their current prices to invented future snapshots.
-    if m.group("base") in GPT_6_MODELS:
+    if m.group("base") in GPT_6_MODELS or m.group("base") == "chat-latest":
         return None
     return table.get(m.group("base"))
 
@@ -521,6 +528,38 @@ def compute_cost(
     rates = _find_rates(model)
     if rates is None:
         return None
+
+    if model == "chat-latest":
+        # Standard token estimate only. Do not normalize malformed evidence or
+        # import newer models' write/tier assumptions into this rolling alias.
+        if (
+            service_tier != "default"
+            or any(
+                type(value) is not int or value < 0
+                for value in (
+                    prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens
+                )
+            )
+            or cached_tokens > prompt_tokens
+            or cache_write_tokens != 0
+        ):
+            return None
+        # Absent breakdown or empty/recognized all-zero buckets mean no reported
+        # writes, not evidence of a supported cache-write price.
+        if cache_write_tokens_details is not None and (
+            not isinstance(cache_write_tokens_details, Mapping)
+            or set(cache_write_tokens_details) - {"ttl_30m_tokens", "ttl_12h_tokens"}
+            or any(
+                type(value) is not int or value != 0
+                for value in cache_write_tokens_details.values()
+            )
+        ):
+            return None
+        return (
+            Decimal(prompt_tokens - cached_tokens) * rates["input_per_m"]
+            + Decimal(cached_tokens) * rates["cache_read_per_m"]
+            + Decimal(completion_tokens) * rates["output_per_m"]
+        ) / _PER_M
 
     # Modern write pricing needs trustworthy, non-overlapping usage counts.
     # Keep the historical pre-5.6 reader behavior (including its clamping).
