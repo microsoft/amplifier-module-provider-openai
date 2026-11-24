@@ -1466,6 +1466,13 @@ results inside it. Count and fit the complete assembled window via
 `request_budget`; the short carrier label is not its token count. A missing or
 invalid carrier must rebuild from original history, not continue with the label.
 
+A GPT-6.1 Sol checkpoint bound to the current OpenAI connection can continue
+directly on GPT-6.2 Sol. Older checkpoints lack a connection binding. For this
+upgrade, the adapter can renew the saved window once on GPT-6.1 Sol using the
+original provider instance. OpenAI receives the complete checkpoint window for
+renewal. The host then measures the renewed window and recent messages on
+GPT-6.2 Sol. A checkpoint bound to another connection is ineligible.
+
 `compact_context` counts input before dispatch, never executes tools, and returns
 normalized usage with separate cache-write/read buckets. Native compact cost is
 left unavailable when the response does not report it. Canonical SDK output uses
