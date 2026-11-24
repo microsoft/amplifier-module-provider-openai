@@ -522,18 +522,36 @@ async def test_cold_count_and_generation_bind_one_legitimate_client(monkeypatch,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("http_mode", ["sdk-injected", "sdk-default"])
-async def test_default_sdk_family_transport_identity_change_refuses(http_mode):
+@pytest.mark.parametrize("proxy", [False, True])
+async def test_default_sdk_family_transport_identity_change_refuses(monkeypatch, http_mode, proxy):
     import httpx2
 
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                 "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    if proxy:
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
     req = request()
     p, _, wires, _ = fixture(req, http_mode=http_mode)
     original_emit = p.coordinator.hooks.emit
-    original_transport = p.client._client._transport
+    http = p.client._client
+    url = type(http.base_url)("https://api.openai.com/v1/responses")
+    original_transport = http._transport_for_url(url)
+    original_default = http._transport
+    original_mounts = dict(http._mounts)
+    assert (original_transport is not original_default) == (proxy and http_mode == "sdk-default")
 
     async def emit(name, data):
         await original_emit(name, data)
         if name == "llm:request":
-            p.client._client._transport = httpx2.MockTransport(lambda _: pytest.fail("changed transport reached"))
+            changed = httpx2.MockTransport(lambda _: pytest.fail("changed transport reached"))
+            # Change the selected route, not an unused default behind a proxy.
+            if original_transport is http._transport:
+                http._transport = changed
+            for pattern, transport in http._mounts.items():
+                if transport is original_transport:
+                    http._mounts[pattern] = changed
+            assert http._transport_for_url(url) is changed
 
     p.coordinator.hooks.emit = emit
     try:
@@ -541,7 +559,8 @@ async def test_default_sdk_family_transport_identity_change_refuses(http_mode):
             await p.complete(req)
         assert len(wires) == 1 and wires[0][0].endswith("input_tokens")
     finally:
-        p.client._client._transport = original_transport
+        http._transport = original_default
+        http._mounts = original_mounts
         await p.client.close()
 
 
