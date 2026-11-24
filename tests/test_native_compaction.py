@@ -271,3 +271,39 @@ async def test_sdk_defaults_do_not_become_unknown_input_parameters():
     )
     saved = result["message"]["metadata"]["openai:compaction"]["output"]
     assert saved[0] == raw  # Retain explicit null, omit only absent SDK defaults.
+
+
+@pytest.mark.asyncio
+async def test_sol_upgrade_renews_only_unscoped_source_and_binds_result_to_connection():
+    from openai import AsyncOpenAI
+    from amplifier_module_provider_openai.compaction import KEY, canonical_window
+
+    _, _, window = fixture()
+    old, new = "gpt-6.1-sol", "gpt-6.2-sol"
+    async with (
+        AsyncOpenAI(api_key="fixture", base_url="https://api.openai.com/v1") as sdk,
+        AsyncOpenAI(api_key="other", base_url="https://api.openai.com/v1") as other,
+    ):
+        provider = OpenAIProvider(client=sdk)
+        foreign = OpenAIProvider(client=other)
+        legacy = compacted_message(old, window)
+        bound = compacted_message(old, window, scope=provider._standalone_compaction_scope())
+        assert provider.rebind_compacted_context(legacy, source_model=old, model=new) is None
+        assert foreign.checkpoint_renewal_request(bound, source_model=old, model=new) is None
+        assert provider.checkpoint_renewal_request(legacy, source_model=old, model="gpt-6.2-astra") is None
+        request = provider.checkpoint_renewal_request(legacy, source_model=old, model=new)
+        assert request.model == old and request.messages[0].metadata[KEY] == legacy["metadata"][KEY]
+        foreign.compact_context = AsyncMock()
+        with pytest.raises(ValueError, match="Invalid source-model"):
+            await foreign.renew_compacted_context(request, model=new)
+        foreign.compact_context.assert_not_awaited()
+
+        provider.compact_context = AsyncMock(return_value={"message": bound})
+        result = await provider.renew_compacted_context(request, model=new)
+        provider.compact_context.assert_awaited_once_with(request)
+        assert canonical_window(result, new) == window
+        assert provider.validate_compacted_context(result, model=new)
+        with pytest.raises(ValueError, match="different connection"):
+            foreign.validate_compacted_context(result, model=new)
+        assert result == provider.rebind_compacted_context(bound, source_model=old, model=new)
+        assert provider.rebind_compacted_context(result, source_model=new, model=old) is None
