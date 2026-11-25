@@ -239,6 +239,16 @@ this is **not** a Core protocol change or a promise about legacy/other providers
 listing failures still raise rather than becoming successful static results.
 No Foundation dependency or shared transport keyword assumption is introduced.
 
+The same local version-1 metadata includes `purpose_recommendations`, currently
+`{"prompt-suggestions": ["gpt-6-luna"]}` for the base OpenAI provider on the
+standard OpenAI endpoint with default filters. It is a fresh ordered candidate
+list, not a model-list fetch, account availability, capability attestation, or
+cost/output guarantee. Custom configured filters, nonstandard endpoints and
+subclasses receive an empty map rather than inheriting public OpenAI policy.
+Consumers must intersect exact IDs with that connection's current inventory and
+required capabilities, preserve explicit model choices, and never synthesize an
+absent model or choose an arbitrary fallback.
+
 Listing fetches one complete Models API response per attempt on the original
 bound SDK client, preserving endpoint, credential, organization/project (including
 absence), headers and caller transport ownership. The generated SDK's bearer-only
