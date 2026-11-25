@@ -17,6 +17,8 @@ import time
 
 from openai import APIError, APIStatusError
 
+from amplifier_openai_decision_catalog import catalog as catalog
+
 
 def decision_info():
     return {
@@ -371,11 +373,3 @@ def register_decision_backend(coordinator, provider, config):
             error.add_note(f"Decision registration rollback failed: {type(cleanup_error).__name__}")
         raise
     return remove
-
-
-def catalog():
-    from amplifier_decisions.config import validate
-    return {"schema_version": 2, "provider_module": "provider-openai", "validate": validate,
-            "backends": [{"kind": "openai-decisions", "label": "OpenAI Decisions",
-                          "default_model": "gpt-6-luna", "models": ["gpt-6-luna"],
-                          "configuration_key": "decisions"}]}

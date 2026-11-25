@@ -1,15 +1,34 @@
 """Exercise the installed wheel without dev dependencies or provider requests."""
 
 import asyncio
-
-import httpx
-from openai import AsyncOpenAI
-
-from amplifier_module_provider_openai import OpenAIProvider
-from amplifier_module_provider_openai import _single_attempt as bounded
+import sys
+from importlib.metadata import distribution
 
 
 async def main():
+    (entry,) = distribution("amplifier-module-provider-openai").entry_points.select(
+        group="amplifier.decision_backends", name="provider_openai"
+    )
+    catalog = entry.load()
+    try:
+        declaration = catalog()
+    except ModuleNotFoundError as error:
+        if error.name != "amplifier_decisions":
+            raise
+    else:
+        from amplifier_decisions.config import validate
+
+        assert declaration["provider_module"] == "provider-openai"
+        assert declaration["validate"] is validate
+    assert {"amplifier_module_provider_openai", "openai", "amplifier_core"}.isdisjoint(sys.modules)
+
+    import httpx
+    from openai import AsyncOpenAI
+    from amplifier_module_provider_openai import OpenAIProvider
+    from amplifier_module_provider_openai import _single_attempt as bounded
+    from amplifier_module_provider_openai.decisions import catalog as legacy_catalog
+
+    assert catalog is legacy_catalog
     provider = OpenAIProvider(api_key="synthetic-runtime-smoke")
     assert bounded.CAPABILITY in provider.get_info().capabilities
     assert provider.supports_native_compaction()
