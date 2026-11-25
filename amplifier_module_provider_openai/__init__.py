@@ -90,7 +90,11 @@ from ._constants import (
     METADATA_TOOL_SEARCH_ITEMS,
     NATIVE_TOOL_TYPES,
 )
-from ._cost import compute_cost, requires_cache_usage_evidence
+from ._cost import (
+    HEALTHCARE_PRICING_MODELS,
+    compute_cost,
+    requires_cache_usage_evidence,
+)
 from ._model_listing import ModelFilters, selector_schema
 from ._response_handling import (
     FunctionCallTruncationError,
@@ -296,7 +300,7 @@ def _has_unpriced_gpt_6_2_mode(value: Any) -> bool:
     from ._capabilities import GPT_6_2_MODELS
 
     model = response_field(value, "model")
-    if not isinstance(model, str) or model not in GPT_6_2_MODELS:
+    if not isinstance(model, str) or model not in GPT_6_2_MODELS | HEALTHCARE_PRICING_MODELS:
         return False
     window = response_field(response_field(value, "background_options"), "completion_window")
     if window not in (None, "soonest"):
@@ -6273,6 +6277,33 @@ class OpenAIProvider:
         if usage_obj is None:
             return None
         input_details = getattr(usage_obj, "input_tokens_details", None)
+        model = getattr(response, "model", None)
+        if isinstance(model, str) and model in HEALTHCARE_PRICING_MODELS:
+            if not self._has_standard_openai_endpoint():
+                return None
+
+            def reported(obj: Any, key: str) -> Any:
+                # SDK defaults/coercions cannot supply absent wire evidence.
+                fields_set = getattr(obj, "model_fields_set", None)
+                if fields_set is not None and key not in fields_set:
+                    return None
+                return getattr(obj, key, None)
+
+            split = reported(input_details, "cache_write_tokens_details")
+            if isinstance(split, _RawResponseObject):
+                # Raw wrappers contain only fields actually present on the wire.
+                split = split.model_dump()
+            elif hasattr(split, "model_dump"):
+                split = split.model_dump(exclude_unset=True)
+            return compute_cost(
+                model,
+                prompt_tokens=reported(usage_obj, "input_tokens"),
+                completion_tokens=reported(usage_obj, "output_tokens"),
+                cached_tokens=reported(input_details, "cached_tokens"),
+                cache_write_tokens=reported(input_details, "cache_write_tokens"),
+                cache_write_tokens_details=split,
+                service_tier=reported(response, "service_tier"),
+            )
         if getattr(response, "model", None) == "chat-latest":
             # Preserve missing/null/malformed evidence before legacy zero defaults.
             # This alias does not require the newer mandatory cache-write field.

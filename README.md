@@ -172,6 +172,34 @@ this provider default does not alter their tier policy.
   reasoning efforts, native computer/image operations, and new cache policies
   are not qualified by it; existing request-policy defaults are unchanged.
 
+### Healthcare pricing-only estimates
+
+The exact observed response IDs `gpt-6.2-astra-healthcare`,
+`gpt-6.2-sol-healthcare`, `gpt-6-astra-healthcare`, and
+`gpt-6.1-sol-healthcare` have global USD token estimates from the specialized
+Healthcare Standard/Fast tables in [official pricing](https://developers.openai.com/api/docs/pricing.md),
+verified 2026-11-25. This adds no capability metadata, request eligibility,
+account access, default selection, or SDK requirement.
+
+The entire request uses long rates above 272,000 **input** tokens (not a
+context-limit assertion). Actual response tier `default` selects Standard;
+`fast`/its historical name `priority` select Fast. Only GPT-6.2 Standard has
+published 30m/12h write rates; positive writes require both non-overlapping
+reported lifetime counts. Fast writes and older Healthcare writes stay unknown.
+Missing, invalid or overlapping usage, unlisted tiers, invented snapshots and
+visible background-window/multi-agent pricing modes return unknown, not zero.
+
+These estimates exclude hosted-tool fees and are not invoice totals. Provider
+accounting qualifies the effective standard OpenAI endpoint only: regional,
+FedRAMP, Azure and gateway endpoints return unknown rather than guessing or
+stacking uplifts. Direct `compute_cost` callers own this global-only scope; its
+existing signature has no endpoint or historical billing timestamp.
+The promotion is guaranteed **at least through December 31, 2026**, not scheduled
+to expire then. As a conservative re-verification deadline, Healthcare estimates
+return unknown outside November 24–December 31, 2026 (UTC); no replacement rate
+or timezone of an eventual vendor price change is inferred. Recheck the source
+before extending that bound.
+
 ### Model listing and optional filters
 
 `await provider.list_models()` remains async and returns `list[ModelInfo]`.

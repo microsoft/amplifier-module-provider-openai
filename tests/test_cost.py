@@ -19,6 +19,272 @@ import pytest
 
 from amplifier_module_provider_openai._cost import _RATES, _find_rates, compute_cost
 
+# Exact specialized rows, not base-model capability or price inheritance.
+# pricing.md, Healthcare Standard/Fast, verified 2026-11-25; USD per 1M.
+HEALTHCARE_PRICES = [
+    ("gpt-6.2-astra-healthcare", ("8", "40", ".40", "10", "20"),
+     ("16", "60", ".80", "20", "40"), ("16", "80", ".80"), ("32", "120", "1.60")),
+    ("gpt-6.2-sol-healthcare", ("2", "10", ".10", "2.50", "5"),
+     ("4", "15", ".20", "5", "10"), ("4", "20", ".20"), ("8", "30", ".40")),
+    ("gpt-6-astra-healthcare", ("10", "50", "1"), ("20", "75", "2"),
+     ("20", "100", "2"), ("40", "150", "4")),
+    ("gpt-6.1-sol-healthcare", ("2", "10", ".10"), ("4", "15", ".20"),
+     ("4", "20", ".20"), ("8", "30", ".40")),
+]
+
+
+@pytest.fixture(autouse=True)
+def healthcare_verification_clock(request, monkeypatch):
+    """Arithmetic fixtures stay at source verification time, not wall time."""
+    if not request.node.name.startswith("test_healthcare"):
+        return
+    from datetime import datetime
+
+    from amplifier_module_provider_openai import _cost
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 25, tzinfo=tz)
+
+    monkeypatch.setattr(_cost, "datetime", Clock)
+
+
+@pytest.mark.parametrize("model,short,long,fast_short,fast_long", HEALTHCARE_PRICES)
+@pytest.mark.parametrize("prompt", [271_999, 272_000, 272_001])
+@pytest.mark.parametrize("tier", ["default", "fast", "priority"])
+def test_healthcare_exact_rates(model, short, long, fast_short, fast_long, prompt, tier):
+    rates = (short if prompt <= 272_000 else long) if tier == "default" else (
+        fast_short if prompt <= 272_000 else fast_long
+    )
+    inp, out, read = map(Decimal, rates[:3])
+    assert compute_cost(
+        model, prompt_tokens=prompt, completion_tokens=1_000_000,
+        cached_tokens=100, cache_write_tokens=0, service_tier=tier,
+    ) == (Decimal(prompt - 100) * inp + 100 * read + 1_000_000 * out) / 1_000_000
+
+
+@pytest.mark.parametrize("model,short,long,fast_short,fast_long", HEALTHCARE_PRICES[:2])
+@pytest.mark.parametrize("prompt", [1000, 272_000, 272_001])
+@pytest.mark.parametrize("split", [
+    {"ttl_30m_tokens": 300, "ttl_12h_tokens": 0},
+    {"ttl_30m_tokens": 0, "ttl_12h_tokens": 300},
+    {"ttl_30m_tokens": 100, "ttl_12h_tokens": 200},
+])
+def test_healthcare_standard_disjoint_writes(
+    model, short, long, fast_short, fast_long, prompt, split,
+):
+    inp, out, read, write30, write12 = map(Decimal, short if prompt <= 272_000 else long)
+    assert compute_cost(
+        model, prompt_tokens=prompt, completion_tokens=50, cached_tokens=200,
+        cache_write_tokens=300, cache_write_tokens_details=split,
+    ) == (
+        Decimal(prompt - 500) * inp + 50 * out + 200 * read
+        + split["ttl_30m_tokens"] * write30 + split["ttl_12h_tokens"] * write12
+    ) / 1_000_000
+
+
+@pytest.mark.parametrize("model", [row[0] for row in HEALTHCARE_PRICES])
+@pytest.mark.parametrize("evidence", [
+    *({field: value} for field in (
+        "prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens",
+    ) for value in (None, False, -1, "0", 0.0)),
+    *({"service_tier": tier} for tier in (
+        None, False, "Default", "standard", "flex", "batch", "ultrafast", "unknown",
+    )),
+    {"cached_tokens": 1001}, {"cached_tokens": 900, "cache_write_tokens": 101},
+    {"cache_write_tokens": 1},
+    *({"cache_write_tokens_details": split} for split in (
+        False, [], {"unknown": 0}, {"ttl_30m_tokens": False},
+        {"ttl_12h_tokens": -1}, {"ttl_30m_tokens": 1},
+    )),
+])
+def test_healthcare_uncertain_usage_unknown(model, evidence):
+    counts = {"prompt_tokens": 1000, "completion_tokens": 10,
+              "cached_tokens": 0, "cache_write_tokens": 0}
+    counts.update(evidence)
+    assert compute_cost(model, **counts) is None
+
+
+@pytest.mark.parametrize("model", [row[0] for row in HEALTHCARE_PRICES])
+@pytest.mark.parametrize("tier", ["default", "fast", "priority"])
+def test_healthcare_unpublished_writes_unknown(model, tier):
+    if model.startswith("gpt-6.2-") and tier == "default":
+        return  # Published Standard writes are exercised above.
+    assert compute_cost(
+        model, prompt_tokens=1000, cache_write_tokens=1, service_tier=tier,
+        cache_write_tokens_details={"ttl_30m_tokens": 1, "ttl_12h_tokens": 0},
+    ) is None
+
+
+@pytest.mark.parametrize("model", [row[0] for row in HEALTHCARE_PRICES])
+@pytest.mark.parametrize("suffix", ["-2026-11-24", "-preview", " "])
+def test_healthcare_no_invented_alias(model, suffix):
+    assert compute_cost(model + suffix, prompt_tokens=1000) is None
+
+
+@pytest.mark.parametrize("day,known", [
+    ("2026-11-23", False), ("2026-11-25", True),
+    ("2026-12-31", True), ("2027-01-01", False),
+])
+@pytest.mark.parametrize("model", [row[0] for row in HEALTHCARE_PRICES])
+@pytest.mark.parametrize("tier", ["default", "fast"])
+def test_healthcare_promotion_requires_reverification(monkeypatch, day, known, model, tier):
+    from datetime import datetime
+
+    from amplifier_module_provider_openai import _cost
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat(day).replace(tzinfo=tz)
+
+    monkeypatch.setattr(_cost, "datetime", Clock)
+    result = compute_cost(model, prompt_tokens=1000, service_tier=tier)
+    assert isinstance(result, Decimal) if known else result is None
+
+
+@pytest.mark.parametrize("model", [row[0] for row in HEALTHCARE_PRICES])
+@pytest.mark.parametrize("field", ["input_tokens", "output_tokens", "cached_tokens",
+                                  "cache_write_tokens"])
+@pytest.mark.parametrize("value", ["absent", None, False, -1, "0"])
+def test_healthcare_provider_preserves_missing_usage(model, field, value):
+    from types import SimpleNamespace
+
+    from amplifier_module_provider_openai import OpenAIProvider
+
+    usage = {"input_tokens": 1000, "output_tokens": 100}
+    details = {"cached_tokens": 100, "cache_write_tokens": 0}
+    target = usage if field in usage else details
+    if value == "absent":
+        target.pop(field)
+    else:
+        target[field] = value
+    response = SimpleNamespace(
+        model=model, service_tier="default",
+        usage=SimpleNamespace(**usage, input_tokens_details=SimpleNamespace(**details)),
+    )
+    provider = OpenAIProvider(config={"api_key": "offline", "default_model": "gpt-5.5"})
+    assert provider._compute_attempt_cost(response) is None
+
+
+@pytest.mark.parametrize("endpoint", [
+    None, "https://api.openai.com/v1", "https://eu.api.openai.com/v1",
+    "https://gateway.example/v1", "https://example.openai.azure.com",
+])
+def test_healthcare_provider_global_endpoint_only(endpoint):
+    from types import SimpleNamespace
+
+    from amplifier_module_provider_openai import OpenAIProvider
+
+    provider = OpenAIProvider(config={
+        "api_key": "offline", "base_url": endpoint, "default_model": "gpt-5.5",
+    })
+    response = SimpleNamespace(
+        model="gpt-6.2-sol-healthcare", service_tier="default",
+        usage=SimpleNamespace(
+            input_tokens=1000, output_tokens=100,
+            input_tokens_details=SimpleNamespace(cached_tokens=100, cache_write_tokens=0),
+        ),
+    )
+    expected = Decimal(".00281") if endpoint in (None, "https://api.openai.com/v1") else None
+    assert provider._compute_attempt_cost(response) == expected
+    response.model = "unpublished-healthcare"
+    assert provider._compute_attempt_cost(response) is None
+
+
+@pytest.mark.parametrize("tier", ["default", "fast"])
+@pytest.mark.parametrize("split", [
+    {"ttl_30m_tokens": 300}, {"ttl_12h_tokens": 300},
+    {"ttl_30m_tokens": 100, "ttl_12h_tokens": 199},
+    {"ttl_30m_tokens": 300, "ttl_12h_tokens": None},
+])
+def test_healthcare_incomplete_lifetime_counts_unknown(tier, split):
+    assert compute_cost(
+        "gpt-6.2-sol-healthcare", prompt_tokens=1000,
+        cache_write_tokens=300, cache_write_tokens_details=split, service_tier=tier,
+    ) is None
+
+
+@pytest.mark.parametrize("evidence", [
+    {"background_options": {"completion_window": "2h"}},
+    {"multi_agent": {"enabled": True}},
+])
+def test_healthcare_unpriced_modes_unknown(evidence):
+    from types import SimpleNamespace
+
+    from amplifier_module_provider_openai import (
+        OpenAIProvider,
+        _has_unpriced_gpt_6_2_mode,
+    )
+
+    response = SimpleNamespace(
+        model="gpt-6.2-sol-healthcare", service_tier="default", **evidence,
+        usage=SimpleNamespace(
+            input_tokens=1000, output_tokens=100,
+            input_tokens_details=SimpleNamespace(cached_tokens=100, cache_write_tokens=0),
+        ),
+    )
+    assert _has_unpriced_gpt_6_2_mode(vars(response))
+    provider = OpenAIProvider(config={"api_key": "offline"})
+    assert provider._compute_attempt_cost(response) is None
+
+
+@pytest.mark.parametrize("model", [row[0] for row in HEALTHCARE_PRICES])
+def test_healthcare_sdk_reported_usage_not_requested_model(model):
+    from openai.types.responses import Response
+
+    from amplifier_module_provider_openai import OpenAIProvider
+    from amplifier_module_provider_openai._capabilities import (
+        GPT_6_MODELS,
+        get_request_policy,
+    )
+
+    response = Response.model_construct(
+        model=model, service_tier="default",
+        usage={
+            "input_tokens": 1000, "output_tokens": 100, "total_tokens": 1100,
+            "input_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    )
+    provider = OpenAIProvider(config={"api_key": "offline", "default_model": "unpriced"})
+    expected = compute_cost(model, prompt_tokens=1000, completion_tokens=100, cached_tokens=100)
+    assert expected is not None
+    assert provider._compute_attempt_cost(response) == expected
+    # Observed unknown ID must not reuse the configured selector.
+    provider.default_model = model
+    response.model = "unpublished-healthcare"
+    assert provider._compute_attempt_cost(response) is None
+    assert model not in GPT_6_MODELS
+    assert get_request_policy(model).cache_ttls == frozenset()
+    # An SDK-created default is not reported wire usage.
+    response.model = model
+    response.usage.input_tokens_details.model_fields_set.discard("cache_write_tokens")
+    assert provider._compute_attempt_cost(response) is None
+
+
+@pytest.mark.parametrize("split,expected", [
+    ({"ttl_30m_tokens": 100, "ttl_12h_tokens": 200}, Decimal(".00327")),
+    ({"ttl_30m_tokens": 300}, None),
+    ({"ttl_30m_tokens": -1, "ttl_12h_tokens": 301}, None),
+])
+def test_healthcare_raw_response_cache_write_breakdown(split, expected):
+    from amplifier_module_provider_openai import OpenAIProvider, _RawResponseObject
+
+    response = _RawResponseObject({
+        "model": "gpt-6.2-sol-healthcare", "service_tier": "default",
+        "usage": {
+            "input_tokens": 1000, "output_tokens": 100,
+            "input_tokens_details": {
+                "cached_tokens": 200, "cache_write_tokens": 300,
+                "cache_write_tokens_details": split,
+            },
+        },
+    })
+    provider = OpenAIProvider(config={"api_key": "offline"})
+    assert provider._compute_attempt_cost(response) == expected
+
 
 @pytest.mark.parametrize("counts,expected", [
     ({"prompt_tokens": 1000}, "0.005"),
