@@ -36,6 +36,7 @@ package = true
 [tool.hatch.build.targets.wheel]
 packages = [
     "amplifier_module_provider_openai",
+    "amplifier_openai_decision_catalog",
 ]
 
 [tool.hatch.metadata]
@@ -62,4 +63,4 @@ dev = [
 ]
 
 [project.entry-points."amplifier.decision_backends"]
-provider_openai = "amplifier_module_provider_openai.decisions:catalog"
+provider_openai = "amplifier_openai_decision_catalog:catalog"
