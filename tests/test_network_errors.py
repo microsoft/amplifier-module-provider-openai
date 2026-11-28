@@ -326,24 +326,26 @@ async def test_failure_reading_response_body_is_not_promoted(streaming, transpor
 @pytest.mark.asyncio
 async def test_response_observation_is_task_and_attempt_local():
     from amplifier_module_provider_openai._transport import (
-        _received_headers,
+        can_promote,
         observe_response,
-        response_received,
+        trace_request,
     )
     ready, done = asyncio.Event(), asyncio.Event()
 
     async def received():
         with observe_response():
-            await asyncio.create_task(_received_headers(None))
+            request = httpx.Request("POST", "http://127.0.0.1:9")
+            await trace_request(request)
+            await asyncio.create_task(request.extensions["trace"]("http11.receive_response_headers.complete", {}))
             ready.set()
             await done.wait()
-            assert response_received()
-        assert not response_received()
+            assert not can_promote(RuntimeError("post-response"))
+        assert not can_promote(RuntimeError("outside attempt"))
 
     async def not_received():
         await ready.wait()
         with observe_response():
-            assert not response_received()
+            assert not can_promote(RuntimeError("no evidence"))
             done.set()
 
     await asyncio.gather(received(), not_received())
