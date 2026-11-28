@@ -65,6 +65,12 @@ def observation_confirmed():
         hooks = client.event_hooks.get("response", [])
         if not hooks or hooks[0] is not _received_headers:
             return False
+        # Caller auth/request hooks can perform their own body reads before
+        # HTTPX's response boundary. Only our socket-only request hook is known.
+        if client.auth is not None or any(
+            hook is not configure_request for hook in client.event_hooks.get("request", [])
+        ):
+            return False
         transports = [client._transport, *client._mounts.values()]
         return all(t is None or (
             type(t) is module.AsyncHTTPTransport and not t._pool._http2

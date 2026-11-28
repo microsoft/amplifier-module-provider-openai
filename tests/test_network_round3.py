@@ -117,6 +117,23 @@ async def test_observer_never_reinserted_or_moved():
             assert not network.observation_confirmed()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extension", ["auth", "request_hook"])
+async def test_public_pre_response_extensions_are_unknown(extension):
+    async with matrix.failing_provider("dns") as p:
+        http = boundary.http_client(p)
+        with network.observe_response():
+            network.watch_response(p.client if NAME == "gemini" else http)
+            assert network.observation_confirmed()
+            if extension == "auth":
+                http.auth = httpx.BasicAuth("dummy", "dummy")
+            else:
+                async def caller(request):
+                    pass
+                http.event_hooks["request"].append(caller)
+            assert not network.observation_confirmed()
+
+
 @asynccontextmanager
 async def race_provider(streaming):
     """A waits in a displaced hook; B starts while A's hook list is active."""
