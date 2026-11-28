@@ -30,10 +30,14 @@ async def test_response_evidence_blocks_promotion(event):
         req = httpx.Request("POST", "http://127.0.0.1:9")
         await network.trace_request(req)
         trace = req.extensions["trace"]
+        report = RuntimeError("reported transport failure")
         error = httpx.ReadError("test", request=req)
-        await trace("connection.connect_tcp.started", {})
+        error.__cause__ = report
+        await trace("connection.connect_tcp.failed", {"exception": report})
         assert network.can_promote(error)
         await trace(event, {})
+        # A later allowed failure must not erase the attempt's response fact.
+        await trace("connection.connect_tcp.failed", {"exception": report})
         assert not network.can_promote(error)
 
 

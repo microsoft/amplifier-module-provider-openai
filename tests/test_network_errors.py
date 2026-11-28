@@ -202,13 +202,13 @@ async def test_real_sdk_interrupted_answer_keeps_prior_class(transport_error):
 
 CASES = {
     "refused": errors.NetworkError,
-    "closed": errors.NetworkError,
+    "closed": errors.LLMError,  # Final transport report is response_closed.complete.
     "dns": errors.NetworkError,
     "tls": errors.NetworkError,
     "certificate": errors.LLMError,
     "proxy": errors.LLMError,
     "sdk_timeout": errors.LLMTimeoutError,
-    "sdk_no_answer": errors.LLMTimeoutError,
+    "sdk_no_answer": errors.LLMError,  # Header timeout is followed by close cleanup.
     "module_timeout": errors.LLMTimeoutError,
     "unsupported_protocol": errors.LLMError,
     "invalid_url": errors.LLMError,

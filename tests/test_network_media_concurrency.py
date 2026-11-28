@@ -72,6 +72,30 @@ async def test_text_does_not_break_media(http_mode, scenario, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("http_mode", ["legacy", "sdk-injected", "sdk-default"])
+@pytest.mark.parametrize("name", ["trace_request", "caller_hook"])
+async def test_media_binding_never_ignores_caller_hook_by_name(http_mode, name):
+    req = media.request()
+    p, _cap, wires, _events = media.fixture(req, http_mode=http_mode)
+    original_emit = p.coordinator.hooks.emit
+    async def caller(request):
+        pass
+    caller.__name__ = name
+    assert caller is not network.trace_request
+    async def emit(event, data):
+        await original_emit(event, data)
+        if event == "llm:request":
+            p.client._client.event_hooks["request"].append(caller)
+    p.coordinator.hooks.emit = emit
+    try:
+        with pytest.raises(errors.InvalidRequestError):
+            await p.complete(req)
+        assert [path for path, _body, _headers in wires] == ["/v1/responses/input_tokens"]
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
 async def test_keepalive_then_evidence_identity_and_options():
     import httpx2
     called, options = [], []
@@ -91,16 +115,24 @@ async def test_keepalive_then_evidence_identity_and_options():
         for _ in range(2):
             await req.extensions["trace"]("connection.connect_tcp.complete", {"return_value": Stream()})
         error = httpx2.ConnectError("local loss", request=req)
+        assert not network.can_promote(error)  # Connect completion is not a failure.
+        reported = RuntimeError("transport connect failure")
+        error.__cause__ = reported
+        await req.extensions["trace"]("connection.connect_tcp.failed", {"exception": reported})
         assert network.can_promote(error)
-        assert called == ["connection.connect_tcp.complete"] * 2
+        assert called == ["connection.connect_tcp.complete"] * 2 + ["connection.connect_tcp.failed"]
         assert options == network.keepalive_options() * 2
         hop = httpx2.Request("POST", "http://127.0.0.1:9/redirect", extensions=dict(req.extensions))
         await network.configure_request(hop)
         await network.trace_request(hop)
         await hop.extensions["trace"]("connection.connect_tcp.complete", {"return_value": Stream()})
-        assert called == ["connection.connect_tcp.complete"] * 3
+        assert called == ["connection.connect_tcp.complete"] * 2 + ["connection.connect_tcp.failed", "connection.connect_tcp.complete"]
         assert options == network.keepalive_options() * 3
-        assert network.can_promote(httpx2.ConnectError("hop", request=hop))
+        hop_error = httpx2.ConnectError("hop", request=hop)
+        hop_error.__cause__ = reported
+        assert not network.can_promote(hop_error)  # Hop has not reported failure yet.
+        await hop.extensions["trace"]("connection.connect_tcp.failed", {"exception": reported})
+        assert network.can_promote(hop_error)
     # Test construction order as well: swapping the two module hooks makes
     # the outermost callable foreign to evidence and fails this assertion.
     from amplifier_module_provider_openai import OpenAIProvider

@@ -10,6 +10,11 @@ import httpx2
 
 logger = logging.getLogger(__name__)
 _response_state = ContextVar("openai_transport_evidence", default=None)
+PRE_RESPONSE_FAILURES = frozenset({
+    "connection.connect_tcp.failed", "connection.connect_unix_socket.failed",
+    "connection.start_tls.failed", "http11.send_request_headers.failed",
+    "http11.send_request_body.failed", "http11.receive_response_headers.failed",
+})
 
 
 @contextmanager
@@ -37,11 +42,12 @@ async def trace_request(request):
             return
         if hasattr(previous, "_openai_previous"):
             previous = previous._openai_previous
-        record = {"seen": False}
+        record = {"last": None, "failure": None}
 
         async def trace(event, info):
             try:
-                record["seen"] = True
+                record["last"] = event
+                record["failure"] = info.get("exception") if event in PRE_RESPONSE_FAILURES else None
                 if event.endswith("receive_response_headers.complete") or "receive_response_body" in event:
                     state["received"] = True
                 if event.startswith("http2."):
@@ -73,26 +79,34 @@ def watch_response(http_client):
 def can_promote(error):
     try:
         state = _response_state.get()
-        request = error.request
-        trace = request.extensions.get("trace")
-        record = state["requests"].get(request) if state else None
-        return bool(record and trace is record["trace"] and record["seen"] and not state["received"]
-                    and not state["unknown"] and not certificate_failure(error))
+        if not state or state["received"] or state["unknown"]:
+            return False
+        records = list(state["requests"].values())
+        if not records or not all(
+            r["last"] in PRE_RESPONSE_FAILURES and isinstance(r["failure"], BaseException)
+            for r in records
+        ):
+            return False
+        chain = exception_chain(error)
+        return any(r["failure"] is e for r in records for e in chain) and not any(
+            isinstance(e, ssl.SSLCertVerificationError) for e in chain
+        )
     except Exception:  # noqa: BLE001 - always preserve the original SDK failure
         return False
 
 
-def certificate_failure(error):
-    seen, pending = set(), [error]
+def exception_chain(error):
+    seen, pending, result = set(), [error], []
     while pending:
         error = pending.pop()
         if error is None or id(error) in seen:
             continue
         seen.add(id(error))
-        if isinstance(error, ssl.SSLCertVerificationError):
-            return True
+        if len(seen) > 64:
+            raise ValueError("Exception chain exceeds evidence bound")
+        result.append(error)
         pending.extend((error.__cause__, error.__context__))
-    return False
+    return result
 
 
 def is_connection_failure(error):

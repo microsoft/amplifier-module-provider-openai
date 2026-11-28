@@ -102,7 +102,7 @@ async def test_auxiliary_variants(variant, streaming):
     async with variant_provider(variant, streaming) as (p, counts, requests):
         with pytest.raises(errors.LLMError) as caught:
             await p.complete(matrix.request())
-        assert type(caught.value) is (errors.NetworkError if variant == "before" else errors.LLMError)
+        assert type(caught.value) is (errors.NetworkError if variant in {"before", "wrapped"} else errors.LLMError)
         assert counts["generation_hooks"] == 1
         if variant in {"aux_failed_replaced", "response_aux", "auth_aux", "other_client_replaced", "late_hook"}:
             assert counts["sends"] == counts["partial"] == 1
@@ -163,14 +163,19 @@ async def test_absent_request_and_foreign_trace_are_unknown():
         req = httpx.Request("GET", "http://127.0.0.1:9")
         await network.trace_request(req)
         trace = req.extensions["trace"]
-        await trace("connection.connect_tcp.started", {})
+        reported = RuntimeError("transport report")
         error = httpx.ConnectError("test", request=req)
+        error.__cause__ = reported
+        await trace("connection.connect_tcp.failed", {"exception": reported})
         assert network.can_promote(error)
         assert not network.can_promote(RuntimeError("no request"))
         async def wrapped(event, info):
             await trace(event, info)
         req.extensions["trace"] = wrapped
-        assert not network.can_promote(error)
+        assert network.can_promote(error)  # Truthful wrapper does not revoke history.
+        no_request = RuntimeError("SDK request attribute is not required")
+        no_request.__cause__ = reported
+        assert network.can_promote(no_request)
 
 
 @asynccontextmanager
@@ -207,8 +212,9 @@ async def test_incomplete_or_interim_headers_are_pre_answer(response, streaming)
     async with boundary.local_response(response) as (url, counts):
         p = matrix.provider(url, streaming)
         try:
-            with pytest.raises(errors.NetworkError):
+            with pytest.raises(errors.LLMError) as caught:
                 await p.complete(matrix.request())
+            assert type(caught.value) is errors.LLMError  # Last report: response_closed.complete.
             assert counts["sends"] == 1
         finally:
             await p.close()
