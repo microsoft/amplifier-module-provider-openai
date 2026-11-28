@@ -271,3 +271,56 @@ async def test_stream_failure_after_response_keeps_prior_class(sdk_error, with_h
         assert caught.value.__cause__ is original
     finally:
         await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("transport_error", [httpx.ReadError, httpx.ReadTimeout])
+async def test_failure_reading_response_body_is_not_promoted(streaming, transport_error):
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            if not streaming:
+                yield b'{"id":"partial-response"'
+            raise transport_error("response body lost")
+
+    def send(req):
+        return httpx.Response(200, stream=Body(), request=req)
+
+    p = provider("http://127.0.0.1:9/v1", streaming)
+    p._client = openai.AsyncOpenAI(
+        api_key="not-a-real-key", base_url="http://127.0.0.1:9/v1", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(send)),
+    )
+    try:
+        with pytest.raises(errors.LLMError) as caught:
+            await p.complete(request())
+        assert type(caught.value) is errors.LLMError
+        assert caught.value.retryable is True
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+async def test_response_observation_is_task_and_attempt_local():
+    from amplifier_module_provider_openai._transport import (
+        _received_headers,
+        observe_response,
+        response_received,
+    )
+    ready, done = asyncio.Event(), asyncio.Event()
+
+    async def received():
+        with observe_response():
+            await asyncio.create_task(_received_headers(None))
+            ready.set()
+            await done.wait()
+            assert response_received()
+        assert not response_received()
+
+    async def not_received():
+        await ready.wait()
+        with observe_response():
+            assert not response_received()
+            done.set()
+
+    await asyncio.gather(received(), not_received())

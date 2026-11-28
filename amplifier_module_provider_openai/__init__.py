@@ -4101,8 +4101,12 @@ class OpenAIProvider:
                     status_code=400,
                 ) from e
 
+            from ._transport import reset_response_observation, watch_response
+
+            reset_response_observation()
             response_started = False
             try:
+                watch_response(getattr(self.client, "_client", None))
                 if _use_streaming:
                     # Streaming path — chunked HTTP transport prevents timeouts on
                     # large context requests. The event loop emits contract events
@@ -4440,13 +4444,13 @@ class OpenAIProvider:
                 # deterministic 400 (context overflow, invalid params) was retried
                 # max_retries times before surfacing.
                 if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
-                    from ._transport import is_connection_failure
+                    from ._transport import is_connection_failure, response_received
 
                     # Only failures before an HTTP response can be promoted.
                     # Keep configuration faults and interrupted answers on the
                     # prior path. Retryability, text and cause stay unchanged.
                     error_class = kernel_errors.LLMError
-                    if not response_started:
+                    if not response_started and not response_received():
                         if isinstance(e, openai.APITimeoutError):
                             error_class = kernel_errors.LLMTimeoutError
                         elif is_connection_failure(e):
@@ -4510,8 +4514,11 @@ class OpenAIProvider:
             # Preserve error class/retry/status/billing while removing exact
             # media echoes before retry observers/logging or public propagation.
             # No SDK request, response or saved replay object is redacted.
+            from ._transport import observe_response
+
             try:
-                return await _do_complete()
+                with observe_response():
+                    return await _do_complete()
             except Exception as caught:
                 redactor.sanitize_error(caught)
                 raise
