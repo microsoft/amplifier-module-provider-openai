@@ -14,7 +14,7 @@ _response_state = ContextVar("openai_transport_evidence", default=None)
 
 @contextmanager
 def observe_response():
-    token = _response_state.set({"seen": False, "received": False, "unknown": False})
+    token = _response_state.set({"requests": {}, "received": False, "unknown": False})
     try:
         yield
     finally:
@@ -23,21 +23,25 @@ def observe_response():
 
 def reset_response_observation():
     # Counting can precede generation inside this same attempt scope.
-    _response_state.set({"seen": False, "received": False, "unknown": False})
+    _response_state.set({"requests": {}, "received": False, "unknown": False})
 
 
 async def trace_request(request):
     state = _response_state.get()
+    if state is None:
+        return
     try:
         previous = request.extensions.get("trace")
-        if getattr(previous, "_openai_evidence", None) is state:
+        record = state["requests"].get(request)
+        if record is not None and record["trace"] is previous:
             return
         if hasattr(previous, "_openai_previous"):
             previous = previous._openai_previous
+        record = {"seen": False}
 
         async def trace(event, info):
             try:
-                state["seen"] = True
+                record["seen"] = True
                 if event.endswith("receive_response_headers.complete") or "receive_response_body" in event:
                     state["received"] = True
                 if event.startswith("http2."):
@@ -48,8 +52,9 @@ async def trace_request(request):
             if previous is not None:
                 await previous(event, info)
 
-        trace._openai_evidence = state
         trace._openai_previous = previous
+        record["trace"] = trace
+        state["requests"][request] = record
         request.extensions["trace"] = trace
     except Exception:  # noqa: BLE001 - optional evidence must not break requests
         if state is not None:
@@ -68,7 +73,10 @@ def watch_response(http_client):
 def can_promote(error):
     try:
         state = _response_state.get()
-        return bool(state and state["seen"] and not state["received"]
+        request = error.request
+        trace = request.extensions.get("trace")
+        record = state["requests"].get(request) if state else None
+        return bool(record and trace is record["trace"] and record["seen"] and not state["received"]
                     and not state["unknown"] and not certificate_failure(error))
     except Exception:  # noqa: BLE001 - always preserve the original SDK failure
         return False
@@ -108,6 +116,12 @@ def keepalive_options():
 
 async def configure_request(request):
     previous = request.extensions.get("trace")
+    # Redirects copy request extensions. Replace only our direct wrappers so
+    # a new request gets one keepalive callback and one evidence callback.
+    if hasattr(previous, "_openai_previous"):
+        previous = previous._openai_previous
+    if hasattr(previous, "_openai_keepalive_previous"):
+        previous = previous._openai_keepalive_previous
 
     async def trace(event, info):
         if event.endswith("connect_tcp.complete"):
@@ -122,4 +136,5 @@ async def configure_request(request):
         if previous is not None:
             await previous(event, info)
 
+    trace._openai_keepalive_previous = previous
     request.extensions["trace"] = trace

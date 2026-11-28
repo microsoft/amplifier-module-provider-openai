@@ -30,10 +30,11 @@ async def test_response_evidence_blocks_promotion(event):
         req = httpx.Request("POST", "http://127.0.0.1:9")
         await network.trace_request(req)
         trace = req.extensions["trace"]
+        error = httpx.ReadError("test", request=req)
         await trace("connection.connect_tcp.started", {})
-        assert network.can_promote(RuntimeError("no response yet"))
+        assert network.can_promote(error)
         await trace(event, {})
-        assert not network.can_promote(RuntimeError("response observed"))
+        assert not network.can_promote(error)
 
 
 @pytest.mark.asyncio

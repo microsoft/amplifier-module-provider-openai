@@ -53,7 +53,7 @@ async def test_config_fault_has_no_transport_report(streaming, case, monkeypatch
             await p.complete(matrix.request())
         assert type(caught.value) is errors.LLMError
     # InvalidURL can bypass the SDK's APIError branch; inspect only if called.
-    assert all(not state["seen"] for state in seen)
+    assert all(not any(r["seen"] for r in state["requests"].values()) for state in seen)
 
 
 @pytest.mark.asyncio

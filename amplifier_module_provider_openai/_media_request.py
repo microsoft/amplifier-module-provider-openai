@@ -19,6 +19,7 @@ from amplifier_core.llm_errors import InvalidRequestError
 from openai import _base_client
 
 from ._chat_images import image_url, known_vision, project_messages
+from ._transport import trace_request
 
 KEY = "experimental.media.v1"
 # The API permits non-animated GIF, which a MIME-only fact cannot express.
@@ -332,7 +333,9 @@ class Binding:
                 type(c._client.base_url)("https://api.openai.com/v1/responses")
             )),
             "cookies": [(cookie.name, cookie.value, cookie.domain, cookie.path) for cookie in c._client.cookies.jar],
-            "request_hooks": [id(h) for h in c._client.event_hooks["request"]],
+            # This observational module hook changes no media wire/account
+            # binding; a concurrent text request may install it after counting.
+            "request_hooks": [id(h) for h in c._client.event_hooks["request"] if h is not trace_request],
             "streaming": p.use_streaming, "timeout": str(p.timeout),
             "retry": [p._retry_config.max_retries, p._retry_config.initial_delay,
                       p._retry_config.max_delay],

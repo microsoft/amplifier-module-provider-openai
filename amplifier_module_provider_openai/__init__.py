@@ -4111,7 +4111,6 @@ class OpenAIProvider:
             from ._transport import reset_response_observation, watch_response
 
             reset_response_observation()
-            response_started = False
             try:
                 if network_recovery_allowed:
                     watch_response(getattr(self.client, "_client", None))
@@ -4147,7 +4146,6 @@ class OpenAIProvider:
                                 )
                             )
                             async with stream_context as stream:
-                                response_started = True
                                 if emit_stream_events:
                                     async for event in stream:
                                         et = event.type
@@ -4458,7 +4456,7 @@ class OpenAIProvider:
                     # Keep configuration faults and interrupted answers on the
                     # prior path. Retryability, text and cause stay unchanged.
                     error_class = kernel_errors.LLMError
-                    if network_recovery_allowed and not response_started and can_promote(e):
+                    if network_recovery_allowed and can_promote(e):
                         if isinstance(e, openai.APITimeoutError):
                             error_class = kernel_errors.LLMTimeoutError
                         elif is_connection_failure(e):
