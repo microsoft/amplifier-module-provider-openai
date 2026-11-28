@@ -21,7 +21,7 @@ def local_only_sockets(monkeypatch):
     connect = socket.socket.connect
 
     def guarded(sock, address):
-        if sock.family != socket.AF_UNIX:
+        if sock.family != getattr(socket, "AF_UNIX", None):
             assert address[0] == "127.0.0.1", "non-local test connection refused"
         return connect(sock, address)
 
@@ -55,8 +55,11 @@ async def endpoint(mode):
 
     if mode == "refused":
         with socket.socket() as reserved:
-            reserved.bind(("127.0.0.1", 0))  # Bound, deliberately not listening.
-            yield f"http://127.0.0.1:{reserved.getsockname()[1]}/v1"
+            reserved.bind(("127.0.0.1", 0))
+            port = reserved.getsockname()[1]
+        # Darwin can blackhole a bound, non-listening socket. Close it before
+        # connecting so this row measures refusal rather than an OS timeout.
+        yield f"http://127.0.0.1:{port}/v1"
         return
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     try:
