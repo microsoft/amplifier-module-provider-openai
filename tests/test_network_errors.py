@@ -110,9 +110,9 @@ async def failing_provider(case, streaming=False, **config):
     if case in {"refused", "closed", "module_timeout", "sdk_no_answer"}:
         mode = "no_answer" if case in {"module_timeout", "sdk_no_answer"} else case
         async with endpoint(mode) as url:
-            p = provider(url, streaming, timeout=0.1 if case == "module_timeout" else 2, **config)
+            p = provider(url, streaming, timeout=0.1 if case == "module_timeout" else 30, **config)
             # The module passes its own timeout per request. Override that seam
-            # only for the real SDK no-answer row, leaving the module deadline 2s.
+            # only for the real SDK no-answer row, leaving its module deadline 30s.
             if case == "sdk_no_answer":
                 p._transport_timeout = lambda value: httpx.Timeout(0.1)
             try:
