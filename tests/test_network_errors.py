@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpcore2 as httpcore
 import httpx2 as httpx
 import openai
 import pytest
@@ -91,6 +92,24 @@ def request():
 
 
 def failure_transport(case):
+    if case in {"dns", "tls", "certificate", "proxy", "sdk_timeout"}:
+        transport = httpx.AsyncHTTPTransport()
+
+        async def connect_tcp(*args, **kwargs):
+            if case == "proxy":
+                raise httpcore.ProxyError("proxy failed")
+            if case == "dns":
+                raise httpcore.ConnectError("DNS failed") from socket.gaierror(-2, "test DNS")
+            if case in {"tls", "certificate"}:
+                cause = ssl.SSLCertVerificationError("test certificate") if case == "certificate" else ssl.SSLError("test TLS")
+                try:
+                    raise cause
+                except ssl.SSLError as exc:
+                    raise httpcore.ConnectError("TLS failed") from exc
+            raise httpcore.ReadTimeout("SDK read timed out")
+
+        transport._pool._network_backend = SimpleNamespace(connect_tcp=connect_tcp)
+        return transport
     def send(req):
         if case == "dns":
             raise httpx.ConnectError("DNS failed", request=req) from socket.gaierror(-2, "test DNS")
@@ -100,6 +119,8 @@ def failure_transport(case):
             raise httpx.ReadTimeout("SDK read timed out", request=req)
         if case == "invalid_url":
             raise httpx.InvalidURL("invalid URL")
+        if case == "proxy":
+            raise httpx.ProxyError("proxy failed", request=req)
         status = {"5xx": 500, "overloaded": 503, "rate_limit": 429, "auth": 401}[case]
         return httpx.Response(status, json={"error": {"message": "test failure", "type": "server_error"}}, request=req)
     return httpx.MockTransport(send)
@@ -184,6 +205,8 @@ CASES = {
     "closed": errors.NetworkError,
     "dns": errors.NetworkError,
     "tls": errors.NetworkError,
+    "certificate": errors.LLMError,
+    "proxy": errors.LLMError,
     "sdk_timeout": errors.LLMTimeoutError,
     "sdk_no_answer": errors.LLMTimeoutError,
     "module_timeout": errors.LLMTimeoutError,

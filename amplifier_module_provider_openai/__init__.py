@@ -3891,6 +3891,13 @@ class OpenAIProvider:
             **params, **(params.get("extra_body") or {}),
         })
         redactor = MediaRedactor(media_values(request.model_dump()) | media_values(params))
+        # Media guards can dispatch through a request-local client rather than
+        # self.client; paid image tools also retain their existing no-host-replay
+        # boundary. Do not infer observation for either from the text client.
+        network_recovery_allowed = (
+            _media_guard is None and not media_values(request.model_dump())
+            and not any(tool.get("type") == "image_generation" for tool in params.get("tools", []))
+        )
 
         message_list = list(request.messages)
         instructions = params.get("instructions")
@@ -4444,13 +4451,13 @@ class OpenAIProvider:
                 # deterministic 400 (context overflow, invalid params) was retried
                 # max_retries times before surfacing.
                 if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
-                    from ._transport import is_connection_failure, response_received
+                    from ._transport import can_promote, is_connection_failure
 
                     # Only failures before an HTTP response can be promoted.
                     # Keep configuration faults and interrupted answers on the
                     # prior path. Retryability, text and cause stay unchanged.
                     error_class = kernel_errors.LLMError
-                    if not response_started and not response_received():
+                    if network_recovery_allowed and not response_started and can_promote(e):
                         if isinstance(e, openai.APITimeoutError):
                             error_class = kernel_errors.LLMTimeoutError
                         elif is_connection_failure(e):

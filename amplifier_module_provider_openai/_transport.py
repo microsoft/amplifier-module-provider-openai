@@ -6,6 +6,7 @@ connections. Keep the SDK's client defaults, TLS and environment proxy routing.
 
 import logging
 import socket
+import ssl
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -25,8 +26,50 @@ async def _received_headers(response):
 def watch_response(http_client):
     if isinstance(http_client, (httpx.AsyncClient, httpx2.AsyncClient)):
         hooks = http_client.event_hooks.setdefault("response", [])
-        if _received_headers not in hooks:
-            hooks.append(_received_headers)
+        # Keep caller hooks, in their order, but observe before any can read.
+        hooks[:] = [_received_headers, *(h for h in hooks if h is not _received_headers)]
+        state = _response_state.get()
+        if state is not None:
+            state["client"] = http_client
+
+
+def observation_confirmed():
+    state = _response_state.get()
+    client = state.get("client") if state is not None else None
+    module = httpx2 if isinstance(client, httpx2.AsyncClient) else httpx
+    if not isinstance(client, module.AsyncClient):
+        return False
+    hooks = client.event_hooks.get("response", [])
+    if not hooks or hooks[0] is not _received_headers:
+        return False  # A caller may have inserted a hook since installation.
+    # Subclasses, wrappers and custom transports can consume bytes before the
+    # HTTPX hook boundary. Only the standard send pipeline is observable here.
+    for method in ("send", "_send_handling_auth", "_send_handling_redirects", "_send_single_request"):
+        if getattr(getattr(client, method, None), "__func__", None) is not getattr(module.AsyncClient, method):
+            return False
+    transports = [client._transport, *client._mounts.values()]
+    # Do not infer ordering inside an HTTP/2 multiplexed receive loop.
+    return all(t is None or (
+        type(t) is module.AsyncHTTPTransport and not getattr(t._pool, "_http2", True)
+    ) for t in transports)
+
+
+def can_promote(error):
+    return observation_confirmed() and not response_received() and not certificate_failure(error)
+
+
+def certificate_failure(error):
+    seen = set()
+    pending = [error]
+    while pending:
+        error = pending.pop()
+        if error is None or id(error) in seen:
+            continue
+        seen.add(id(error))
+        if isinstance(error, ssl.SSLCertVerificationError):
+            return True
+        pending.extend((error.__cause__, error.__context__))
+    return False
 
 
 @contextmanager
@@ -37,7 +80,7 @@ def observe_response():
     and concurrent requests cannot transfer an observation to another attempt.
     A mutable cell also carries observations out of asyncio.wait_for's task.
     """
-    token = _response_state.set({"received": False})
+    token = _response_state.set({"received": False, "client": None})
     try:
         yield
     finally:
@@ -54,6 +97,7 @@ def reset_response_observation():
     state = _response_state.get()
     if state is not None:
         state["received"] = False
+        state["client"] = None
 
 
 def is_connection_failure(error):
