@@ -9,12 +9,27 @@ import socket
 import ssl
 from contextlib import contextmanager
 from contextvars import ContextVar
+from weakref import WeakSet
 
 import httpx
 import httpx2
 
 logger = logging.getLogger(__name__)
 _response_state = ContextVar("openai_response_state", default=None)
+_installed = WeakSet()
+_CLIENT_TYPES = (httpx.AsyncClient, httpx2.AsyncClient)
+try:
+    from openai._base_client import AsyncHttpxClientWrapper, DefaultAsyncHttpxClient
+
+    _CLIENT_TYPES += (AsyncHttpxClientWrapper, DefaultAsyncHttpxClient)
+except (ImportError, AttributeError):
+    pass  # Unknown SDK defaults do not qualify for recovery.
+
+
+def _client_module(client):
+    if type(client) not in _CLIENT_TYPES:
+        return None
+    return httpx2 if isinstance(client, httpx2.AsyncClient) else httpx
 
 
 async def _received_headers(response):
@@ -24,34 +39,38 @@ async def _received_headers(response):
 
 
 def watch_response(http_client):
-    if isinstance(http_client, (httpx.AsyncClient, httpx2.AsyncClient)):
+    try:
+        if _client_module(http_client) is None:
+            return
         hooks = http_client.event_hooks.setdefault("response", [])
-        # Keep caller hooks, in their order, but observe before any can read.
-        hooks[:] = [_received_headers, *(h for h in hooks if h is not _received_headers)]
+        if http_client not in _installed:
+            # Install once. Never reorder a list that another request may be
+            # iterating. Displacement/removal permanently means unknown.
+            _installed.add(http_client)
+            hooks.insert(0, _received_headers)
         state = _response_state.get()
         if state is not None:
             state["client"] = http_client
+    except Exception:  # noqa: BLE001 - any observation failure means unknown
+        return  # Optional observation must never replace the provider error.
 
 
 def observation_confirmed():
-    state = _response_state.get()
-    client = state.get("client") if state is not None else None
-    module = httpx2 if isinstance(client, httpx2.AsyncClient) else httpx
-    if not isinstance(client, module.AsyncClient):
-        return False
-    hooks = client.event_hooks.get("response", [])
-    if not hooks or hooks[0] is not _received_headers:
-        return False  # A caller may have inserted a hook since installation.
-    # Subclasses, wrappers and custom transports can consume bytes before the
-    # HTTPX hook boundary. Only the standard send pipeline is observable here.
-    for method in ("send", "_send_handling_auth", "_send_handling_redirects", "_send_single_request"):
-        if getattr(getattr(client, method, None), "__func__", None) is not getattr(module.AsyncClient, method):
+    try:
+        state = _response_state.get()
+        client = state.get("client") if state is not None else None
+        module = _client_module(client)
+        if module is None or client not in _installed:
             return False
-    transports = [client._transport, *client._mounts.values()]
-    # Do not infer ordering inside an HTTP/2 multiplexed receive loop.
-    return all(t is None or (
-        type(t) is module.AsyncHTTPTransport and not getattr(t._pool, "_http2", True)
-    ) for t in transports)
+        hooks = client.event_hooks.get("response", [])
+        if not hooks or hooks[0] is not _received_headers:
+            return False
+        transports = [client._transport, *client._mounts.values()]
+        return all(t is None or (
+            type(t) is module.AsyncHTTPTransport and not t._pool._http2
+        ) for t in transports)
+    except Exception:  # noqa: BLE001 - library-private drift must fail closed
+        return False
 
 
 def can_promote(error):
