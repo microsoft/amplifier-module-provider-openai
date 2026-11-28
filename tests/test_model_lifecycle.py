@@ -64,7 +64,10 @@ def test_real_sdk_catalog_preserves_shutdown_field_and_drops_only_known_retireme
     asyncio.run(run())
 
 
-def test_custom_endpoint_and_subclass_catalog_are_not_openai_lifecycle():
+@pytest.mark.parametrize("model_id", [
+    "o3-deep-research", "gpt-image-2", "gpt-image-2-2026-04-21",
+])
+def test_custom_endpoint_and_subclass_catalog_are_not_openai_lifecycle(model_id, caplog):
     async def run():
         for provider_type in (OpenAIProvider, type("AzureLike", (OpenAIProvider,), {"name": "azure-openai"})):
             for endpoint in ("https://gateway.invalid/v1", "https://api.openai.com/v1"):
@@ -73,17 +76,94 @@ def test_custom_endpoint_and_subclass_catalog_are_not_openai_lifecycle():
                 def handler(request):
                     assert request.method == "GET" and not request.url.query
                     return httpx.Response(200, json={"object": "list", "data": [
-                        {"id": "o3-deep-research", "shutdown_date": "2020-01-01"},
+                        {"id": model_id, "shutdown_date": "2020-01-01"},
                     ]})
                 async with AsyncOpenAI(
                     api_key="test", base_url=endpoint,
                     http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
                 ) as client:
-                    provider = provider_type(client=client, config={"max_retries": 0})
+                    caplog.clear()
+                    provider = provider_type(client=client, config={
+                        "max_retries": 0, "default_model": model_id,
+                    })
+                    assert provider.default_model == model_id
+                    assert "OpenAI shutdown_date" not in caplog.text
                     models = await provider.list_models(filters={"hide_shutdown": True})
-                    assert models[0].id == "o3-deep-research"
+                    assert [model.id for model in models] == [model_id]
                     assert "shutdown_date" not in models[0].defaults
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("model_id", ["gpt-image-2", "gpt-image-2-2026-04-21"])
+def test_image2_exact_shutdown_dates_and_boundaries(model_id):
+    assert shutdown_date(model_id) == "2027-02-10"
+    assert not is_shutdown(model_id, today=date(2027, 2, 9))
+    assert is_shutdown(model_id, today=date(2027, 2, 10))
+    assert shutdown_date(model_id, "2099-01-01") == "2099-01-01"
+    assert shutdown_date(model_id, "2027-02-30") == "2027-02-10"
+    for unknown in (
+        "gpt-image-2-custom", "gpt-image-2-2099-01-01",
+        "gpt-image-2.6-sunburst", "gpt-image-2.6-flare",
+    ):
+        assert shutdown_date(unknown) is None
+        assert not is_shutdown(unknown, today=date(2099, 1, 1))
+
+
+@pytest.mark.asyncio
+async def test_image2_catalog_metadata_and_date_filter():
+    retiring = {"gpt-image-2", "gpt-image-2-2026-04-21"}
+    replacements = {"gpt-image-2.6-sunburst", "gpt-image-2.6-flare"}
+
+    def handler(request):
+        assert request.method == "GET" and request.url.path == "/v1/models"
+        assert not request.url.query
+        return httpx.Response(200, json={"object": "list", "data": [
+            {"id": model_id, "object": "model", "created": 0, "owned_by": "openai"}
+            for model_id in sorted(retiring | replacements)
+        ]})
+
+    real_is_shutdown = is_shutdown
+    async with AsyncOpenAI(
+        api_key="test", base_url="https://api.openai.com/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        provider = OpenAIProvider(client=client, config={"max_retries": 0})
+        for today, visible in (
+            (date(2027, 2, 9), retiring | replacements),
+            (date(2027, 2, 10), replacements),
+        ):
+            with patch(
+                "amplifier_module_provider_openai._lifecycle.is_shutdown",
+                side_effect=lambda model_id, *, reported=None, today=today: real_is_shutdown(
+                    model_id, reported=reported, today=today,
+                ),
+            ):
+                models = {model.id: model for model in await provider.list_models(
+                    filters={"hide_shutdown": True, "hide_dated": False},
+                )}
+                assert set(models) == visible
+                for model_id in retiring & visible:
+                    assert models[model_id].defaults["shutdown_date"] == "2027-02-10"
+                for model_id in replacements:
+                    assert "shutdown_date" not in models[model_id].defaults
+                all_models = {
+                    model.id: model for model in await provider.list_models(filters={})
+                }
+                assert set(all_models) == retiring | replacements
+                for model_id in retiring:
+                    assert all_models[model_id].defaults["shutdown_date"] == "2027-02-10"
+                assert await provider.list_models() == []
+                assert provider.default_model == "gpt-6.2-sol"
+
+
+@pytest.mark.parametrize("model_id", ["gpt-image-2", "gpt-image-2-2026-04-21"])
+def test_image2_explicit_pins_warn_without_replacement(model_id, caplog, monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    provider = OpenAIProvider(api_key="test", config={"default_model": model_id})
+    assert provider.default_model == model_id
+    assert model_id in caplog.text
+    assert "2027-02-10" in caplog.text
+    assert "pin is preserved" in caplog.text
 
 
 @pytest.mark.asyncio

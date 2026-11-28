@@ -1,6 +1,6 @@
 """Direct OpenAI lifecycle facts, separate from capabilities and saved pins.
 
-Source (checked 2026-11-06): https://developers.openai.com/api/docs/deprecations.md
+Source (checked 2026-11-28): https://developers.openai.com/api/docs/deprecations.md
 Never apply this catalog policy to Azure deployment names or custom gateways.
 """
 
@@ -38,6 +38,7 @@ for shutdown, models in (
         "gpt-4.1", "gpt-4.1-2025-04-14", "gpt-4.1-mini", "gpt-4.1-mini-2025-04-14",
     )),
     ("2027-02-01", ("gpt-5.5-cyber-preview",)),
+    ("2027-02-10", ("gpt-image-2", "gpt-image-2-2026-04-21")),
     ("2027-04-01", (
         "gpt-5.1", "gpt-5.1-2025-11-13", "gpt-5.3-codex",
         "gpt-5.4-nano", "gpt-5.4-nano-2026-03-17",
