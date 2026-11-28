@@ -90,7 +90,11 @@ from ._constants import (
     METADATA_TOOL_SEARCH_ITEMS,
     NATIVE_TOOL_TYPES,
 )
-from ._cost import compute_cost, requires_cache_usage_evidence
+from ._cost import (
+    HEALTHCARE_PRICING_MODELS,
+    compute_cost,
+    requires_cache_usage_evidence,
+)
 from ._model_listing import ModelFilters, selector_schema
 from ._response_handling import (
     FunctionCallTruncationError,
@@ -296,7 +300,7 @@ def _has_unpriced_gpt_6_2_mode(value: Any) -> bool:
     from ._capabilities import GPT_6_2_MODELS
 
     model = response_field(value, "model")
-    if not isinstance(model, str) or model not in GPT_6_2_MODELS:
+    if not isinstance(model, str) or model not in GPT_6_2_MODELS | HEALTHCARE_PRICING_MODELS:
         return False
     window = response_field(response_field(value, "background_options"), "completion_window")
     if window not in (None, "soonest"):
@@ -6273,6 +6277,60 @@ class OpenAIProvider:
         if usage_obj is None:
             return None
         input_details = getattr(usage_obj, "input_tokens_details", None)
+        model = getattr(response, "model", None)
+        if isinstance(model, str) and model in HEALTHCARE_PRICING_MODELS:
+            if not self._has_standard_openai_endpoint():
+                return None
+
+            def reported(obj: Any, key: str) -> Any:
+                # SDK defaults/coercions cannot supply absent wire evidence.
+                fields_set = getattr(obj, "model_fields_set", None)
+                if fields_set is not None and key not in fields_set:
+                    return None
+                return getattr(obj, key, None)
+
+            split = reported(input_details, "cache_write_tokens_details")
+            if isinstance(split, _RawResponseObject):
+                # Raw wrappers contain only fields actually present on the wire.
+                split = split.model_dump()
+            elif hasattr(split, "model_dump"):
+                split = split.model_dump(exclude_unset=True)
+            return compute_cost(
+                model,
+                prompt_tokens=reported(usage_obj, "input_tokens"),
+                completion_tokens=reported(usage_obj, "output_tokens"),
+                cached_tokens=reported(input_details, "cached_tokens"),
+                cache_write_tokens=reported(input_details, "cache_write_tokens"),
+                cache_write_tokens_details=split,
+                service_tier=reported(response, "service_tier"),
+            )
+        if getattr(response, "model", None) == "chat-latest":
+            # Preserve missing/null/malformed evidence before legacy zero defaults.
+            # This alias does not require the newer mandatory cache-write field.
+            missing = object()
+            writes = getattr(input_details, "cache_write_tokens", missing)
+            split = getattr(input_details, "cache_write_tokens_details", missing)
+            fields_set = getattr(input_details, "model_fields_set", None)
+            declared = getattr(type(input_details), "model_fields", {})
+            if fields_set is not None:
+                if "cache_write_tokens" in declared and "cache_write_tokens" not in fields_set:
+                    writes = missing
+                if "cache_write_tokens_details" in declared and "cache_write_tokens_details" not in fields_set:
+                    split = missing
+            if split is not missing:
+                if hasattr(split, "model_dump"):
+                    split = split.model_dump()
+                if not isinstance(split, dict):
+                    return None
+            return compute_cost(
+                "chat-latest",
+                prompt_tokens=getattr(usage_obj, "input_tokens", None),
+                completion_tokens=getattr(usage_obj, "output_tokens", None),
+                cached_tokens=getattr(input_details, "cached_tokens", None),
+                cache_write_tokens=0 if writes is missing else writes,
+                cache_write_tokens_details=None if split is missing else split,
+                service_tier=getattr(response, "service_tier", None),
+            )
         if requires_cache_usage_evidence(getattr(response, "model", "")) and (
             any(
                 type(getattr(input_details, key, None)) is not int

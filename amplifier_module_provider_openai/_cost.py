@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from ._capabilities import GPT_6_2_MODELS, GPT_6_MODELS, get_capabilities
@@ -52,6 +53,33 @@ from ._capabilities import GPT_6_2_MODELS, GPT_6_MODELS, get_capabilities
 # ---------------------------------------------------------------------------
 
 _PER_M = Decimal(1_000_000)
+
+# Pricing eligibility ONLY: never add these IDs to request/capability families.
+# Specialized Healthcare rows, USD / 1M tokens, global processing.
+# https://developers.openai.com/api/docs/pricing.md, checked 2026-11-25.
+# Each pair is (short <=272K input, long >272K input); each row is
+# (input, output, read, 30m write, 12h write). None means UNPUBLISHED.
+# Promotion guaranteed "at least through December 31, 2026": the date guard
+# below demands re-verification, not an invented expiry or automatic increase.
+_HEALTHCARE_RATES = {
+    "gpt-6.2-astra-healthcare": {
+        "default": (("8", "40", ".40", "10", "20"), ("16", "60", ".80", "20", "40")),
+        "fast": (("16", "80", ".80", None, None), ("32", "120", "1.60", None, None)),
+    },
+    "gpt-6.2-sol-healthcare": {
+        "default": (("2", "10", ".10", "2.50", "5"), ("4", "15", ".20", "5", "10")),
+        "fast": (("4", "20", ".20", None, None), ("8", "30", ".40", None, None)),
+    },
+    "gpt-6-astra-healthcare": {
+        "default": (("10", "50", "1", None, None), ("20", "75", "2", None, None)),
+        "fast": (("20", "100", "2", None, None), ("40", "150", "4", None, None)),
+    },
+    "gpt-6.1-sol-healthcare": {
+        "default": (("2", "10", ".10", None, None), ("4", "15", ".20", None, None)),
+        "fast": (("4", "20", ".20", None, None), ("8", "30", ".40", None, None)),
+    },
+}
+HEALTHCARE_PRICING_MODELS = frozenset(_HEALTHCARE_RATES)
 
 # Long-context re-rating threshold. A request whose INPUT (prompt) token count
 # exceeds the model's `long_context_pricing_threshold` bills the ENTIRE request --
@@ -100,6 +128,13 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.10"),
         "cache_write_per_m": Decimal("2.50"),
         "cache_write_12h_per_m": Decimal("5.00"),
+    },
+    # Exact rolling alias only; no documented write, tier, or long-context rates.
+    # https://developers.openai.com/api/docs/models/chat-latest.md (2026-11-15).
+    "chat-latest": {
+        "input_per_m": Decimal("5.00"),
+        "output_per_m": Decimal("30.00"),
+        "cache_read_per_m": Decimal("0.50"),
     },
     # GPT-6 and GPT-6.1 short-context Standard pricing, per 1M tokens.
     # Source: https://developers.openai.com/api/docs/pricing
@@ -460,9 +495,9 @@ def _find_rates(
     m = _SNAPSHOT_RE.match(model)
     if m is None:
         return None
-    # GPT-6 plus GPT-6.1 have exact documented model IDs and no dated snapshots. Do not
+    # GPT-6, GPT-6.1 and chat-latest have exact IDs and no dated snapshots. Do not
     # assign their current prices to invented future snapshots.
-    if m.group("base") in GPT_6_MODELS:
+    if m.group("base") in GPT_6_MODELS or m.group("base") == "chat-latest":
         return None
     return table.get(m.group("base"))
 
@@ -486,7 +521,13 @@ def compute_cost(
     cache_write_tokens_details: Mapping[str, int] | None = None,
     service_tier: str | None = "default",
 ) -> Decimal | None:
-    """Compute the cost of an OpenAI API call in USD.
+    """Compute the token-cost estimate of an OpenAI API call in USD.
+
+    Exact Healthcare selectors use only their specialized global Standard/Fast
+    rows, checked 2026-11-25. Callers own endpoint and billing-mode qualification;
+    this interface cannot price regional invoices or historical billing dates.
+    After the guaranteed promotional period, return unknown until reverified
+    rather than assuming expiry or inventing replacement prices.
 
     Args:
         model: The model ID (e.g. 'gpt-5.4') or dated snapshot id
@@ -499,8 +540,8 @@ def compute_cost(
         cache_write_tokens: Number of prompt tokens written to cache this call.
             GPT-5.6/GPT-6; billed at the reported lifetime's rate, never both the
             ordinary input rate and write rate. usage.{prompt,input}_tokens_details.cache_write_tokens.
-            Models without a cache_write_per_m rate never emit this field and bill
-            it as ordinary input.
+            Legacy models without a cache_write_per_m rate bill it as ordinary
+            input. Unpublished Healthcare write prices instead remain unknown.
         cache_write_tokens_details: Non-overlapping ttl_30m_tokens and ttl_12h_tokens
             buckets supplied by the endpoint's usage reader.
             Their sum must equal cache_write_tokens. For GPT-5.6/GPT-6/GPT-6.1,
@@ -518,9 +559,88 @@ def compute_cost(
         cached_tokens / cache_write_tokens subtraction happens inside this function
         to prevent call-site double-charging. Callers pass the raw API fields directly.
     """
+    if isinstance(model, str) and model in HEALTHCARE_PRICING_MODELS:
+        # Current global token estimate, not historical billing or hosted-tool
+        # fees. No regional/FedRAMP/Azure rates or other tiers are inferred.
+        if not date(2026, 11, 24) <= datetime.now(UTC).date() <= date(2026, 12, 31):
+            return None
+        if not isinstance(service_tier, str):
+            return None
+        tier = "fast" if service_tier == "priority" else service_tier
+        bands = _HEALTHCARE_RATES[model].get(tier)
+        if bands is None or any(
+            type(value) is not int or value < 0
+            for value in (prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens)
+        ):
+            return None
+        if cached_tokens + cache_write_tokens > prompt_tokens:
+            return None
+        row = bands[int(prompt_tokens > 272_000)]
+        writes_30m = writes_12h = 0
+        if cache_write_tokens_details is not None:
+            if (
+                not isinstance(cache_write_tokens_details, Mapping)
+                or set(cache_write_tokens_details) - {"ttl_30m_tokens", "ttl_12h_tokens"}
+            ):
+                return None
+            writes_30m = cache_write_tokens_details.get("ttl_30m_tokens", 0)
+            writes_12h = cache_write_tokens_details.get("ttl_12h_tokens", 0)
+            if cache_write_tokens and set(cache_write_tokens_details) != {
+                "ttl_30m_tokens", "ttl_12h_tokens",
+            }:
+                return None
+            if any(type(n) is not int or n < 0 for n in (writes_30m, writes_12h)):
+                return None
+        if writes_30m + writes_12h != cache_write_tokens:
+            return None
+        if cache_write_tokens and (row[3] is None or row[4] is None):
+            return None
+        cost = (
+            Decimal(prompt_tokens - cached_tokens - cache_write_tokens) * Decimal(row[0])
+            + Decimal(completion_tokens) * Decimal(row[1])
+            + Decimal(cached_tokens) * Decimal(row[2])
+        )
+        if cache_write_tokens:
+            assert row[3] is not None and row[4] is not None
+            cost += Decimal(writes_30m) * Decimal(row[3])
+            cost += Decimal(writes_12h) * Decimal(row[4])
+        return cost / _PER_M
+
     rates = _find_rates(model)
     if rates is None:
         return None
+
+    if model == "chat-latest":
+        # Standard token estimate only. Do not normalize malformed evidence or
+        # import newer models' write/tier assumptions into this rolling alias.
+        if (
+            service_tier != "default"
+            or any(
+                type(value) is not int or value < 0
+                for value in (
+                    prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens
+                )
+            )
+            or cached_tokens > prompt_tokens
+            or cache_write_tokens != 0
+        ):
+            return None
+        # Absent breakdown or empty/recognized all-zero buckets mean no reported
+        # writes, not evidence of a supported cache-write price.
+        if cache_write_tokens_details is not None and (
+            not isinstance(cache_write_tokens_details, Mapping)
+            or set(cache_write_tokens_details) - {"ttl_30m_tokens", "ttl_12h_tokens"}
+            or any(
+                type(value) is not int or value != 0
+                for value in cache_write_tokens_details.values()
+            )
+        ):
+            return None
+        return (
+            Decimal(prompt_tokens - cached_tokens) * rates["input_per_m"]
+            + Decimal(cached_tokens) * rates["cache_read_per_m"]
+            + Decimal(completion_tokens) * rates["output_per_m"]
+        ) / _PER_M
 
     # Modern write pricing needs trustworthy, non-overlapping usage counts.
     # Keep the historical pre-5.6 reader behavior (including its clamping).
