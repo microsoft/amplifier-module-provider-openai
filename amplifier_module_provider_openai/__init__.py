@@ -3891,6 +3891,13 @@ class OpenAIProvider:
             **params, **(params.get("extra_body") or {}),
         })
         redactor = MediaRedactor(media_values(request.model_dump()) | media_values(params))
+        # Media guards can dispatch through a request-local client rather than
+        # self.client; paid image tools also retain their existing no-host-replay
+        # boundary. Do not infer observation for either from the text client.
+        network_recovery_allowed = (
+            _media_guard is None and not media_values(request.model_dump())
+            and not any(tool.get("type") == "image_generation" for tool in params.get("tools", []))
+        )
 
         message_list = list(request.messages)
         instructions = params.get("instructions")
@@ -4101,7 +4108,12 @@ class OpenAIProvider:
                     status_code=400,
                 ) from e
 
+            from ._transport import reset_response_observation, watch_response
+
+            reset_response_observation()
             try:
+                if network_recovery_allowed:
+                    watch_response(getattr(self.client, "_client", None))
                 if _use_streaming:
                     # Streaming path — chunked HTTP transport prevents timeouts on
                     # large context requests. The event loop emits contract events
@@ -4438,8 +4450,18 @@ class OpenAIProvider:
                 # deterministic 400 (context overflow, invalid params) was retried
                 # max_retries times before surfacing.
                 if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
-                    # Transport-level failures are genuinely transient.
-                    raise kernel_errors.LLMError(
+                    from ._transport import can_promote, is_connection_failure
+
+                    # Only failures before an HTTP response can be promoted.
+                    # Keep configuration faults and interrupted answers on the
+                    # prior path. Retryability, text and cause stay unchanged.
+                    error_class = kernel_errors.LLMError
+                    if network_recovery_allowed and can_promote(e):
+                        if isinstance(e, openai.APITimeoutError):
+                            error_class = kernel_errors.LLMTimeoutError
+                        elif is_connection_failure(e):
+                            error_class = kernel_errors.NetworkError
+                    raise error_class(
                         str(e) or f"{type(e).__name__}: (no message)",
                         provider=self.name,
                         retryable=True,
@@ -4498,8 +4520,11 @@ class OpenAIProvider:
             # Preserve error class/retry/status/billing while removing exact
             # media echoes before retry observers/logging or public propagation.
             # No SDK request, response or saved replay object is redacted.
+            from ._transport import observe_response
+
             try:
-                return await _do_complete()
+                with observe_response():
+                    return await _do_complete()
             except Exception as caught:
                 redactor.sanitize_error(caught)
                 raise
