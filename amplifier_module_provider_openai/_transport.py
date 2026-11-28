@@ -7,7 +7,23 @@ connections. Keep the SDK's client defaults, TLS and environment proxy routing.
 import logging
 import socket
 
+import httpx
+import httpx2
+
 logger = logging.getLogger(__name__)
+
+
+def is_connection_failure(error):
+    """Require transport evidence, not merely the SDK's catch-all wrapper.
+
+    The SDK also wraps configuration errors (UnsupportedProtocol, InvalidURL)
+    in APIConnectionError. Neither is a lost connection. Include legacy HTTPX
+    because the SDK still accepts caller-supplied HTTPX clients.
+    """
+    return isinstance(error.__cause__, (
+        httpx.NetworkError, httpx.RemoteProtocolError,
+        httpx2.NetworkError, httpx2.RemoteProtocolError,
+    ))
 
 
 def keepalive_options():

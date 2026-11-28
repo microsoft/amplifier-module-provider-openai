@@ -4101,6 +4101,7 @@ class OpenAIProvider:
                     status_code=400,
                 ) from e
 
+            response_started = False
             try:
                 if _use_streaming:
                     # Streaming path — chunked HTTP transport prevents timeouts on
@@ -4134,6 +4135,7 @@ class OpenAIProvider:
                                 )
                             )
                             async with stream_context as stream:
+                                response_started = True
                                 if emit_stream_events:
                                     async for event in stream:
                                         et = event.type
@@ -4438,8 +4440,18 @@ class OpenAIProvider:
                 # deterministic 400 (context overflow, invalid params) was retried
                 # max_retries times before surfacing.
                 if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
-                    # Transport-level failures are genuinely transient.
-                    raise kernel_errors.LLMError(
+                    from ._transport import is_connection_failure
+
+                    # Only failures before an HTTP response can be promoted.
+                    # Keep configuration faults and interrupted answers on the
+                    # prior path. Retryability, text and cause stay unchanged.
+                    error_class = kernel_errors.LLMError
+                    if not response_started:
+                        if isinstance(e, openai.APITimeoutError):
+                            error_class = kernel_errors.LLMTimeoutError
+                        elif is_connection_failure(e):
+                            error_class = kernel_errors.NetworkError
+                    raise error_class(
                         str(e) or f"{type(e).__name__}: (no message)",
                         provider=self.name,
                         retryable=True,
