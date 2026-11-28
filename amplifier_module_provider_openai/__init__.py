@@ -4113,7 +4113,8 @@ class OpenAIProvider:
             reset_response_observation()
             response_started = False
             try:
-                watch_response(getattr(self.client, "_client", None))
+                if network_recovery_allowed:
+                    watch_response(getattr(self.client, "_client", None))
                 if _use_streaming:
                     # Streaming path — chunked HTTP transport prevents timeouts on
                     # large context requests. The event loop emits contract events
